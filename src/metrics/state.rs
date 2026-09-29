@@ -95,6 +95,8 @@ pub struct MetricsSnapshot {
     pub vram_total_gb: f64,
     pub power_w: f64,
     pub joules_per_token: f64,
+    /// GPU core clock in MHz (blueprint §6 View 1 top-left key metric).
+    pub gpu_clock_mhz: f64,
 
     // ---- inter-token latency percentiles (nanoseconds) ----
     pub itl_p50_ns: u64,
@@ -133,6 +135,7 @@ impl Default for MetricsSnapshot {
             vram_total_gb: 0.0,
             power_w: 0.0,
             joules_per_token: 0.0,
+            gpu_clock_mhz: 0.0,
             itl_p50_ns: 0,
             itl_p90_ns: 0,
             itl_p99_ns: 0,
@@ -169,6 +172,17 @@ impl MetricsSnapshot {
         self.itl_p999_ns as f64 / 1_000_000.0
     }
 
+    /// Display label for the GPU core clock: `1410 MHz`, or `N/A` when no
+    /// GPU/driver telemetry is available (the `0.0` sentinel, blueprint
+    /// §5D graceful-degradation rule).
+    pub fn gpu_clock_label(&self) -> String {
+        if self.gpu_clock_mhz > 0.0 {
+            format!("{:.0} MHz", self.gpu_clock_mhz)
+        } else {
+            "N/A".to_string()
+        }
+    }
+
     /// Fill the ITL percentile fields from a [`LatencyHistogram`] (Chunk 2).
     ///
     /// This is the bridge between the worker-side latency histogram and the
@@ -202,6 +216,7 @@ impl MetricsSnapshot {
             vram_total_gb: 24.0,
             power_w: 285.0,
             joules_per_token: 0.338,
+            gpu_clock_mhz: 1410.0,
             // 12.1 ms / 16.4 ms / 41.2 ms / 55.0 ms.
             itl_p50_ns: 12_100_000,
             itl_p90_ns: 16_400_000,

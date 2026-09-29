@@ -148,38 +148,40 @@ fn snapshot_default_is_zeroed() {
 fn snapshot_update_load_roundtrip() {
     let state = MetricsState::new();
 
-    let mut snap = MetricsSnapshot::default();
-    snap.endpoint = "http://127.0.0.1:8000/v1".into();
-    snap.backend = "vLLM".into();
-    snap.model = "test-model".into();
-    snap.mode = "Speed".into();
-    snap.aggregate_tps = 123.45;
-    snap.active_streams = 3;
-    snap.total_streams = 4;
-    snap.vram_used_gb = 10.5;
-    snap.vram_total_gb = 24.0;
-    snap.power_w = 250.0;
-    snap.joules_per_token = 0.2;
-    snap.itl_p50_ns = 10_000_000;
-    snap.itl_p90_ns = 20_000_000;
-    snap.itl_p99_ns = 30_000_000;
-    snap.itl_p999_ns = 40_000_000;
-    snap.prompt_tokens = 512;
-    snap.completion_tokens = 256;
-    snap.reasoning_tokens = 128;
-    snap.status = StreamStatus::Streaming;
-    snap.streams.push(StreamMetric {
-        id: 7,
-        kind: "Reasoning".into(),
-        state: StreamStatus::Streaming,
-        pp_tokens: Some(512),
-        tg_tokens: Some(256),
-        ttft_s: Some(0.12),
-        gen_tps: Some(60.0),
-        mtp: Some(1.5),
-        progress: 0.5,
-    });
-    snap.throughput_series = vec![1.0, 2.0, 3.0];
+    let snap = MetricsSnapshot {
+        endpoint: "http://127.0.0.1:8000/v1".into(),
+        backend: "vLLM".into(),
+        model: "test-model".into(),
+        mode: "Speed".into(),
+        aggregate_tps: 123.45,
+        active_streams: 3,
+        total_streams: 4,
+        vram_used_gb: 10.5,
+        vram_total_gb: 24.0,
+        power_w: 250.0,
+        joules_per_token: 0.2,
+        itl_p50_ns: 10_000_000,
+        itl_p90_ns: 20_000_000,
+        itl_p99_ns: 30_000_000,
+        itl_p999_ns: 40_000_000,
+        prompt_tokens: 512,
+        completion_tokens: 256,
+        reasoning_tokens: 128,
+        status: StreamStatus::Streaming,
+        streams: vec![StreamMetric {
+            id: 7,
+            kind: "Reasoning".into(),
+            state: StreamStatus::Streaming,
+            pp_tokens: Some(512),
+            tg_tokens: Some(256),
+            ttft_s: Some(0.12),
+            gen_tps: Some(60.0),
+            mtp: Some(1.5),
+            progress: 0.5,
+        }],
+        throughput_series: vec![1.0, 2.0, 3.0],
+        ..Default::default()
+    };
 
     state.update(snap);
 
@@ -212,8 +214,10 @@ fn snapshot_update_replaces_previous() {
     state.update(MetricsSnapshot::sample());
     assert_eq!(state.load().aggregate_tps, 842.3);
 
-    let mut s = MetricsSnapshot::default();
-    s.aggregate_tps = 1.0;
+    let s = MetricsSnapshot {
+        aggregate_tps: 1.0,
+        ..Default::default()
+    };
     state.update(s);
     assert_eq!(state.load().aggregate_tps, 1.0);
 }
@@ -248,9 +252,11 @@ fn snapshot_lockfree_reads_concurrent_with_updates() {
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_millis(50) {
                 v += 1;
-                let mut snap = MetricsSnapshot::default();
-                snap.aggregate_tps = v as f64;
-                snap.status = StreamStatus::Streaming;
+                let snap = MetricsSnapshot {
+                    aggregate_tps: v as f64,
+                    status: StreamStatus::Streaming,
+                    ..Default::default()
+                };
                 s.update(snap);
             }
             v
@@ -272,11 +278,13 @@ fn snapshot_lockfree_reads_concurrent_with_updates() {
 /// Nanosecond percentiles convert to milliseconds for display.
 #[test]
 fn snapshot_ns_to_ms_conversion() {
-    let mut s = MetricsSnapshot::default();
-    s.itl_p50_ns = 12_100_000; // 12.1 ms
-    s.itl_p90_ns = 16_400_000; // 16.4 ms
-    s.itl_p99_ns = 41_200_000; // 41.2 ms
-    s.itl_p999_ns = 55_000_000; // 55.0 ms
+    let s = MetricsSnapshot {
+        itl_p50_ns: 12_100_000,  // 12.1 ms
+        itl_p90_ns: 16_400_000,  // 16.4 ms
+        itl_p99_ns: 41_200_000,  // 41.2 ms
+        itl_p999_ns: 55_000_000, // 55.0 ms
+        ..Default::default()
+    };
 
     assert!((s.itl_p50_ms() - 12.1).abs() < 1e-6);
     assert!((s.itl_p90_ms() - 16.4).abs() < 1e-6);

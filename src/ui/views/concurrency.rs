@@ -37,13 +37,11 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame) {
     for &level in &LADDER {
         let is_target = level == app.concurrency_target;
         rows.push(Row::new(vec![
-            Cell::from(level.to_string()).style(
-                if is_target {
-                    style::value_ok()
-                } else {
-                    style::label()
-                },
-            ),
+            Cell::from(level.to_string()).style(if is_target {
+                style::value_ok()
+            } else {
+                style::label()
+            }),
             Cell::from("--"),
             Cell::from("--"),
             Cell::from(if is_target {

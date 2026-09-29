@@ -9,8 +9,8 @@ use ratatui::Frame;
 
 use crate::ui::app::{App, View};
 
-pub mod config;
 pub mod concurrency;
+pub mod config;
 pub mod history;
 pub mod live;
 pub mod needle;

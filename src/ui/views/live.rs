@@ -58,9 +58,19 @@ fn kv(label: &str, value: String, value_style: Style) -> Line<'static> {
     ])
 }
 
-/// Top-left: aggregate throughput, active streams, power, VRAM bar.
+/// Top-left: aggregate throughput, active streams, GPU clock, power
+/// (with J/token), and the VRAM capacity bar (blueprint §6 View 1
+/// "Key Metrics": aggregate t/s, VRAM bar, GPU core frequency,
+/// energy efficiency).
 fn render_gauges(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
-    let vram_ratio = (m.vram_used_gb / m.vram_total_gb).clamp(0.0, 1.0);
+    // Guard the 0-total case (no GPU telemetry) so the ratio is a real
+    // number: graceful degradation to a 0% bar, never a NaN ratio
+    // (blueprint §5D: report N/A, never panic).
+    let vram_ratio = if m.vram_total_gb > 0.0 {
+        (m.vram_used_gb / m.vram_total_gb).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let vram_style = if vram_ratio < 0.75 {
         style::value_ok()
     } else if vram_ratio < 0.90 {
@@ -79,6 +89,7 @@ fn render_gauges(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
             format!("{:2} / {:2}", m.active_streams, m.total_streams),
             style::value(),
         ),
+        kv("GPU Clock", m.gpu_clock_label(), style::value()),
         kv(
             "Current Power",
             format!("{:.0} W ({:.3} J/token)", m.power_w, m.joules_per_token),

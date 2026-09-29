@@ -51,13 +51,12 @@ fn render_grid(area: Rect, f: &mut Frame) {
     }
 
     f.render_widget(
-        Table::new(rows, widths)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style::border())
-                    .title("NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
-            ),
+        Table::new(rows, widths).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(style::border())
+                .title("NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
+        ),
         area,
     );
 }
