@@ -100,7 +100,11 @@ impl EventLoop {
                             KeyAction::Continue
                             | KeyAction::PauseResume
                             | KeyAction::StepConcurrency
-                            | KeyAction::NewNeedle => {}
+                            | KeyAction::NewNeedle
+                            | KeyAction::HistoryNext
+                            | KeyAction::HistoryPrev
+                            | KeyAction::HistorySelectA
+                            | KeyAction::HistorySelectB => {}
                         }
                     }
                     // Resize: the backend re-queries the terminal size on

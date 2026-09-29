@@ -22,10 +22,12 @@ use ratatui::Frame;
 use crate::config::ExportFormat;
 use crate::engines::SweepResult;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
+use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
+use crate::ui::views::history::HistoryState;
 
 /// The five dashboard views (blueprint §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,6 +105,14 @@ pub enum KeyAction {
     NewNeedle,
     /// `e` — export results (JSON/MD/CSV).
     Export,
+    /// `j` / `↓` (History view) — move the session cursor down.
+    HistoryNext,
+    /// `k` / `↑` (History view) — move the session cursor up.
+    HistoryPrev,
+    /// `a` (History view) — set the cursor's session as diff run A.
+    HistorySelectA,
+    /// `b` (History view) — set the cursor's session as diff run B.
+    HistorySelectB,
 }
 
 /// Application state machine: current view, navigation, pause state, and the
@@ -130,6 +140,11 @@ pub struct App {
     /// Format the `e` key exports (Chunk 13; JSON by default, set from
     /// `--export` by the entry point).
     pub export_format: ExportFormat,
+    /// History view state (Chunk 14): the stored session list plus the
+    /// A/B selection and precomputed diff. `None` until the History view
+    /// is first opened (lazy DB load) — or the DB is unavailable, in
+    /// which case the view renders its placeholder.
+    pub history: Option<HistoryState>,
 }
 
 impl Default for App {
@@ -171,7 +186,25 @@ impl App {
             log,
             sweep: None,
             export_format: ExportFormat::default(),
+            history: None,
         }
+    }
+
+    /// Lazily load the History view state (Chunk 14): open the default
+    /// SQLite DB (`data_dir()/crucible/benchmarks.db`) and list the stored
+    /// sessions.
+    ///
+    /// Called only from the key path (first entry into the History view,
+    /// or a history key press) — never from the render path, which stays a
+    /// pure `&App` read (measurement-isolation invariant, blueprint §4).
+    /// A storage failure leaves the state `None`: the view renders its
+    /// "no stored runs" placeholder and never panics.
+    pub fn ensure_history(&mut self) {
+        if self.history.is_some() {
+            return;
+        }
+        let path = Database::default_path();
+        self.history = HistoryState::load(&path).ok();
     }
 
     /// Set the `e`-key export format (`--export` wiring, Chunk 13).
@@ -195,6 +228,11 @@ impl App {
             KeyCode::Char(c @ '1'..='5') => {
                 if let Some(view) = View::from_digit(c as u8) {
                     self.view = view;
+                    // Chunk 14: entering the History view loads the stored
+                    // session list once (key path, not the render path).
+                    if view == View::History {
+                        self.ensure_history();
+                    }
                 }
                 KeyAction::Continue
             }
@@ -208,6 +246,39 @@ impl App {
             }
             KeyCode::Char('n') => KeyAction::NewNeedle,
             KeyCode::Char('e') => KeyAction::Export,
+            // Chunk 14 — History view navigation/selection. These keys are
+            // scoped to the History view; elsewhere they are inert.
+            KeyCode::Char('j')
+            | KeyCode::Down
+            | KeyCode::Char('k')
+            | KeyCode::Up
+            | KeyCode::Char('a')
+            | KeyCode::Char('b')
+                if self.view == View::History && self.history.is_some() =>
+            {
+                let h = self
+                    .history
+                    .as_mut()
+                    .expect("history is Some (guard above)");
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        h.move_cursor(1);
+                        KeyAction::HistoryNext
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        h.move_cursor(-1);
+                        KeyAction::HistoryPrev
+                    }
+                    KeyCode::Char('a') => {
+                        h.select_a();
+                        KeyAction::HistorySelectA
+                    }
+                    _ => {
+                        h.select_b();
+                        KeyAction::HistorySelectB
+                    }
+                }
+            }
             _ => KeyAction::Continue,
         }
     }
