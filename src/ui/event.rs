@@ -3,17 +3,17 @@
 //!
 //! **Strictly decoupled from the worker pool** (blueprint §4): this loop
 //! only reads `App` state and draws to the terminal. A dropped frame or a
-//! terminal resize never touches the quanta timing path. Until the real
-//! `ArcSwap<MetricsSnapshot>` pipeline lands (Chunk 6), the "snapshot pull"
-//! is `App::on_tick()` over placeholder state; the read site is the same
-//! one the lock-free `ArcSwap::load()` will occupy.
+//! terminal resize never touches the quanta timing path. The metric snapshot
+//! is the shared `ArcSwap<MetricsSnapshot>` pipeline (Chunk 6): the stream
+//! worker publishes it via `MetricsState::update()`, and the render path
+//! (`App::render` → views → `MetricsState::load()`) reads it lock-free.
 
 use std::io::{self, Stdout};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::time::{interval, Interval};
@@ -71,12 +71,10 @@ impl EventLoop {
 
             // Poll input on a blocking thread so the async tick stays
             // responsive. `None` = no event within the poll window.
-            let polled = tokio::task::spawn_blocking(|| {
-                match event::poll(TICK) {
-                    Ok(true) => Some(event::read()),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(e)),
-                }
+            let polled = tokio::task::spawn_blocking(|| match event::poll(TICK) {
+                Ok(true) => Some(event::read()),
+                Ok(false) => None,
+                Err(e) => Some(Err(e)),
             })
             .await
             .map_err(io::Error::other)?;
@@ -97,8 +95,9 @@ impl EventLoop {
                 }
             }
 
-            // "Snapshot pull" site: placeholder state for now, the
-            // lock-free `ArcSwap<MetricsSnapshot>` read goes here.
+            // Advance the render clock. The lock-free
+            // `ArcSwap<MetricsSnapshot>` read happens in `draw()` (the views
+            // call `MetricsState::load()`); the render loop never writes it.
             app.on_tick();
             self.draw(app)?;
         }

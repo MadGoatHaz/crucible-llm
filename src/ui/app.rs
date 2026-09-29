@@ -3,10 +3,14 @@
 //! views, `Space` pause/resume, `+` step concurrency, `n` new needle,
 //! `e` export, `q`/`Esc` quit).
 //!
-//! Also carries the placeholder metric state the views render until the real
-//! `ArcSwap<MetricsSnapshot>` pipeline (Chunk 6) is wired in. The render
-//! loop only ever *reads* this state — it never touches the timing path
-//! (measurement-isolation invariant, blueprint §4).
+//! The `App` holds the shared `Arc<MetricsState>` — the `ArcSwap`
+//! double-buffered [`MetricsSnapshot`] pipeline (Chunk 6). The render loop
+//! only ever *reads* the snapshot via `MetricsState::load()` (a lock-free
+//! atomic read); the stream worker *writes* it via `MetricsState::update()`.
+//! The render loop never writes the snapshot and never touches the timing
+//! path (measurement-isolation invariant, blueprint §4).
+
+use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
 
@@ -96,128 +101,12 @@ pub enum KeyAction {
     Export,
 }
 
-/// One row of the Active Streams Monitor (blueprint §6, View 1).
-#[derive(Debug, Clone)]
-pub struct StreamRow {
-    pub id: u32,
-    /// `Reasoning` | `Content` | `Tool-Call`.
-    pub kind: &'static str,
-    /// `Streaming` | `Waiting` | `Done`.
-    pub state: &'static str,
-    pub pp_tokens: Option<usize>,
-    pub tg_tokens: Option<usize>,
-    pub ttft_s: Option<f64>,
-    pub gen_tps: Option<f64>,
-    /// MTP multiplier (`tokens / packets`).
-    pub mtp: Option<f64>,
-    /// 0.0..=1.0.
-    pub progress: f64,
-}
-
-/// Placeholder metric snapshot the views render while the real
-/// `ArcSwap<MetricsSnapshot>` (Chunk 6) is not yet wired in. Values mirror
-/// the blueprint §6 mockup so the layout is verifiable against it.
-#[derive(Debug, Clone)]
-pub struct PlaceholderMetrics {
-    pub endpoint: &'static str,
-    pub backend: &'static str,
-    pub model: &'static str,
-    pub mode: &'static str,
-    pub aggregate_tps: f64,
-    pub active_streams: usize,
-    pub total_streams: usize,
-    pub vram_used_gb: f64,
-    pub vram_total_gb: f64,
-    pub power_w: f64,
-    pub joules_per_token: f64,
-    pub itl_p50_ms: f64,
-    pub itl_p90_ms: f64,
-    pub itl_p99_ms: f64,
-    /// Normalized ITL histogram bins (0.0..=1.0), low → high latency.
-    pub itl_bins: [f64; 24],
-    pub streams: Vec<StreamRow>,
-    /// Rolling aggregate-throughput window (one sample per second, last 60).
-    pub throughput_series: Vec<f64>,
-}
-
-impl PlaceholderMetrics {
-    /// Sample values straight from the blueprint §6 mockup.
-    pub fn sample() -> Self {
-        let itl_bins = [
-            0.92, 0.86, 0.79, 0.71, 0.62, 0.53, 0.44, 0.36, 0.29, 0.23, 0.18, 0.14, 0.11, 0.08,
-            0.06, 0.045, 0.033, 0.024, 0.017, 0.012, 0.008, 0.005, 0.003, 0.002,
-        ];
-        Self {
-            endpoint: "http://127.0.0.1:8000/v1",
-            backend: "vLLM",
-            model: "Qwen3.6-35B-A3B-UD-Q4_K_XL",
-            mode: "Concurrency",
-            aggregate_tps: 842.3,
-            active_streams: 16,
-            total_streams: 16,
-            vram_used_gb: 21.4,
-            vram_total_gb: 24.0,
-            power_w: 285.0,
-            joules_per_token: 0.338,
-            itl_p50_ms: 12.1,
-            itl_p90_ms: 16.4,
-            itl_p99_ms: 41.2,
-            itl_bins,
-            streams: vec![
-                StreamRow {
-                    id: 1,
-                    kind: "Reasoning",
-                    state: "Streaming",
-                    pp_tokens: Some(2048),
-                    tg_tokens: Some(312),
-                    ttft_s: Some(0.182),
-                    gen_tps: Some(72.4),
-                    mtp: Some(1.84),
-                    progress: 0.55,
-                },
-                StreamRow {
-                    id: 2,
-                    kind: "Content",
-                    state: "Streaming",
-                    pp_tokens: Some(512),
-                    tg_tokens: Some(180),
-                    ttft_s: Some(0.045),
-                    gen_tps: Some(88.1),
-                    mtp: Some(1.02),
-                    progress: 0.70,
-                },
-                StreamRow {
-                    id: 3,
-                    kind: "Tool-Call",
-                    state: "Waiting",
-                    pp_tokens: Some(4096),
-                    tg_tokens: None,
-                    ttft_s: None,
-                    gen_tps: None,
-                    mtp: None,
-                    progress: 0.0,
-                },
-                StreamRow {
-                    id: 4,
-                    kind: "Reasoning",
-                    state: "Done",
-                    pp_tokens: Some(2048),
-                    tg_tokens: Some(840),
-                    ttft_s: Some(0.191),
-                    gen_tps: Some(68.9),
-                    mtp: Some(1.79),
-                    progress: 1.0,
-                },
-            ],
-            throughput_series: (0..60)
-                .map(|i| 842.3 + 18.0 * ((i as f64) * 0.31).sin())
-                .collect(),
-        }
-    }
-}
-
-/// Application state machine: current view, navigation, pause state, and
-/// the (placeholder) metric snapshot the views render.
+/// Application state machine: current view, navigation, pause state, and the
+/// shared `ArcSwap`-backed metric snapshot the views render.
+///
+/// `metrics` is the lock-free [`MetricsState`] (Chunk 6): the stream worker
+/// publishes a fresh [`MetricsSnapshot`] via `update()`, and the render loop
+/// reads it via `load()` without ever blocking or touching the timing path.
 #[derive(Debug)]
 pub struct App {
     pub running: bool,
@@ -226,9 +115,10 @@ pub struct App {
     /// Concurrency target the `+` key steps up (plumbed to the worker pool
     /// in later chunks).
     pub concurrency_target: usize,
-    /// Monotonic 60Hz tick counter (placeholder animation clock).
+    /// Monotonic 60Hz render tick counter.
     pub tick: u64,
-    pub metrics: PlaceholderMetrics,
+    /// Shared lock-free metrics snapshot (the `ArcSwap` double buffer).
+    pub metrics: Arc<MetricsState>,
     pub log: Vec<Line<'static>>,
 }
 
@@ -239,7 +129,9 @@ impl Default for App {
 }
 
 impl App {
-    /// Fresh app in the Live view, running, with blueprint-mock sample data.
+    /// Fresh app in the Live view, running, seeded with the blueprint-mock
+    /// sample snapshot so the dashboard is verifiable before a real stream
+    /// worker publishes data.
     pub fn new() -> Self {
         let log = vec![
             Line::from(Span::styled(
@@ -255,13 +147,17 @@ impl App {
                 style::label(),
             )),
         ];
+        let metrics = Arc::new(MetricsState::new());
+        // Seed the initial snapshot with blueprint-mock sample data. A real
+        // stream worker overwrites this via `MetricsState::update()`.
+        metrics.update(MetricsSnapshot::sample());
         Self {
             running: true,
             paused: false,
             view: View::Live,
             concurrency_target: 1,
             tick: 0,
-            metrics: PlaceholderMetrics::sample(),
+            metrics,
             log,
         }
     }
@@ -298,26 +194,18 @@ impl App {
         }
     }
 
-    /// Advance the 60Hz placeholder clock. Until the real engine snapshot
-    /// exists (Chunk 6), this animates the sample metrics so the redraw
-    /// cycle is visible; `Space` (paused) freezes it.
+    /// Advance the 60Hz render clock.
+    ///
+    /// The metric snapshot itself is *not* touched here: it is published by
+    /// the stream worker / engine via `MetricsState::update()` and read
+    /// lock-free in the render path (`render` → views → `MetricsState::load`).
+    /// Keeping the write out of the render loop is the measurement-isolation
+    /// invariant (blueprint §4). `Space` (paused) freezes the clock.
     pub fn on_tick(&mut self) {
         if self.paused {
             return;
         }
         self.tick += 1;
-        let t = self.tick as f64;
-        self.metrics.aggregate_tps = 842.3 + 18.0 * t.sin() + 6.0 * (t * 0.31).sin();
-        self.metrics.power_w = 285.0 + 4.0 * (t * 0.5).sin();
-        self.metrics.vram_used_gb = 21.4 + 0.05 * (t * 0.2).sin();
-        self.metrics
-            .throughput_series
-            .push(self.metrics.aggregate_tps);
-        if self.metrics.throughput_series.len() > 60 {
-            self.metrics
-                .throughput_series
-                .drain(0..self.metrics.throughput_series.len() - 60);
-        }
     }
 
     /// Draw the full frame: status bar, tab bar, current view, footer.
@@ -340,8 +228,11 @@ impl App {
     }
 
     /// Top status bar: version, backend, target model, mode (blueprint §6).
+    ///
+    /// Reads the shared snapshot lock-free; a fresh `Arc` is taken each frame
+    /// so the bar always reflects the latest published metrics.
     fn render_status_bar(&self, area: Rect, f: &mut Frame) {
-        let m = &self.metrics;
+        let m = self.metrics.load();
         let mut spans = vec![
             Span::styled(
                 format!(" Crucible-LLM v{} ", env!("CARGO_PKG_VERSION")),
@@ -402,9 +293,8 @@ impl App {
 /// Small formatting helpers shared by the views.
 pub mod fmt {
     /// `2048` or `--` when absent.
-    pub fn tokens(v: Option<usize>) -> String {
-        v.map(|v| v.to_string())
-            .unwrap_or_else(|| "--".to_string())
+    pub fn tokens(v: Option<u64>) -> String {
+        v.map(|v| v.to_string()).unwrap_or_else(|| "--".to_string())
     }
 
     /// `0.182 s` or `--` when absent.
@@ -432,7 +322,11 @@ pub mod fmt {
         let mut s = String::with_capacity(width);
         for i in 0..width {
             if i < filled {
-                s.push(if i == filled - 1 && filled < width { '>' } else { '=' });
+                s.push(if i == filled - 1 && filled < width {
+                    '>'
+                } else {
+                    '='
+                });
             } else {
                 s.push(' ');
             }

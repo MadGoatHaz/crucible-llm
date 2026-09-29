@@ -6,3 +6,4 @@ pub mod histogram;
 pub mod state;
 
 pub use histogram::LatencyHistogram;
+pub use state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};

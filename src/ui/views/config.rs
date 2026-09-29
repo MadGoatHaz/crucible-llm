@@ -16,7 +16,8 @@ use crate::ui::theme::style;
 
 /// Render the Config view into `area`.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
-    let m = &app.metrics;
+    // Lock-free read of the latest published snapshot (Chunk 6).
+    let m = app.metrics.load();
     let kv = |k: &str, v: String, vs: Style| -> Line<'static> {
         Line::from(vec![
             Span::styled(format!("{k:<28} "), style::label()),
@@ -27,20 +28,32 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let on = style::value_ok();
     let off = style::footer();
     let lines = Text::from(vec![
-        kv("Target URL", m.endpoint.to_string(), style::value()),
-        kv("Model", m.model.to_string(), style::value()),
-        kv("Mode", m.mode.to_string(), style::value()),
+        kv("Target URL", m.endpoint.clone(), style::value()),
+        kv("Model", m.model.clone(), style::value()),
+        kv("Mode", m.mode.clone(), style::value()),
         kv(
             "Concurrency target",
             format!("{} streams", app.concurrency_target),
             style::highlight(),
         ),
-        kv("Concurrency ladder", "1 → 2 → 4 → 8 → 16 → 32 → 64".to_string(), style::label()),
+        kv(
+            "Concurrency ladder",
+            "1 → 2 → 4 → 8 → 16 → 32 → 64".to_string(),
+            style::label(),
+        ),
         kv("Prompt mode", "long".to_string(), style::label()),
         kv("Target tokens", "2048".to_string(), style::label()),
         kv("Iterations", "4".to_string(), style::label()),
-        kv("Tokenizer", "(not set — chars/4 fallback, estimated)".to_string(), style::value_warn()),
-        kv("NVML telemetry", "off (feature-gated, default)".to_string(), off),
+        kv(
+            "Tokenizer",
+            "(not set — chars/4 fallback, estimated)".to_string(),
+            style::value_warn(),
+        ),
+        kv(
+            "NVML telemetry",
+            "off (feature-gated, default)".to_string(),
+            off,
+        ),
         kv("Cache bypass (--nocache)", "off".to_string(), off),
         Line::from(Span::raw("")),
         kv("Engine A — Speed & Latency", "on".to_string(), on),

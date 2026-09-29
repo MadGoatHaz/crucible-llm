@@ -1,9 +1,15 @@
-//! Integration tests for Chunk 2: the `MonotonicInstant` timing core and the
-//! `LatencyHistogram` percentile wrapper.
+//! Integration tests for the metrics pipeline:
+//! - Chunk 2: the `MonotonicInstant` timing core and the `LatencyHistogram`
+//!   percentile wrapper.
+//! - Chunk 6: the `ArcSwap<MetricsSnapshot>` double-buffered snapshot the TUI
+//!   reads lock-free.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use crucible_llm::metrics::LatencyHistogram;
+use crucible_llm::metrics::{
+    LatencyHistogram, MetricsSnapshot, MetricsState, StreamMetric, StreamStatus,
+};
 use crucible_llm::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Assert `actual` is within `tol_pct` percent of `expected`.
@@ -113,4 +119,218 @@ fn stream_timestamps_missing_milestones_yield_none() {
     assert_eq!(ts.ttft_nanos(), None);
     assert_eq!(ts.total_nanos(), None);
     assert_eq!(ts.first_byte_nanos(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 6: ArcSwap metrics snapshot pipeline
+// ---------------------------------------------------------------------------
+
+/// The default snapshot is fully zeroed / empty.
+#[test]
+fn snapshot_default_is_zeroed() {
+    let s = MetricsSnapshot::default();
+    assert_eq!(s.aggregate_tps, 0.0);
+    assert_eq!(s.active_streams, 0);
+    assert_eq!(s.total_streams, 0);
+    assert_eq!(s.prompt_tokens, 0);
+    assert_eq!(s.completion_tokens, 0);
+    assert_eq!(s.reasoning_tokens, 0);
+    assert_eq!(s.itl_p50_ns, 0);
+    assert_eq!(s.itl_p99_ns, 0);
+    assert!(s.itl_bins.is_empty());
+    assert!(s.streams.is_empty());
+    assert!(s.throughput_series.is_empty());
+    assert_eq!(s.status, StreamStatus::Waiting);
+}
+
+/// `update` then `load` round-trips every field exactly.
+#[test]
+fn snapshot_update_load_roundtrip() {
+    let state = MetricsState::new();
+
+    let mut snap = MetricsSnapshot::default();
+    snap.endpoint = "http://127.0.0.1:8000/v1".into();
+    snap.backend = "vLLM".into();
+    snap.model = "test-model".into();
+    snap.mode = "Speed".into();
+    snap.aggregate_tps = 123.45;
+    snap.active_streams = 3;
+    snap.total_streams = 4;
+    snap.vram_used_gb = 10.5;
+    snap.vram_total_gb = 24.0;
+    snap.power_w = 250.0;
+    snap.joules_per_token = 0.2;
+    snap.itl_p50_ns = 10_000_000;
+    snap.itl_p90_ns = 20_000_000;
+    snap.itl_p99_ns = 30_000_000;
+    snap.itl_p999_ns = 40_000_000;
+    snap.prompt_tokens = 512;
+    snap.completion_tokens = 256;
+    snap.reasoning_tokens = 128;
+    snap.status = StreamStatus::Streaming;
+    snap.streams.push(StreamMetric {
+        id: 7,
+        kind: "Reasoning".into(),
+        state: StreamStatus::Streaming,
+        pp_tokens: Some(512),
+        tg_tokens: Some(256),
+        ttft_s: Some(0.12),
+        gen_tps: Some(60.0),
+        mtp: Some(1.5),
+        progress: 0.5,
+    });
+    snap.throughput_series = vec![1.0, 2.0, 3.0];
+
+    state.update(snap);
+
+    let loaded = state.load();
+    assert_eq!(loaded.endpoint, "http://127.0.0.1:8000/v1");
+    assert_eq!(loaded.backend, "vLLM");
+    assert_eq!(loaded.model, "test-model");
+    assert_eq!(loaded.mode, "Speed");
+    assert!((loaded.aggregate_tps - 123.45).abs() < f64::EPSILON);
+    assert_eq!(loaded.active_streams, 3);
+    assert_eq!(loaded.total_streams, 4);
+    assert!((loaded.vram_used_gb - 10.5).abs() < f64::EPSILON);
+    assert!((loaded.power_w - 250.0).abs() < f64::EPSILON);
+    assert_eq!(loaded.itl_p50_ns, 10_000_000);
+    assert_eq!(loaded.itl_p999_ns, 40_000_000);
+    assert_eq!(loaded.prompt_tokens, 512);
+    assert_eq!(loaded.completion_tokens, 256);
+    assert_eq!(loaded.reasoning_tokens, 128);
+    assert_eq!(loaded.status, StreamStatus::Streaming);
+    assert_eq!(loaded.streams.len(), 1);
+    assert_eq!(loaded.streams[0].id, 7);
+    assert_eq!(loaded.streams[0].kind, "Reasoning");
+    assert_eq!(loaded.throughput_series, vec![1.0, 2.0, 3.0]);
+}
+
+/// A later `update` atomically replaces the pointee; `load` sees the latest.
+#[test]
+fn snapshot_update_replaces_previous() {
+    let state = MetricsState::new();
+    state.update(MetricsSnapshot::sample());
+    assert_eq!(state.load().aggregate_tps, 842.3);
+
+    let mut s = MetricsSnapshot::default();
+    s.aggregate_tps = 1.0;
+    state.update(s);
+    assert_eq!(state.load().aggregate_tps, 1.0);
+}
+
+/// Many concurrent lock-free readers never block while a writer publishes.
+#[test]
+fn snapshot_lockfree_reads_concurrent_with_updates() {
+    let state = Arc::new(MetricsState::new());
+    let mut handles = vec![];
+
+    // 8 reader threads: tight loop of `load()` + field read. `load()` is a
+    // lock-free atomic read, so none of these can block on the writer.
+    for _ in 0..8 {
+        let s = Arc::clone(&state);
+        handles.push(std::thread::spawn(move || {
+            let mut reads = 0u64;
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_millis(50) {
+                let snap = s.load();
+                let _ = snap.aggregate_tps; // plain immutable read
+                reads += 1;
+            }
+            reads
+        }));
+    }
+
+    // One writer thread publishing a fresh snapshot each iteration.
+    {
+        let s = Arc::clone(&state);
+        handles.push(std::thread::spawn(move || {
+            let mut v = 0u64;
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_millis(50) {
+                v += 1;
+                let mut snap = MetricsSnapshot::default();
+                snap.aggregate_tps = v as f64;
+                snap.status = StreamStatus::Streaming;
+                s.update(snap);
+            }
+            v
+        }));
+    }
+
+    let total: u64 = handles
+        .into_iter()
+        .map(|h| h.join().expect("reader/writer thread panicked (deadlock?)"))
+        .sum();
+
+    assert!(total > 0, "no thread made progress");
+    // The writer published at least one snapshot with a positive t/s.
+    let final_snap = state.load();
+    assert!(final_snap.aggregate_tps > 0.0, "writer never published");
+    assert_eq!(final_snap.status, StreamStatus::Streaming);
+}
+
+/// Nanosecond percentiles convert to milliseconds for display.
+#[test]
+fn snapshot_ns_to_ms_conversion() {
+    let mut s = MetricsSnapshot::default();
+    s.itl_p50_ns = 12_100_000; // 12.1 ms
+    s.itl_p90_ns = 16_400_000; // 16.4 ms
+    s.itl_p99_ns = 41_200_000; // 41.2 ms
+    s.itl_p999_ns = 55_000_000; // 55.0 ms
+
+    assert!((s.itl_p50_ms() - 12.1).abs() < 1e-6);
+    assert!((s.itl_p90_ms() - 16.4).abs() < 1e-6);
+    assert!((s.itl_p99_ms() - 41.2).abs() < 1e-6);
+    assert!((s.itl_p999_ms() - 55.0).abs() < 1e-6);
+}
+
+/// The snapshot pulls ITL percentiles directly from the Chunk 2 histogram.
+#[test]
+fn snapshot_from_histogram() {
+    let mut h = LatencyHistogram::new(1_000_000);
+    for v in 1..=10_000 {
+        h.record(v);
+    }
+    let s = MetricsSnapshot::default().with_itl_percentiles(&h);
+    // Uniform [1, 10_000] ns → p50 ≈ 5_000, p90 ≈ 9_000, p99 ≈ 9_900.
+    assert!(
+        within_pct(s.itl_p50_ns as f64, 5_000.0, 2.0),
+        "p50={}",
+        s.itl_p50_ns
+    );
+    assert!(
+        within_pct(s.itl_p90_ns as f64, 9_000.0, 2.0),
+        "p90={}",
+        s.itl_p90_ns
+    );
+    assert!(
+        within_pct(s.itl_p99_ns as f64, 9_900.0, 2.0),
+        "p99={}",
+        s.itl_p99_ns
+    );
+}
+
+/// The blueprint-mock sample snapshot is fully populated for the dashboard.
+#[test]
+fn snapshot_sample_is_populated() {
+    let s = MetricsSnapshot::sample();
+    assert!(!s.endpoint.is_empty());
+    assert!(!s.model.is_empty());
+    assert!(s.aggregate_tps > 0.0);
+    assert!(s.active_streams > 0);
+    assert!(s.vram_total_gb > 0.0);
+    assert!(s.itl_p50_ns > 0);
+    assert!(!s.itl_bins.is_empty());
+    assert_eq!(s.streams.len(), 4);
+    assert_eq!(s.throughput_series.len(), 60);
+    assert_eq!(s.status, StreamStatus::Streaming);
+}
+
+/// Every `StreamStatus` maps to its `STATE` column label.
+#[test]
+fn stream_status_labels() {
+    assert_eq!(StreamStatus::Waiting.label(), "Waiting");
+    assert_eq!(StreamStatus::Streaming.label(), "Streaming");
+    assert_eq!(StreamStatus::Done.label(), "Done");
+    assert_eq!(StreamStatus::Error.label(), "Error");
 }
