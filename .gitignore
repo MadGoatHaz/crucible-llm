@@ -1,0 +1,13 @@
+# Kilo multi-agent scratchpad and staging (plans/ and docs/ remain tracked)
+work/scratch/
+work/sysops/
+
+# Rust build artifacts
+target/
+
+# Python
+*.pyc
+__pycache__/
+
+# Environment
+.env
