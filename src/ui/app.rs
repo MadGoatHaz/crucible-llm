@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::engines::SweepResult;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
@@ -120,6 +121,9 @@ pub struct App {
     /// Shared lock-free metrics snapshot (the `ArcSwap` double buffer).
     pub metrics: Arc<MetricsState>,
     pub log: Vec<Line<'static>>,
+    /// The last completed concurrency sweep (plan Chunk 10). `None` until a
+    /// sweep has run; View 2 renders the curve from this.
+    pub sweep: Option<Arc<SweepResult>>,
 }
 
 impl Default for App {
@@ -159,6 +163,7 @@ impl App {
             tick: 0,
             metrics,
             log,
+            sweep: None,
         }
     }
 
