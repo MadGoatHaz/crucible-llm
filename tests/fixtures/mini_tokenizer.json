@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "apple": 0,
+      "Repeat": 1,
+      "the": 2,
+      "following": 3,
+      "sequence": 4,
+      "back": 5,
+      "to": 6,
+      "me": 7,
+      "briefly": 8,
+      ",": 9,
+      "then": 10,
+      "explain": 11,
+      "importance": 12,
+      "of": 13,
+      "context": 14,
+      "window": 15,
+      "size": 16,
+      ":": 17,
+      "quick": 18,
+      "brown": 19,
+      "fox": 20,
+      "[UNK]": 21
+    },
+    "unk_token": "[UNK]"
+  }
+}
