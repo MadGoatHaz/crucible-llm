@@ -4,6 +4,8 @@ work/sysops/
 
 # Rust build artifacts
 target/
+# Local benchmark database (persisted at runtime)
+benchmarks.db
 
 # Python
 *.pyc

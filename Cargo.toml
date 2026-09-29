@@ -1,0 +1,46 @@
+[package]
+name = "crucible-llm"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance terminal LLM benchmark & inference profiler"
+
+[dependencies]
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+# Async engine
+tokio = { version = "1.53", features = ["full"] }
+# Networking / SSE
+reqwest = { version = "0.13", features = ["json", "stream", "http2"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+# Tokenization (optional at runtime)
+tokenizers = "0.23"
+# Timing & statistics
+quanta = "0.13"
+hdrhistogram = "7.6"
+# Hardware monitoring (feature-gated)
+sysinfo = "0.39"
+nvml-wrapper = { version = "0.13", optional = true }
+# Persistence
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Concurrency plumbing
+crossbeam-channel = "0.5"
+arc-swap = "1.7"
+# Utilities
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+dirs = "5"
+rand = "0.9"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+nvml = ["dep:nvml-wrapper"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
