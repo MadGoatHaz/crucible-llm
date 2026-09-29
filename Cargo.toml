@@ -25,7 +25,9 @@ nvml-wrapper = { version = "0.13", optional = true }
 # Persistence
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `preserve_order` keeps `--json` key order identical to the prototype's
+# `output_json` (indexmap-backed maps instead of sorted BTreeMaps).
+serde_json = { version = "1.0", features = ["preserve_order"] }
 # Concurrency plumbing
 crossbeam-channel = "0.5"
 arc-swap = "1.7"
