@@ -4,16 +4,19 @@
 //!
 //! Once a [`Sweep`] (plan Chunk 10) has run, the matrix renders the real
 //! per-level curve — aggregate tokens/sec and client-perceived p90 TPOT
-//! pooled across every concurrent stream of the level — and the envelope
-//! panel reports the peak-throughput point. Knee-point detection that
-//! narrows that to the recommended sweet spot lands in Chunk 11.
+//! pooled across every concurrent stream of the level — and highlights the
+//! **saturation knee** (plan Chunk 11, [`SweepResult::detect_knee`]): the
+//! level where aggregate throughput plateaus while p90 TPOT spikes (the
+//! memory-bandwidth-bound → compute-bound transition), plus the
+//! **Optimal Operational Envelope** ([`SweepResult::envelope`]) — the
+//! recommended sweet spot just before the knee.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::engines::concurrency::{SweepLevel, DEFAULT_LADDER};
+use crate::engines::concurrency::{Envelope, SweepLevel, DEFAULT_LADDER};
 use crate::ui::app::App;
 use crate::ui::theme::style;
 
@@ -22,18 +25,25 @@ use crate::ui::theme::style;
 const LADDER: [usize; 7] = DEFAULT_LADDER;
 
 /// Render the Concurrency view into `area`.
+///
+/// The envelope (knee + sweet spot) is computed once per frame from the
+/// last [`SweepResult`] and shared by the matrix and the envelope panel.
+/// Reading `app.sweep` is a pure `&` read — no locks, no timing path
+/// (measurement isolation, blueprint §4).
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
-    render_matrix(chunks[0], app, f);
-    render_envelope(chunks[1], app, f);
+    let envelope = app.sweep.as_deref().and_then(|r| r.envelope());
+    render_matrix(chunks[0], app, f, &envelope);
+    render_envelope(chunks[1], app, f, &envelope);
 }
 
 /// Sweep matrix: one row per ladder step — real aggregate t/s + p90 TPOT
-/// once a sweep has run, `--` until then.
-fn render_matrix(area: Rect, app: &App, f: &mut Frame) {
+/// once a sweep has run, `--` until then. The knee row is flagged red
+/// (`KNEE`) and the sweet-spot row green (`SWEET`).
+fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
     let mut rows: Vec<Row> = vec![Row::new(vec![
         Cell::from("CONC"),
         Cell::from("AGG T/S"),
@@ -44,9 +54,8 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame) {
 
     match app.sweep.as_deref() {
         Some(result) if !result.levels.is_empty() => {
-            let peak = result.peak_throughput().map(|l| l.concurrency).unwrap_or(0);
             for level in &result.levels {
-                rows.push(sweep_row(level, peak, app.concurrency_target));
+                rows.push(sweep_row(level, envelope, app.concurrency_target));
             }
         }
         _ => {
@@ -79,10 +88,10 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame) {
         Table::new(
             rows,
             [
+                Constraint::Percentage(20),
                 Constraint::Percentage(25),
                 Constraint::Percentage(25),
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
+                Constraint::Percentage(30),
             ],
         )
         .block(
@@ -95,20 +104,34 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame) {
     );
 }
 
-/// One matrix row for a completed sweep level.
-fn sweep_row(level: &SweepLevel, peak: usize, target: usize) -> Row<'_> {
-    let state = if level.failed_streams == level.concurrency {
+/// One matrix row for a completed sweep level, flagged when it is the
+/// detected knee (red) or the recommended sweet spot (green).
+fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: usize) -> Row<'a> {
+    let is_knee = envelope
+        .as_ref()
+        .and_then(|e| e.knee)
+        .is_some_and(|k| k.concurrency == level.concurrency);
+    let is_sweet = envelope.is_some_and(|e| e.sweet_spot == level.concurrency);
+
+    let mut state = if level.failed_streams == level.concurrency {
         "failed".to_string()
     } else if level.failed_streams > 0 {
         format!("{}/{} ok", level.completed_streams, level.concurrency)
     } else {
         "done".to_string()
     };
-    let is_peak = level.concurrency == peak;
-    let is_target = level.concurrency == target;
-    let value_style = if is_peak {
+    if is_knee {
+        state.push_str(" · KNEE");
+    }
+    if is_sweet {
+        state.push_str(" · SWEET");
+    }
+
+    let value_style = if is_knee {
+        style::value_err()
+    } else if is_sweet {
         style::value_ok()
-    } else if is_target {
+    } else if level.concurrency == target {
         style::highlight()
     } else {
         style::label()
@@ -117,7 +140,9 @@ fn sweep_row(level: &SweepLevel, peak: usize, target: usize) -> Row<'_> {
         Cell::from(level.concurrency.to_string()).style(value_style),
         Cell::from(format!("{:.1} t/s", level.aggregate_tps)).style(value_style),
         Cell::from(format!("{:.1} ms", level.p90_tpot_ms())).style(value_style),
-        Cell::from(state).style(if is_peak {
+        Cell::from(state).style(if is_knee {
+            style::value_err()
+        } else if is_sweet {
             style::value_ok()
         } else {
             style::footer()
@@ -125,28 +150,44 @@ fn sweep_row(level: &SweepLevel, peak: usize, target: usize) -> Row<'_> {
     ])
 }
 
-/// Optimal operational envelope: the peak-throughput point once a sweep has
-/// run; knee detection (Chunk 11) refines it into the recommended sweet spot.
-fn render_envelope(area: Rect, app: &App, f: &mut Frame) {
-    let lines = match app.sweep.as_deref().and_then(|r| r.peak_throughput()) {
-        Some(peak) => Text::from(vec![
-            Line::from(vec![
-                Span::styled("Peak aggregate: ", style::label()),
+/// Optimal Operational Envelope (blueprint §6 View 2): the recommended
+/// sweet spot, with the detected saturation knee (and the rationale —
+/// throughput plateau + p90 spike) when the curve showed a transition.
+fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
+    let lines = match envelope {
+        Some(env) => {
+            let mut ls = vec![Line::from(vec![
+                Span::styled("Recommended sweet spot: ", style::label()),
                 Span::styled(
                     format!(
-                        "{:.1} t/s at {} streams (p90 TPOT {:.1} ms)",
-                        peak.aggregate_tps,
-                        peak.concurrency,
-                        peak.p90_tpot_ms()
+                        "{} streams ({} t/s @ p90 {} ms)",
+                        env.sweet_spot,
+                        env.aggregate_tps,
+                        env.p90_tpot_ns as f64 / 1_000_000.0
                     ),
-                    style::highlight(),
+                    style::value_ok(),
                 ),
-            ]),
-            Line::from(Span::styled(
-                "Saturation knee detection (the recommended sweet spot) lands in Chunk 11 — step the target with [+] while it refines the envelope.",
-                style::footer(),
-            )),
-        ]),
+            ])];
+            match env.knee {
+                Some(k) => ls.push(Line::from(vec![
+                    Span::styled("Saturation knee: ", style::label()),
+                    Span::styled(
+                        format!(
+                            "{} streams — throughput plateaus ({} t/s) while p90 TPOT spikes to {} ms",
+                            k.concurrency,
+                            k.aggregate_tps,
+                            k.p90_tpot_ns as f64 / 1_000_000.0
+                        ),
+                        style::value_err(),
+                    ),
+                ])),
+                None => ls.push(Line::from(Span::styled(
+                    "No saturation knee detected — running at the peak-throughput point.",
+                    style::footer(),
+                ))),
+            }
+            Text::from(ls)
+        }
         None => Text::from(vec![
             Line::from(vec![
                 Span::styled("Recommended sweet spot: ", style::label()),
@@ -157,7 +198,7 @@ fn render_envelope(area: Rect, app: &App, f: &mut Frame) {
                 Span::styled("  (step with [+])", style::footer()),
             ]),
             Line::from(Span::styled(
-                "Run a sweep to detect the saturation knee — the transition from memory-bandwidth-bound to compute-bound (planned: Chunk 11).",
+                "Run a sweep to detect the saturation knee — the transition from memory-bandwidth-bound to compute-bound.",
                 style::footer(),
             )),
         ]),

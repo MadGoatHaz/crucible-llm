@@ -15,9 +15,12 @@
 //! * TTFT percentiles (one sample per stream), per-stream detail rows
 //!   ([`StreamMetric`]), and completion/failure counts.
 //!
-//! The resulting [`SweepResult`] is the curve knee-point detection
-//! (the "Optimal Operational Envelope") runs on in Chunk 11, and the data
-//! View 2 (Concurrency Matrix) renders.
+//! The resulting [`SweepResult`] feeds the saturation knee-point detection
+//! ([`SweepResult::detect_knee`] — the level where aggregate throughput
+//! plateaus while p90 TPOT spikes, i.e. the memory-bandwidth-bound →
+//! compute-bound transition) and the "Optimal Operational Envelope"
+//! ([`SweepResult::envelope`] — the recommended sweet spot), and is the
+//! data View 2 (Concurrency Matrix) renders with the knee highlighted.
 //!
 //! **Measurement isolation** (blueprint §4): all timing comes from the
 //! workers' `quanta` stamps — the sweep only *consumes* tagged events. The
@@ -118,14 +121,108 @@ impl SweepResult {
         self.levels.is_empty()
     }
 
-    /// The level with the highest aggregate throughput — the candidate
-    /// knee region. Full knee-point detection (the "Optimal Operational
-    /// Envelope") lands in Chunk 11.
+    /// The level with the highest aggregate throughput — the fallback
+    /// sweet spot when [`Self::detect_knee`] finds no saturation
+    /// transition on the curve.
     pub fn peak_throughput(&self) -> Option<&SweepLevel> {
         self.levels
             .iter()
             .max_by(|a, b| a.aggregate_tps.total_cmp(&b.aggregate_tps))
     }
+
+    /// Detect the saturation knee (blueprint §5 Engine B "Throughput
+    /// Knee-Point Detection", plan Chunk 11).
+    ///
+    /// The knee is the *first* level (ascending concurrency) at which
+    /// **both** hold relative to the previous level:
+    ///
+    /// 1. the aggregate-throughput gain drops to
+    ///    [`KNEE_GAIN_THRESHOLD`] or below — throughput has plateaued;
+    /// 2. the p90 TPOT grows by at least [`KNEE_SPIKE_THRESHOLD`]× —
+    ///    client latency is spiking.
+    ///
+    /// That dual condition is the memory-bandwidth-bound (under-saturated)
+    /// → compute-bound (saturated) transition. Returns [`None`] when the
+    /// curve shows no such transition (fewer than two levels, throughput
+    /// still climbing, or latency never spikes) — the envelope then falls
+    /// back to [`Self::peak_throughput`].
+    ///
+    /// Pure function over the curve: no timing, no locks (measurement
+    /// isolation, blueprint §4).
+    pub fn detect_knee(&self) -> Option<KneePoint> {
+        let mut levels: Vec<&SweepLevel> = self.levels.iter().collect();
+        levels.sort_by_key(|l| l.concurrency);
+        for (prev, cur) in levels.windows(2).map(|w| (w[0], w[1])) {
+            let gain = relative_gain(prev.aggregate_tps, cur.aggregate_tps);
+            let spike = relative_spike(prev.p90_tpot_ns, cur.p90_tpot_ns);
+            if gain <= KNEE_GAIN_THRESHOLD && spike >= KNEE_SPIKE_THRESHOLD {
+                return Some(KneePoint {
+                    concurrency: cur.concurrency,
+                    sweet_spot: prev.concurrency,
+                    aggregate_tps: cur.aggregate_tps,
+                    p90_tpot_ns: cur.p90_tpot_ns,
+                });
+            }
+        }
+        None
+    }
+
+    /// The "Optimal Operational Envelope" (blueprint §6 View 2): the
+    /// recommended sweet spot for hosting this model on the target
+    /// hardware — the level just before the detected knee, or the
+    /// peak-throughput level when the curve is healthy (no knee).
+    pub fn envelope(&self) -> Option<Envelope> {
+        let knee = self.detect_knee();
+        let sweet = match knee {
+            Some(k) => k.sweet_spot,
+            None => self.peak_throughput()?.concurrency,
+        };
+        let level = self.levels.iter().find(|l| l.concurrency == sweet)?;
+        Some(Envelope {
+            sweet_spot: level.concurrency,
+            aggregate_tps: level.aggregate_tps,
+            p90_tpot_ns: level.p90_tpot_ns,
+            knee,
+        })
+    }
+}
+
+/// Relative aggregate-throughput gain at or below which a level is
+/// considered to have *plateaued* (the knee's throughput condition).
+pub const KNEE_GAIN_THRESHOLD: f64 = 0.05;
+
+/// p90-TPOT growth factor (vs the previous level) at or above which a
+/// level is considered to be *spiking* (the knee's latency condition).
+pub const KNEE_SPIKE_THRESHOLD: f64 = 2.0;
+
+/// The detected saturation knee: the first concurrency level where
+/// aggregate throughput plateaus while p90 TPOT spikes (blueprint §5
+/// Engine B — the memory-bandwidth-bound → compute-bound transition).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KneePoint {
+    /// The concurrency at the knee (the first saturated level).
+    pub concurrency: usize,
+    /// The recommended sweet spot: the last level before the knee.
+    pub sweet_spot: usize,
+    /// Aggregate throughput (t/s) at the knee.
+    pub aggregate_tps: f64,
+    /// p90 TPOT (ns) at the knee — the spiking side.
+    pub p90_tpot_ns: u64,
+}
+
+/// The "Optimal Operational Envelope" (blueprint §6 View 2): the
+/// recommended sweet spot, with the detected knee (when the curve shows a
+/// saturation transition) attached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Envelope {
+    /// The recommended concurrency (the sweet spot).
+    pub sweet_spot: usize,
+    /// Aggregate throughput (t/s) at the sweet spot.
+    pub aggregate_tps: f64,
+    /// p90 TPOT (ns) at the sweet spot.
+    pub p90_tpot_ns: u64,
+    /// The detected knee, if the curve showed a saturation transition.
+    pub knee: Option<KneePoint>,
 }
 
 /// A concurrency ladder sweep (blueprint §5 Engine B).
@@ -517,6 +614,28 @@ fn is_token_frame(chunk: &Chunk) -> bool {
     matches!(chunk, Chunk::Reasoning(_) | Chunk::Content(_))
 }
 
+/// Relative throughput change `prev → cur` (`(cur − prev) / prev`).
+///
+/// A non-positive baseline with a positive `cur` is treated as infinite
+/// growth (never a plateau); a zero/zero pair is no change.
+fn relative_gain(prev: f64, cur: f64) -> f64 {
+    if prev <= 0.0 {
+        return if cur > 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    (cur - prev) / prev
+}
+
+/// Relative p90-TPOT change `prev → cur` (`cur / prev`).
+///
+/// A zero baseline with a positive `cur` is treated as an infinite spike;
+/// a zero/zero pair is no change.
+fn relative_spike(prev_ns: u64, cur_ns: u64) -> f64 {
+    if prev_ns == 0 {
+        return if cur_ns > 0 { f64::INFINITY } else { 0.0 };
+    }
+    cur_ns as f64 / prev_ns as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +909,154 @@ mod tests {
         };
         assert_eq!(result.peak_throughput().unwrap().concurrency, 2);
         assert!(SweepResult::default().is_empty());
+    }
+
+    /// A minimal curve point for knee-detection tests (only the fields the
+    /// detector reads are set; the rest are zeroed/placeholder).
+    fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
+        SweepLevel {
+            concurrency,
+            aggregate_tps: tps,
+            p50_tpot_ns: (p90_ms * 0.8e6) as u64,
+            p90_tpot_ns: (p90_ms * 1e6) as u64,
+            p99_tpot_ns: (p90_ms * 2e6) as u64,
+            ttft_p50_ns: 10_000_000,
+            ttft_p90_ns: 20_000_000,
+            total_tokens: 100,
+            completed_streams: concurrency,
+            failed_streams: 0,
+            wall_ns: 1_000_000_000,
+            streams: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn detect_knee_finds_the_injected_inflection() {
+        // Throughput climbs 100→340, plateaus at 16 (+1.5%, ≤ 5%), then
+        // decays. p90 TPOT stays sub-2× until 16, where it spikes 3×
+        // (10→30 ms) and keeps climbing — a clear saturation knee at 16.
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 190.0, 6.0),
+                level(4, 280.0, 7.0),
+                level(8, 340.0, 10.0),
+                level(16, 345.0, 30.0),
+                level(32, 342.0, 60.0),
+                level(64, 338.0, 90.0),
+            ],
+        };
+        let knee = result.detect_knee().expect("knee detected");
+        assert_eq!(knee.concurrency, 16, "knee at the injected inflection");
+        assert_eq!(knee.sweet_spot, 8, "sweet spot is the last healthy level");
+        assert!((knee.aggregate_tps - 345.0).abs() < 1e-9);
+        assert_eq!(knee.p90_tpot_ns, 30_000_000);
+    }
+
+    #[test]
+    fn detect_knee_none_when_the_curve_is_healthy() {
+        // Throughput keeps growing (every gain > 5%) and p90 TPOT never
+        // doubles — no saturation transition, so no knee.
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 180.0, 5.0),
+                level(4, 300.0, 6.0),
+                level(8, 420.0, 6.0),
+            ],
+        };
+        assert!(result.detect_knee().is_none());
+    }
+
+    #[test]
+    fn detect_knee_none_with_fewer_than_two_levels() {
+        assert!(SweepResult::default().detect_knee().is_none());
+        let single = SweepResult {
+            levels: vec![level(1, 100.0, 5.0)],
+        };
+        assert!(single.detect_knee().is_none());
+    }
+
+    #[test]
+    fn detect_knee_degrading_throughput_knees_at_first_spike() {
+        // Throughput decays monotonically (every gain is negative, hence ≤
+        // the threshold); the knee is the first level where p90 spikes 2×
+        // (6→12 ms).
+        let result = SweepResult {
+            levels: vec![
+                level(1, 400.0, 5.0),
+                level(2, 380.0, 6.0),
+                level(4, 350.0, 12.0),
+                level(8, 300.0, 30.0),
+            ],
+        };
+        let knee = result.detect_knee().expect("knee detected");
+        assert_eq!(knee.concurrency, 4);
+        assert_eq!(knee.sweet_spot, 2);
+    }
+
+    #[test]
+    fn detect_knee_ignores_a_plateau_without_a_latency_spike() {
+        // Throughput plateaus (even dips) at 4, but p90 TPOT never doubles
+        // (7/6 ≈ 1.17×) — a plateau alone is not a saturation knee.
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 350.0, 6.0),
+                level(4, 300.0, 7.0),
+            ],
+        };
+        assert!(result.detect_knee().is_none());
+    }
+
+    #[test]
+    fn envelope_reports_knee_and_sweet_spot() {
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 190.0, 6.0),
+                level(4, 280.0, 7.0),
+                level(8, 340.0, 10.0),
+                level(16, 345.0, 30.0),
+            ],
+        };
+        let env = result.envelope().expect("envelope");
+        assert_eq!(env.sweet_spot, 8);
+        assert!((env.aggregate_tps - 340.0).abs() < 1e-9);
+        assert_eq!(env.p90_tpot_ns, 10_000_000);
+        assert_eq!(env.knee.map(|k| k.concurrency), Some(16));
+    }
+
+    #[test]
+    fn envelope_falls_back_to_peak_throughput_when_no_knee() {
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 350.0, 6.0),
+                level(4, 300.0, 7.0),
+            ],
+        };
+        // No knee (plateau without a 2× latency spike) → the envelope is
+        // the peak-throughput level (350 t/s @ 2).
+        let env = result.envelope().expect("envelope");
+        assert!(env.knee.is_none());
+        assert_eq!(env.sweet_spot, 2);
+        assert!((env.aggregate_tps - 350.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn envelope_is_none_for_an_empty_curve() {
+        assert!(SweepResult::default().envelope().is_none());
+    }
+
+    #[test]
+    fn relative_gain_and_spike_handle_zero_baselines() {
+        assert_eq!(relative_gain(0.0, 100.0), f64::INFINITY);
+        assert_eq!(relative_gain(0.0, 0.0), 0.0);
+        assert!((relative_gain(100.0, 150.0) - 0.5).abs() < 1e-9);
+        assert_eq!(relative_spike(0, 10), f64::INFINITY);
+        assert_eq!(relative_spike(0, 0), 0.0);
+        assert!((relative_spike(10, 30) - 3.0).abs() < 1e-9);
     }
 
     #[tokio::test]

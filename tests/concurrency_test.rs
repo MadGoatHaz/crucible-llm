@@ -9,8 +9,10 @@
 //! * **aggregate throughput and p90 are computed across all concurrent
 //!   streams** of the level (not just one).
 //!
-//! Plus View 2 (Concurrency Matrix) render checks: the placeholder matrix
-//! before a sweep and the real curve + peak-throughput envelope after one.
+//! Plus Chunk 11 acceptance: knee-point detection on synthetic sweep data
+//! (the detected knee matches the injected inflection) and View 2 render
+//! checks — the placeholder matrix before a sweep, and the real curve with
+//! the knee / optimal-operational-envelope highlighted after one.
 //!
 //! The mock is an in-process `tokio` `TcpListener` that accepts *many*
 //! concurrent connections (one task per connection, vLLM-style SSE with a
@@ -327,7 +329,7 @@ fn view2_shows_placeholder_matrix_before_a_sweep() {
 }
 
 #[test]
-fn view2_renders_sweep_curve_and_peak_envelope() {
+fn view2_renders_sweep_curve_knee_and_envelope() {
     let mut app = App::new();
     app.view = View::Concurrency;
     app.sweep = Some(std::sync::Arc::new(SweepResult {
@@ -346,12 +348,54 @@ fn view2_renders_sweep_curve_and_peak_envelope() {
     assert!(text.contains("5.0 ms"));
     assert!(text.contains("8.0 ms"));
     assert!(text.contains("20.0 ms"));
-    assert!(text.contains("done"));
-    // The envelope panel reports the peak-throughput point (350 t/s @ 2).
-    assert!(text.contains("Peak aggregate"));
-    assert!(text.contains("350.0 t/s at 2 streams"));
+    // The knee row (c=4: throughput plateaus 350→340, p90 spikes 8→20 ms)
+    // is flagged in the matrix.
+    assert!(text.contains("KNEE"));
+    // The sweet-spot row (c=2, the last healthy level) is flagged.
+    assert!(text.contains("SWEET"));
+    // The envelope panel reports the recommended sweet spot and the
+    // detected knee.
+    assert!(text.contains("Recommended sweet spot"));
+    assert!(text.contains("2 streams"));
+    assert!(text.contains("Saturation knee"));
+    assert!(text.contains("4 streams"));
     // The placeholder copy is gone.
     assert!(!text.contains("not run"));
+}
+
+#[test]
+fn view2_highlights_knee_on_the_full_ladder_curve() {
+    // A full 7-level curve with a clear saturation knee at 16: throughput
+    // plateaus (340→345, +1.5%) while p90 TPOT spikes 3× (10→30 ms).
+    let mut app = App::new();
+    app.view = View::Concurrency;
+    app.sweep = Some(std::sync::Arc::new(SweepResult {
+        levels: vec![
+            level(1, 100.0, 5.0),
+            level(2, 190.0, 6.0),
+            level(4, 280.0, 7.0),
+            level(8, 340.0, 10.0),
+            level(16, 345.0, 30.0),
+            level(32, 342.0, 60.0),
+            level(64, 338.0, 90.0),
+        ],
+    }));
+    let text = render_concurrency(&app);
+
+    // The detected knee matches the injected inflection (acceptance:
+    // "the detected knee matches the injected level").
+    let knee = app.sweep.as_ref().unwrap().detect_knee().expect("knee");
+    assert_eq!(knee.concurrency, 16);
+    assert_eq!(knee.sweet_spot, 8);
+
+    // The matrix flags the knee and sweet-spot rows.
+    assert!(text.contains("KNEE"));
+    assert!(text.contains("SWEET"));
+    // The envelope panel reports the sweet spot (8) and the knee (16).
+    assert!(text.contains("Recommended sweet spot"));
+    assert!(text.contains("8 streams"));
+    assert!(text.contains("Saturation knee"));
+    assert!(text.contains("16 streams"));
 }
 
 #[test]
