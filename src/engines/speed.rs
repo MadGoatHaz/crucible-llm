@@ -162,6 +162,17 @@ impl SpeedEngine {
     /// One full iteration: run the worker, drain its bounded channel, and
     /// synthesize the §7 metrics.
     pub async fn run_iteration(&self, prompt: &GeneratedPrompt) -> SpeedResult {
+        self.run_iteration_events(prompt).await.0
+    }
+
+    /// [`run_iteration`] plus the raw worker events (Chunk 13): the
+    /// per-packet arrival timestamps the CSV export dumps. The events are
+    /// drained and returned as-is; the metrics are synthesized exactly as
+    /// in [`run_iteration`].
+    pub async fn run_iteration_events(
+        &self,
+        prompt: &GeneratedPrompt,
+    ) -> (SpeedResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
             self.client.clone(),
@@ -182,7 +193,7 @@ impl SpeedEngine {
         while let Some(event) = rx.recv().await {
             events.push(event);
         }
-        aggregate(&self.cfg, prompt, &outcome, &events)
+        (aggregate(&self.cfg, prompt, &outcome, &events), events)
     }
 
     /// All `iterations` runs (sequential — single-stream engine).

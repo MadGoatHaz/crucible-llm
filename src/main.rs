@@ -13,10 +13,11 @@ use std::io::IsTerminal;
 use std::panic;
 use std::process;
 
-use crucible_llm::config::{Config, ConfigError};
+use crucible_llm::config::{Config, ConfigError, ExportFormat};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine,
 };
+use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
@@ -34,7 +35,7 @@ fn main() {
     };
 
     if cfg.tui {
-        let ok = run_tui();
+        let ok = run_tui(&cfg);
         EventLoop::restore(); // best-effort terminal restore on all paths
         if !ok {
             process::exit(1);
@@ -96,19 +97,27 @@ fn run_headless(cfg: &Config) -> i32 {
                 term.dim(&format!("  Running {iterations} iterations"));
             }
             if let Some(fmt) = cfg.export {
-                term.dim(&format!(
-                    "  --export {} is wired in Chunk 13 (storage/export); skipping",
-                    fmt.label()
-                ));
+                term.dim(&format!("  --export {} enabled", fmt.label()));
             }
         }
 
+        // With `--export`, also keep each iteration's raw worker events —
+        // the per-packet arrival timestamps the CSV export dumps (Chunk 13).
+        // Without it the channel is drained and dropped (zero extra cost).
+        let capture_events = cfg.export.is_some();
         let mut results = Vec::with_capacity(iterations);
+        let mut packets: Vec<PacketSample> = Vec::new();
         for i in 0..iterations {
             if !cfg.json && iterations > 1 {
                 term.progress(&format!("  [{}/{}] Running...", i + 1, iterations));
             }
-            let result = engine.run_iteration(&prompt).await;
+            let result = if capture_events {
+                let (result, events) = engine.run_iteration_events(&prompt).await;
+                packets.extend(export::samples_from_events(&events, (i + 1) as u64));
+                result
+            } else {
+                engine.run_iteration(&prompt).await
+            };
             if cfg.verbose && !cfg.json {
                 term.dim(&format!(
                     "  chunks={} content={} reasoning={}",
@@ -166,17 +175,31 @@ fn run_headless(cfg: &Config) -> i32 {
             .map(|r| StreamMetricRow::from_speed_result(r, &session.session_id, 1))
             .collect();
         match Database::open_default() {
-            Ok(mut db) => match db.persist_run(&session, &rows) {
-                Ok(()) => {
-                    let id = &session.session_id;
-                    term.dim(&format!(
-                        "  saved → {} (session {})",
-                        db.path().display(),
-                        &id[..8]
-                    ))
+            Ok(mut db) => {
+                match db.persist_run(&session, &rows) {
+                    Ok(()) => {
+                        let id = &session.session_id;
+                        term.dim(&format!(
+                            "  saved → {} (session {})",
+                            db.path().display(),
+                            &id[..8]
+                        ))
+                    }
+                    Err(e) => term.warning(&format!("persist failed: {e}")),
                 }
-                Err(e) => term.warning(&format!("persist failed: {e}")),
-            },
+                // `--export` (Chunk 13): consume the run back from the
+                // SQLite storage layer and write the requested format.
+                if let Some(fmt) = cfg.export {
+                    run_export(
+                        &db,
+                        &session,
+                        &packets,
+                        fmt,
+                        cfg.export_path.as_deref(),
+                        &term,
+                    );
+                }
+            }
             Err(e) => term.warning(&format!("persist failed: {e}")),
         }
 
@@ -191,6 +214,39 @@ fn run_headless(cfg: &Config) -> i32 {
     })
 }
 
+/// Chunk 13: write the `--export` file for a just-persisted run,
+/// consuming the data back from the SQLite storage layer (session row +
+/// `stream_metrics` rows), plus the live per-packet samples for the CSV.
+///
+/// Destination: `--export-path`, or
+/// `data_dir()/exports/crucible-<session-id[:8]>.<ext>` by default.
+/// Degrades gracefully — an export failure never breaks (or changes the
+/// exit code of) a benchmark run.
+fn run_export(
+    db: &Database,
+    session: &BenchmarkSession,
+    packets: &[PacketSample],
+    format: ExportFormat,
+    path: Option<&std::path::Path>,
+    term: &Term,
+) {
+    let mut payload = match ExportPayload::from_stored(db, &session.session_id) {
+        Ok(p) => p,
+        Err(e) => {
+            term.warning(&format!("export failed: {e}"));
+            return;
+        }
+    };
+    payload.packets = packets.to_vec();
+    let dest = path
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| export::default_path(&session.session_id, format));
+    match export::write(&dest, format, &payload) {
+        Ok(p) => term.dim(&format!("  exported → {}", p.display())),
+        Err(e) => term.warning(&format!("export failed: {e}")),
+    }
+}
+
 /// Run the TUI on a dedicated single-thread runtime, guaranteeing the
 /// terminal is restored even on panic.
 ///
@@ -198,7 +254,8 @@ fn run_headless(cfg: &Config) -> i32 {
 /// foreground terminal program, so a current-thread runtime is all it
 /// needs; the worker pool will run on its own multi-thread runtime in
 /// later chunks.
-fn run_tui() -> bool {
+fn run_tui(cfg: &Config) -> bool {
+    let export_format = cfg.export.unwrap_or_default();
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -206,7 +263,7 @@ fn run_tui() -> bool {
             .expect("failed to build tokio runtime");
         runtime.block_on(async {
             let mut event_loop = EventLoop::new()?;
-            let mut app = App::new();
+            let mut app = App::new().with_export_format(export_format);
             event_loop.run(&mut app).await?;
             event_loop.teardown()
         })

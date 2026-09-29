@@ -19,8 +19,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::config::ExportFormat;
 use crate::engines::SweepResult;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
+use crate::storage::export::{self, ExportPayload};
+use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
 
@@ -124,6 +127,9 @@ pub struct App {
     /// The last completed concurrency sweep (plan Chunk 10). `None` until a
     /// sweep has run; View 2 renders the curve from this.
     pub sweep: Option<Arc<SweepResult>>,
+    /// Format the `e` key exports (Chunk 13; JSON by default, set from
+    /// `--export` by the entry point).
+    pub export_format: ExportFormat,
 }
 
 impl Default for App {
@@ -164,7 +170,14 @@ impl App {
             metrics,
             log,
             sweep: None,
+            export_format: ExportFormat::default(),
         }
+    }
+
+    /// Set the `e`-key export format (`--export` wiring, Chunk 13).
+    pub fn with_export_format(mut self, format: ExportFormat) -> Self {
+        self.export_format = format;
+        self
     }
 
     /// Handle one terminal key event (blueprint §6 footer key map).
@@ -196,6 +209,68 @@ impl App {
             KeyCode::Char('n') => KeyAction::NewNeedle,
             KeyCode::Char('e') => KeyAction::Export,
             _ => KeyAction::Continue,
+        }
+    }
+
+    /// The `e` key (blueprint §6 footer, Chunk 13): export the current
+    /// metrics snapshot to `data_dir()/exports/` in the configured format
+    /// and log the destination.
+    ///
+    /// The TUI has no persisted session to re-read, so the payload is built
+    /// **live** from the lock-free [`MetricsSnapshot`] (the headless path
+    /// instead consumes the SQLite layer after persistence — same
+    /// [`ExportPayload`] shape). Per-packet CSV detail only exists on the
+    /// headless path, where the raw stream events are captured; a TUI CSV
+    /// export carries the metrics rows only.
+    pub fn export(&mut self) -> Result<std::path::PathBuf, String> {
+        let snap = self.metrics.load();
+        let session = BenchmarkSession {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            timestamp: None,
+            target_url: snap.endpoint.clone(),
+            model_name: snap.model.clone(),
+            backend_type: (!snap.backend.is_empty()).then(|| snap.backend.clone()),
+            quantization: None,
+            system_gpu: None,
+            total_duration_sec: None,
+        };
+        let metrics: Vec<StreamMetricRow> = snap
+            .streams
+            .iter()
+            .map(|s| StreamMetricRow {
+                metric_id: None,
+                session_id: session.session_id.clone(),
+                concurrency_level: Some(self.concurrency_target as i64),
+                prompt_tokens: s.pp_tokens.map(|v| v as i64),
+                completion_tokens: s.tg_tokens.map(|v| v as i64),
+                reasoning_tokens: None,
+                ttft_ms: s.ttft_s.map(|v| v * 1000.0),
+                tpot_ms: s.gen_tps.filter(|v| *v > 0.0).map(|v| 1000.0 / v),
+                mtp_efficiency: s.mtp,
+                joules_per_token: None,
+                cache_hit: None,
+            })
+            .collect();
+        let payload = ExportPayload::from_live(session, metrics, Vec::new(), Vec::new());
+        let dest = export::default_path_live(self.export_format);
+        let path = export::write(&dest, self.export_format, &payload).map_err(|e| e.to_string())?;
+        self.push_log(
+            format!(
+                "[export] {} → {}",
+                self.export_format.label(),
+                path.display()
+            ),
+            style::value_ok(),
+        );
+        Ok(path)
+    }
+
+    /// Append a line to the event log (bounded: the oldest lines drop when
+    /// it grows past 200).
+    pub fn push_log(&mut self, msg: String, st: Style) {
+        self.log.push(Line::from(Span::styled(msg, st)));
+        if self.log.len() > 200 {
+            self.log.drain(0..self.log.len() - 200);
         }
     }
 

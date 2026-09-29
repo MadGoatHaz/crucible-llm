@@ -19,6 +19,7 @@ use ratatui::Terminal;
 use tokio::time::{interval, Interval};
 
 use crate::ui::app::{App, KeyAction};
+use crate::ui::theme::style;
 
 /// One render frame: 1000 / 60 ≈ 16 ms.
 const TICK: Duration = Duration::from_millis(16);
@@ -83,8 +84,23 @@ impl EventLoop {
                 match ev {
                     // Act on key presses only (ignore release/repeat).
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if app.handle_key(&key) == KeyAction::Quit {
-                            app.running = false;
+                        match app.handle_key(&key) {
+                            KeyAction::Quit => app.running = false,
+                            // `e` (Chunk 13): export the current snapshot to
+                            // the data dir. A failure only logs a warning —
+                            // it never disturbs the render/timing loop.
+                            KeyAction::Export => {
+                                if let Err(e) = app.export() {
+                                    app.push_log(
+                                        format!("[export] failed: {e}"),
+                                        style::value_warn(),
+                                    );
+                                }
+                            }
+                            KeyAction::Continue
+                            | KeyAction::PauseResume
+                            | KeyAction::StepConcurrency
+                            | KeyAction::NewNeedle => {}
                         }
                     }
                     // Resize: the backend re-queries the terminal size on
