@@ -4,3 +4,5 @@
 pub mod engine;
 pub mod histogram;
 pub mod state;
+
+pub use histogram::LatencyHistogram;
