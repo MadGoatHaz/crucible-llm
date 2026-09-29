@@ -1,5 +1,7 @@
--- Crucible-LLM persistence schema (blueprint §8).
--- Applied by `storage/db.rs` on first open via `rusqlite`.
+-- Crucible-LLM persistence schema (blueprint §8, "Database Relational Schema").
+--
+-- Applied idempotently by `Database::open` (the migration step): `IF NOT
+-- EXISTS` makes re-running the batch on an existing DB a no-op.
 
 CREATE TABLE IF NOT EXISTS benchmark_sessions (
     session_id TEXT PRIMARY KEY,

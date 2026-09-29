@@ -17,6 +17,7 @@ use crucible_llm::config::{Config, ConfigError};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine,
 };
+use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
 
@@ -142,6 +143,41 @@ fn run_headless(cfg: &Config) -> i32 {
             if let Some(summary) = format_summary(&results, term.color) {
                 print!("{summary}");
             }
+        }
+
+        // Persist the completed run (Chunk 12): one `benchmark_sessions`
+        // row + one `stream_metrics` row per iteration, in the platform
+        // data dir. A storage failure degrades gracefully — it must never
+        // break (or change the exit code of) a benchmark run.
+        let session = BenchmarkSession {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            timestamp: None, // SQLite `DEFAULT CURRENT_TIMESTAMP` fills it
+            target_url: cfg.url.clone(),
+            model_name: cfg.model.clone(),
+            backend_type: None,
+            quantization: None,
+            system_gpu: None,
+            total_duration_sec: Some(results.iter().map(|r| r.stream_time).sum()),
+        };
+        // Single-stream headless engine: every iteration runs at
+        // concurrency level 1.
+        let rows: Vec<StreamMetricRow> = results
+            .iter()
+            .map(|r| StreamMetricRow::from_speed_result(r, &session.session_id, 1))
+            .collect();
+        match Database::open_default() {
+            Ok(mut db) => match db.persist_run(&session, &rows) {
+                Ok(()) => {
+                    let id = &session.session_id;
+                    term.dim(&format!(
+                        "  saved → {} (session {})",
+                        db.path().display(),
+                        &id[..8]
+                    ))
+                }
+                Err(e) => term.warning(&format!("persist failed: {e}")),
+            },
+            Err(e) => term.warning(&format!("persist failed: {e}")),
         }
 
         // Prototype exit-code rule: all runs failed → exit 1.
