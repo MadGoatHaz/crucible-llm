@@ -178,6 +178,10 @@ pub struct StreamWorker {
     max_tokens: u32,
     read_timeout: Duration,
     retries: u32,
+    /// The OpenAI-compatible `response_format` type (e.g.
+    /// `"json_object"`) — Engine C3's grammar-constrained runs. `None`
+    /// (the default) sends the body unchanged.
+    response_format: Option<String>,
 }
 
 impl StreamWorker {
@@ -200,6 +204,7 @@ impl StreamWorker {
             max_tokens: max_tokens.max(1),
             read_timeout: DEFAULT_READ_TIMEOUT,
             retries: 0,
+            response_format: None,
         }
     }
 
@@ -219,6 +224,15 @@ impl StreamWorker {
     /// ([`StreamError::is_retriable`]).
     pub fn retries(mut self, n: u32) -> Self {
         self.retries = n;
+        self
+    }
+
+    /// Request constrained (structured) output via the OpenAI-compatible
+    /// `response_format` directive (Engine C3, Chunk 16): the body gains
+    /// `"response_format": { "type": <format> }` (e.g. `"json_object"`),
+    /// which server-side constrained-decoding engines honor.
+    pub fn response_format(mut self, format: &str) -> Self {
+        self.response_format = Some(format.to_string());
         self
     }
 
@@ -508,9 +522,11 @@ impl StreamWorker {
         }
     }
 
-    /// Build and send the chat-completion request.
-    async fn send_request(&self) -> Result<reqwest::Response, reqwest::Error> {
-        let body = serde_json::json!({
+    /// The chat-completion request body. Gains a `response_format`
+    /// object when [`response_format`](Self::response_format) is set
+    /// (Engine C3); otherwise byte-identical to the Engine A body.
+    fn request_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": [{ "role": "user", "content": self.prompt }],
             "stream": true,
@@ -518,6 +534,15 @@ impl StreamWorker {
             "temperature": 0,
             "max_tokens": self.max_tokens,
         });
+        if let Some(format) = &self.response_format {
+            body["response_format"] = serde_json::json!({ "type": format });
+        }
+        body
+    }
+
+    /// Build and send the chat-completion request.
+    async fn send_request(&self) -> Result<reqwest::Response, reqwest::Error> {
+        let body = self.request_body();
         let mut req = self.client.post(&self.endpoint).json(&body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -801,5 +826,39 @@ mod tests {
         assert!(is_token_frame(&Chunk::Content("x".into())));
         assert!(!is_token_frame(&Chunk::Control));
         assert!(!is_token_frame(&Chunk::Usage(Usage::default())));
+    }
+
+    #[test]
+    fn request_body_without_response_format_is_the_engine_a_shape() {
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        );
+        let body = w.request_body();
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["max_tokens"], 10);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn request_body_with_response_format_adds_the_directive() {
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .response_format("json_object");
+        let body = w.request_body();
+        assert_eq!(body["response_format"]["type"], "json_object");
+        // The rest of the body is untouched.
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 10);
     }
 }

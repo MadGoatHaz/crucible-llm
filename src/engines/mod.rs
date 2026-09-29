@@ -9,12 +9,20 @@
 //!   and client-perceived p90 TPOT across all concurrent streams, plus
 //!   saturation knee-point detection and the "Optimal Operational
 //!   Envelope" (the recommended sweet spot).
+//! * [`capability`] — Engine C (Chunk 15 + 16): C1 needle-in-a-haystack
+//!   context retention, C2 deterministic reasoning/code verification,
+//!   and C3 structured-output/JSON-grammar compliance.
 
 pub mod capability;
 pub mod concurrency;
 pub mod hardware;
 pub mod speed;
 
+pub use capability::{
+    is_json_compliant, score_responses, Challenge, Checker, ReasoningEngine, ReasoningResult,
+    ReasoningScore, StructuredEngine, StructuredResult, REASONING_BANK, REASONING_MAX_GEN_TOKENS,
+    REQUIRED_FIELDS, STRUCTURED_MAX_GEN_TOKENS, STRUCTURED_TASK,
+};
 pub use concurrency::{
     normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, DEFAULT_LADDER,
     KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,

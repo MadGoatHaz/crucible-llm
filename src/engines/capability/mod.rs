@@ -1,6 +1,24 @@
 //! Engine C — Capability & Fidelity: needle-in-a-haystack, deterministic
 //! reasoning/code verification, and structured-output/JSON-grammar compliance.
+//!
+//! * [`niah`] — (Chunk 15) Engine C1: the N×M context-size × depth
+//!   matrix measuring retrieval accuracy and prefill degradation.
+//! * [`reasoning`] — (Chunk 16) Engine C2: a standardized bank of
+//!   deterministic logic/math/code challenges validated by strict
+//!   checkers, yielding a reproducible pass/fail accuracy score.
+//! * [`structured`] — (Chunk 16) Engine C3: the speed penalty of
+//!   grammar-constrained (`response_format`) generation vs free-form,
+//!   plus JSON compliance.
 
 pub mod niah;
 pub mod reasoning;
 pub mod structured;
+
+pub use reasoning::{
+    score_responses, Challenge, Checker, ReasoningEngine, ReasoningResult, ReasoningScore,
+    REASONING_BANK, REASONING_MAX_GEN_TOKENS,
+};
+pub use structured::{
+    is_json_compliant, StructuredEngine, StructuredResult, REQUIRED_FIELDS,
+    STRUCTURED_MAX_GEN_TOKENS, STRUCTURED_TASK,
+};
