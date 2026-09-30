@@ -456,7 +456,7 @@ impl StreamWorker {
                         tokens += tc;
                     }
                     ts.t_end = Some(at);
-                    self.log_stream_end(ts, tokens, true);
+                    self.log_stream_end(ts, tokens, parser.usage(), true);
                     return self
                         .finish_complete(tx, ts, parser.usage(), true, parser.malformed_frames())
                         .await;
@@ -470,7 +470,7 @@ impl StreamWorker {
                             tokens += tc;
                         }
                         ts.t_end = Some(at);
-                        self.log_stream_end(ts, tokens, true);
+                        self.log_stream_end(ts, tokens, parser.usage(), true);
                         return self
                             .finish_complete(
                                 tx,
@@ -513,7 +513,7 @@ impl StreamWorker {
 
         // `[DONE]` received: Tn — stream close.
         ts.t_end = Some(MonotonicInstant::now());
-        self.log_stream_end(ts, tokens, false);
+        self.log_stream_end(ts, tokens, parser.usage(), false);
         self.finish_complete(tx, ts, parser.usage(), false, parser.malformed_frames())
             .await
     }
@@ -559,10 +559,22 @@ impl StreamWorker {
         }
     }
 
-    /// Log the stream's completion (total tokens over the T0→Tn window,
-    /// the decode rate over the T3→Tn window, and a `premature` marker
-    /// when the stream closed without `[DONE]`).
-    fn log_stream_end(&self, ts: &StreamTimestamps, tokens: u64, premature: bool) {
+    /// Log the stream's completion. `frames` is the count of SSE chunks
+    /// that carried tokens — an *estimate*, not the server's token count.
+    /// When the server reported `usage.completion_tokens`, that is the
+    /// authoritative count and the line reads
+    /// `… N tokens (M frames) in Xs (Y t/s)`; otherwise it reads
+    /// `… M frames in Xs (~Y t/s est)`. The rate is over the T3→Tn
+    /// window, and a `premature` marker is added when the stream closed
+    /// without `[DONE]`.
+    fn log_stream_end(
+        &self,
+        ts: &StreamTimestamps,
+        frames: u64,
+        usage: Option<Usage>,
+        premature: bool,
+    ) {
+        let tokens = usage.map(|u| u.completion_tokens).unwrap_or(frames);
         let (total_s, rate) = match (ts.t0, ts.t_end, ts.t3) {
             (Some(t0), Some(end), Some(t3)) => {
                 let total = t0.delta_nanos(&end) as f64 / 1e9;
@@ -573,14 +585,17 @@ impl StreamWorker {
             _ => (0.0, 0.0),
         };
         let tag = if premature { " (premature close)" } else { "" };
-        self.logl(
-            Level::Info,
-            Context::Sse,
-            &format!(
-                "{} stream complete: {tokens} tokens in {total_s:.1}s ({rate:.1} t/s){tag}",
+        let msg = match usage {
+            Some(u) => format!(
+                "{} stream complete: {} tokens ({} frames) in {total_s:.1}s ({:.1} t/s){tag}",
+                self.tag, u.completion_tokens, frames, rate
+            ),
+            None => format!(
+                "{} stream complete: {frames} frames in {total_s:.1}s (~{rate:.1} t/s est){tag}",
                 self.tag
             ),
-        );
+        };
+        self.logl(Level::Info, Context::Sse, &msg);
     }
 
     /// The non-SSE plain-JSON fallback: a server that ignored `stream: true`
@@ -640,7 +655,7 @@ impl StreamWorker {
                     }
                 };
                 ts.t_end = Some(MonotonicInstant::now());
-                self.log_stream_end(ts, tokens, false);
+                self.log_stream_end(ts, tokens, usage, false);
                 // A complete plain-JSON response is a normal completion, not
                 // a premature one (there is no `[DONE]` to expect).
                 self.finish_complete(tx, ts, usage, false, 0).await
@@ -1002,5 +1017,94 @@ mod tests {
         // The rest of the body is untouched.
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn stream_end_log_labels_frames_and_tokens_correctly() {
+        let dir = std::env::temp_dir().join(format!("crucible-streamend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("test");
+
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(100_000_000);
+            let t3 = MonotonicInstant::now(); // 100 ms
+            mock.increment(100_000_000);
+            let t_end = MonotonicInstant::now(); // 200 ms
+
+            // Server reports usage: the authoritative token count (256)
+            // is logged alongside the 119 counted frames; the rate is
+            // 256 / 0.1 s over the T3→Tn window.
+            w.log_stream_end(
+                &StreamTimestamps {
+                    t0: Some(t0),
+                    t1: None,
+                    t2: None,
+                    t3: Some(t3),
+                    t_end: Some(t_end),
+                },
+                119,
+                Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 256,
+                }),
+                false,
+            );
+            // No usage: the frame count is only an estimate.
+            w.log_stream_end(
+                &StreamTimestamps {
+                    t0: Some(t0),
+                    t1: None,
+                    t2: None,
+                    t3: Some(t0),
+                    t_end: Some(t_end),
+                },
+                119,
+                None,
+                false,
+            );
+            // A premature close keeps the marker.
+            w.log_stream_end(
+                &StreamTimestamps {
+                    t0: Some(t0),
+                    t1: None,
+                    t2: None,
+                    t3: Some(t3),
+                    t_end: Some(t_end),
+                },
+                119,
+                Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 256,
+                }),
+                true,
+            );
+        });
+        logger.finish();
+        // The writer flushes on every newline; read after finish.
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        assert!(
+            latest.contains("test stream complete: 256 tokens (119 frames) in 0.2s (2560.0 t/s)"),
+            "usage line missing: {latest}"
+        );
+        assert!(
+            latest.contains("test stream complete: 119 frames in 0.2s (~595.0 t/s est)"),
+            "estimate line missing: {latest}"
+        );
+        assert!(
+            latest.contains("256 tokens (119 frames) in 0.2s (2560.0 t/s) (premature close)"),
+            "premature marker missing: {latest}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

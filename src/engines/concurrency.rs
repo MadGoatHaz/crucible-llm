@@ -44,10 +44,18 @@ use crate::timing::MonotonicInstant;
 /// `1→2→4→8→16→32→64` simultaneous sessions).
 pub const DEFAULT_LADDER: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 
-/// The stall-detection window: a worker with no tokens for this long
-/// during a level is flagged (warned) as stalled. The per-worker timeout
-/// (the pool's `worker_timeout`) is what eventually kills it.
+/// The stall-detection window for the *inter-token* phase: a worker that
+/// has received at least one token and then goes silent for this long is
+/// flagged (warned) as stalled. The per-worker timeout (the pool's
+/// `worker_timeout`) is what eventually kills it.
 pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The stall-detection floor for the *TTFB* phase (no token received
+/// yet): at high concurrency the server batch-schedules, so a worker
+/// waiting in the queue is *not* stalled — it gets this longer leash
+/// (or the pool's per-worker timeout / 2, when that is larger) before a
+/// warning fires.
+pub const DEFAULT_TTFB_STALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The cadence of the sweep's stall / step-budget checks (the drain
 /// loop wakes on this interval between events).
@@ -276,7 +284,9 @@ pub struct Sweep {
     /// Optional run logger: the sweep records step starts / completions,
     /// per-worker timeouts, stalls, and step aborts.
     logger: Option<Arc<RunLogger>>,
-    /// The stall-detection window (no tokens for this long → warn).
+    /// The inter-token stall-detection window (no tokens for this long →
+    /// warn). The TTFB phase (no token yet) uses the longer
+    /// [`DEFAULT_TTFB_STALL_TIMEOUT`] / `worker_timeout` / 2 threshold.
     stall_timeout: Duration,
     /// Optional hard cap on the computed step budget (tests use it to
     /// make a hanging level abort quickly; production leaves it `None`).
@@ -350,8 +360,10 @@ impl Sweep {
         self
     }
 
-    /// Override the stall-detection window (default
-    /// [`DEFAULT_STALL_TIMEOUT`]).
+    /// Override the inter-token stall-detection window (default
+    /// [`DEFAULT_STALL_TIMEOUT`]). The TTFB phase (no token received
+    /// yet) always uses the longer [`DEFAULT_TTFB_STALL_TIMEOUT`] (or the
+    /// pool's per-worker timeout / 2, when that is larger).
     pub fn stall_timeout(mut self, d: Duration) -> Self {
         self.stall_timeout = d;
         self
@@ -389,8 +401,12 @@ impl Sweep {
     /// 1. **per-worker timeout** (the pool's `worker_timeout`): a worker
     ///    that does not finish in time is killed and reported as a
     ///    `WorkerTimeout` failure with its partial tokens;
-    /// 2. **stall detection**: a worker with no tokens for
-    ///    [`DEFAULT_STALL_TIMEOUT`] is flagged with a warning (it
+    /// 2. **stall detection**: a worker that received tokens and then
+    ///    goes silent for [`DEFAULT_STALL_TIMEOUT`] is warned as
+    ///    stalled; a worker still in the TTFB phase (no token yet) is
+    ///    warned only after the longer
+    ///    [`DEFAULT_TTFB_STALL_TIMEOUT`] / `worker_timeout` / 2 leash —
+    ///    high-concurrency server queuing is not a stall (it
     ///    distinguishes a slow server from a hung connection — the
     ///    kill comes from #1);
     /// 3. **step-level timeout**: if the whole level runs past its budget
@@ -617,7 +633,15 @@ impl Sweep {
     }
 
     /// Stall detection: warn (once per worker) when a live worker has
-    /// produced no tokens for [`stall_timeout`](Self::stall_timeout).
+    /// been silent past its *phase-appropriate* threshold:
+    ///
+    /// * **TTFB phase** (no token received yet): the worker is likely
+    ///   queued at the server (batch-scheduling delay at high
+    ///   concurrency), not stalled — it gets the longer
+    ///   [`ttfb_stall_threshold`](Self::ttfb_stall_threshold) leash;
+    /// * **inter-token phase** (at least one token received, then
+    ///   silence): [`stall_timeout`](Self::stall_timeout) (default
+    ///   30 s) — this *is* a real stall.
     ///
     /// A warning only — the kill comes from the per-worker timeout, so a
     /// *slow* server (tokens every 40 s) is distinguished from a *hung*
@@ -639,28 +663,61 @@ impl Sweep {
             }
             let ref_t = t.last_token_at.unwrap_or(*start);
             let idle_ns = ref_t.delta_nanos(&now);
-            if (idle_ns as u128) >= self.stall_timeout.as_nanos() && !t.stall_warned {
+            let threshold = if t.last_token_at.is_none() {
+                self.ttfb_stall_threshold()
+            } else {
+                self.stall_timeout
+            };
+            if (idle_ns as u128) >= threshold.as_nanos() && !t.stall_warned {
                 t.stall_warned = true;
-                let last = t
-                    .last_token_wall
-                    .map(|w| {
-                        let ms = w
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        crate::log::format_timestamp(ms, false)
-                    })
-                    .unwrap_or_else(|| "no token yet".to_string());
-                self.logw(
-                    Context::EngineB,
-                    format!(
-                        "Step {step}/{total_steps}: worker #{} no tokens for {:.0}s (last token at {last})",
-                        t.id,
-                        idle_ns as f64 / 1e9
-                    ),
-                );
+                if t.last_token_at.is_none() {
+                    // TTFB phase: no token yet — the server is queuing
+                    // this level's concurrent requests (normal at high
+                    // concurrency), not stalled.
+                    self.logw(
+                        Context::EngineB,
+                        format!(
+                            "Step {step}/{total_steps}: worker #{} awaiting first token (TTFB: {:.0}s) — server queuing {} concurrent requests",
+                            t.id,
+                            idle_ns as f64 / 1e9,
+                            acc.n
+                        ),
+                    );
+                } else {
+                    // Inter-token phase: at least one token arrived, then
+                    // silence — a real stall.
+                    let last = t
+                        .last_token_wall
+                        .map(|w| {
+                            let ms = w
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            crate::log::format_timestamp(ms, false)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.logw(
+                        Context::EngineB,
+                        format!(
+                            "Step {step}/{total_steps}: worker #{} stalled: no tokens for {:.0}s (last token at {last})",
+                            t.id,
+                            idle_ns as f64 / 1e9
+                        ),
+                    );
+                }
             }
         }
+    }
+
+    /// The TTFB-phase stall threshold: the pool's per-worker timeout / 2
+    /// when one is set (the kill is the full cap, so half of it is a
+    /// reasonable "queued, not hung" warning point), floored at
+    /// [`DEFAULT_TTFB_STALL_TIMEOUT`] (90 s).
+    fn ttfb_stall_threshold(&self) -> Duration {
+        self.pool
+            .worker_timeout_cap()
+            .map(|cap| (cap / 2).max(DEFAULT_TTFB_STALL_TIMEOUT))
+            .unwrap_or(DEFAULT_TTFB_STALL_TIMEOUT)
     }
 
     /// Log the per-worker terminal events (stream complete / failure).
@@ -1689,20 +1746,23 @@ mod tests {
     }
 
     #[test]
-    fn check_stalls_warns_once_per_worker_and_only_when_idle() {
+    fn check_stalls_distinguishes_ttfb_from_inter_token() {
         let dir =
             std::env::temp_dir().join(format!("crucible-runlog-stall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let logger = RunLogger::start(Some(&dir));
+        // Pool cap 120 s → TTFB threshold = max(120/2, 90) = 90 s;
+        // inter-token threshold = the 30 s default.
         let sweep = Sweep::new(pool_with_cap(Some(120)), [2]).logger(logger.clone());
 
         let (clock, mock) = quanta::Clock::mock();
         quanta::with_clock(&clock, || {
             let t0 = MonotonicInstant::now();
             let mut acc = LevelAccumulator::new(2, 16);
-            // Stream 0 got a token 6 s before the check (fresh: 29 s idle
-            // < the 30 s window); stream 1 has had no token since the
-            // level start (35 s idle ≥ 30 s → stalled).
+            // Stream 0 got its first token 6 s after the level start
+            // (TTFB done → inter-token phase); stream 1 has had no
+            // token since the level start (still in the TTFB phase —
+            // queued at the server).
             let ts1 = ts_with_ttft(t0, t0);
             acc.on_event(&frame_event(0, ts1));
             {
@@ -1712,14 +1772,27 @@ mod tests {
                 t.last_token_wall = Some(std::time::SystemTime::now());
                 t.state = StreamStatus::Streaming;
             }
-            acc.trackers[1].last_token_wall = Some(std::time::SystemTime::now());
             mock.increment(29_000_000_000); // now = t0 + 35 s
 
-            // First check: only stream 1 warns.
+            // At 35 s: stream 0 is 29 s idle (< 30 s inter-token
+            // threshold) and stream 1 is 35 s in TTFB (< 90 s TTFB
+            // threshold) — neither warns (the old false positive).
             sweep.check_stalls(&mut acc, 1, 7, &t0);
-            assert!(acc.trackers[1].stall_warned);
             assert!(!acc.trackers[0].stall_warned);
-            // Second check: the warning fires once (no repeat spam).
+            assert!(!acc.trackers[1].stall_warned);
+
+            mock.increment(5_000_000_000); // now = t0 + 40 s
+                                           // Stream 0 is now 34 s idle ≥ 30 s → inter-token stall.
+                                           // Stream 1 is 40 s in TTFB < 90 s → still just queuing.
+            sweep.check_stalls(&mut acc, 1, 7, &t0);
+            assert!(acc.trackers[0].stall_warned);
+            assert!(!acc.trackers[1].stall_warned);
+            // The warning fires once (no repeat spam).
+            sweep.check_stalls(&mut acc, 1, 7, &t0);
+            assert!(acc.trackers[0].stall_warned);
+
+            mock.increment(55_000_000_000); // now = t0 + 95 s
+                                            // Stream 1 is now 95 s in TTFB ≥ 90 s → TTFB warning.
             sweep.check_stalls(&mut acc, 1, 7, &t0);
             assert!(acc.trackers[1].stall_warned);
 
@@ -1727,13 +1800,18 @@ mod tests {
             // The writer flushes on every newline; read after finish.
             let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
             assert!(
-                latest.contains("worker #1 no tokens for 35s"),
-                "stall warning missing: {latest}"
+                latest.contains("worker #0 stalled: no tokens for 34s"),
+                "inter-token stall warning missing: {latest}"
             );
             assert!(
-                !latest.contains("worker #0 no tokens"),
-                "fresh worker must not stall"
+                latest.contains(
+                    "worker #1 awaiting first token (TTFB: 95s) — server queuing 2 concurrent requests"
+                ),
+                "TTFB warning missing: {latest}"
             );
+            // Each warning fires exactly once.
+            assert_eq!(latest.matches("stalled: no tokens").count(), 1);
+            assert_eq!(latest.matches("awaiting first token").count(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
