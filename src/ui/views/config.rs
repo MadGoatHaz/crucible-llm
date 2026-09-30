@@ -260,6 +260,8 @@ impl ConfigState {
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
             tui: None,
+            // Mode markers are CLI concerns — never persisted (Chunk 20).
+            headless: None,
             export: None,
             export_path: None,
             ladder,

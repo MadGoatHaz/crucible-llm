@@ -1,13 +1,20 @@
 //! Crucible-LLM entry point.
 //!
-//! Dispatch (plan Chunk 7):
-//! - `crucible-llm` → banner (no target specified: no `--url`/env/config
-//!   file URL)
-//! - `crucible-llm --tui …` → the ratatui dashboard (Chunk 8)
-//! - `crucible-llm --url … [flags]` → **headless** single-stream
+//! Dispatch (Chunk 20 — **the TUI is the default mode**):
+//! - `crucible-llm` → the ratatui dashboard (Chunk 8). A bare invocation
+//!   launches the TUI — it no longer prints the banner.
+//! - `crucible-llm --headless …` / `--json …` → **headless** single-stream
 //!   benchmark (Engine A): N iterations, the prototype's result box
 //!   and/or `--json` (same field set as `llmspeedtest.py`), a
 //!   multi-iteration summary, and exit 1 if all runs failed.
+//!   (`--json` implies headless; `--headless` is the explicit marker.)
+//! - `crucible-llm --tui …` → forces the TUI (compat: e.g. on a non-TTY,
+//!   where the run would otherwise fall back to headless).
+//! - `crucible-llm --banner` → the old startup banner, demoted to a
+//!   hidden flag.
+//!
+//! A non-TTY stdout (pipe / CI) also falls back to the headless run
+//! unless `--tui` is given explicitly.
 
 use std::io::IsTerminal;
 use std::panic;
@@ -41,20 +48,35 @@ fn main() {
         }
     };
 
-    if cfg.tui {
-        let ok = run_tui(&cfg);
-        EventLoop::restore(); // best-effort terminal restore on all paths
-        if !ok {
-            process::exit(1);
-        }
+    // `--banner` (hidden, Chunk 20): the old bare-invocation banner path,
+    // demoted to an explicit flag.
+    if cfg.banner {
+        print_banner();
         return;
     }
 
-    if cfg.target_explicit {
+    // Chunk 20 — the TUI is the default mode. The run goes headless when
+    // an explicit headless marker is present (`--headless`, or `--json`
+    // which implies it)…
+    let headless = cfg.headless || cfg.json;
+    // …or when stdout is not a TTY (pipe / CI) and the user did not
+    // explicitly ask for the dashboard with `--tui`. A TUI on a pipe
+    // cannot render; the headless run is the sane fallback.
+    let tty = std::io::stdout().is_terminal();
+    if headless || (!tty && !cfg.tui) {
+        if !headless {
+            eprintln!("crucible-llm: stdout is not a TTY — running headless (use --tui to force the dashboard)");
+        }
         process::exit(run_headless(&cfg));
     }
 
-    print_banner();
+    // Everything else — including a bare `crucible-llm` — launches the
+    // TUI (Chunk 8).
+    let ok = run_tui(&cfg);
+    EventLoop::restore(); // best-effort terminal restore on all paths
+    if !ok {
+        process::exit(1);
+    }
 }
 
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
@@ -495,10 +517,12 @@ fn print_banner() {
     println!("  High-performance terminal LLM benchmark & inference profiler");
     println!("============================================================");
     println!();
-    println!("  modes:");
-    println!("    --url <endpoint> [flags]   headless single-stream benchmark");
-    println!("                               (result box, --json, --iterations …)");
-    println!("    --tui                      open the interactive ratatui dashboard");
+    println!("  modes (Chunk 20: the TUI is the default):");
+    println!("    (no mode flags)              open the interactive ratatui dashboard");
+    println!("    --headless [flags]           classic one-shot headless benchmark");
+    println!("                               (result box, --iterations …)");
+    println!("    --json [flags]               headless benchmark, JSON on stdout");
+    println!("    --banner                     this banner");
     println!();
     println!("  run `crucible-llm --help` for all flags (a superset of");
     println!("  llmspeedtest.py / llmspeedtest2.py).");

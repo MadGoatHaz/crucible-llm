@@ -1,6 +1,6 @@
 # DEV_LOG — Crucible-LLM
 
-> **Status: IMPLEMENTATION COMPLETE — all 19 plan chunks delivered and committed. Full suite green (280 tests), `clippy --all-targets` + `fmt --check` clean; Definition of Done items 1–5 satisfied.**
+> **Status: IMPLEMENTATION COMPLETE — all 19 plan chunks + Chunk 20 (TUI default + model discovery) delivered and committed. Full suite green (297 tests), `clippy --all-targets` + `fmt --check` clean; Definition of Done items 1–5 satisfied.**
 > Authoritative blueprint: `crucible_llm_architecture_blueprint.md`
 > Chunked implementation plan: `work/plans/PLAN.md`
 > Final QA verdict: `work/scratch/qa_report.txt`
@@ -10,6 +10,7 @@
 ## Active Work
 
 None - implementation complete
+
 
 ## Completed Milestones
 
@@ -34,3 +35,4 @@ None - implementation complete
 - **chunk-18** — View 5 Config + full engine integration (editable/persistent config form, EngineSelection A–D, `run_selected`).
 - **chunk-19** — Release binary hardening + e2e smoke tests + full README.
 - **exit-code-fix** — `llmspeedtest.py` exit-code fix (py_compile OK, dead-endpoint run exits 1).
+- **chunk-20** — TUI as the default mode (bare invocation launches the dashboard; `--headless`/`--json` force the classic run; non-TTY falls back to headless; `--banner` demoted to a hidden flag) + model discovery client (`src/client/models.rs`: `GET {base}/v1/models`, `ModelInfo`, `ModelError`, id-sorted deduped list) wired into `App` via a lock-free `ResultSlot<Vec<ModelInfo>>` + `start_discovery()` (`tokio::spawn`, measurement-isolation intact). 297 tests green incl. live mock-discovery e2e.

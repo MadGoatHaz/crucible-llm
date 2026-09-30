@@ -3,13 +3,16 @@
 //! 1. **In-process full pipeline** against an in-process mock SSE server:
 //!    single-stream (Engine A) → small ladder sweep (Engine B) →
 //!    needle-in-a-haystack (Engine C1) → SQLite persistence → all three
-//!    export formats (JSON / Markdown / CSV, blueprint §8).
+//!    export formats (JSON / Markdown / CSV, blueprint §8) → model
+//!    discovery (`GET /v1/models`, Chunk 20).
 //! 2. **The real binary as a subprocess**: headless `--json` + `--export
 //!    json` against the mock, with the platform data dir redirected into a
 //!    throwaway temp dir (no user data is touched) — verifying the
 //!    prototype's JSON field set, the persisted session/metric rows, and
 //!    the written export file.
-//! 3. **Bare invocation** prints the banner and exits 0.
+//! 3. **Chunk 20 dispatch**: `--banner` prints the (demoted) banner and
+//!    exits 0, and a bare invocation on a non-TTY stdout falls back to
+//!    the headless run (the TUI is the default mode).
 //!
 //! The mock simulates a *well-behaved* endpoint without any LLM in the
 //! loop: a NIAH-style prompt (one that embeds `the secret code is …`)
@@ -31,9 +34,10 @@ use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 
 // ── Mock SSE server (multi-connection) ───────────────────────────────────
 
-/// Read the full HTTP request (headers + body) and return
-/// `messages[0].content` from the JSON body.
-async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+/// Read the full HTTP request (headers + body) and return the request
+/// target (e.g. `GET /v1/models http/1.1`, lowercased) plus
+/// `messages[0].content` from the JSON body (empty for a GET).
+async fn read_request(sock: &mut tokio::net::TcpStream) -> (String, String) {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 8192];
     loop {
@@ -53,6 +57,7 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         .map(|p| p + 4)
         .unwrap_or(buf.len());
     let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let target = headers.lines().next().unwrap_or_default().to_string();
     let mut content_length = 0usize;
     for line in headers.lines() {
         if let Some(rest) = line.strip_prefix("content-length:") {
@@ -67,10 +72,11 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
         }
     }
     let body = body[..content_length.min(body.len())].to_vec();
-    serde_json::from_slice::<serde_json::Value>(&body)
+    let prompt = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["messages"][0]["content"].as_str().map(String::from))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (target, prompt)
 }
 
 /// The needle value as the NIAH engine injects it into the prompt
@@ -95,8 +101,14 @@ async fn start_mock() -> (String, tokio::task::JoinHandle<()>) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let prompt = read_request(&mut sock).await;
-            respond(&mut sock, prompt).await;
+            let (target, prompt) = read_request(&mut sock).await;
+            // Chunk 20: the mock also serves the OpenAI-compatible model
+            // discovery endpoint (the TUI's `list_models` target).
+            if target.starts_with("get /v1/models") {
+                respond_models(&mut sock).await;
+            } else {
+                respond(&mut sock, prompt).await;
+            }
         }
     });
     (format!("http://{addr}"), handle)
@@ -151,6 +163,30 @@ async fn respond(sock: &mut tokio::net::TcpStream, prompt: String) {
         write_chunk(sock, frame.as_bytes()).await;
     }
     write_chunk(sock, b"").await; // terminating chunk
+    let _ = sock.shutdown().await;
+}
+
+/// Serve the OpenAI-compatible `GET /v1/models` discovery response
+/// (Chunk 20). Deliberately listed *out of order* (b before a) so the
+/// test also pins the client's id-sorting.
+async fn respond_models(sock: &mut tokio::net::TcpStream) {
+    let body = serde_json::json!({
+        "object": "list",
+        "data": [
+            { "id": "e2e-model-b", "object": "model", "created": 1718000001, "owned_by": "e2e" },
+            { "id": "e2e-model-a", "object": "model", "created": 1718000000, "owned_by": "e2e" }
+        ]
+    })
+    .to_string();
+    write_all(
+        sock,
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await;
     let _ = sock.shutdown().await;
 }
 
@@ -342,6 +378,25 @@ async fn full_pipeline_single_stream_sweep_niah_persist_and_export() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+// ── 1b. Chunk 20: model discovery against the mock ──────────────────────
+
+#[tokio::test]
+async fn model_discovery_lists_sorts_and_parses_the_mock() {
+    let (url, _server) = start_mock().await;
+    let models = crucible_llm::client::list_models(&url, None)
+        .await
+        .expect("discovery against the in-process mock");
+    // The mock lists b before a: the client returns them id-sorted.
+    assert_eq!(
+        models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+        vec!["e2e-model-a", "e2e-model-b"]
+    );
+    let a = &models[0];
+    assert_eq!(a.object.as_deref(), Some("model"));
+    assert_eq!(a.created, Some(1718000000));
+    assert_eq!(a.owned_by.as_deref(), Some("e2e"));
+}
+
 // ── 2. The real binary, as a subprocess ──────────────────────────────────
 
 /// The test binary path cargo provides for the package's `crucible-llm`
@@ -453,10 +508,13 @@ fn binary_headless_json_and_export_end_to_end() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+// ── 3. Chunk 20 dispatch: the TUI is the default ─────────────────────────
+
 #[test]
-fn binary_bare_invocation_prints_banner_and_exits_zero() {
+fn binary_banner_flag_prints_banner_and_exits_zero() {
     let tmp = temp_dir();
     let out = Command::new(binary())
+        .args(["--banner"])
         .env_clear()
         .env("HOME", &tmp)
         .output()
@@ -470,7 +528,46 @@ fn binary_bare_invocation_prints_banner_and_exits_zero() {
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 banner");
     assert!(stdout.contains("Crucible-LLM"), "banner: {stdout}");
+    assert!(
+        stdout.contains("--headless"),
+        "banner lists the headless mode"
+    );
     assert!(stdout.contains("--help"), "banner points at --help");
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn binary_bare_invocation_on_a_pipe_falls_back_to_headless() {
+    // Chunk 20: a bare `crucible-llm` launches the TUI — *except* when
+    // stdout is not a TTY (this subprocess pipes it), in which case the
+    // run degrades to headless. Point it at a dead local endpoint (port
+    // 1: immediate connection refused) so every iteration fails fast and
+    // deterministically → the prototype's exit-1 rule.
+    let tmp = temp_dir();
+    let out = Command::new(binary())
+        .args([
+            "--url",
+            "http://127.0.0.1:1/v1",
+            "--timeout",
+            "5",
+            "--no-color",
+        ])
+        .env_clear()
+        .env("HOME", &tmp)
+        .output()
+        .expect("spawn the crucible-llm binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "all runs failed → exit 1; stderr: {stderr}"
+    );
+    assert!(stderr.contains("not a TTY"), "fallback note: {stderr}");
+    assert!(
+        stderr.contains("All test runs failed"),
+        "headless ran: {stderr}"
+    );
 
     std::fs::remove_dir_all(&tmp).ok();
 }

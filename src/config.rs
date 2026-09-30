@@ -6,6 +6,11 @@
 //! (this chunk), the TUI path (Chunk 8), and the export path (Chunk 13)
 //! identically.
 //!
+//! Mode dispatch (Chunk 20): **the TUI is the default**. A run goes
+//! headless only when `--headless` / `--json` is given (or stdout is not a
+//! TTY); the `Config` fields [`Config::headless`] / [`Config::banner`]
+//! carry those markers.
+//!
 //! Resolution order (first match wins, per field):
 //!
 //! 1. **CLI flag** (`--url`, `--model`, …) — [`Cli`] via `clap`;
@@ -53,6 +58,9 @@ pub mod env_vars {
     pub const VERBOSE: &str = "CRUCIBLE_VERBOSE";
     pub const NO_COLOR: &str = "CRUCIBLE_NO_COLOR";
     pub const TUI: &str = "CRUCIBLE_TUI";
+    /// `true`/`false` — run the classic headless one-shot benchmark
+    /// instead of the TUI (Chunk 20; `--json` implies it too).
+    pub const HEADLESS: &str = "CRUCIBLE_HEADLESS";
     pub const CONFIG: &str = "CRUCIBLE_CONFIG";
     /// Comma-separated concurrency ladder (Chunk 18).
     pub const LADDER: &str = "CRUCIBLE_LADDER";
@@ -280,6 +288,7 @@ pub struct Cli {
     #[arg(long)]
     pub nocache: bool,
     /// Emit the result as JSON on stdout (prototype `--json` field set).
+    /// Also forces headless mode (the TUI is the default, Chunk 20).
     #[arg(long)]
     pub json: bool,
     /// Show per-run chunk detail.
@@ -292,10 +301,21 @@ pub struct Cli {
     /// (falls back to `chars/4`, flagged `estimated`, when absent).
     #[arg(long)]
     pub tokenizer: Option<PathBuf>,
-    /// Open the interactive ratatui dashboard (Chunk 8) instead of the
-    /// headless run.
+    /// The interactive ratatui dashboard is the **default** mode (Chunk
+    /// 20) — a bare `crucible-llm` launches it. This flag is kept for
+    /// compatibility: it forces the TUI (e.g. on a non-TTY, where the
+    /// run would otherwise fall back to headless).
     #[arg(long)]
     pub tui: bool,
+    /// Run the classic headless one-shot benchmark instead of the TUI
+    /// (Chunk 20): the prototype's result box(es) and/or `--json` on
+    /// stdout.
+    #[arg(long)]
+    pub headless: bool,
+    /// Print the startup banner and exit (Chunk 20: the bare-invocation
+    /// banner path, demoted to an explicit flag).
+    #[arg(long, hide = true)]
+    pub banner: bool,
     /// Export format (`json` | `md` | `csv`); wired in Chunk 13.
     #[arg(long, value_enum)]
     pub export: Option<ExportFormat>,
@@ -339,6 +359,13 @@ pub struct Config {
     pub no_color: bool,
     pub tokenizer: Option<PathBuf>,
     pub tui: bool,
+    /// Headless mode (Chunk 20): the classic one-shot benchmark instead
+    /// of the TUI. `--json` implies it at dispatch time; this field
+    /// carries the explicit `--headless` marker (env/file layered).
+    pub headless: bool,
+    /// Print the startup banner and exit (Chunk 20; CLI-only, hidden
+    /// flag — the demoted bare-invocation banner path).
+    pub banner: bool,
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
     /// The concurrency ladder Engine B sweeps (Chunk 18; default
@@ -350,8 +377,9 @@ pub struct Config {
     /// Which engines a single run orchestrates (Chunk 18).
     pub engines: EngineSelection,
     /// `true` when the URL was provided explicitly (CLI / env / config
-    /// file) rather than falling back to the built-in default. A bare
-    /// `crucible-llm` with no target prints the banner and exits 0.
+    /// file) rather than falling back to the built-in default. Chunk 20:
+    /// a bare `crucible-llm` with no target launches the TUI (the
+    /// default mode) — it no longer prints the banner.
     #[serde(skip)]
     pub target_explicit: bool,
 }
@@ -372,6 +400,8 @@ impl Default for Config {
             no_color: false,
             tokenizer: None,
             tui: false,
+            headless: false,
+            banner: false,
             export: None,
             export_path: None,
             ladder: DEFAULT_LADDER.to_vec(),
@@ -440,6 +470,7 @@ pub struct ConfigFile {
     pub no_color: Option<bool>,
     pub tokenizer: Option<PathBuf>,
     pub tui: Option<bool>,
+    pub headless: Option<bool>,
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
     /// The concurrency ladder (Chunk 18).
@@ -493,6 +524,9 @@ impl ConfigFile {
         }
         if let Some(v) = self.tui {
             c.tui = v;
+        }
+        if let Some(v) = self.headless {
+            c.headless = v;
         }
         if let Some(v) = self.export {
             c.export = Some(v);
@@ -693,6 +727,15 @@ pub fn layer(
         file.and_then(|f| f.no_color),
     )?;
     let tui = bool_layer(cli.tui, "tui", env_vars::TUI, file.and_then(|f| f.tui))?;
+    let headless = bool_layer(
+        cli.headless,
+        "headless",
+        env_vars::HEADLESS,
+        file.and_then(|f| f.headless),
+    )?;
+    // `--banner` is a CLI-only display marker (hidden flag): it never
+    // layers from env/file.
+    let banner = cli.banner;
 
     // ── export (Chunk 13) ──
     let export = if explicit("export") {
@@ -780,6 +823,8 @@ pub fn layer(
         no_color,
         tokenizer,
         tui,
+        headless,
+        banner,
         export,
         export_path,
         ladder,
@@ -918,6 +963,8 @@ mod tests {
         assert!(!cfg.verbose);
         assert!(!cfg.no_color);
         assert!(!cfg.tui);
+        assert!(!cfg.headless);
+        assert!(!cfg.banner);
         assert!(cfg.api_key.is_none());
         assert!(cfg.tokenizer.is_none());
         assert!(cfg.export.is_none());
@@ -1076,6 +1123,27 @@ mod tests {
         assert!(cfg.tui);
     }
 
+    // ── Chunk 20: headless marker ────────────────────────────────────────
+
+    #[test]
+    fn headless_flag_off_by_default() {
+        assert!(!resolve_bare(&["crucible-llm"]).headless);
+        // `--json` alone does not set the `headless` field — it implies
+        // headless at dispatch time, not in the resolved config.
+        let cfg = resolve_bare(&["crucible-llm", "--json"]);
+        assert!(cfg.json);
+        assert!(!cfg.headless);
+    }
+
+    #[test]
+    fn headless_flag_layers_from_cli_and_env() {
+        assert!(resolve_bare(&["crucible-llm", "--headless"]).headless);
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        let env = vec![(env_vars::HEADLESS.to_string(), "1".to_string())];
+        assert!(layer(&cli, &matches, &env, None).unwrap().headless);
+    }
+
     #[test]
     fn invalid_env_value_is_an_error() {
         let cli = cli_from(&["crucible-llm"]);
@@ -1123,7 +1191,8 @@ mod tests {
             &p,
             r#"{"url":"http://f:1/v1","model":"m","mode":"long","tokens":100,"iterations":2,
                 "api_key":"k","timeout":9,"nocache":true,"json":true,"verbose":true,
-                "no_color":true,"tokenizer":"/t.json","tui":false,"export":"md","export_path":"/o.md"}"#,
+                "no_color":true,"tokenizer":"/t.json","tui":false,"headless":false,
+                "export":"md","export_path":"/o.md"}"#,
         )
         .unwrap();
         let f = load_config_file(&p).unwrap().unwrap();
@@ -1142,6 +1211,7 @@ mod tests {
         assert!(c.no_color);
         assert_eq!(c.tokenizer.as_deref(), Some(Path::new("/t.json")));
         assert!(!c.tui);
+        assert!(!c.headless);
         assert_eq!(c.export, Some(ExportFormat::Md));
         assert_eq!(c.export_path.as_deref(), Some(Path::new("/o.md")));
         assert!(c.target_explicit);
@@ -1176,6 +1246,7 @@ mod tests {
             "--no-color",
             "--tokenizer",
             "--tui",
+            "--headless",
             "--export",
             "--config",
             "--ladder",

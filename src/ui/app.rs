@@ -19,6 +19,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
 use crate::engines::{
     fragmentation_warning, NiahEngineConfig, NiahSlot, ReasoningResult, ResultSlot, SpeedResult,
@@ -176,6 +177,15 @@ pub struct App {
     /// `ArcSwap<MetricsSnapshot>`; the views read it lock-free. `None`
     /// until the entry point attaches one.
     pub hw: Option<Arc<Mutex<HwPoller>>>,
+    /// Lock-free model-discovery slot (Chunk 20): a background
+    /// `tokio::spawn`ed `GET {base}/v1/models` (OpenAI-compatible)
+    /// publishes the discovered [`ModelInfo`] list here; the setup flow
+    /// / Config view read it lock-free via
+    /// [`model_list`](Self::model_list) (measurement-isolation
+    /// invariant, blueprint §4). `None` until the first discovery
+    /// completes; a failed discovery leaves the previous list (if any)
+    /// in place — the picker degrades to free text (N/A-never-fail).
+    pub models: Arc<ResultSlot<Vec<ModelInfo>>>,
     /// Hysteresis latch for the VRAM fragmentation warning (blueprint
     /// §5D): the log line fires once when occupancy crosses the
     /// threshold and re-arms once it falls 5 points below it.
@@ -229,6 +239,7 @@ impl App {
             structured_slot: Arc::new(ResultSlot::new()),
             config: ConfigState::default(),
             hw: None,
+            models: Arc::new(ResultSlot::new()),
             vram_warned: false,
         }
     }
@@ -257,6 +268,18 @@ impl App {
     pub fn with_hw(mut self, hw: Arc<Mutex<HwPoller>>) -> Self {
         self.hw = Some(hw);
         self
+    }
+
+    /// The discovered model list (Chunk 20): a lock-free read of the
+    /// [`models`](Self::models) slot — `None` until the first discovery
+    /// completes. The render path may call this; it never blocks.
+    pub fn model_list(&self) -> Option<Vec<ModelInfo>> {
+        (*self.models.load()).clone()
+    }
+
+    /// `true` while a model-discovery request is in flight (Chunk 20).
+    pub fn discovery_running(&self) -> bool {
+        self.models.is_running()
     }
 
     /// Lazily load the History view state (Chunk 14): open the default
@@ -331,6 +354,55 @@ impl App {
             let result = engine.run().await;
             slot.set_running(false);
             slot.store(result);
+        });
+    }
+
+    /// Trigger model discovery (Chunk 20): `tokio::spawn` a
+    /// `GET {base}/v1/models` call (OpenAI-compatible; the base is taken
+    /// from the current Configuration form) and publish the result to the
+    /// lock-free [`models`](Self::models) slot.
+    ///
+    /// This is a *key-path* action (the setup flow calls it once the user
+    /// confirms the target URL — never the render path): the discovery
+    /// task publishes the deduped, id-sorted [`ModelInfo`] list when done,
+    /// and the views read it lock-free — so an in-flight HTTP call never
+    /// perturbs the 60Hz render loop or the timing path
+    /// (measurement-isolation invariant, blueprint §4). Re-triggering
+    /// while a discovery is in flight is a no-op (logged). A failed
+    /// discovery leaves the previous list (if any) in place — the model
+    /// field degrades to free text (N/A-never-fail rule).
+    pub fn start_discovery(&mut self) {
+        if self.models.is_running() {
+            self.push_log(
+                "[discovery] already in progress — one request at a time".to_string(),
+                style::value_warn(),
+            );
+            return;
+        }
+        // The form (View 5 / the setup flow) is the source of the target
+        // URL and API key, so edits apply immediately.
+        let cfg = self.config.to_config();
+        let url = cfg.url.clone();
+        let api_key = cfg.api_key.clone();
+        let slot = self.models.clone();
+        slot.set_running(true);
+        self.push_log(
+            format!("[discovery] listing models at {url}/models"),
+            style::value_ok(),
+        );
+        tokio::spawn(async move {
+            match crate::client::models::list_models(&url, api_key.as_deref()).await {
+                Ok(models) => {
+                    slot.set_running(false);
+                    slot.store(models);
+                }
+                Err(e) => {
+                    // Clear the running flag; keep any previously
+                    // discovered list (the view falls back to free text).
+                    slot.set_running(false);
+                    eprintln!("[discovery] failed: {e}");
+                }
+            }
         });
     }
 
