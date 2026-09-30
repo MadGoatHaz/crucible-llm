@@ -21,7 +21,8 @@ use ratatui::Frame;
 
 use crate::config::{Config, ExportFormat};
 use crate::engines::{
-    fragmentation_warning, NiahEngineConfig, NiahSlot, SweepResult, VRAM_FRAGMENTATION_THRESHOLD,
+    fragmentation_warning, NiahEngineConfig, NiahSlot, ReasoningResult, ResultSlot, SpeedResult,
+    StructuredResult, SweepResult, VRAM_FRAGMENTATION_THRESHOLD,
 };
 use crate::hw::HwPoller;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
@@ -30,6 +31,7 @@ use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
+use crate::ui::views::config::{ConfigKeyResult, ConfigState};
 use crate::ui::views::history::HistoryState;
 
 /// The five dashboard views (blueprint §6).
@@ -108,6 +110,8 @@ pub enum KeyAction {
     NewNeedle,
     /// `e` — export results (JSON/MD/CSV).
     Export,
+    /// `r` / `F5` — run the engines selected in the Config view (Chunk 18).
+    Run,
     /// `j` / `↓` (History view) — move the session cursor down.
     HistoryNext,
     /// `k` / `↑` (History view) — move the session cursor up.
@@ -137,9 +141,10 @@ pub struct App {
     /// Shared lock-free metrics snapshot (the `ArcSwap` double buffer).
     pub metrics: Arc<MetricsState>,
     pub log: Vec<Line<'static>>,
-    /// The last completed concurrency sweep (plan Chunk 10). `None` until a
-    /// sweep has run; View 2 renders the curve from this.
-    pub sweep: Option<Arc<SweepResult>>,
+    /// The last completed concurrency sweep (plan Chunk 10) — a lock-free
+    /// [`ResultSlot`] (Chunk 18) so a background `r`-key sweep can publish
+    /// its [`SweepResult`] and View 2 reads it without blocking.
+    pub sweep: Arc<ResultSlot<SweepResult>>,
     /// Format the `e` key exports (Chunk 13; JSON by default, set from
     /// `--export` by the entry point).
     pub export_format: ExportFormat,
@@ -155,6 +160,17 @@ pub struct App {
     /// The NIAH-relevant config snapshot for spawning background runs
     /// (`n` key). `None` until the entry point supplies one.
     pub niah_config: Option<NiahEngineConfig>,
+    /// Lock-free Engine A (speed) result holder (Chunk 18): the `r`-key
+    /// runner publishes the per-iteration [`SpeedResult`]s here.
+    pub speed_slot: Arc<ResultSlot<Vec<SpeedResult>>>,
+    /// Lock-free Engine C2 (reasoning) result holder (Chunk 18).
+    pub reasoning_slot: Arc<ResultSlot<ReasoningResult>>,
+    /// Lock-free Engine C3 (structured) result holder (Chunk 18).
+    pub structured_slot: Arc<ResultSlot<StructuredResult>>,
+    /// The editable Configuration form (View 5, Chunk 18). Seeded from the
+    /// resolved [`Config`]; edited on the key path; `F2` persists it and
+    /// `F5`/`r` runs the selected engines from it.
+    pub config: ConfigState,
     /// The 100 ms hardware telemetry poller (Chunk 17): a background
     /// task publishes VRAM / power / clock / J-token into the shared
     /// `ArcSwap<MetricsSnapshot>`; the views read it lock-free. `None`
@@ -203,11 +219,15 @@ impl App {
             tick: 0,
             metrics,
             log,
-            sweep: None,
+            sweep: Arc::new(ResultSlot::new()),
             export_format: ExportFormat::default(),
             history: None,
             niah: Arc::new(NiahSlot::new()),
             niah_config: None,
+            speed_slot: Arc::new(ResultSlot::new()),
+            reasoning_slot: Arc::new(ResultSlot::new()),
+            structured_slot: Arc::new(ResultSlot::new()),
+            config: ConfigState::default(),
             hw: None,
             vram_warned: false,
         }
@@ -216,6 +236,17 @@ impl App {
     /// Supply the NIAH-relevant config snapshot (Chunk 15) so the `n`
     /// key can spawn a background matrix run against the target endpoint.
     pub fn with_niah_config(mut self, cfg: &Config) -> Self {
+        self.niah_config = Some(NiahEngineConfig::from_config(cfg));
+        self
+    }
+
+    /// Seed the editable Configuration form (View 5, Chunk 18) from the
+    /// resolved [`Config`]. The form is the TUI's edit surface over the
+    /// same config the headless/export paths consume; `F2` persists it and
+    /// `F5`/`r` run the selected engines from it. Also refreshes the NIAH
+    /// config snapshot so the `n` key stays in sync with the form.
+    pub fn with_config(mut self, cfg: &Config) -> Self {
+        self.config = ConfigState::from_config(cfg);
         self.niah_config = Some(NiahEngineConfig::from_config(cfg));
         self
     }
@@ -268,16 +299,9 @@ impl App {
             );
             return;
         }
-        let config = match self.niah_config.clone() {
-            Some(c) => c,
-            None => {
-                self.push_log(
-                    "[niah] no target configured — set --url first".to_string(),
-                    style::value_warn(),
-                );
-                return;
-            }
-        };
+        // Chunk 18: the `n` key runs against the *current* Configuration
+        // form, so edits made in View 5 apply immediately.
+        let config = NiahEngineConfig::from_config(&self.config.to_config());
         let engine = match config.engine() {
             Ok(e) => e,
             Err(e) => {
@@ -310,18 +334,194 @@ impl App {
         });
     }
 
+    /// `r` / `F5` (Chunk 18): run **every engine selected** in the
+    /// Configuration form. Each selected engine spawns as an independent
+    /// background task that publishes its result to a lock-free slot
+    /// (measurement-isolation invariant, blueprint §4) — the render loop
+    /// never blocks and never touches the quanta timing path.
+    ///
+    /// Engine D (hardware) is continuous telemetry (the 100 ms poller),
+    /// not a one-shot, so its toggle is honored by the entry point (which
+    /// decides whether to spawn the poller task) rather than here. A
+    /// selected engine that fails to initialize degrades gracefully (its
+    /// slot publishes an empty/zeroed result) without aborting the others.
+    pub fn start_run(&mut self) {
+        let cfg = self.config.to_config();
+        let sel = cfg.engines;
+
+        // Engine A — Speed & Latency (N sequential single-stream iterations).
+        if sel.speed && !self.speed_slot.is_running() {
+            let slot = self.speed_slot.clone();
+            slot.set_running(true);
+            self.push_log(
+                format!("[run] Engine A (speed): {} iteration(s)", cfg.iterations),
+                style::value_ok(),
+            );
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                let results = match crate::engines::SpeedEngine::new(&cfg) {
+                    Ok(engine) => engine.run().await.1,
+                    Err(e) => {
+                        eprintln!("[run] speed engine init failed: {e}");
+                        Vec::new()
+                    }
+                };
+                slot.set_running(false);
+                slot.store(results);
+            });
+        }
+
+        // Engine B — Concurrency & Saturation sweep (ladder from the form),
+        // publishing live snapshots to the shared metrics seam.
+        if sel.concurrency && !self.sweep.is_running() {
+            if let Some(sweep) = crate::engines::build_sweep(&cfg, Some(self.metrics.clone())) {
+                let slot = self.sweep.clone();
+                slot.set_running(true);
+                self.push_log(
+                    format!(
+                        "[run] Engine B (concurrency): ladder [{}]",
+                        cfg.ladder
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                    style::value_ok(),
+                );
+                tokio::spawn(async move {
+                    let result = sweep.run().await;
+                    slot.set_running(false);
+                    slot.store(result);
+                });
+            }
+        }
+
+        // Engine C1 — NIAH (reuses the existing `n`-key background path).
+        if sel.niah {
+            self.start_niah();
+        }
+
+        // Engine C2 — Deterministic reasoning / code verification.
+        if sel.reasoning && !self.reasoning_slot.is_running() {
+            let slot = self.reasoning_slot.clone();
+            slot.set_running(true);
+            self.push_log(
+                "[run] Engine C2 (reasoning): 13-challenge bank".to_string(),
+                style::value_ok(),
+            );
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                let result = match crate::engines::ReasoningEngine::new(&cfg) {
+                    Ok(engine) => engine.run().await,
+                    Err(e) => {
+                        eprintln!("[run] reasoning engine init failed: {e}");
+                        crate::engines::ReasoningResult {
+                            responses: Vec::new(),
+                            ttfts: Vec::new(),
+                            tg_speeds: Vec::new(),
+                            score: crate::engines::ReasoningScore {
+                                total: 0,
+                                solved: 0,
+                                by_category: [(0, 0); 3],
+                            },
+                        }
+                    }
+                };
+                slot.set_running(false);
+                slot.store(result);
+            });
+        }
+
+        // Engine C3 — Structured output / JSON-grammar compliance.
+        if sel.structured && !self.structured_slot.is_running() {
+            let slot = self.structured_slot.clone();
+            slot.set_running(true);
+            self.push_log(
+                "[run] Engine C3 (structured): free-form vs grammar-constrained".to_string(),
+                style::value_ok(),
+            );
+            let cfg = cfg.clone();
+            tokio::spawn(async move {
+                let result = match crate::engines::StructuredEngine::new(&cfg) {
+                    Ok(engine) => engine.run().await,
+                    Err(e) => {
+                        eprintln!("[run] structured engine init failed: {e}");
+                        crate::engines::StructuredResult {
+                            free_tps: 0.0,
+                            constrained_tps: 0.0,
+                            penalty_pct: 0.0,
+                            free_ttft: 0.0,
+                            constrained_ttft: 0.0,
+                            compliant: false,
+                            constrained_body: String::new(),
+                            free_body: String::new(),
+                        }
+                    }
+                };
+                slot.set_running(false);
+                slot.store(result);
+            });
+        }
+
+        if sel.is_empty() {
+            self.push_log(
+                "[run] no engines selected — enable some in the Config view (View 5)".to_string(),
+                style::value_warn(),
+            );
+        }
+    }
+
     /// Handle one terminal key event (blueprint §6 footer key map).
     pub fn handle_key(&mut self, key: &KeyEvent) -> KeyAction {
-        // Terminal etiquette: Ctrl-C quits like any other quit key.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // Global quit always works — even inside the Config view (where
+        // `q` would otherwise be typed into a field).
+        if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+            || key.code == KeyCode::Char('q')
+            || key.code == KeyCode::Esc
+        {
             self.running = false;
             return KeyAction::Quit;
         }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                self.running = false;
-                KeyAction::Quit
+
+        // Config view (Chunk 18): `PageDown`/`PageUp` switch views (so the
+        // user can leave); everything else is delegated to the editor
+        // (`F2` saves, `F5` runs, arrows/typing edit the focused field).
+        if self.view == View::Config {
+            match key.code {
+                KeyCode::PageDown => {
+                    self.view = View::ALL[(self.view.index() + 1) % View::ALL.len()];
+                    if self.view == View::History {
+                        self.ensure_history();
+                    }
+                    return KeyAction::Continue;
+                }
+                KeyCode::PageUp => {
+                    self.view =
+                        View::ALL[(self.view.index() + View::ALL.len() - 1) % View::ALL.len()];
+                    if self.view == View::History {
+                        self.ensure_history();
+                    }
+                    return KeyAction::Continue;
+                }
+                _ => {}
             }
+            match self.config.handle_key(key) {
+                ConfigKeyResult::Saved => {
+                    self.push_log(
+                        format!("[config] saved → {}", self.config.config_path.display()),
+                        style::value_ok(),
+                    );
+                    return KeyAction::Continue;
+                }
+                ConfigKeyResult::Run => {
+                    self.start_run();
+                    return KeyAction::Run;
+                }
+                ConfigKeyResult::Inert => return KeyAction::Continue,
+            }
+        }
+
+        match key.code {
             KeyCode::Char(c @ '1'..='5') => {
                 if let Some(view) = View::from_digit(c as u8) {
                     self.view = view;
@@ -343,6 +543,11 @@ impl App {
             }
             KeyCode::Char('n') => KeyAction::NewNeedle,
             KeyCode::Char('e') => KeyAction::Export,
+            // Chunk 18: `r` runs the engines selected in the Config view.
+            KeyCode::Char('r') => {
+                self.start_run();
+                KeyAction::Run
+            }
             // Chunk 14 — History view navigation/selection. These keys are
             // scoped to the History view; elsewhere they are inert.
             KeyCode::Char('j')

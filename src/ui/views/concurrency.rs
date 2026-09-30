@@ -35,7 +35,14 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
-    let envelope = app.sweep.as_deref().and_then(|r| r.envelope());
+    // Chunk 18: the sweep result is a lock-free `ResultSlot` (a background
+    // `r`-key sweep publishes it); reading is a pure lock-free load.
+    let envelope = app
+        .sweep
+        .load()
+        .as_ref()
+        .as_ref()
+        .and_then(|r| r.envelope());
     render_matrix(chunks[0], app, f, &envelope);
     render_envelope(chunks[1], app, f, &envelope);
 }
@@ -52,7 +59,8 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
     ])
     .style(style::muted_title())];
 
-    match app.sweep.as_deref() {
+    let sweep = app.sweep.load();
+    match sweep.as_ref().as_ref() {
         Some(result) if !result.levels.is_empty() => {
             for level in &result.levels {
                 rows.push(sweep_row(level, envelope, app.concurrency_target));

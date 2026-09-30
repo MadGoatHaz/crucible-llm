@@ -84,13 +84,17 @@ pub struct Needle {
 impl Needle {
     /// A fresh, unique needle (blueprint §5 C1: "a unique,
     /// cryptographically random key-value fact").
+    ///
+    /// The value is 128 random bits (`{a:016X}-{b:016X}` = 33 chars) so a
+    /// coincidental occurrence in a model response is effectively
+    /// impossible — a substring hit is a genuine retrieval.
     pub fn random() -> Self {
         let mut rng = rand::rng();
         let a = rng.random::<u64>();
         let b = rng.random::<u64>();
         Self {
             key: "the secret code".to_string(),
-            value: format!("{a:016X}-{b:08X}"),
+            value: format!("{a:016X}-{b:016X}"),
         }
     }
 

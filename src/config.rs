@@ -24,6 +24,8 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::engines::concurrency::DEFAULT_LADDER;
+
 /// Default endpoint (parity with `llmspeedtest.py`'s `DEFAULT_URL`).
 pub const DEFAULT_URL: &str = "http://192.168.51.163:8080/v1/chat/completions";
 /// Default model name (parity with `llmspeedtest.py`'s `DEFAULT_MODEL`).
@@ -52,6 +54,14 @@ pub mod env_vars {
     pub const NO_COLOR: &str = "CRUCIBLE_NO_COLOR";
     pub const TUI: &str = "CRUCIBLE_TUI";
     pub const CONFIG: &str = "CRUCIBLE_CONFIG";
+    /// Comma-separated concurrency ladder (Chunk 18).
+    pub const LADDER: &str = "CRUCIBLE_LADDER";
+    /// `true`/`false` — enable the hardware/energy telemetry poller
+    /// (Chunk 18).
+    pub const HARDWARE: &str = "CRUCIBLE_HARDWARE";
+    /// Comma-separated engine selection (Chunk 18): `speed`,
+    /// `concurrency`, `niah`, `reasoning`, `structured`, `hardware`.
+    pub const ENGINE: &str = "CRUCIBLE_ENGINE";
 }
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
@@ -127,6 +137,114 @@ impl std::str::FromStr for ExportFormat {
     }
 }
 
+/// Which of the four benchmark engines (blueprint §5) a single run
+/// orchestrates (plan Chunk 18: "a single command/run can trigger any
+/// subset of engines A–D").
+///
+/// * `speed` — Engine A (single-stream TTFT/PP/TG/MTP);
+/// * `concurrency` — Engine B (the ladder sweep);
+/// * `niah` / `reasoning` / `structured` — Engine C1/C2/C3;
+/// * `hardware` — Engine D (the 100 ms power/VRAM poller).
+///
+/// The default run is Engine A + Engine D: `speed` and `hardware` are on
+/// (the hardware poller degrades gracefully to N/A on a driverless host),
+/// the rest are off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EngineSelection {
+    /// Engine A — Speed & Latency.
+    pub speed: bool,
+    /// Engine B — Concurrency & Saturation sweep.
+    pub concurrency: bool,
+    /// Engine C1 — Needle-in-a-Haystack.
+    pub niah: bool,
+    /// Engine C2 — Deterministic reasoning / code verification.
+    pub reasoning: bool,
+    /// Engine C3 — Structured output / JSON-grammar compliance.
+    pub structured: bool,
+    /// Engine D — Hardware & Energy profiler.
+    pub hardware: bool,
+}
+
+impl Default for EngineSelection {
+    fn default() -> Self {
+        Self {
+            speed: true,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+        }
+    }
+}
+
+impl EngineSelection {
+    /// Build a selection from a list of engine names (case-insensitive).
+    ///
+    /// Accepted names: `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`,
+    /// `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`. Returns
+    /// the selection (starting from the default) plus any unknown names, so
+    /// the caller can surface a precise error.
+    pub fn from_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> (Self, Vec<String>) {
+        let mut sel = Self::default();
+        let mut unknown = Vec::new();
+        for name in names {
+            match name.as_ref().to_ascii_lowercase().as_str() {
+                "speed" | "a" => sel.speed = true,
+                "concurrency" | "b" => sel.concurrency = true,
+                "niah" | "needle" | "c1" => sel.niah = true,
+                "reasoning" | "c2" => sel.reasoning = true,
+                "structured" | "c3" => sel.structured = true,
+                "hardware" | "energy" | "d" => sel.hardware = true,
+                other => unknown.push(other.to_string()),
+            }
+        }
+        (sel, unknown)
+    }
+
+    /// `true` when no engine is selected.
+    pub fn is_empty(&self) -> bool {
+        !self.speed
+            && !self.concurrency
+            && !self.niah
+            && !self.reasoning
+            && !self.structured
+            && !self.hardware
+    }
+
+    /// The number of selected engines.
+    pub fn count(&self) -> usize {
+        [
+            self.speed,
+            self.concurrency,
+            self.niah,
+            self.reasoning,
+            self.structured,
+            self.hardware,
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count()
+    }
+
+    /// The display labels of the enabled engines, in A/B/C1/C2/C3/D order
+    /// (for logs and the headless "running selected engines" line).
+    pub fn iter_labels(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.speed, "A (speed)"),
+            (self.concurrency, "B (concurrency)"),
+            (self.niah, "C1 (niah)"),
+            (self.reasoning, "C2 (reasoning)"),
+            (self.structured, "C3 (structured)"),
+            (self.hardware, "D (hardware)"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, label)| label)
+    }
+}
+
 /// The `clap`-derived CLI surface: the superset of both Python prototype
 /// CLIs plus `--tui` (Chunk 8), `--config`, and `--export` (Chunk 13).
 #[derive(Debug, Clone, Parser)]
@@ -187,6 +305,19 @@ pub struct Cli {
     /// Config file path (default: `~/.config/crucible/config.json`).
     #[arg(long)]
     pub config: Option<PathBuf>,
+    /// Concurrency ladder as a comma-separated list of stream counts
+    /// (e.g. `--ladder 1,2,4,8,16,32,64`); Engine B (Chunk 18).
+    #[arg(long, value_name = "CSV")]
+    pub ladder: Option<String>,
+    /// Select which engines a run orchestrates (repeatable; Chunk 18):
+    /// `speed` (A), `concurrency` (B), `niah` (C1), `reasoning` (C2),
+    /// `structured` (C3), `hardware` (D).
+    #[arg(long, value_name = "ENGINE")]
+    pub engine: Vec<String>,
+    /// Disable the hardware/energy telemetry poller (Engine D; on by
+    /// default — it degrades to N/A on a driverless host).
+    #[arg(long)]
+    pub no_hardware: bool,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -210,6 +341,14 @@ pub struct Config {
     pub tui: bool,
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
+    /// The concurrency ladder Engine B sweeps (Chunk 18; default
+    /// `1→2→4→8→16→32→64`).
+    pub ladder: Vec<usize>,
+    /// Enable the hardware/energy telemetry poller (Engine D, Chunk 17/18).
+    /// On by default; a driverless host degrades to N/A, never a failure.
+    pub hardware: bool,
+    /// Which engines a single run orchestrates (Chunk 18).
+    pub engines: EngineSelection,
     /// `true` when the URL was provided explicitly (CLI / env / config
     /// file) rather than falling back to the built-in default. A bare
     /// `crucible-llm` with no target prints the banner and exits 0.
@@ -235,6 +374,9 @@ impl Default for Config {
             tui: false,
             export: None,
             export_path: None,
+            ladder: DEFAULT_LADDER.to_vec(),
+            hardware: true,
+            engines: EngineSelection::default(),
             target_explicit: false,
         }
     }
@@ -280,8 +422,9 @@ impl Config {
 }
 
 /// The JSON config file (layer 3). Every field is optional — only what the
-/// file specifies overrides the defaults.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// file specifies overrides the defaults. `Serialize` supports the TUI
+/// Config view's `F2` save (Chunk 18) writing the file back out.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ConfigFile {
     pub url: Option<String>,
@@ -299,6 +442,12 @@ pub struct ConfigFile {
     pub tui: Option<bool>,
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
+    /// The concurrency ladder (Chunk 18).
+    pub ladder: Option<Vec<usize>>,
+    /// Enable the hardware/energy telemetry poller (Chunk 18).
+    pub hardware: Option<bool>,
+    /// Which engines a run orchestrates (Chunk 18).
+    pub engines: Option<EngineSelection>,
 }
 
 impl ConfigFile {
@@ -350,6 +499,15 @@ impl ConfigFile {
         }
         if let Some(v) = &self.export_path {
             c.export_path = Some(v.clone());
+        }
+        if let Some(v) = &self.ladder {
+            c.ladder = v.clone();
+        }
+        if let Some(v) = self.hardware {
+            c.hardware = v;
+        }
+        if let Some(v) = self.engines {
+            c.engines = v;
         }
         c.target_explicit = self.url.is_some();
         c
@@ -558,6 +716,56 @@ pub fn layer(
             .or_else(|| file.and_then(|f| f.export_path.clone()))
     };
 
+    // ── concurrency ladder (Chunk 18) ──
+    let ladder = if explicit("ladder") {
+        cli.ladder
+            .as_deref()
+            .and_then(parse_ladder)
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| DEFAULT_LADDER.to_vec())
+    } else {
+        env_get(env_vars::LADDER)
+            .and_then(|s| parse_ladder(&s))
+            .or_else(|| file.and_then(|f| f.ladder.clone()))
+            .unwrap_or_else(|| DEFAULT_LADDER.to_vec())
+    };
+
+    // ── hardware / energy telemetry (Chunk 18) ──
+    // `--no-hardware` is a flag (false by default), so its mere presence
+    // disables the poller; otherwise env > file > the on-by-default value.
+    let hardware = if cli.no_hardware {
+        false
+    } else {
+        env_get(env_vars::HARDWARE)
+            .map(|s| parse_bool(&s))
+            .transpose()
+            .map_err(|e| ConfigError::InvalidEnv {
+                var: env_vars::HARDWARE.to_string(),
+                value: env_get(env_vars::HARDWARE).unwrap_or_default(),
+                reason: e,
+            })?
+            .or(file.and_then(|f| f.hardware))
+            .unwrap_or(true)
+    };
+
+    // ── engine selection (Chunk 18) ──
+    let engines = if !cli.engine.is_empty() {
+        selection_from_names(&cli.engine)?
+    } else if let Some(raw) = env_get(env_vars::ENGINE) {
+        let names: Vec<String> = raw
+            .split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if names.is_empty() {
+            file.and_then(|f| f.engines).unwrap_or_default()
+        } else {
+            selection_from_names(&names)?
+        }
+    } else {
+        file.and_then(|f| f.engines).unwrap_or_default()
+    };
+
     Ok(Config {
         url,
         model,
@@ -574,8 +782,36 @@ pub fn layer(
         tui,
         export,
         export_path,
+        ladder,
+        hardware,
+        engines,
         target_explicit,
     })
+}
+
+/// Parse a comma-separated ladder (`"1,2,4,8"`) into stream counts.
+/// `None` when any entry is not a valid `usize`.
+pub fn parse_ladder(s: &str) -> Option<Vec<usize>> {
+    let v: Vec<usize> = s
+        .split(',')
+        .map(|p| p.trim().parse::<usize>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(v)
+}
+
+/// Build an [`EngineSelection`] from engine names, erroring on any unknown
+/// name (so a typo in `--engine` is surfaced, not silently dropped).
+fn selection_from_names(names: &[String]) -> Result<EngineSelection, ConfigError> {
+    let (sel, unknown) = EngineSelection::from_names(names);
+    if unknown.is_empty() {
+        Ok(sel)
+    } else {
+        Err(ConfigError::InvalidEnv {
+            var: "--engine".to_string(),
+            value: unknown.join(","),
+            reason: "unknown engine name(s)".to_string(),
+        })
+    }
 }
 
 /// `true`/`false` (case-insensitive), `1`/`0`, or `yes`/`no`.
@@ -942,8 +1178,143 @@ mod tests {
             "--tui",
             "--export",
             "--config",
+            "--ladder",
+            "--engine",
+            "--no-hardware",
         ] {
             assert!(help.contains(flag), "help missing {flag}");
         }
+    }
+
+    // ── Chunk 18: engine selection, ladder, hardware ─────────────────────
+
+    #[test]
+    fn engine_selection_default_is_speed_and_hardware() {
+        let e = EngineSelection::default();
+        assert!(e.speed, "Engine A on by default");
+        assert!(e.hardware, "Engine D on by default (degrades to N/A)");
+        assert!(!e.concurrency);
+        assert!(!e.niah);
+        assert!(!e.reasoning);
+        assert!(!e.structured);
+        assert_eq!(e.count(), 2);
+        assert!(!e.is_empty());
+    }
+
+    #[test]
+    fn engine_selection_parses_names_and_aliases() {
+        let (e, unknown) =
+            EngineSelection::from_names(["speed", "B", "niah", "C2", "structured", "D"]);
+        assert!(unknown.is_empty(), "no unknown names: {unknown:?}");
+        assert!(e.speed);
+        assert!(e.concurrency); // "B"
+        assert!(e.niah);
+        assert!(e.reasoning); // "C2"
+        assert!(e.structured);
+        assert!(e.hardware); // "D"
+        assert_eq!(e.count(), 6);
+    }
+
+    #[test]
+    fn engine_selection_reports_unknown_names() {
+        let (e, unknown) = EngineSelection::from_names(["speed", "bogus"]);
+        assert_eq!(unknown, vec!["bogus".to_string()]);
+        // The known name still applies.
+        assert!(e.speed);
+    }
+
+    #[test]
+    fn parse_ladder_splits_and_trims() {
+        assert_eq!(parse_ladder("1,2,4,8"), Some(vec![1, 2, 4, 8]));
+        assert_eq!(parse_ladder(" 16 , 32 ,64 "), Some(vec![16, 32, 64]));
+        assert_eq!(parse_ladder("1,2,x"), None);
+        // An empty string is not a valid ladder entry (the caller falls
+        // back to the default ladder).
+        assert_eq!(parse_ladder(""), None);
+    }
+
+    #[test]
+    fn cli_ladder_overrides_default() {
+        let cfg = resolve_bare(&["crucible-llm", "--ladder", "1,4,16"]);
+        assert_eq!(cfg.ladder, vec![1, 4, 16]);
+    }
+
+    #[test]
+    fn default_ladder_matches_the_blueprint() {
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert_eq!(cfg.ladder, vec![1, 2, 4, 8, 16, 32, 64]);
+        assert!(cfg.hardware, "hardware on by default");
+    }
+
+    #[test]
+    fn no_hardware_flag_disables_the_poller() {
+        let cfg = resolve_bare(&["crucible-llm", "--no-hardware"]);
+        assert!(!cfg.hardware);
+    }
+
+    #[test]
+    fn cli_engine_selection_layers() {
+        let cfg = resolve_bare(&[
+            "crucible-llm",
+            "--engine",
+            "speed",
+            "--engine",
+            "concurrency",
+            "--engine",
+            "niah",
+        ]);
+        assert!(cfg.engines.speed);
+        assert!(cfg.engines.concurrency);
+        assert!(cfg.engines.niah);
+        assert!(!cfg.engines.reasoning);
+        assert!(!cfg.engines.structured);
+    }
+
+    #[test]
+    fn unknown_cli_engine_is_an_error() {
+        let r = Cli::try_parse_from(["crucible-llm", "--engine", "warp-drive"]);
+        assert!(r.is_ok(), "clap accepts the raw value");
+        // The layering step is where the unknown name is rejected.
+        let cli = r.unwrap();
+        let matches = matches_from(&["crucible-llm", "--engine", "warp-drive"]);
+        let e = layer(&cli, &matches, &[], None).unwrap_err();
+        assert!(matches!(e, ConfigError::InvalidEnv { .. }));
+        assert!(e.to_string().contains("warp-drive"));
+    }
+
+    #[test]
+    fn env_engine_selection_layers() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        let env = vec![(
+            env_vars::ENGINE.to_string(),
+            "reasoning,structured".to_string(),
+        )];
+        let cfg = layer(&cli, &matches, &env, None).unwrap();
+        assert!(cfg.engines.reasoning);
+        assert!(cfg.engines.structured);
+        assert!(cfg.engines.speed, "default speed stays on");
+    }
+
+    #[test]
+    fn config_file_carries_ladder_hardware_and_engines() {
+        let p = std::env::temp_dir().join(format!("crucible-cfg18-{}.json", std::process::id()));
+        std::fs::write(
+            &p,
+            r#"{"url":"http://f:1/v1","ladder":[1,8,32],"hardware":false,
+                "engines":{"speed":true,"concurrency":true,"niah":true,
+                           "reasoning":false,"structured":true,"hardware":false}}"#,
+        )
+        .unwrap();
+        let f = load_config_file(&p).unwrap().unwrap();
+        let c = f.to_config();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(c.ladder, vec![1, 8, 32]);
+        assert!(!c.hardware);
+        assert!(c.engines.concurrency);
+        assert!(c.engines.niah);
+        assert!(c.engines.structured);
+        assert!(!c.engines.reasoning);
+        assert!(!c.engines.hardware);
     }
 }

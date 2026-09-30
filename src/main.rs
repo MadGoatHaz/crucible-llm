@@ -21,6 +21,7 @@ use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine,
 };
+use crucible_llm::engines::{build_sweep, NiahEngine, ReasoningEngine, StructuredEngine};
 use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
@@ -269,6 +270,91 @@ fn run_headless(cfg: &Config) -> i32 {
             Err(e) => term.warning(&format!("persist failed: {e}")),
         }
 
+        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
+        // C3) and report a one-line summary for each. Engine A (speed) is
+        // the run above; Engine D (hardware) is the continuous poller
+        // started earlier. A selection of only `speed` (the default) skips
+        // this block entirely — headless behavior is unchanged.
+        let extra = cfg.engines;
+        if extra.concurrency || extra.niah || extra.reasoning || extra.structured {
+            if !cfg.json {
+                term.dim(&format!(
+                    "  running selected engines: {}",
+                    extra.iter_labels().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            if extra.concurrency {
+                if let Some(sweep) = build_sweep(cfg, None) {
+                    if !cfg.json {
+                        term.dim(&format!(
+                            "  [B] concurrency sweep [{}]…",
+                            cfg.ladder
+                                .iter()
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                    }
+                    let r = sweep.run().await;
+                    match r.envelope() {
+                        Some(env) => term.info(&format!(
+                            "  [B] sweet spot: {} streams ({} t/s @ p90 {:.1} ms){}",
+                            env.sweet_spot,
+                            env.aggregate_tps,
+                            env.p90_tpot_ns as f64 / 1e6,
+                            env.knee
+                                .map(|k| format!(" · knee at {}", k.concurrency))
+                                .unwrap_or_default()
+                        )),
+                        None => term.warning("  [B] sweep produced no usable levels"),
+                    }
+                }
+            }
+            if extra.niah {
+                match NiahEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
+                        }
+                        let r = engine.run().await;
+                        term.info(&format!("  [C1] {}", r.accuracy_label()));
+                    }
+                    Err(e) => term.warning(&format!("[C1] niah init failed: {e}")),
+                }
+            }
+            if extra.reasoning {
+                match ReasoningEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C2] reasoning bank (13 challenges)…");
+                        }
+                        let r = engine.run().await;
+                        term.info(&format!(
+                            "  [C2] {} · avg {:.1} t/s",
+                            r.score.label(),
+                            r.avg_tg_speed()
+                        ));
+                    }
+                    Err(e) => term.warning(&format!("[C2] reasoning init failed: {e}")),
+                }
+            }
+            if extra.structured {
+                match StructuredEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C3] structured output (free-form vs constrained)…");
+                        }
+                        let r = engine.run().await;
+                        term.info(&format!(
+                            "  [C3] {:+.1}% penalty · compliant={}",
+                            r.penalty_pct, r.compliant
+                        ));
+                    }
+                    Err(e) => term.warning(&format!("[C3] structured init failed: {e}")),
+                }
+            }
+        }
+
         // Prototype exit-code rule: all runs failed → exit 1.
         if all_failed(&results) {
             if !cfg.json {
@@ -353,27 +439,34 @@ fn run_tui(cfg: &Config) -> bool {
             .expect("failed to build tokio runtime");
         runtime.block_on(async {
             let mut event_loop = EventLoop::new()?;
+            // Chunk 18: the App is seeded with the full resolved config —
+            // the editable Configuration form (View 5) and the engine
+            // selection all draw from the same `Config` the headless and
+            // export paths use.
             let mut app = App::new()
                 .with_export_format(export_format)
-                .with_niah_config(cfg)
+                .with_config(cfg)
                 .with_hw(hw.clone());
             // The 100 ms hardware telemetry task (blueprint §4.3): it
             // polls and merges into the `ArcSwap<MetricsSnapshot>` the
             // views read lock-free. It never touches the stream
             // workers' quanta timing path (measurement isolation,
-            // blueprint §4); a lock failure is a no-op.
-            let state = app.metrics.clone();
-            let poller = hw;
-            tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
-                loop {
-                    interval.tick().await;
-                    if let Ok(mut p) = poller.lock() {
-                        p.tick(&state);
+            // blueprint §4); a lock failure is a no-op. Chunk 18: only
+            // spawned when the hardware/energy engine is enabled.
+            if cfg.hardware {
+                let state = app.metrics.clone();
+                let poller = hw;
+                tokio::spawn(async move {
+                    let mut interval =
+                        tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
+                    loop {
+                        interval.tick().await;
+                        if let Ok(mut p) = poller.lock() {
+                            p.tick(&state);
+                        }
                     }
-                }
-            });
+                });
+            }
             event_loop.run(&mut app).await?;
             event_loop.teardown()
         })

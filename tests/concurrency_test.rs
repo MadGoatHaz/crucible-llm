@@ -332,13 +332,13 @@ fn view2_shows_placeholder_matrix_before_a_sweep() {
 fn view2_renders_sweep_curve_knee_and_envelope() {
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep = Some(std::sync::Arc::new(SweepResult {
+    app.sweep.store(SweepResult {
         levels: vec![
             level(1, 100.0, 5.0),
             level(2, 350.0, 8.0),
             level(4, 340.0, 20.0),
         ],
-    }));
+    });
     let text = render_concurrency(&app);
 
     // Real curve rows: aggregate t/s + p90 TPOT per level.
@@ -369,7 +369,7 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
     // plateaus (340→345, +1.5%) while p90 TPOT spikes 3× (10→30 ms).
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep = Some(std::sync::Arc::new(SweepResult {
+    app.sweep.store(SweepResult {
         levels: vec![
             level(1, 100.0, 5.0),
             level(2, 190.0, 6.0),
@@ -379,12 +379,19 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
             level(32, 342.0, 60.0),
             level(64, 338.0, 90.0),
         ],
-    }));
+    });
     let text = render_concurrency(&app);
 
     // The detected knee matches the injected inflection (acceptance:
     // "the detected knee matches the injected level").
-    let knee = app.sweep.as_ref().unwrap().detect_knee().expect("knee");
+    let knee = app
+        .sweep
+        .load()
+        .as_ref()
+        .as_ref()
+        .unwrap()
+        .detect_knee()
+        .expect("knee");
     assert_eq!(knee.concurrency, 16);
     assert_eq!(knee.sweet_spot, 8);
 
@@ -418,7 +425,7 @@ fn view2_survives_a_partial_failure_level() {
             m
         })
         .collect();
-    app.sweep = Some(std::sync::Arc::new(SweepResult { levels: vec![lvl] }));
+    app.sweep.store(SweepResult { levels: vec![lvl] });
     let text = render_concurrency(&app);
     assert!(text.contains("6/8 ok"));
     assert!(text.contains("300.0 t/s"));

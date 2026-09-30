@@ -103,9 +103,12 @@ impl EventLoop {
                             KeyAction::NewNeedle => {
                                 app.start_niah();
                             }
+                            // `r` / `F5` (Chunk 18): `start_run` is already
+                            // invoked inside `handle_key`; nothing to do here.
                             KeyAction::Continue
                             | KeyAction::PauseResume
                             | KeyAction::StepConcurrency
+                            | KeyAction::Run
                             | KeyAction::HistoryNext
                             | KeyAction::HistoryPrev
                             | KeyAction::HistorySelectA
