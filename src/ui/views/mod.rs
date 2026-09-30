@@ -6,9 +6,12 @@
 //! measurement path.
 
 use ratatui::layout::Rect;
+use ratatui::text::{Line, Span};
 use ratatui::Frame;
 
+use crate::engines::sequence::Engine;
 use crate::ui::app::{App, View};
+use crate::ui::theme::style;
 
 pub mod concurrency;
 pub mod config;
@@ -26,4 +29,26 @@ pub fn render_current(area: Rect, app: &App, f: &mut Frame) {
         View::History => history::render(area, app, f),
         View::Config => config::render(area, app, f),
     }
+}
+
+/// The dimmed `ℹ` info lines for one engine's
+/// [`description`](Engine::description) (the setup / config engine
+/// selection shows the focused engine's note; the first line carries the
+/// `ℹ` marker, continuation lines are indented).
+pub fn engine_info_lines(engine: Engine) -> Vec<Line<'static>> {
+    engine
+        .description()
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            Line::from(Span::styled(
+                if i == 0 {
+                    format!("ℹ {l}")
+                } else {
+                    format!("  {l}")
+                },
+                style::info(),
+            ))
+        })
+        .collect()
 }

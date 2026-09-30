@@ -21,7 +21,7 @@ use std::path::Path;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::storage::db::{Database, StorageError};
@@ -432,7 +432,12 @@ fn render_session_list(area: Rect, app: &App, f: &mut Frame) {
     }
 }
 
-/// Delta panel: signed % change per metric, green = gain, red = regression.
+/// The dimmed `ℹ` note explaining what the delta panel's numbers mean.
+const DELTA_INFO: &str = "Δ% = run B vs run A. Green = gain, red = regression. TTFT and J/token \
+     improve when lower; tokens/s and MTP rate improve when higher.";
+
+/// Delta panel: signed % change per metric, green = gain, red =
+/// regression, with a dimmed `ℹ` note explaining the numbers.
 fn render_delta(area: Rect, app: &App, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -449,8 +454,13 @@ fn render_delta(area: Rect, app: &App, f: &mut Frame) {
                     "Gains render green, regressions red.",
                     style::footer(),
                 )),
+                Line::raw(""),
+                Line::from(Span::styled(format!("ℹ {DELTA_INFO}"), style::info())),
             ];
-            f.render_widget(Paragraph::new(lines).block(block), area);
+            f.render_widget(
+                Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+                area,
+            );
         }
         Some(diff) => {
             let mut rows: Vec<Row> = vec![Row::new(vec![
@@ -473,6 +483,12 @@ fn render_delta(area: Rect, app: &App, f: &mut Frame) {
                     Cell::from(format_delta(r.delta_pct)).style(delta_style),
                 ]));
             }
+            // The info note sits in its own bottom strip so the table
+            // keeps its full width above it.
+            let sub = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
+                .split(area);
             f.render_widget(
                 Table::new(
                     rows,
@@ -484,7 +500,15 @@ fn render_delta(area: Rect, app: &App, f: &mut Frame) {
                     ],
                 )
                 .block(block),
-                area,
+                sub[0],
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!("ℹ {DELTA_INFO}"),
+                    style::info(),
+                )))
+                .wrap(Wrap { trim: true }),
+                sub[1],
             );
         }
     }
@@ -677,5 +701,54 @@ mod tests {
         // boundary — 5 bytes lands mid-é, so the cut is at 4.
         let s = "ééééé";
         assert_eq!(shorten(s, 5), "éé…");
+    }
+
+    // ---- rendering: the dimmed ℹ note in the delta panel ----
+
+    fn render_history_text(app: &crate::ui::app::App, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), app, f))
+            .expect("render frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn delta_panel_shows_the_info_note_without_a_diff() {
+        let app = crate::ui::app::App::new();
+        let text = render_history_text(&app, 120, 40);
+        assert!(text.contains("DELTA"), "{text}");
+        assert!(text.contains('ℹ'), "info note: {text}");
+        assert!(text.contains("Green = gain"), "{text}");
+    }
+
+    #[test]
+    fn delta_panel_shows_the_info_note_below_the_table() {
+        let a = session("aaaa", "m-a");
+        let b = session("bbbb", "m-b");
+        let mut app = crate::ui::app::App::new();
+        app.history = Some(HistoryState {
+            sessions: vec![a.clone(), b.clone()],
+            run_a: Some(0),
+            run_b: Some(1),
+            diff: Some(DiffReport::from_sessions(
+                &a,
+                &[metric("aaaa", Some(200.0), Some(20.0), Some(1.0), None)],
+                &b,
+                &[metric("bbbb", Some(160.0), Some(16.0), Some(1.25), None)],
+            )),
+            ..Default::default()
+        });
+        let text = render_history_text(&app, 120, 40);
+        assert!(text.contains("-20.0%"), "the diff table: {text}");
+        assert!(text.contains('ℹ'), "info note below the table: {text}");
+        assert!(text.contains("Green = gain"), "{text}");
     }
 }

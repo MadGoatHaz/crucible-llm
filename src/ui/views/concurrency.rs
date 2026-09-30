@@ -19,7 +19,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::engines::concurrency::{Envelope, SweepLevel, DEFAULT_LADDER};
@@ -319,11 +319,17 @@ fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: 
     ])
 }
 
+/// The dimmed `ℹ` note explaining what the envelope's numbers mean.
+const ENVELOPE_INFO: &str = "Finds your server's capacity limit. The sweet spot is where you get \
+     the best throughput before latency spikes; the knee is where adding \
+     more users starts hurting everyone's response time.";
+
 /// Optimal Operational Envelope (blueprint §6 View 2): the recommended
 /// sweet spot, with the detected saturation knee (and the rationale —
-/// throughput plateau + p90 spike) when the curve showed a transition.
+/// throughput plateau + p90 spike) when the curve showed a transition,
+/// plus a dimmed `ℹ` note explaining the numbers.
 fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
-    let lines = match envelope {
+    let mut lines: Vec<Line> = match envelope {
         Some(env) => {
             let mut ls = vec![Line::from(vec![
                 Span::styled("Recommended sweet spot: ", style::label()),
@@ -355,9 +361,9 @@ fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envel
                     style::footer(),
                 ))),
             }
-            Text::from(ls)
+            ls
         }
-        None => Text::from(vec![
+        None => vec![
             Line::from(vec![
                 Span::styled("Recommended sweet spot: ", style::label()),
                 Span::styled(
@@ -370,15 +376,22 @@ fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envel
                 "Run a sweep to detect the saturation knee — the transition from memory-bandwidth-bound to compute-bound.",
                 style::footer(),
             )),
-        ]),
+        ],
     };
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!("ℹ {ENVELOPE_INFO}"),
+        style::info(),
+    )));
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style::active_border())
-                .title("OPTIMAL OPERATIONAL ENVELOPE"),
-        ),
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(style::active_border())
+                    .title("OPTIMAL OPERATIONAL ENVELOPE"),
+            )
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -438,6 +451,26 @@ mod tests {
         for c in ["1", "2", "4"] {
             assert!(bottom.contains(c), "missing x label {c}");
         }
+    }
+
+    #[test]
+    fn envelope_panel_shows_the_capacity_info_note() {
+        let app = crate::ui::app::App::new();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("OPTIMAL OPERATIONAL ENVELOPE"), "{text}");
+        assert!(text.contains('ℹ'), "capacity info note: {text}");
+        assert!(text.contains("capacity limit"), "{text}");
     }
 
     #[test]

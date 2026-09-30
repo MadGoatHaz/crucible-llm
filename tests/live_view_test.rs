@@ -591,3 +591,77 @@ fn sequence_ui_survives_small_terminals() {
         let _ = render_live(&app, w, h);
     }
 }
+
+// ---- engine results panel: data lines + dimmed ℹ info notes ----
+
+#[test]
+fn engine_results_panel_fills_in_as_engines_complete() {
+    let app = app_with(test_snapshot());
+    app.speed_slot
+        .store(vec![crucible_llm::engines::SpeedResult {
+            ttft: 0.25,
+            prompt_tokens: 128,
+            completion_tokens: 256,
+            pp_speed: 1000.0,
+            tg_speed: 60.6,
+            mtp_efficiency: 1.0,
+            stream_time: 4.2,
+            total_chunks: 256,
+            content_chunks: 256,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "test-model".into(),
+            mode: "short".into(),
+            error: None,
+        }]);
+    app.reasoning_slot
+        .store(crucible_llm::engines::ReasoningResult {
+            responses: vec![],
+            ttfts: vec![],
+            tg_speeds: vec![85.0],
+            score: crucible_llm::engines::ReasoningScore {
+                total: 13,
+                solved: 12,
+                by_category: [(5, 5), (4, 4), (3, 4)],
+            },
+        });
+    app.structured_slot
+        .store(crucible_llm::engines::StructuredResult {
+            free_tps: 100.0,
+            constrained_tps: 98.0,
+            penalty_pct: -0.3,
+            free_ttft: 0.1,
+            constrained_ttft: 0.101,
+            compliant: false,
+            constrained_body: "{}".into(),
+            free_body: "hi".into(),
+        });
+
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("ENGINE RESULTS"), "results panel title");
+    // Each completed engine: its headline number …
+    assert!(text.contains("A: Speed"), "{text}");
+    assert!(text.contains("60.6 t/s decode"), "{text}");
+    assert!(text.contains("C2: Reasoning"), "{text}");
+    assert!(text.contains("12/13 solved"), "{text}");
+    assert!(text.contains("C3: Structured"), "{text}");
+    assert!(text.contains("compliant: NO"), "{text}");
+    // … and the dimmed ℹ note explaining what it means.
+    assert!(text.contains('ℹ'), "{text}");
+    assert!(text.contains("Single-stream throughput"), "{text}");
+    assert!(text.contains("Logical reasoning accuracy"), "{text}");
+    assert!(text.contains("JSON compliance"), "{text}");
+    // Engine D was never requested (no poller, no summary) → the results
+    // panel carries no energy value ("D: Energy" also appears in the
+    // queue panel's default list, so assert on the data value instead).
+    assert!(!text.contains("N/A (no GPU telemetry)"), "{text}");
+}
+
+#[test]
+fn engine_results_panel_placeholder_before_any_engine() {
+    let app = app_with(test_snapshot());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("ENGINE RESULTS"), "{text}");
+    assert!(text.contains("No engines completed yet"), "{text}");
+}

@@ -9,7 +9,9 @@
 //! telemetry panels show **real** data from the *currently running*
 //! engine only: the engines publish live [`MetricsSnapshot`]s to the
 //! shared `ArcSwap` seam (Chunk 6) and the log stream carries the
-//! executor's real events.
+//! executor's real events. The **ENGINE RESULTS** panel lists each
+//! completed engine (A, C2, C3, D) with its headline number and a
+//! dimmed `ℹ` note explaining what that number means.
 //!
 //! Every panel reads the shared state lock-free (the
 //! [`crate::engines::sequence::SeqStateSlot`] for the sequence, the
@@ -26,7 +28,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::engines::sequence::{Engine, SeqPhase, SeqState};
+use crate::engines::sequence::{summarize_speed, Engine, SeqPhase, SeqState};
 use crate::metrics::state::{MetricsSnapshot, StreamMetric, StreamStatus};
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{palette, style};
@@ -41,10 +43,11 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),      // sequence header + progress bar
-            Constraint::Percentage(32), // gauges | ITL | benchmark queue
-            Constraint::Percentage(24), // active streams monitor
-            Constraint::Percentage(18), // throughput sparkline | token counter
-            Constraint::Percentage(15), // log & event stream
+            Constraint::Percentage(26), // gauges | ITL | benchmark queue
+            Constraint::Percentage(18), // active streams monitor
+            Constraint::Percentage(13), // throughput sparkline | token counter
+            Constraint::Percentage(26), // engine results + ℹ info
+            Constraint::Percentage(14), // log & event stream
         ])
         .split(area);
 
@@ -52,7 +55,111 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     render_top(rows[1], m, app, f);
     render_streams(rows[2], m, f);
     render_bottom(rows[3], m, f);
-    render_log(rows[4], app, f);
+    render_results(rows[4], m, app, f);
+    render_log(rows[5], app, f);
+}
+
+/// Engine results panel: one data line per completed engine (A, C2, C3, D)
+/// from the lock-free result slots, each followed by a dimmed `ℹ` line
+/// explaining what the numbers mean. Engines that have not run yet are
+/// omitted — the panel fills in as the benchmark sequence progresses.
+fn render_results(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style::border())
+        .title("ENGINE RESULTS");
+    if area.width < 12 || area.height < 3 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Engine A — single-stream speed.
+    if let Some(results) = app.speed_slot.load().as_ref().as_ref() {
+        lines.push(result_line("A: Speed", &summarize_speed(results)));
+        lines.push(info_line(Engine::Speed));
+    }
+    // Engine C2 — reasoning accuracy.
+    if let Some(r) = app.reasoning_slot.load().as_ref().as_ref() {
+        lines.push(result_line(
+            "C2: Reasoning",
+            &format!("{} · {:.1} t/s", r.score.label(), r.avg_tg_speed()),
+        ));
+        lines.push(info_line(Engine::Reasoning));
+    }
+    // Engine C3 — structured-output compliance.
+    if let Some(s) = app.structured_slot.load().as_ref().as_ref() {
+        lines.push(result_line(
+            "C3: Structured",
+            &format!(
+                "{:+.1}% penalty · compliant: {}",
+                s.penalty_pct,
+                if s.compliant { "YES" } else { "NO" }
+            ),
+        ));
+        lines.push(info_line(Engine::Structured));
+    }
+    // Engine D — energy (only when requested: a sequence summary or a
+    // live hardware poller exists).
+    if let Some(energy) = energy_line(m, app) {
+        lines.push(result_line("D: Energy", &energy));
+        lines.push(info_line(Engine::Hardware));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No engines completed yet — results appear here as each engine finishes.",
+            style::info(),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// The Engine D data line, when one should be shown: the sequence's
+/// sampling summary wins; otherwise the live hardware-poller telemetry
+/// (`N/A` without GPU telemetry). `None` when Engine D was never
+/// requested (no poller, no summary) — the line is omitted entirely.
+fn energy_line(m: &MetricsSnapshot, app: &App) -> Option<String> {
+    if let Some(st) = app.seq.load().as_ref() {
+        if let Some((_, summary)) = st.completed.iter().find(|(e, _)| *e == Engine::Hardware) {
+            return Some(summary.clone());
+        }
+    }
+    if app.hw.is_some() {
+        return Some(if m.joules_per_token > 0.0 {
+            format!("{:.3} J/token · {:.0} W", m.joules_per_token, m.power_w)
+        } else {
+            "N/A (no GPU telemetry)".to_string()
+        });
+    }
+    None
+}
+
+/// One results data line: the engine label + its value (the label column
+/// is padded so a 14-char label like `C3: Structured` keeps a gap).
+fn result_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<14}  "), style::label()),
+        Span::styled(value.to_string(), style::value()),
+    ])
+}
+
+/// The dimmed `ℹ` note explaining an engine's numbers (the description
+/// joined to one line; the panel wraps it to fit).
+fn info_line(engine: Engine) -> Line<'static> {
+    let desc = engine
+        .description()
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Line::from(Span::styled(format!("ℹ {desc}"), style::info()))
 }
 
 // ── Benchmark Sequence: header, progress bar, queue ──────────────────────
@@ -653,6 +760,7 @@ pub(crate) fn throughput_color(ratio: f64) -> Color {
 mod tests {
     use super::*;
     use crate::engines::sequence::EngineProgress;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn block_char_maps_ratio_onto_the_ramp() {
@@ -773,5 +881,147 @@ mod tests {
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.starts_with("○ "), "{text}");
         assert!(text.contains("(not started)"), "{text}");
+    }
+
+    // ── engine results panel (data + dimmed ℹ info) ─────────────────────
+
+    fn speed_result(tg: f64, ttft: f64, tokens: u64) -> crate::engines::speed::SpeedResult {
+        crate::engines::speed::SpeedResult {
+            ttft,
+            prompt_tokens: 100,
+            completion_tokens: tokens,
+            pp_speed: 1000.0,
+            tg_speed: tg,
+            mtp_efficiency: 1.0,
+            stream_time: 1.0,
+            total_chunks: 10,
+            content_chunks: 10,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "m".into(),
+            mode: "short".into(),
+            error: None,
+        }
+    }
+
+    fn render_live_text(app: &crate::ui::app::App, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), app, f))
+            .expect("render frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn results_panel_lists_completed_engines_with_info_notes() {
+        let app = crate::ui::app::App::new();
+        app.speed_slot.store(vec![speed_result(60.6, 0.25, 256)]);
+        app.reasoning_slot
+            .store(crate::engines::capability::ReasoningResult {
+                responses: vec![],
+                ttfts: vec![],
+                tg_speeds: vec![85.0],
+                score: crate::engines::capability::ReasoningScore {
+                    total: 13,
+                    solved: 12,
+                    by_category: [(5, 5), (4, 4), (3, 4)],
+                },
+            });
+        app.structured_slot
+            .store(crate::engines::capability::StructuredResult {
+                free_tps: 100.0,
+                constrained_tps: 98.0,
+                penalty_pct: -0.3,
+                free_ttft: 0.1,
+                constrained_ttft: 0.101,
+                compliant: false,
+                constrained_body: "{}".into(),
+                free_body: "hi".into(),
+            });
+
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("ENGINE RESULTS"), "results panel: {text}");
+        assert!(text.contains("A: Speed"), "{text}");
+        assert!(text.contains("60.6 t/s decode"), "{text}");
+        assert!(text.contains("C2: Reasoning"), "{text}");
+        assert!(text.contains("12/13 solved"), "{text}");
+        assert!(text.contains("C3: Structured"), "{text}");
+        assert!(text.contains("compliant: NO"), "{text}");
+        // The dimmed ℹ notes explain each engine's numbers.
+        assert!(text.contains('ℹ'), "{text}");
+        assert!(text.contains("Single-stream throughput"), "{text}");
+        assert!(text.contains("Logical reasoning accuracy"), "{text}");
+        assert!(text.contains("JSON compliance"), "{text}");
+        // Engine D was never requested (no poller): the results panel
+        // carries no energy line ("D: Energy" also appears in the queue
+        // panel's default list, so assert on the data value instead).
+        assert!(!text.contains("N/A (no GPU telemetry)"), "{text}");
+    }
+
+    #[test]
+    fn results_panel_placeholder_before_any_engine_completes() {
+        let app = crate::ui::app::App::new();
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("ENGINE RESULTS"), "{text}");
+        assert!(text.contains("No engines completed yet"), "{text}");
+    }
+
+    #[test]
+    fn energy_line_tracks_summary_poller_and_telemetry() {
+        use crate::metrics::state::MetricsSnapshot;
+        // Nothing (no poller, no sequence summary) → omitted.
+        let app = crate::ui::app::App::new();
+        assert!(
+            energy_line(&MetricsSnapshot::default(), &app).is_none(),
+            "no Engine D request → no line"
+        );
+        // A completed D run in the sequence: its summary wins.
+        let app = crate::ui::app::App::new();
+        app.seq.store(SeqState {
+            phase: SeqPhase::AllComplete,
+            queue: vec![Engine::Hardware],
+            engine: Engine::Hardware,
+            progress: None,
+            summary: String::new(),
+            completed: vec![(Engine::Hardware, "0.338 J/token · peak 285 W".to_string())],
+        });
+        assert_eq!(
+            energy_line(&MetricsSnapshot::default(), &app).as_deref(),
+            Some("0.338 J/token · peak 285 W")
+        );
+        // A live poller without GPU telemetry: N/A.
+        let mut app = crate::ui::app::App::new();
+        app.hw = Some(Arc::new(Mutex::new(crate::hw::HwPoller::new())));
+        assert_eq!(
+            energy_line(&MetricsSnapshot::default(), &app).as_deref(),
+            Some("N/A (no GPU telemetry)")
+        );
+        // … and with telemetry: the live J/token value.
+        let m = MetricsSnapshot {
+            joules_per_token: 0.338,
+            power_w: 285.0,
+            ..MetricsSnapshot::default()
+        };
+        assert_eq!(
+            energy_line(&m, &app).as_deref(),
+            Some("0.338 J/token · 285 W")
+        );
+    }
+
+    #[test]
+    fn results_panel_survives_tiny_terminals() {
+        let app = crate::ui::app::App::new();
+        app.speed_slot.store(vec![speed_result(60.6, 0.25, 256)]);
+        for (w, h) in [(40, 10), (20, 6), (80, 24)] {
+            let _ = render_live_text(&app, w, h);
+        }
     }
 }

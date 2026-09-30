@@ -104,6 +104,14 @@ pub mod style {
         Style::default().fg(palette::MUTED)
     }
 
+    /// Dimmed informational text (the `ℹ` notes that explain what a panel's
+    /// numbers mean — muted + dim so they never compete with the data).
+    pub fn info() -> Style {
+        Style::default()
+            .fg(palette::MUTED)
+            .add_modifier(Modifier::DIM)
+    }
+
     /// Active tab in the tab bar.
     pub fn tab_active() -> Style {
         Style::default()

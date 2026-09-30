@@ -30,7 +30,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::client::models::ModelInfo;
@@ -129,6 +129,22 @@ impl SetupField {
             SetupField::EngineReasoning => "Engine C2",
             SetupField::EngineStructured => "Engine C3",
             SetupField::EngineHardware => "Engine D",
+        }
+    }
+
+    /// The [`Engine`] this field toggles (`None` for the non-engine
+    /// fields) — the config stage shows the focused engine's description
+    /// so the user can choose engines knowingly.
+    pub fn engine(self) -> Option<crate::engines::sequence::Engine> {
+        use crate::engines::sequence::Engine;
+        match self {
+            SetupField::EngineSpeed => Some(Engine::Speed),
+            SetupField::EngineConcurrency => Some(Engine::Concurrency),
+            SetupField::EngineNiah => Some(Engine::Niah),
+            SetupField::EngineReasoning => Some(Engine::Reasoning),
+            SetupField::EngineStructured => Some(Engine::Structured),
+            SetupField::EngineHardware => Some(Engine::Hardware),
+            _ => None,
         }
     }
 }
@@ -830,8 +846,16 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
             Span::styled(value, vstyle),
         ]));
     }
+    // The focused engine's description (dimmed `ℹ` note) — so the user
+    // can see what a benchmark measures before toggling it.
+    if let Some(engine) = s.current_field().engine() {
+        lines.push(Line::raw(""));
+        lines.extend(crate::ui::views::engine_info_lines(engine));
+    }
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel("SETUP — BENCHMARK CONFIGURATION")),
+        Paragraph::new(Text::from(lines))
+            .block(panel("SETUP — BENCHMARK CONFIGURATION"))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -1362,6 +1386,63 @@ mod tests {
         let r = s.handle_key(&key(KeyCode::Esc), &mut cfg());
         assert_eq!(r, SetupKeyResult::Inert);
         assert_eq!(s.phase, SetupPhase::Config);
+    }
+
+    // ── stage 3: rendering the focused engine's description ──────────────
+
+    fn render_setup_text(app: &crate::ui::app::App, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), app, f))
+            .expect("render frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn setup_app_at_config(field: usize) -> crate::ui::app::App {
+        let mut app = crate::ui::app::App::new();
+        app.phase = crate::ui::app::Phase::Setup;
+        app.setup.phase = SetupPhase::Config;
+        app.setup.form_field = field;
+        app
+    }
+
+    #[test]
+    fn config_stage_shows_the_focused_engine_description() {
+        // form_field 4 = Engine A (Speed).
+        let app = setup_app_at_config(4);
+        let text = render_setup_text(&app, 100, 30);
+        assert!(text.contains("SETUP — BENCHMARK CONFIGURATION"), "{text}");
+        assert!(
+            text.contains('ℹ'),
+            "focused engine gets an info note: {text}"
+        );
+        assert!(text.contains("Single-stream throughput"), "{text}");
+    }
+
+    #[test]
+    fn config_stage_tracks_the_focus_across_engines() {
+        // form_field 9 = Engine D (Hardware).
+        let app = setup_app_at_config(9);
+        let text = render_setup_text(&app, 100, 30);
+        assert!(text.contains("GPU power profiling"), "{text}");
+    }
+
+    #[test]
+    fn config_stage_hides_the_description_for_non_engine_fields() {
+        // form_field 0 = Mode.
+        let app = setup_app_at_config(0);
+        let text = render_setup_text(&app, 100, 30);
+        assert!(
+            !text.contains('ℹ'),
+            "no info note for a non-engine field: {text}"
+        );
     }
 
     // ── step indicator ───────────────────────────────────────────────────

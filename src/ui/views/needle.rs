@@ -12,7 +12,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::engines::capability::{NiahCellState, NIAH_DEPTHS, NIAH_SIZES};
@@ -109,7 +109,11 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
             NIAH_DEPTHS.len()
         )
     };
-    let lines = Text::from(vec![
+    // The dimmed `ℹ` note explaining what the matrix measures.
+    const NIAH_INFO: &str = "Tests long-context memory: one hidden fact in a 2k–128k document. \
+         Low % = the model loses track in long documents — critical for \
+         RAG and document QA.";
+    let mut lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled("● ", Style::default().fg(palette::OK)),
             Span::styled("accurate + nominal prefill    ", style::label()),
@@ -119,14 +123,46 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
             Span::styled("retrieval failed / hallucinated", style::label()),
         ]),
         Line::from(Span::styled(status, style::footer())),
-    ]);
+    ];
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        format!("ℹ {NIAH_INFO}"),
+        style::info(),
+    )));
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style::border())
-                .title("LEGEND"),
-        ),
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(style::border())
+                    .title("LEGEND"),
+            )
+            .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legend_shows_the_long_context_info_note() {
+        let app = crate::ui::app::App::new();
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("LEGEND"), "{text}");
+        assert!(text.contains('ℹ'), "long-context info note: {text}");
+        assert!(text.contains("long-context memory"), "{text}");
+    }
 }

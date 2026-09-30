@@ -151,6 +151,37 @@ impl Engine {
         Engine::Structured,
         Engine::Hardware,
     ];
+
+    /// A concise, user-facing description of what this engine measures.
+    ///
+    /// The TUI shows this under an `ℹ` marker (dimmed) in the setup /
+    /// config engine-selection phase and beside each engine's results, so
+    /// users can choose engines knowingly and interpret the numbers.
+    ///
+    /// Kept to at most three lines, each pre-wrapped at ≤58 columns, so it
+    /// fits a terminal panel without crowding the data.
+    pub fn description(self) -> &'static str {
+        match self {
+            Engine::Speed => {
+                "Single-stream throughput. Measures tokens/sec and\nTTFT (time to first token) for one user — how fast\nthe model generates text in isolation."
+            }
+            Engine::Concurrency => {
+                "Multi-stream sweep. Gradually raises parallel requests\n(1→2→4→8→16→32→64) to find the server's saturation\npoint — max users before latency degrades."
+            }
+            Engine::Niah => {
+                "Long-context retrieval. Hides a fact in a 2k–128k\ndocument and asks the model to find it — measures\ncontext retention for RAG / document QA."
+            }
+            Engine::Reasoning => {
+                "Logical reasoning accuracy. 13 deterministic challenges\n(math, logic, code) — measures problem-solving\nindependent of speed."
+            }
+            Engine::Structured => {
+                "JSON compliance. Tests whether the model follows\nthe response_format instruction — reliability for API\nand agent tool-calling."
+            }
+            Engine::Hardware => {
+                "GPU power profiling. Measures watts and joules-per-token\nduring inference. Needs NVIDIA telemetry (NVML);\ndegrades to N/A without it."
+            }
+        }
+    }
 }
 
 /// The progress of the *current* engine, as reported by that engine's own
@@ -985,6 +1016,36 @@ mod tests {
             hardware: false,
         };
         assert!(seq(sel).engines().is_empty());
+    }
+
+    // ── user-facing descriptions ─────────────────────────────────────────
+
+    #[test]
+    fn description_is_concise_for_every_engine() {
+        for engine in Engine::ALL {
+            let desc = engine.description();
+            let lines: Vec<&str> = desc.lines().collect();
+            assert!(!lines.is_empty(), "{engine:?} has a description");
+            assert!(
+                lines.len() <= 3,
+                "{engine:?} description fits in 3 lines: {desc:?}"
+            );
+            for l in &lines {
+                assert!(
+                    l.chars().count() <= 58,
+                    "{engine:?} line stays ≤58 cols (panel width): {l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn descriptions_are_distinct_per_engine() {
+        let mut descs: Vec<&str> = Engine::ALL.iter().map(|e| e.description()).collect();
+        descs.sort();
+        for w in descs.windows(2) {
+            assert_ne!(w[0], w[1], "two engines share a description");
+        }
     }
 
     // ── progress fractions & labels ─────────────────────────────────────

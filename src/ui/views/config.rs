@@ -33,7 +33,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::{default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode};
@@ -102,6 +102,22 @@ impl Field {
             Field::EngineNiah => "Engine C1 — NIAH",
             Field::EngineReasoning => "Engine C2 — Reasoning",
             Field::EngineStructured => "Engine C3 — Structured",
+        }
+    }
+
+    /// The [`Engine`] this field toggles (`None` for the non-engine
+    /// fields) — the form shows the focused engine's description so the
+    /// user can see what a benchmark measures before toggling it.
+    pub fn engine(self) -> Option<crate::engines::sequence::Engine> {
+        use crate::engines::sequence::Engine;
+        match self {
+            Field::EngineSpeed => Some(Engine::Speed),
+            Field::EngineConcurrency => Some(Engine::Concurrency),
+            Field::EngineNiah => Some(Engine::Niah),
+            Field::EngineReasoning => Some(Engine::Reasoning),
+            Field::EngineStructured => Some(Engine::Structured),
+            Field::Hardware => Some(Engine::Hardware),
+            _ => None,
         }
     }
 }
@@ -492,6 +508,11 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
             Span::styled(value, vstyle),
         ]));
     }
+    // The focused engine's description (dimmed `ℹ` note).
+    if let Some(engine) = c.current().engine() {
+        lines.push(Line::raw(""));
+        lines.extend(crate::ui::views::engine_info_lines(engine));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [type] edit · [⌫] delete",
@@ -510,12 +531,14 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         style::border()
     };
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border)
-                .title("CONFIGURATION (edit a field, then F2 to save)"),
-        ),
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title("CONFIGURATION (edit a field, then F2 to save)"),
+            )
+            .wrap(Wrap { trim: true }),
         area,
     );
 }
@@ -621,5 +644,55 @@ fn bool_style(b: bool) -> Style {
         style::value_ok()
     } else {
         Style::default().fg(palette::MUTED)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::app::{App, View};
+
+    fn render_text(app: &App, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), app, f))
+            .expect("render frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn focused_engine_field_shows_its_description() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 10; // Hardware (Engine D)
+        let text = render_text(&app, 120, 30);
+        assert!(
+            text.contains('ℹ'),
+            "info note for the focused engine: {text}"
+        );
+        assert!(text.contains("GPU power profiling"), "{text}");
+
+        app.config.cursor = 11; // Engine A
+        let text = render_text(&app, 120, 30);
+        assert!(text.contains("Single-stream throughput"), "{text}");
+    }
+
+    #[test]
+    fn non_engine_field_shows_no_description() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 0; // Url
+        let text = render_text(&app, 120, 30);
+        assert!(
+            !text.contains('ℹ'),
+            "no info note for a non-engine field: {text}"
+        );
     }
 }
