@@ -211,7 +211,10 @@ fn snapshot_update_load_roundtrip() {
 #[test]
 fn snapshot_update_replaces_previous() {
     let state = MetricsState::new();
-    state.update(MetricsSnapshot::sample());
+    state.update(MetricsSnapshot {
+        aggregate_tps: 842.3,
+        ..Default::default()
+    });
     assert_eq!(state.load().aggregate_tps, 842.3);
 
     let s = MetricsSnapshot {
@@ -316,22 +319,6 @@ fn snapshot_from_histogram() {
         "p99={}",
         s.itl_p99_ns
     );
-}
-
-/// The blueprint-mock sample snapshot is fully populated for the dashboard.
-#[test]
-fn snapshot_sample_is_populated() {
-    let s = MetricsSnapshot::sample();
-    assert!(!s.endpoint.is_empty());
-    assert!(!s.model.is_empty());
-    assert!(s.aggregate_tps > 0.0);
-    assert!(s.active_streams > 0);
-    assert!(s.vram_total_gb > 0.0);
-    assert!(s.itl_p50_ns > 0);
-    assert!(!s.itl_bins.is_empty());
-    assert_eq!(s.streams.len(), 4);
-    assert_eq!(s.throughput_series.len(), 60);
-    assert_eq!(s.status, StreamStatus::Streaming);
 }
 
 /// Every `StreamStatus` maps to its `STATE` column label.

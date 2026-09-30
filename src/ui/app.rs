@@ -235,24 +235,8 @@ impl App {
     /// sample snapshot so the dashboard is verifiable before a real stream
     /// worker publishes data.
     pub fn new() -> Self {
-        let log = vec![
-            Line::from(Span::styled(
-                "[12:44:02] Stream #04 completed: 840 tokens in 12.19s (68.9 t/s). Speculative Acceptance: 79%",
-                style::value_ok(),
-            )),
-            Line::from(Span::styled(
-                "[12:44:03] Warning: Stream #03 prefill context reached 4096 tokens. Server KV memory allocation +400MB",
-                style::value_warn(),
-            )),
-            Line::from(Span::styled(
-                "[12:44:04] Concurrency step up: Spawning batch 17..24.",
-                style::label(),
-            )),
-        ];
+        let log = Vec::new();
         let metrics = Arc::new(MetricsState::new());
-        // Seed the initial snapshot with blueprint-mock sample data. A real
-        // stream worker overwrites this via `MetricsState::update()`.
-        metrics.update(MetricsSnapshot::sample());
         Self {
             running: true,
             paused: false,
@@ -297,6 +281,14 @@ impl App {
     pub fn with_config(mut self, cfg: &Config) -> Self {
         self.config = ConfigState::from_config(cfg);
         self.niah_config = Some(NiahEngineConfig::from_config(cfg));
+        // Seed the metrics snapshot with the real target identity so the
+        // status bar shows the correct model/endpoint before any engine runs.
+        let mut snap = MetricsSnapshot::default();
+        snap.endpoint = cfg.url.clone();
+        snap.model = cfg.model.clone();
+        snap.mode = cfg.mode.label().to_string();
+        snap.backend = "vLLM".to_string();
+        self.metrics.update(snap);
         self
     }
 
@@ -359,10 +351,20 @@ impl App {
         self.phase = Phase::Dashboard;
         self.view = View::Live;
         self.paused = false;
+        // Refresh the snapshot identity from the current config so the
+        // status bar and panels show the real target (not stale/zeroed
+        // values from before the setup flow filled in the form).
+        let cfg = self.config.to_config();
+        let mut snap = MetricsSnapshot::default();
+        snap.endpoint = cfg.url.clone();
+        snap.model = cfg.model.clone();
+        snap.mode = cfg.mode.label().to_string();
+        snap.backend = "vLLM".to_string();
+        self.metrics.update(snap);
         self.push_log(
             format!(
                 "[setup] launching: {} / {}",
-                self.config.url, self.config.model
+                cfg.url, cfg.model
             ),
             style::value_ok(),
         );
@@ -533,6 +535,8 @@ impl App {
         let sel = cfg.engines;
 
         // Engine A — Speed & Latency (N sequential single-stream iterations).
+        // Publishes live snapshots to the shared metrics seam so the Live
+        // Monitor updates in real time (not just at completion).
         if sel.speed && !self.speed_slot.is_running() {
             let slot = self.speed_slot.clone();
             slot.set_running(true);
@@ -541,9 +545,10 @@ impl App {
                 style::value_ok(),
             );
             let cfg = cfg.clone();
+            let metrics = self.metrics.clone();
             tokio::spawn(async move {
                 let results = match crate::engines::SpeedEngine::new(&cfg) {
-                    Ok(engine) => engine.run().await.1,
+                    Ok(engine) => engine.metrics(metrics).run().await.1,
                     Err(e) => {
                         eprintln!("[run] speed engine init failed: {e}");
                         Vec::new()

@@ -20,7 +20,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
-use crucible_llm::metrics::MetricsSnapshot;
+use crucible_llm::metrics::{MetricsSnapshot, StreamMetric, StreamStatus};
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::live;
 
@@ -50,11 +50,92 @@ fn app_with(snap: MetricsSnapshot) -> App {
     app
 }
 
+/// A synthetic snapshot with known values for the Live view tests
+/// (replaces the removed `test_snapshot()` blueprint mock).
+fn test_snapshot() -> MetricsSnapshot {
+    let itl_bins = [
+        0.92, 0.86, 0.79, 0.71, 0.62, 0.53, 0.44, 0.36, 0.29, 0.23, 0.18, 0.14, 0.11, 0.08,
+        0.06, 0.045, 0.033, 0.024, 0.017, 0.012, 0.008, 0.005, 0.003, 0.002,
+    ];
+    MetricsSnapshot {
+        endpoint: "http://127.0.0.1:8000/v1".into(),
+        backend: "vLLM".into(),
+        model: "test-model".into(),
+        mode: "Concurrency".into(),
+        aggregate_tps: 842.3,
+        active_streams: 16,
+        total_streams: 16,
+        vram_used_gb: 21.4,
+        vram_total_gb: 24.0,
+        power_w: 285.0,
+        joules_per_token: 0.338,
+        gpu_clock_mhz: 1410.0,
+        itl_p50_ns: 12_100_000,
+        itl_p90_ns: 16_400_000,
+        itl_p99_ns: 41_200_000,
+        itl_p999_ns: 55_000_000,
+        itl_bins: itl_bins.to_vec(),
+        prompt_tokens: 4096,
+        completion_tokens: 1332,
+        reasoning_tokens: 1152,
+        status: StreamStatus::Streaming,
+        streams: vec![
+            StreamMetric {
+                id: 1,
+                kind: "Reasoning".into(),
+                state: StreamStatus::Streaming,
+                pp_tokens: Some(2048),
+                tg_tokens: Some(312),
+                ttft_s: Some(0.182),
+                gen_tps: Some(72.4),
+                mtp: Some(1.84),
+                progress: 0.55,
+            },
+            StreamMetric {
+                id: 2,
+                kind: "Content".into(),
+                state: StreamStatus::Streaming,
+                pp_tokens: Some(512),
+                tg_tokens: Some(180),
+                ttft_s: Some(0.045),
+                gen_tps: Some(88.1),
+                mtp: Some(1.02),
+                progress: 0.70,
+            },
+            StreamMetric {
+                id: 3,
+                kind: "Tool-Call".into(),
+                state: StreamStatus::Waiting,
+                pp_tokens: Some(4096),
+                tg_tokens: None,
+                ttft_s: None,
+                gen_tps: None,
+                mtp: None,
+                progress: 0.0,
+            },
+            StreamMetric {
+                id: 4,
+                kind: "Reasoning".into(),
+                state: StreamStatus::Done,
+                pp_tokens: Some(2048),
+                tg_tokens: Some(840),
+                ttft_s: Some(0.191),
+                gen_tps: Some(68.9),
+                mtp: Some(1.79),
+                progress: 1.0,
+            },
+        ],
+        throughput_series: (0..60)
+            .map(|i| 842.3 + 18.0 * ((i as f64) * 0.31).sin())
+            .collect(),
+    }
+}
+
 // ---- acceptance: all five panels render with injected metrics ----
 
 #[test]
 fn all_five_panels_render_with_synthetic_metrics() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     for title in [
         "TELEMETRY GAUGES",
@@ -71,7 +152,7 @@ fn all_five_panels_render_with_synthetic_metrics() {
 
 #[test]
 fn gauge_panel_shows_key_metrics() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     assert!(text.contains("Total Aggregate"));
     assert!(text.contains("842.3 t/s"));
@@ -99,7 +180,7 @@ fn gpu_clock_shows_na_without_telemetry() {
 
 #[test]
 fn itl_percentiles_render_from_snapshot() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     assert!(text.contains("12.1 ms"));
     assert!(text.contains("16.4 ms"));
@@ -108,12 +189,12 @@ fn itl_percentiles_render_from_snapshot() {
 
 #[test]
 fn itl_histogram_and_rolling_chart_reflect_changing_data() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let before = render_live(&app, W, H);
 
     // Publish a second snapshot: mirrored ITL distribution, shifted
     // throughput series, new percentile values.
-    let mut s = MetricsSnapshot::sample();
+    let mut s = test_snapshot();
     s.itl_bins.reverse();
     s.throughput_series = s.throughput_series.iter().map(|v| v + 400.0).collect();
     s.itl_p50_ns = 99_000_000;
@@ -136,7 +217,7 @@ fn itl_histogram_and_rolling_chart_reflect_changing_data() {
 
 #[test]
 fn stream_matrix_shows_pp_tg_split_and_mtp() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     // Row #01: Reasoning, streaming, 2048 PP / 312 TG.
     assert!(text.contains("#01"));
@@ -162,12 +243,12 @@ fn stream_matrix_shows_pp_tg_split_and_mtp() {
 
 #[test]
 fn live_view_survives_60hz_frame_sequence() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     for frame in 0..60u64 {
         // Simulate the engine publishing a fresh snapshot each tick, then
         // the 60 Hz render loop painting one frame from it.
         let tps = 842.3 + frame as f64;
-        let mut s = MetricsSnapshot::sample();
+        let mut s = test_snapshot();
         s.aggregate_tps = tps;
         s.throughput_series.push(tps.round());
         s.throughput_series.remove(0);
@@ -185,7 +266,7 @@ fn live_view_survives_60hz_frame_sequence() {
 
 #[test]
 fn renders_at_small_terminals_without_panic() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     for (w, h) in [(40, 10), (20, 6), (80, 24)] {
         let _ = render_live(&app, w, h);
     }
@@ -196,7 +277,7 @@ fn renders_at_small_terminals_without_panic() {
 #[test]
 fn vram_gauge_color_tracks_usage_thresholds() {
     let check = |ratio: f64, want: Color, not: Color| {
-        let mut s = MetricsSnapshot::sample();
+        let mut s = test_snapshot();
         s.vram_total_gb = 24.0;
         s.vram_used_gb = 24.0 * ratio;
         let app = app_with(s);
@@ -242,7 +323,7 @@ fn vram_gauge_color_tracks_usage_thresholds() {
 
 #[test]
 fn throughput_sparkline_renders_block_ramp_with_color_gradient() {
-    let mut s = MetricsSnapshot::sample();
+    let mut s = test_snapshot();
     // A high/medium/low mix across the rolling window so all three
     // gradient colors appear.
     s.throughput_series = vec![900.0, 100.0, 480.0, 950.0, 60.0, 420.0];
@@ -293,7 +374,7 @@ fn throughput_sparkline_degrades_gracefully_when_empty() {
 
 #[test]
 fn itl_gauge_bars_render_percentile_values() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let buf = render_live(&app, W, H);
     let text = buf_text(&buf);
     assert!(text.contains("p50"));
@@ -327,7 +408,7 @@ fn itl_gauge_bars_render_percentile_values() {
 
 #[test]
 fn token_counter_shows_total_generated() {
-    let app = app_with(MetricsSnapshot::sample());
+    let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     assert!(text.contains("TOKENS GENERATED"));
     assert!(text.contains("1,332"));

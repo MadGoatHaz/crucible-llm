@@ -19,6 +19,7 @@
 //! (quanta, `T0..Tn`); this module only takes deltas of those records.
 //! Nothing here touches the TUI or the timing path.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
@@ -27,9 +28,11 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamError, StreamEvent, StreamOutcome, StreamWorker};
 use crate::config::{Config, Mode};
+use crate::metrics::histogram::LatencyHistogram;
+use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
 use crate::sse::{Chunk, Usage};
-use crate::timing::StreamTimestamps;
+use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Max generation tokens per run (parity with the prototype's
 /// `DEFAULT_MAX_GEN_TOKENS`).
@@ -123,6 +126,9 @@ pub struct SpeedEngine {
     cfg: Config,
     client: reqwest::Client,
     generator: PromptGenerator,
+    /// Optional TUI seam: publish live [`MetricsSnapshot`]s while the
+    /// engine runs (the render loop reads them lock-free).
+    metrics: Option<Arc<MetricsState>>,
 }
 
 impl SpeedEngine {
@@ -144,7 +150,17 @@ impl SpeedEngine {
             cfg: cfg.clone(),
             client,
             generator,
+            metrics: None,
         })
+    }
+
+    /// Attach a [`MetricsState`] publisher so the engine pushes live
+    /// snapshots to the TUI while running (measurement-isolation invariant,
+    /// blueprint §4). The TUI's `start_run` wires this; the headless path
+    /// leaves it `None`.
+    pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
+        self.metrics = Some(state);
+        self
     }
 
     /// The prompt for this run (generated once and reused across
@@ -186,14 +202,166 @@ impl SpeedEngine {
             worker = worker.api_key(key);
         }
 
+        let start = MonotonicInstant::now();
         let outcome = tokio::spawn(worker.run(tx))
             .await
             .expect("stream worker task panicked");
         let mut events = Vec::new();
+        let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
             events.push(event);
+            batch += 1;
+            // Publish a live snapshot every 8 events, and immediately on
+            // a terminal event, so the TUI's Live Monitor updates in real
+            // time (measurement-isolation invariant: the render loop only
+            // reads the snapshot; it never touches this timing path).
+            if let Some(state) = &self.metrics {
+                let is_terminal = matches!(
+                    events.last(),
+                    Some(StreamEvent::Complete { .. }) | Some(StreamEvent::Failed { .. })
+                );
+                if batch >= 8 || is_terminal {
+                    state.update(self.live_snapshot(&events, &start));
+                    batch = 0;
+                }
+            }
+        }
+        // Final publish (the terminal event may have been batched out).
+        if let Some(state) = &self.metrics {
+            state.update(self.live_snapshot(&events, &start));
         }
         (aggregate(&self.cfg, prompt, &outcome, &events), events)
+    }
+
+    /// Build a live [`MetricsSnapshot`] from the events collected so far
+    /// (single-stream Engine A → the TUI's Live Monitor).
+    fn live_snapshot(&self, events: &[StreamEvent], start: &MonotonicInstant) -> MetricsSnapshot {
+        let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
+        let mut itl = LatencyHistogram::default();
+        let mut token_frames = 0u64;
+        let mut reasoning_frames = 0u64;
+        let mut content_frames = 0u64;
+        let mut last_token_at: Option<MonotonicInstant> = None;
+        let mut ttft_ns: Option<u64> = None;
+        let mut usage: Option<Usage> = None;
+        let mut state = StreamStatus::Waiting;
+        let mut t3: Option<MonotonicInstant> = None;
+        let mut t_end: Option<MonotonicInstant> = None;
+
+        for event in events {
+            match event {
+                StreamEvent::Frame {
+                    frame,
+                    at,
+                    timestamps,
+                } => {
+                    let is_tok =
+                        matches!(&frame.chunk, Chunk::Reasoning(_) | Chunk::Content(_));
+                    if is_tok {
+                        if let Some(prev) = last_token_at {
+                            itl.record(prev.delta_nanos(at));
+                        }
+                        token_frames += 1;
+                        match &frame.chunk {
+                            Chunk::Reasoning(_) => reasoning_frames += 1,
+                            _ => content_frames += 1,
+                        }
+                        last_token_at = Some(*at);
+                        if t3.is_none() {
+                            t3 = Some(*at);
+                        }
+                        if state == StreamStatus::Waiting {
+                            state = StreamStatus::Streaming;
+                        }
+                    }
+                    if ttft_ns.is_none() {
+                        ttft_ns = timestamps.ttft_nanos();
+                    }
+                }
+                StreamEvent::Complete {
+                    timestamps,
+                    usage: u,
+                    ..
+                } => {
+                    usage = *u;
+                    t_end = timestamps.t_end;
+                    state = StreamStatus::Done;
+                    if ttft_ns.is_none() {
+                        ttft_ns = timestamps.ttft_nanos();
+                    }
+                }
+                StreamEvent::Failed { timestamps, .. } => {
+                    t_end = timestamps.t_end;
+                    state = StreamStatus::Error;
+                    if ttft_ns.is_none() {
+                        ttft_ns = timestamps.ttft_nanos();
+                    }
+                }
+            }
+        }
+
+        let tokens = usage
+            .map(|u| u.completion_tokens)
+            .unwrap_or(token_frames);
+        let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+        let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
+        let gen_tps = match (t3, t_end) {
+            (Some(t3), Some(end)) => {
+                let span_s = t3.delta_nanos(&end) as f64 / 1_000_000_000.0;
+                if span_s > 0.0 && tokens > 0 {
+                    Some(tokens as f64 / span_s)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let mtp = if content_frames > 0 {
+            Some(tokens as f64 / content_frames as f64)
+        } else {
+            None
+        };
+        let progress = if state == StreamStatus::Done {
+            1.0
+        } else {
+            (tokens as f64 / MAX_GEN_TOKENS as f64).min(1.0)
+        };
+        let kind = if reasoning_frames > content_frames {
+            "Reasoning"
+        } else if content_frames > 0 {
+            "Content"
+        } else {
+            "Control"
+        };
+
+        MetricsSnapshot {
+            endpoint: self.cfg.url.clone(),
+            backend: "vLLM".to_string(),
+            model: self.cfg.model.clone(),
+            mode: self.cfg.mode.label().to_string(),
+            aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),
+            active_streams: (state == StreamStatus::Streaming).then(|| 1).unwrap_or(0),
+            total_streams: 1,
+            itl_p50_ns: itl.p50() as u64,
+            itl_p90_ns: itl.p90() as u64,
+            itl_p99_ns: itl.p99() as u64,
+            itl_p999_ns: itl.p999() as u64,
+            prompt_tokens,
+            completion_tokens: tokens,
+            status: state,
+            streams: vec![StreamMetric {
+                id: 0,
+                kind: kind.to_string(),
+                state,
+                pp_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
+                tg_tokens: (tokens > 0).then_some(tokens),
+                ttft_s,
+                gen_tps,
+                mtp,
+                progress,
+            }],
+            ..Default::default()
+        }
     }
 
     /// All `iterations` runs (sequential — single-stream engine).
