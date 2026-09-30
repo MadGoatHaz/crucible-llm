@@ -195,7 +195,6 @@ impl MetricsSnapshot {
         self.itl_p999_ns = h.p999() as u64;
         self
     }
-
 }
 
 /// Lock-free double-buffered holder for the current [`MetricsSnapshot`].

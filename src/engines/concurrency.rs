@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use crate::client::pool::{PoolEvent, WorkerPool};
+use crate::engines::sequence::{EngineProgress, ProgressBus};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::sse::{Chunk, Usage};
@@ -238,6 +239,10 @@ pub struct Sweep {
     /// Optional TUI seam: publish live [`MetricsSnapshot`]s while the sweep
     /// runs (the render loop reads them lock-free).
     metrics: Option<Arc<MetricsState>>,
+    /// Optional sequence seam: publish `Concurrency level … (step …)` +
+    /// streams active to the [`ProgressBus`] the Benchmark Sequence
+    /// mirrors into the TUI's progress bar.
+    progress: Option<Arc<ProgressBus>>,
 }
 
 impl Sweep {
@@ -248,6 +253,7 @@ impl Sweep {
             pool,
             ladder: normalize_ladder(ladder),
             metrics: None,
+            progress: None,
         }
     }
 
@@ -264,19 +270,34 @@ impl Sweep {
         self
     }
 
+    /// Attach a [`ProgressBus`] so the sweep reports its ladder position
+    /// (`level`, `step`, streams active) to the Benchmark Sequence.
+    pub fn progress(mut self, bus: Arc<ProgressBus>) -> Self {
+        self.progress = Some(bus);
+        self
+    }
+
     /// Run the full sweep: one level at a time, in ladder order.
     pub async fn run(&self) -> SweepResult {
         let mut levels = Vec::with_capacity(self.ladder.len());
-        for &n in &self.ladder {
-            levels.push(self.run_level(n).await);
+        for (i, &n) in self.ladder.iter().enumerate() {
+            levels.push(self.run_level(n, i + 1, self.ladder.len()).await);
         }
         SweepResult { levels }
     }
 
     /// Run one ladder level: spawn `n` workers, drain the aggregate channel
     /// into a [`LevelAccumulator`], and fold the level's metrics.
-    async fn run_level(&self, n: usize) -> SweepLevel {
+    async fn run_level(&self, n: usize, step: usize, total_steps: usize) -> SweepLevel {
         let start = MonotonicInstant::now();
+        if let Some(bus) = &self.progress {
+            bus.publish(EngineProgress::Concurrency {
+                level: n,
+                step,
+                total_steps,
+                active: 0,
+            });
+        }
         let (mut rx, supervisor) = self.pool.clone().spawn(n);
         let mut acc = LevelAccumulator::new(n, self.pool.max_tokens());
         let mut batch = 0u32;
@@ -292,6 +313,18 @@ impl Sweep {
                     batch = 0;
                 }
             }
+            // The progress bus shares the batch cadence: the live stream
+            // count is the "alive" signal while a level runs.
+            if let Some(bus) = &self.progress {
+                if batch >= 16 {
+                    bus.publish(EngineProgress::Concurrency {
+                        level: n,
+                        step,
+                        total_steps,
+                        active: acc.active(),
+                    });
+                }
+            }
         }
         // Channel closed ⇒ every worker has ended; the supervisor resolves
         // at the true end of the level.
@@ -304,6 +337,14 @@ impl Sweep {
                 StreamStatus::Done
             };
             state.update(self.live_snapshot(&acc, n, &start, status));
+        }
+        if let Some(bus) = &self.progress {
+            bus.publish(EngineProgress::Concurrency {
+                level: n,
+                step,
+                total_steps,
+                active: acc.active(),
+            });
         }
         acc.finish(wall_ns)
     }

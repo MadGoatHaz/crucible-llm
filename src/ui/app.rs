@@ -23,7 +23,8 @@ use ratatui::Frame;
 use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
 use crate::engines::{
-    fragmentation_warning, NiahEngineConfig, NiahSlot, ReasoningResult, ResultSlot, SpeedResult,
+    fragmentation_warning, queue_for, BenchmarkSequence, NiahEngineConfig, NiahSlot, ProgressBus,
+    ReasoningResult, ResultSlot, RunSlots, SeqPhase, SeqState, SeqStateSlot, SpeedResult,
     StructuredResult, SweepResult, VRAM_FRAGMENTATION_THRESHOLD,
 };
 use crate::hw::HwPoller;
@@ -218,6 +219,19 @@ pub struct App {
     /// success). The setup flow surfaces it in the manual-entry stage
     /// (N/A-never-fail: a failed discovery degrades to free text).
     pub discovery_error: Arc<ArcSwapOption<String>>,
+    /// Lock-free benchmark-sequence state (the sequential executor's TUI
+    /// seam): the Live view's header / progress bar / queue panel read it
+    /// lock-free via [`SeqStateSlot::load`]. `None` until a sequence
+    /// starts (measurement-isolation invariant, blueprint §4).
+    pub seq: Arc<SeqStateSlot>,
+    /// The per-engine progress bus: the sequence's engines publish their
+    /// [`crate::engines::EngineProgress`] here, and the executor's 10 Hz
+    /// ticker mirrors it into [`seq`](Self::seq).
+    pub seq_bus: Arc<ProgressBus>,
+    /// The executor's log pipe: the sequence task *sends* real events;
+    /// the tick path *drains* them into [`log`](Self::log) (the bounded
+    /// line list the Live view renders). `None` until the first run.
+    pub log_rx: Option<std::sync::mpsc::Receiver<String>>,
     /// Hysteresis latch for the VRAM fragmentation warning (blueprint
     /// §5D): the log line fires once when occupancy crosses the
     /// threshold and re-arms once it falls 5 points below it.
@@ -262,6 +276,9 @@ impl App {
             phase: Phase::Dashboard,
             setup: SetupState::new(),
             discovery_error: Arc::new(ArcSwapOption::empty()),
+            seq: Arc::new(SeqStateSlot::new()),
+            seq_bus: Arc::new(ProgressBus::new()),
+            log_rx: None,
             vram_warned: false,
         }
     }
@@ -283,12 +300,13 @@ impl App {
         self.niah_config = Some(NiahEngineConfig::from_config(cfg));
         // Seed the metrics snapshot with the real target identity so the
         // status bar shows the correct model/endpoint before any engine runs.
-        let mut snap = MetricsSnapshot::default();
-        snap.endpoint = cfg.url.clone();
-        snap.model = cfg.model.clone();
-        snap.mode = cfg.mode.label().to_string();
-        snap.backend = "vLLM".to_string();
-        self.metrics.update(snap);
+        self.metrics.update(MetricsSnapshot {
+            endpoint: cfg.url.clone(),
+            model: cfg.model.clone(),
+            mode: cfg.mode.label().to_string(),
+            backend: "vLLM".to_string(),
+            ..Default::default()
+        });
         self
     }
 
@@ -355,17 +373,15 @@ impl App {
         // status bar and panels show the real target (not stale/zeroed
         // values from before the setup flow filled in the form).
         let cfg = self.config.to_config();
-        let mut snap = MetricsSnapshot::default();
-        snap.endpoint = cfg.url.clone();
-        snap.model = cfg.model.clone();
-        snap.mode = cfg.mode.label().to_string();
-        snap.backend = "vLLM".to_string();
-        self.metrics.update(snap);
+        self.metrics.update(MetricsSnapshot {
+            endpoint: cfg.url.clone(),
+            model: cfg.model.clone(),
+            mode: cfg.mode.label().to_string(),
+            backend: "vLLM".to_string(),
+            ..Default::default()
+        });
         self.push_log(
-            format!(
-                "[setup] launching: {} / {}",
-                cfg.url, cfg.model
-            ),
+            format!("[setup] launching: {} / {}", cfg.url, cfg.model),
             style::value_ok(),
         );
         self.start_run();
@@ -519,144 +535,89 @@ impl App {
         });
     }
 
-    /// `r` / `F5` (Chunk 18): run **every engine selected** in the
-    /// Configuration form. Each selected engine spawns as an independent
-    /// background task that publishes its result to a lock-free slot
-    /// (measurement-isolation invariant, blueprint §4) — the render loop
-    /// never blocks and never touches the quanta timing path.
+    /// `r` / `F5` (and the setup flow's launch): run **every engine
+    /// selected** in the Configuration form — **strictly one at a time**,
+    /// in the canonical A → B → C1 → C2 → C3 → D order.
     ///
-    /// Engine D (hardware) is continuous telemetry (the 100 ms poller),
-    /// not a one-shot, so its toggle is honored by the entry point (which
-    /// decides whether to spawn the poller task) rather than here. A
-    /// selected engine that fails to initialize degrades gracefully (its
-    /// slot publishes an empty/zeroed result) without aborting the others.
+    /// The [`BenchmarkSequence`] runs as a single background `tokio` task:
+    ///
+    /// * it awaits each engine's completion before starting the next (one
+    ///   engine hits the endpoint at a time — no queueing cross-talk);
+    /// * each engine reports its [`crate::engines::EngineProgress`] to
+    ///   [`seq_bus`](Self::seq_bus); the executor's 10 Hz ticker mirrors
+    ///   it into the lock-free [`seq`](Self::seq) slot, which the Live
+    ///   view's header / progress bar / queue panel read every frame;
+    /// * live [`crate::metrics::state::MetricsSnapshot`]s keep flowing to
+    ///   the shared metrics seam, so the telemetry gauges show the
+    ///   *current* engine's real data;
+    /// * each completed result is published to the existing lock-free
+    ///   result slots (Views 2/3 read them exactly as before);
+    /// * real events stream to [`log`](Self::log) through the mpsc pipe
+    ///   the tick path drains (no pre-generated fake logs).
+    ///
+    /// The render loop never blocks and never touches the quanta timing
+    /// path (measurement-isolation invariant, blueprint §4). Engine D
+    /// (hardware) is continuous telemetry (the 100 ms poller spawned by
+    /// the entry point); when selected, the sequence ends with a short
+    /// sampling window that folds the power trace into Joules/Token.
+    /// Re-pressing `r` while a sequence is in progress is a no-op (logged).
     pub fn start_run(&mut self) {
-        let cfg = self.config.to_config();
-        let sel = cfg.engines;
-
-        // Engine A — Speed & Latency (N sequential single-stream iterations).
-        // Publishes live snapshots to the shared metrics seam so the Live
-        // Monitor updates in real time (not just at completion).
-        if sel.speed && !self.speed_slot.is_running() {
-            let slot = self.speed_slot.clone();
-            slot.set_running(true);
+        if self.seq.is_running() {
             self.push_log(
-                format!("[run] Engine A (speed): {} iteration(s)", cfg.iterations),
-                style::value_ok(),
-            );
-            let cfg = cfg.clone();
-            let metrics = self.metrics.clone();
-            tokio::spawn(async move {
-                let results = match crate::engines::SpeedEngine::new(&cfg) {
-                    Ok(engine) => engine.metrics(metrics).run().await.1,
-                    Err(e) => {
-                        eprintln!("[run] speed engine init failed: {e}");
-                        Vec::new()
-                    }
-                };
-                slot.set_running(false);
-                slot.store(results);
-            });
-        }
-
-        // Engine B — Concurrency & Saturation sweep (ladder from the form),
-        // publishing live snapshots to the shared metrics seam.
-        if sel.concurrency && !self.sweep.is_running() {
-            if let Some(sweep) = crate::engines::build_sweep(&cfg, Some(self.metrics.clone())) {
-                let slot = self.sweep.clone();
-                slot.set_running(true);
-                self.push_log(
-                    format!(
-                        "[run] Engine B (concurrency): ladder [{}]",
-                        cfg.ladder
-                            .iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ),
-                    style::value_ok(),
-                );
-                tokio::spawn(async move {
-                    let result = sweep.run().await;
-                    slot.set_running(false);
-                    slot.store(result);
-                });
-            }
-        }
-
-        // Engine C1 — NIAH (reuses the existing `n`-key background path).
-        if sel.niah {
-            self.start_niah();
-        }
-
-        // Engine C2 — Deterministic reasoning / code verification.
-        if sel.reasoning && !self.reasoning_slot.is_running() {
-            let slot = self.reasoning_slot.clone();
-            slot.set_running(true);
-            self.push_log(
-                "[run] Engine C2 (reasoning): 13-challenge bank".to_string(),
-                style::value_ok(),
-            );
-            let cfg = cfg.clone();
-            tokio::spawn(async move {
-                let result = match crate::engines::ReasoningEngine::new(&cfg) {
-                    Ok(engine) => engine.run().await,
-                    Err(e) => {
-                        eprintln!("[run] reasoning engine init failed: {e}");
-                        crate::engines::ReasoningResult {
-                            responses: Vec::new(),
-                            ttfts: Vec::new(),
-                            tg_speeds: Vec::new(),
-                            score: crate::engines::ReasoningScore {
-                                total: 0,
-                                solved: 0,
-                                by_category: [(0, 0); 3],
-                            },
-                        }
-                    }
-                };
-                slot.set_running(false);
-                slot.store(result);
-            });
-        }
-
-        // Engine C3 — Structured output / JSON-grammar compliance.
-        if sel.structured && !self.structured_slot.is_running() {
-            let slot = self.structured_slot.clone();
-            slot.set_running(true);
-            self.push_log(
-                "[run] Engine C3 (structured): free-form vs grammar-constrained".to_string(),
-                style::value_ok(),
-            );
-            let cfg = cfg.clone();
-            tokio::spawn(async move {
-                let result = match crate::engines::StructuredEngine::new(&cfg) {
-                    Ok(engine) => engine.run().await,
-                    Err(e) => {
-                        eprintln!("[run] structured engine init failed: {e}");
-                        crate::engines::StructuredResult {
-                            free_tps: 0.0,
-                            constrained_tps: 0.0,
-                            penalty_pct: 0.0,
-                            free_ttft: 0.0,
-                            constrained_ttft: 0.0,
-                            compliant: false,
-                            constrained_body: String::new(),
-                            free_body: String::new(),
-                        }
-                    }
-                };
-                slot.set_running(false);
-                slot.store(result);
-            });
-        }
-
-        if sel.is_empty() {
-            self.push_log(
-                "[run] no engines selected — enable some in the Config view (View 5)".to_string(),
+                "[seq] already running — engines execute one at a time".to_string(),
                 style::value_warn(),
             );
+            return;
         }
+        let cfg = self.config.to_config();
+        if cfg.engines.is_empty() {
+            self.push_log(
+                "[seq] no engines selected — enable some in the Config view (View 5)".to_string(),
+                style::value_warn(),
+            );
+            return;
+        }
+        self.seq.set_running(true);
+        // Publish the initial sequence state *synchronously* so the Live
+        // view's header / progress bar / queue panel are correct from the
+        // very first frame (before the spawned task's first 10 Hz tick).
+        let queue = queue_for(&cfg.engines);
+        self.seq.store(SeqState {
+            phase: SeqPhase::Running,
+            queue: queue.clone(),
+            engine: queue[0],
+            progress: None,
+            summary: String::new(),
+            completed: Vec::new(),
+        });
+        self.push_log(
+            format!(
+                "[seq] starting {} engine(s): {}",
+                cfg.engines.count(),
+                cfg.engines.iter_labels().collect::<Vec<_>>().join(" → ")
+            ),
+            style::value_ok(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.log_rx = Some(rx);
+        let seq = BenchmarkSequence::new(
+            cfg,
+            self.metrics.clone(),
+            self.hw.clone(),
+            self.seq.clone(),
+            self.seq_bus.clone(),
+            RunSlots {
+                speed: self.speed_slot.clone(),
+                concurrency: self.sweep.clone(),
+                niah: self.niah.clone(),
+                reasoning: self.reasoning_slot.clone(),
+                structured: self.structured_slot.clone(),
+            },
+            Some(tx),
+        );
+        tokio::spawn(async move {
+            seq.run().await;
+        });
     }
 
     /// Handle one terminal key event (blueprint §6 footer key map).
@@ -910,6 +871,21 @@ impl App {
     /// a 5-point drop. Reading the snapshot here is a plain lock-free
     /// load; no timing path is touched.
     pub fn on_tick(&mut self) {
+        // Drain the executor's log pipe first (even while paused, so the
+        // bounded log catches up instead of growing unbounded in the
+        // channel): the sequence task sends *real* events as they happen,
+        // and the Live view renders them. Collect before mutating `self`
+        // (the receiver lives inside `self`).
+        let mut pending = Vec::new();
+        if let Some(rx) = &self.log_rx {
+            while let Ok(line) = rx.try_recv() {
+                pending.push(line);
+            }
+        }
+        for line in pending {
+            self.push_log(line, style::value());
+        }
+
         // The render clock freezes on `Space` only in the dashboard; the
         // setup flow keeps ticking (the discovery spinner advances and
         // the stage-2 hand-off below must fire).
@@ -1287,8 +1263,9 @@ mod tests {
         assert_eq!(app.phase, Phase::Dashboard);
         assert_eq!(app.view, View::Live);
         assert!(app.running);
-        // The selected engines (default: speed) are running now.
-        assert!(app.speed_slot.is_running());
+        // The sequential executor is in progress now (set synchronously
+        // by `start_run` before the `tokio::spawn`).
+        assert!(app.seq.is_running());
     }
 
     // ── full walk-through: URL → model → config → launch ────────────────
@@ -1339,6 +1316,6 @@ mod tests {
         app.handle_key(&key(KeyCode::Enter));
         assert_eq!(app.phase, Phase::Dashboard);
         assert_eq!(app.view, View::Live);
-        assert!(app.speed_slot.is_running());
+        assert!(app.seq.is_running());
     }
 }

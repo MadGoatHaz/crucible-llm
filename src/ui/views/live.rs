@@ -1,12 +1,21 @@
-//! View 1 — Live Monitor & Telemetry (blueprint §6):
-//! telemetry gauges, ITL percentile gauge bars + latency distribution,
-//! active-streams matrix, a rolling throughput sparkline (unicode block
-//! ramp with a green/yellow/red gradient), a large token counter, and the
-//! log/event stream.
+//! View 1 — Live Monitor & Telemetry (blueprint §6) + the **Benchmark
+//! Sequence** panel.
 //!
-//! Every panel reads the shared `ArcSwap<MetricsSnapshot>` (Chunk 6) lock-free
-//! via `MetricsState::load()`; the panel geometry matches the blueprint
-//! mockup.
+//! The top of the view is the sequence header: which engine is running,
+//! its phase, a live progress bar, and the current engine's progress
+//! line (e.g. `ENGINE A: SPEED — Running — Iteration 2/5`). The queue
+//! panel lists every engine in the run with `✓` (complete, with its
+//! summary), `▶` (running) or `○` (queued) markers. Below, the classic
+//! telemetry panels show **real** data from the *currently running*
+//! engine only: the engines publish live [`MetricsSnapshot`]s to the
+//! shared `ArcSwap` seam (Chunk 6) and the log stream carries the
+//! executor's real events.
+//!
+//! Every panel reads the shared state lock-free (the
+//! [`crate::engines::sequence::SeqStateSlot`] for the sequence, the
+//! `MetricsState` for the telemetry) — the render loop never blocks and
+//! never touches the timing path (measurement-isolation invariant,
+//! blueprint §4).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -17,6 +26,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{MetricsSnapshot, StreamMetric, StreamStatus};
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{palette, style};
@@ -30,40 +40,265 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(30), // telemetry gauges | ITL gauge bars + distribution
-            Constraint::Percentage(30), // active streams monitor
-            Constraint::Percentage(25), // throughput sparkline | token counter
+            Constraint::Length(3),      // sequence header + progress bar
+            Constraint::Percentage(32), // gauges | ITL | benchmark queue
+            Constraint::Percentage(24), // active streams monitor
+            Constraint::Percentage(18), // throughput sparkline | token counter
             Constraint::Percentage(15), // log & event stream
         ])
         .split(area);
 
-    render_top(rows[0], m, f);
-    render_streams(rows[1], m, f);
-    render_bottom(rows[2], m, f);
-    render_log(rows[3], app, f);
+    render_sequence_header(rows[0], app, f);
+    render_top(rows[1], m, app, f);
+    render_streams(rows[2], m, f);
+    render_bottom(rows[3], m, f);
+    render_log(rows[4], app, f);
 }
 
-/// Top row: telemetry gauges (left) + ITL distribution (right).
-fn render_top(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+// ── Benchmark Sequence: header, progress bar, queue ──────────────────────
+
+/// The 10-frame braille spinner (the "alive" pulse of the running state).
+const SPINNERS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Top: the sequence header — current engine + phase + progress line,
+/// with a visual progress bar. The border pulses (accent) while an
+/// engine runs, turns green on completion, and magenta when the whole
+/// sequence is done.
+fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+
+    // (marker, marker style, text, text style, bar ratio, border style)
+    let (marker, marker_style, text, text_style, ratio, border_style) = match app.seq.load() {
+        None => (
+            "○".to_string(),
+            style::footer(),
+            "No benchmark running — launch from Setup or press r".to_string(),
+            style::footer(),
+            0.0,
+            style::border(),
+        ),
+        Some(state) => seq_header_parts(&state, app.tick),
+    };
+
+    // The progress bar: `[████████░░░░]  40%` — sized to the remaining
+    // width after the text (never negative; small terminals drop it).
+    let inner_width = (area.width - 2) as usize;
+    let bar_width = inner_width
+        .saturating_sub(text.chars().count() + marker.len() + 8)
+        .clamp(0, 40);
+
+    let mut spans: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(marker.to_string(), marker_style),
+        Span::raw(" "),
+        Span::styled(text, text_style),
+    ];
+    if bar_width > 0 {
+        let filled = (ratio.clamp(0.0, 1.0) * bar_width as f64).round() as usize;
+        let bar_color = match ratio {
+            1.0 => palette::HIGHLIGHT,
+            _ => palette::ACCENT,
+        };
+        let mut bar = String::with_capacity(bar_width + 3);
+        bar.push('[');
+        for i in 0..bar_width {
+            bar.push(if i < filled { '█' } else { '░' });
+        }
+        bar.push(']');
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(bar, Style::default().fg(bar_color)));
+        spans.push(Span::styled(
+            format!("{:4.0}%", ratio * 100.0),
+            style::value(),
+        ));
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(spans))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(" BENCHMARK SEQUENCE "),
+            )
+            .style(Style::default().bg(Color::Black)),
+        area,
+    );
+}
+
+/// The header's (marker, marker style, text, text style, bar ratio,
+/// border style) for a [`SeqState`].
+fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Style, f64, Style) {
+    match state.phase {
+        SeqPhase::Idle => (
+            "○".to_string(),
+            style::footer(),
+            "Idle — press r to run the selected engines".to_string(),
+            style::footer(),
+            0.0,
+            style::border(),
+        ),
+        SeqPhase::Running => {
+            let spinner = SPINNERS[(tick as usize / 6) % SPINNERS.len()].to_string();
+            let progress_text = state
+                .progress
+                .as_ref()
+                .map(|p| p.label())
+                .unwrap_or_else(|| "starting…".to_string());
+            let ratio = state.progress.as_ref().map(|p| p.fraction()).unwrap_or(0.0);
+            (
+                spinner,
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+                format!(
+                    "{} — {} — {progress_text}",
+                    state.engine.title(),
+                    SeqPhase::Running.label()
+                ),
+                style::value(),
+                ratio,
+                style::active_border(),
+            )
+        }
+        SeqPhase::Complete => (
+            "✓".to_string(),
+            style::value_ok(),
+            format!(
+                "{} — {} — {}",
+                state.engine.title(),
+                SeqPhase::Complete.label(),
+                state.summary
+            ),
+            style::value(),
+            1.0,
+            style::value_ok(),
+        ),
+        SeqPhase::AllComplete => (
+            "✓".to_string(),
+            style::highlight(),
+            format!("ALL BENCHMARKS COMPLETE — {}", state.summary),
+            style::value(),
+            1.0,
+            style::highlight(),
+        ),
+    }
+}
+
+/// The queue panel: one line per engine in the run — `✓` completed
+/// (with its summary), `▶` the running one (with its live progress),
+/// `○` the rest (queued). Before a run starts, the full default queue is
+/// shown, dimmed.
+fn render_queue(area: Rect, app: &App, f: &mut Frame) {
+    if area.width < 12 || area.height < 3 {
+        return;
+    }
+    let state = app.seq.load();
+    let queue = state
+        .as_ref()
+        .map(|s| s.queue.clone())
+        .unwrap_or_else(|| Engine::ALL.to_vec());
+    let lines: Vec<Line> = queue
+        .iter()
+        .map(|engine| queue_line(state.as_deref(), engine))
+        .collect();
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(style::border())
+                    .title(" BENCHMARK QUEUE "),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// One queue line for `engine`, styled by its state in `state`.
+fn queue_line(state: Option<&SeqState>, engine: &Engine) -> Line<'static> {
+    match state {
+        None => Line::from(vec![
+            Span::styled("○ ", style::footer()),
+            Span::styled(engine.label().to_string(), style::footer()),
+            Span::styled("  (not started)", style::footer()),
+        ]),
+        Some(state) => {
+            if let Some((_, summary)) = state.completed.iter().find(|(e, _)| e == engine) {
+                // Completed: green check + the engine's summary.
+                Line::from(vec![
+                    Span::styled("✓ ", style::value_ok()),
+                    Span::styled(engine.label().to_string(), style::value_ok()),
+                    Span::styled(format!("  {summary}"), style::footer()),
+                ])
+            } else if state.engine == *engine && state.phase != SeqPhase::Idle {
+                // The current engine (running, or briefly on its summary
+                // hold before the queue advances).
+                let progress = state
+                    .progress
+                    .as_ref()
+                    .map(|p| p.label())
+                    .unwrap_or_else(|| state.summary.clone());
+                Line::from(vec![
+                    Span::styled(
+                        "▶ ",
+                        Style::default()
+                            .fg(palette::ACCENT)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        engine.label().to_string(),
+                        Style::default()
+                            .fg(palette::ACCENT)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  {progress}"), style::value_warn()),
+                ])
+            } else {
+                // Queued (or the Idle state's placeholder queue).
+                Line::from(vec![
+                    Span::styled("○ ", style::footer()),
+                    Span::styled(engine.label().to_string(), style::footer()),
+                    Span::styled("  (queued)", style::footer()),
+                ])
+            }
+        }
+    }
+}
+
+// ── Telemetry panels (real data from the current engine) ─────────────────
+
+/// Top row: telemetry gauges (left) + ITL distribution (middle) + the
+/// benchmark queue (right).
+fn render_top(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([
+            Constraint::Percentage(32), // gauges
+            Constraint::Percentage(34), // ITL (the 38-char title needs this)
+            Constraint::Fill(1),        // queue (the rest)
+        ])
         .split(area);
     render_gauges(cols[0], m, f);
     render_itl(cols[1], m, f);
+    render_queue(cols[2], app, f);
 }
 
 fn kv(label: &str, value: String, value_style: Style) -> Line<'static> {
+    // The gauges column is ~38 wide (the 3-column top row), so the label
+    // carries its own two-space gap — no fixed padding column.
     Line::from(vec![
-        Span::styled(format!("{label:<22} "), style::label()),
+        Span::styled(format!("{label}  "), style::label()),
         Span::styled(value, value_style),
     ])
 }
 
 /// Top-left: aggregate throughput, active streams, GPU clock, power
 /// (with J/token), and the VRAM capacity bar (blueprint §6 View 1
-/// "Key Metrics": aggregate t/s, VRAM bar, GPU core frequency,
-/// energy efficiency).
+/// "Key Metrics"). All values are from the *currently running* engine's
+/// live snapshots (plus the continuous hardware poller's telemetry).
 fn render_gauges(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     // Guard the 0-total case (no GPU telemetry) so the ratio is a real
     // number: graceful degradation to a 0% bar, never a NaN ratio
@@ -133,7 +368,7 @@ fn render_gauges(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     );
 }
 
-/// Top-right: ITL percentile gauge bars (p50/p90/p99) + histogram.
+/// Top-middle: ITL percentile gauge bars (p50/p90/p99) + histogram.
 ///
 /// The three one-row [`Gauge`] bars are scaled against the widest
 /// percentile (p99.9) and carry the green (p50) → yellow (p90) → red
@@ -206,7 +441,8 @@ fn render_itl(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
 }
 
 /// Mid-panel: per-stream matrix (ID, type, state, PP/TG, TTFT, gen speed,
-/// MTP rate, progress).
+/// MTP rate, progress) — the *real* streams of the currently running
+/// engine (the engines publish their live stream rows to the snapshot).
 fn render_streams(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let mut rows: Vec<Row> = vec![Row::new(vec![
         Cell::from("ID"),
@@ -374,7 +610,9 @@ fn grouped(v: u64) -> String {
     out
 }
 
-/// Bottom: scrolling log / event stream.
+/// Bottom: scrolling log / event stream — the executor's *real* events
+/// (engine starts, completions, summaries), drained from the mpsc pipe
+/// on the tick path (never pre-generated).
 fn render_log(area: Rect, app: &App, f: &mut Frame) {
     f.render_widget(
         Paragraph::new(Text::from(app.log.clone()))
@@ -414,6 +652,7 @@ pub(crate) fn throughput_color(ratio: f64) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::sequence::EngineProgress;
 
     #[test]
     fn block_char_maps_ratio_onto_the_ramp() {
@@ -433,5 +672,106 @@ mod tests {
         assert_eq!(throughput_color(0.4), palette::WARN);
         assert_eq!(throughput_color(0.2), palette::ERR);
         assert_eq!(throughput_color(0.0), palette::ERR);
+    }
+
+    // ── sequence header / queue parts (pure logic) ──────────────────────
+
+    #[test]
+    fn header_running_state_shows_engine_phase_and_progress() {
+        let state = SeqState {
+            phase: SeqPhase::Running,
+            queue: vec![Engine::Speed],
+            engine: Engine::Speed,
+            progress: Some(EngineProgress::Speed {
+                iteration: 2,
+                total: 5,
+                tokens: 248,
+            }),
+            summary: String::new(),
+            completed: Vec::new(),
+        };
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        assert!(text.contains("ENGINE A: SPEED"), "{text}");
+        assert!(text.contains("Running"), "{text}");
+        assert!(text.contains("Iteration 2/5 · 248 tok"), "{text}");
+        assert!((ratio - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn header_complete_state_carries_the_summary() {
+        let state = SeqState {
+            phase: SeqPhase::Complete,
+            queue: vec![Engine::Speed, Engine::Concurrency],
+            engine: Engine::Speed,
+            progress: None,
+            summary: "100.0 t/s decode".to_string(),
+            completed: vec![(Engine::Speed, "100.0 t/s decode".to_string())],
+        };
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        assert!(text.contains("ENGINE A: SPEED"), "{text}");
+        assert!(text.contains("Complete"), "{text}");
+        assert!(text.contains("100.0 t/s decode"), "{text}");
+        assert_eq!(ratio, 1.0);
+    }
+
+    #[test]
+    fn header_all_complete_marks_the_whole_run() {
+        let state = SeqState {
+            phase: SeqPhase::AllComplete,
+            queue: vec![Engine::Speed],
+            engine: Engine::Speed,
+            progress: None,
+            summary: String::new(),
+            completed: Vec::new(),
+        };
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        assert!(text.contains("ALL BENCHMARKS COMPLETE"), "{text}");
+        assert_eq!(ratio, 1.0);
+    }
+
+    #[test]
+    fn queue_line_marks_completed_running_and_queued() {
+        let state = SeqState {
+            phase: SeqPhase::Running,
+            queue: vec![Engine::Speed, Engine::Concurrency, Engine::Niah],
+            engine: Engine::Concurrency,
+            progress: Some(EngineProgress::Concurrency {
+                level: 8,
+                step: 2,
+                total_steps: 7,
+                active: 8,
+            }),
+            summary: String::new(),
+            completed: vec![(Engine::Speed, "100.0 t/s decode".to_string())],
+        };
+        let done = queue_line(Some(&state), &Engine::Speed);
+        let running = queue_line(Some(&state), &Engine::Concurrency);
+        let queued = queue_line(Some(&state), &Engine::Niah);
+
+        let done_text: String = done.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(done_text.starts_with("✓ "), "{done_text}");
+        assert!(done_text.contains("A: Speed"), "{done_text}");
+        assert!(done_text.contains("100.0 t/s decode"), "{done_text}");
+
+        let running_text: String = running.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(running_text.starts_with("▶ "), "{running_text}");
+        assert!(running_text.contains("B: Concurrency"), "{running_text}");
+        assert!(
+            running_text.contains("Concurrency level 8 (step 2/7)"),
+            "{running_text}"
+        );
+
+        let queued_text: String = queued.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(queued_text.starts_with("○ "), "{queued_text}");
+        assert!(queued_text.contains("C1: NIAH"), "{queued_text}");
+        assert!(queued_text.contains("(queued)"), "{queued_text}");
+    }
+
+    #[test]
+    fn queue_line_before_any_run_is_dimmed_not_started() {
+        let line = queue_line(None, &Engine::Speed);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("○ "), "{text}");
+        assert!(text.contains("(not started)"), "{text}");
     }
 }

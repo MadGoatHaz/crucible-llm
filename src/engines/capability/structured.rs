@@ -20,15 +20,18 @@
 //! `StreamWorker` (quanta `T0..Tn` live in the worker); this module only
 //! takes deltas of those records.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 use crate::client::{StreamEvent, StreamWorker};
 use crate::config::Config;
-use crate::engines::speed::EngineError;
+use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::speed::{EngineError, SpeedEngine};
+use crate::metrics::state::MetricsState;
 use crate::sse::Chunk;
-use crate::timing::StreamTimestamps;
+use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
@@ -74,6 +77,13 @@ pub struct StructuredEngine {
     model: String,
     api_key: Option<String>,
     timeout: u64,
+    /// Optional sequence seam: publish `Run {n}/{total}` to the
+    /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
+    progress: Option<Arc<ProgressBus>>,
+    /// Optional TUI seam: publish live single-stream
+    /// [`MetricsState`] snapshots while a run, so the Live Monitor shows
+    /// the current run's real stream data.
+    metrics: Option<Arc<MetricsState>>,
 }
 
 impl StructuredEngine {
@@ -88,7 +98,24 @@ impl StructuredEngine {
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
+            progress: None,
+            metrics: None,
         })
+    }
+
+    /// Attach a [`ProgressBus`] so the two runs report `Run {n}/{total}`
+    /// to the Benchmark Sequence (the TUI's progress bar).
+    pub fn progress(mut self, bus: Arc<ProgressBus>) -> Self {
+        self.progress = Some(bus);
+        self
+    }
+
+    /// Attach a [`MetricsState`] publisher so each run pushes live
+    /// single-stream snapshots to the TUI (the Live Monitor's stream
+    /// matrix / gauges show the current run's real data).
+    pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
+        self.metrics = Some(state);
+        self
     }
 
     /// One run: spawn a worker (optionally with the JSON `response_format`
@@ -110,10 +137,13 @@ impl StructuredEngine {
             worker = worker.response_format("json_object");
         }
 
+        let start = MonotonicInstant::now();
         let outcome = tokio::spawn(worker.run(tx))
             .await
             .expect("structured worker task panicked");
         let mut body = String::new();
+        let mut events = Vec::new();
+        let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
             if let StreamEvent::Frame { frame, .. } = &event {
                 if !frame.done {
@@ -122,6 +152,40 @@ impl StructuredEngine {
                     }
                 }
             }
+            // Publish a live snapshot every 8 events, and immediately on
+            // a terminal event, so the TUI's Live Monitor shows the
+            // current run's real stream data (measurement-isolation
+            // invariant: the render loop only reads the snapshot).
+            let is_terminal = matches!(
+                &event,
+                StreamEvent::Complete { .. } | StreamEvent::Failed { .. }
+            );
+            events.push(event);
+            batch += 1;
+            if let Some(state) = &self.metrics {
+                if batch >= 8 || is_terminal {
+                    state.update(SpeedEngine::single_stream_snapshot(
+                        &self.url,
+                        &self.model,
+                        "Structured",
+                        &events,
+                        &start,
+                        STRUCTURED_MAX_GEN_TOKENS,
+                    ));
+                    batch = 0;
+                }
+            }
+        }
+        // Final publish (the terminal event may have been batched out).
+        if let Some(state) = &self.metrics {
+            state.update(SpeedEngine::single_stream_snapshot(
+                &self.url,
+                &self.model,
+                "Structured",
+                &events,
+                &start,
+                STRUCTURED_MAX_GEN_TOKENS,
+            ));
         }
 
         // §7 timing deltas (the worker owns the quanta stamps).
@@ -142,8 +206,18 @@ impl StructuredEngine {
 
     /// The full evaluation: free-form baseline, then the grammar-
     /// constrained run, plus the compliance check and penalty.
+    ///
+    /// While a [`ProgressBus`] is attached, each run publishes
+    /// `Run {n}/2` — the Benchmark Sequence mirrors it into the TUI's
+    /// progress bar.
     pub async fn run(&self) -> StructuredResult {
+        if let Some(bus) = &self.progress {
+            bus.publish(EngineProgress::Structured { run: 1, total: 2 });
+        }
         let (free_body, free_ttft, free_tps) = self.run_once(false).await;
+        if let Some(bus) = &self.progress {
+            bus.publish(EngineProgress::Structured { run: 2, total: 2 });
+        }
         let (constrained_body, constrained_ttft, constrained_tps) = self.run_once(true).await;
 
         let penalty_pct = if free_tps > 0.0 {

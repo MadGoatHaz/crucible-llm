@@ -39,11 +39,13 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamEvent, StreamWorker};
 use crate::config::Config;
-use crate::engines::speed::EngineError;
+use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::speed::{EngineError, SpeedEngine};
+use crate::metrics::state::MetricsState;
 use crate::prompt::{count_tokens, Tokenizer, BASE_SENTENCES, FILLER};
 use crate::sse::Chunk;
 use crate::storage::models::NeedleEvaluation;
-use crate::timing::StreamTimestamps;
+use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Bounded worker→engine channel capacity (same as Engine A / C2).
 const CHANNEL_CAPACITY: usize = 256;
@@ -459,6 +461,13 @@ pub struct NiahEngine {
     tokenizer: Option<Arc<Tokenizer>>,
     sizes: Vec<u32>,
     depths: Vec<u8>,
+    /// Optional sequence seam: publish `Size …, Depth …` to the
+    /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
+    progress: Option<Arc<ProgressBus>>,
+    /// Optional TUI seam: publish live single-stream
+    /// [`crate::metrics::state::MetricsSnapshot`]s while a cell runs, so
+    /// the Live Monitor shows the current cell's real stream data.
+    metrics: Option<Arc<MetricsState>>,
 }
 
 impl NiahEngine {
@@ -481,6 +490,8 @@ impl NiahEngine {
             tokenizer,
             sizes: NIAH_SIZES.to_vec(),
             depths: NIAH_DEPTHS.to_vec(),
+            progress: None,
+            metrics: None,
         })
     }
 
@@ -496,6 +507,21 @@ impl NiahEngine {
         self
     }
 
+    /// Attach a [`ProgressBus`] so the matrix run reports `Size …,
+    /// Depth …/…` to the Benchmark Sequence (the TUI's progress bar).
+    pub fn progress(mut self, bus: Arc<ProgressBus>) -> Self {
+        self.progress = Some(bus);
+        self
+    }
+
+    /// Attach a [`MetricsState`] publisher so each cell pushes live
+    /// single-stream snapshots to the TUI (the Live Monitor's stream
+    /// matrix / gauges show the current cell's real data).
+    pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
+        self.metrics = Some(state);
+        self
+    }
+
     /// The configured context sizes.
     pub fn sizes_list(&self) -> &[u32] {
         &self.sizes
@@ -508,12 +534,27 @@ impl NiahEngine {
 
     /// Run the full matrix (sequential), returning the scored grid
     /// (states computed against the smallest-size baseline).
+    ///
+    /// While a [`ProgressBus`] is attached, each cell publishes
+    /// `Size …, Depth …/…` — the Benchmark Sequence mirrors it into the
+    /// TUI's progress bar.
     pub async fn run(&self) -> NiahResult {
         let mut result = NiahResult::new(self.sizes.clone(), self.depths.clone());
+        let total_cells = self.sizes.len() * self.depths.len();
         for (si, size) in self.sizes.iter().enumerate() {
             for (di, depth) in self.depths.iter().enumerate() {
+                let cell_idx = si * self.depths.len() + di;
+                if let Some(bus) = &self.progress {
+                    bus.publish(EngineProgress::Niah {
+                        size: *size,
+                        depth: di + 1,
+                        total_depths: self.depths.len(),
+                        cell: cell_idx + 1,
+                        total_cells,
+                    });
+                }
                 let cell = self.run_cell(*size, *depth).await;
-                result.cells[si * self.depths.len() + di] = cell;
+                result.cells[cell_idx] = cell;
             }
         }
         result.compute_states();
@@ -539,10 +580,13 @@ impl NiahEngine {
             worker = worker.api_key(key);
         }
 
+        let start = MonotonicInstant::now();
         let outcome = tokio::spawn(worker.run(tx))
             .await
             .expect("niah worker task panicked");
         let mut response = String::new();
+        let mut events = Vec::new();
+        let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
             if let StreamEvent::Frame { frame, .. } = &event {
                 if !frame.done {
@@ -551,6 +595,40 @@ impl NiahEngine {
                     }
                 }
             }
+            // Publish a live snapshot every 8 events, and immediately on
+            // a terminal event, so the TUI's Live Monitor shows the
+            // current cell's real stream data (measurement-isolation
+            // invariant: the render loop only reads the snapshot).
+            let is_terminal = matches!(
+                &event,
+                StreamEvent::Complete { .. } | StreamEvent::Failed { .. }
+            );
+            events.push(event);
+            batch += 1;
+            if let Some(state) = &self.metrics {
+                if batch >= 8 || is_terminal {
+                    state.update(SpeedEngine::single_stream_snapshot(
+                        &self.url,
+                        &self.model,
+                        "NIAH",
+                        &events,
+                        &start,
+                        NIAH_MAX_GEN_TOKENS,
+                    ));
+                    batch = 0;
+                }
+            }
+        }
+        // Final publish (the terminal event may have been batched out).
+        if let Some(state) = &self.metrics {
+            state.update(SpeedEngine::single_stream_snapshot(
+                &self.url,
+                &self.model,
+                "NIAH",
+                &events,
+                &start,
+                NIAH_MAX_GEN_TOKENS,
+            ));
         }
 
         let retrieved = needle.is_retrieved(&response);
@@ -673,6 +751,8 @@ impl NiahEngineConfig {
             tokenizer,
             sizes: NIAH_SIZES.to_vec(),
             depths: NIAH_DEPTHS.to_vec(),
+            progress: None,
+            metrics: None,
         })
     }
 }

@@ -20,6 +20,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
+use crucible_llm::engines::{Engine, EngineProgress, SeqPhase, SeqState};
 use crucible_llm::metrics::{MetricsSnapshot, StreamMetric, StreamStatus};
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::live;
@@ -54,8 +55,8 @@ fn app_with(snap: MetricsSnapshot) -> App {
 /// (replaces the removed `test_snapshot()` blueprint mock).
 fn test_snapshot() -> MetricsSnapshot {
     let itl_bins = [
-        0.92, 0.86, 0.79, 0.71, 0.62, 0.53, 0.44, 0.36, 0.29, 0.23, 0.18, 0.14, 0.11, 0.08,
-        0.06, 0.045, 0.033, 0.024, 0.017, 0.012, 0.008, 0.005, 0.003, 0.002,
+        0.92, 0.86, 0.79, 0.71, 0.62, 0.53, 0.44, 0.36, 0.29, 0.23, 0.18, 0.14, 0.11, 0.08, 0.06,
+        0.045, 0.033, 0.024, 0.017, 0.012, 0.008, 0.005, 0.003, 0.002,
     ];
     MetricsSnapshot {
         endpoint: "http://127.0.0.1:8000/v1".into(),
@@ -414,4 +415,179 @@ fn token_counter_shows_total_generated() {
     assert!(text.contains("1,332"));
     assert!(text.contains("1,152"));
     assert!(text.contains("4,096"));
+}
+
+// ---- benchmark sequence: header, progress bar, queue panel ----
+
+/// A full A→D queue in the given phase (the shape the executor publishes).
+fn seq_state(
+    phase: SeqPhase,
+    engine: Engine,
+    progress: Option<EngineProgress>,
+    completed: Vec<(Engine, String)>,
+) -> SeqState {
+    SeqState {
+        phase,
+        queue: Engine::ALL.to_vec(),
+        engine,
+        progress,
+        summary: String::new(),
+        completed,
+    }
+}
+
+#[test]
+fn sequence_header_shows_running_engine_progress_and_bar() {
+    let app = app_with(test_snapshot());
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Speed,
+        Some(EngineProgress::Speed {
+            iteration: 2,
+            total: 5,
+            tokens: 248,
+        }),
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("BENCHMARK SEQUENCE"), "header panel");
+    assert!(text.contains("ENGINE A: SPEED"), "current engine name");
+    assert!(text.contains("Running"), "phase");
+    assert!(text.contains("Iteration 2/5"), "progress line");
+    assert!(text.contains("248 tok"), "tokens so far");
+    assert!(text.contains('█'), "progress bar has filled cells");
+    assert!(text.contains('░'), "progress bar has empty cells");
+}
+
+#[test]
+fn sequence_header_shows_each_engine_progress_shape() {
+    let cases = [
+        (
+            Engine::Concurrency,
+            EngineProgress::Concurrency {
+                level: 8,
+                step: 3,
+                total_steps: 7,
+                active: 8,
+            },
+            "Concurrency level 8 (step 3/7)",
+        ),
+        (
+            Engine::Niah,
+            EngineProgress::Niah {
+                size: 4000,
+                depth: 3,
+                total_depths: 11,
+                cell: 13,
+                total_cells: 77,
+            },
+            "Size 4k, Depth 3/11",
+        ),
+        (
+            Engine::Reasoning,
+            EngineProgress::Reasoning {
+                challenge: 5,
+                total: 13,
+            },
+            "Challenge 5/13",
+        ),
+        (
+            Engine::Structured,
+            EngineProgress::Structured { run: 2, total: 2 },
+            "Run 2/2",
+        ),
+        (
+            Engine::Hardware,
+            EngineProgress::Sampling { elapsed: 2.5 },
+            "Sampling… 2.5s",
+        ),
+    ];
+    for (engine, progress, expect) in cases {
+        let app = app_with(test_snapshot());
+        app.seq.store(seq_state(
+            SeqPhase::Running,
+            engine,
+            Some(progress),
+            Vec::new(),
+        ));
+        let text = buf_text(&render_live(&app, W, H));
+        assert!(
+            text.contains(engine.title()),
+            "header names {engine:?}: {text}"
+        );
+        assert!(text.contains(expect), "missing {expect:?}: {text}");
+    }
+}
+
+#[test]
+fn sequence_queue_marks_completed_running_and_queued() {
+    let app = app_with(test_snapshot());
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Niah,
+        Some(EngineProgress::Niah {
+            size: 4000,
+            depth: 3,
+            total_depths: 11,
+            cell: 13,
+            total_cells: 77,
+        }),
+        vec![
+            (Engine::Speed, "847 t/s decode".to_string()),
+            (Engine::Concurrency, "sweet spot 16 streams".to_string()),
+        ],
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("BENCHMARK QUEUE"), "queue panel");
+    // Completed entries carry a check + summary.
+    assert!(text.contains("A: Speed"), "completed A in queue");
+    assert!(text.contains("847 t/s decode"), "A's summary");
+    assert!(text.contains("B: Concurrency"), "completed B in queue");
+    assert!(text.contains("sweet spot 16 streams"), "B's summary");
+    // The running entry is highlighted; the rest are queued.
+    assert!(text.contains("▶"), "running marker");
+    assert!(text.contains("C1: NIAH"), "running C1 in queue");
+    assert!(text.contains("○"), "queued marker");
+    assert!(text.contains("C2: Reasoning"), "queued C2 in queue");
+    assert!(text.contains("D: Energy"), "queued D in queue");
+}
+
+#[test]
+fn sequence_all_complete_header_wins() {
+    let app = app_with(test_snapshot());
+    let mut state = seq_state(SeqPhase::AllComplete, Engine::Hardware, None, Vec::new());
+    state.summary = "6 of 6 engines complete".to_string();
+    app.seq.store(state);
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("ALL BENCHMARKS COMPLETE"));
+    assert!(text.contains("6 of 6 engines complete"));
+}
+
+#[test]
+fn sequence_idle_before_any_run_shows_a_hint() {
+    // A fresh App has never started a sequence: the header offers the
+    // launch hint and the queue shows the full default list, dimmed.
+    let app = app_with(test_snapshot());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("No benchmark running"));
+    assert!(text.contains("A: Speed"));
+    assert!(text.contains("D: Energy"));
+}
+
+#[test]
+fn sequence_ui_survives_small_terminals() {
+    let app = app_with(test_snapshot());
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Speed,
+        Some(EngineProgress::Speed {
+            iteration: 2,
+            total: 5,
+            tokens: 248,
+        }),
+        Vec::new(),
+    ));
+    for (w, h) in [(40, 10), (20, 6), (80, 24)] {
+        let _ = render_live(&app, w, h);
+    }
 }

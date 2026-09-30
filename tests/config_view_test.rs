@@ -26,6 +26,7 @@ use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
 use crucible_llm::config::Config;
+use crucible_llm::engines::Engine;
 use crucible_llm::ui::app::{App, View};
 use crucible_llm::ui::views::config::{ConfigKeyResult, ConfigState, Field};
 
@@ -360,9 +361,16 @@ async fn run_key_triggers_only_the_selected_engines() {
 
     let action = app.handle_key(&key(KeyCode::Char('r')));
     assert_eq!(action, crucible_llm::ui::app::KeyAction::Run);
-    // Engine A started (its slot is marked running synchronously).
-    assert!(app.speed_slot.is_running());
-    // The non-selected engines did not start.
+    // The sequential executor is in progress (marked synchronously by
+    // `start_run` before the `tokio::spawn`).
+    assert!(app.seq.is_running());
+    // The queue holds exactly the selected engines, in the canonical
+    // A → D order — the non-selected engines never run.
+    assert_eq!(
+        app.seq.load().unwrap().queue,
+        vec![Engine::Speed, Engine::Hardware]
+    );
+    // The non-selected engines' slots are not marked running.
     assert!(!app.sweep.is_running());
     assert!(!app.niah.is_running());
     assert!(!app.reasoning_slot.is_running());
@@ -380,7 +388,11 @@ async fn f5_in_the_config_view_also_runs() {
 
     let action = app.handle_key(&key(KeyCode::F(5)));
     assert_eq!(action, crucible_llm::ui::app::KeyAction::Run);
-    assert!(app.speed_slot.is_running());
+    assert!(app.seq.is_running());
+    assert_eq!(
+        app.seq.load().unwrap().queue,
+        vec![Engine::Speed, Engine::Hardware]
+    );
 }
 
 #[tokio::test]
@@ -395,7 +407,8 @@ async fn no_engines_selected_logs_a_warning() {
     app.config.hardware = false;
     let action = app.handle_key(&key(KeyCode::Char('r')));
     assert_eq!(action, crucible_llm::ui::app::KeyAction::Run);
-    // Nothing started.
+    // Nothing started (no sequence, no engine slots).
+    assert!(!app.seq.is_running());
     assert!(!app.speed_slot.is_running());
     assert!(!app.sweep.is_running());
     // A warning was logged.

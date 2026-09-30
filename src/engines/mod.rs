@@ -34,6 +34,7 @@ use crate::metrics::state::MetricsState;
 pub mod capability;
 pub mod concurrency;
 pub mod hardware;
+pub mod sequence;
 pub mod speed;
 
 pub use capability::{
@@ -50,6 +51,10 @@ pub use concurrency::{
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
+};
+pub use sequence::{
+    queue_for, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunSlots, SeqPhase,
+    SeqState, SeqStateSlot,
 };
 pub use speed::{
     aggregate, all_failed, format_result_box, format_summary, json_report, EngineError,

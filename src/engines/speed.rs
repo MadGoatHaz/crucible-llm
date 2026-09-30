@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamError, StreamEvent, StreamOutcome, StreamWorker};
 use crate::config::{Config, Mode};
+use crate::engines::sequence::{EngineProgress, ProgressBus};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
@@ -129,6 +130,10 @@ pub struct SpeedEngine {
     /// Optional TUI seam: publish live [`MetricsSnapshot`]s while the
     /// engine runs (the render loop reads them lock-free).
     metrics: Option<Arc<MetricsState>>,
+    /// Optional sequence seam: publish [`EngineProgress`] (iteration /
+    /// tokens) to the [`ProgressBus`] the Benchmark Sequence mirrors into
+    /// the TUI's sequence header (the render loop reads it lock-free).
+    progress: Option<Arc<ProgressBus>>,
 }
 
 impl SpeedEngine {
@@ -151,6 +156,7 @@ impl SpeedEngine {
             client,
             generator,
             metrics: None,
+            progress: None,
         })
     }
 
@@ -160,6 +166,14 @@ impl SpeedEngine {
     /// leaves it `None`.
     pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
         self.metrics = Some(state);
+        self
+    }
+
+    /// Attach a [`ProgressBus`] so the engine reports `Iteration
+    /// {current}/{total}` + tokens generated to the Benchmark Sequence
+    /// (the TUI's progress bar). The headless path leaves it `None`.
+    pub fn progress(mut self, bus: Arc<ProgressBus>) -> Self {
+        self.progress = Some(bus);
         self
     }
 
@@ -236,6 +250,29 @@ impl SpeedEngine {
     /// Build a live [`MetricsSnapshot`] from the events collected so far
     /// (single-stream Engine A → the TUI's Live Monitor).
     fn live_snapshot(&self, events: &[StreamEvent], start: &MonotonicInstant) -> MetricsSnapshot {
+        Self::single_stream_snapshot(
+            &self.cfg.url,
+            &self.cfg.model,
+            self.cfg.mode.label(),
+            events,
+            start,
+            MAX_GEN_TOKENS,
+        )
+    }
+
+    /// Build a live single-stream [`MetricsSnapshot`] from the events
+    /// collected so far — the shared TUI seam for the one-stream engines
+    /// (A, C1, C2, C3): the Live Monitor's gauges / ITL distribution /
+    /// stream matrix / token counter all read it lock-free while the
+    /// current engine runs (measurement-isolation invariant, blueprint §4).
+    pub fn single_stream_snapshot(
+        endpoint: &str,
+        model: &str,
+        mode: &str,
+        events: &[StreamEvent],
+        start: &MonotonicInstant,
+        max_tokens: u32,
+    ) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let mut itl = LatencyHistogram::default();
         let mut token_frames = 0u64;
@@ -255,8 +292,7 @@ impl SpeedEngine {
                     at,
                     timestamps,
                 } => {
-                    let is_tok =
-                        matches!(&frame.chunk, Chunk::Reasoning(_) | Chunk::Content(_));
+                    let is_tok = matches!(&frame.chunk, Chunk::Reasoning(_) | Chunk::Content(_));
                     if is_tok {
                         if let Some(prev) = last_token_at {
                             itl.record(prev.delta_nanos(at));
@@ -300,9 +336,7 @@ impl SpeedEngine {
             }
         }
 
-        let tokens = usage
-            .map(|u| u.completion_tokens)
-            .unwrap_or(token_frames);
+        let tokens = usage.map(|u| u.completion_tokens).unwrap_or(token_frames);
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
         let gen_tps = match (t3, t_end) {
@@ -324,7 +358,7 @@ impl SpeedEngine {
         let progress = if state == StreamStatus::Done {
             1.0
         } else {
-            (tokens as f64 / MAX_GEN_TOKENS as f64).min(1.0)
+            (tokens as f64 / max_tokens.max(1) as f64).min(1.0)
         };
         let kind = if reasoning_frames > content_frames {
             "Reasoning"
@@ -335,12 +369,16 @@ impl SpeedEngine {
         };
 
         MetricsSnapshot {
-            endpoint: self.cfg.url.clone(),
+            endpoint: endpoint.to_string(),
             backend: "vLLM".to_string(),
-            model: self.cfg.model.clone(),
-            mode: self.cfg.mode.label().to_string(),
+            model: model.to_string(),
+            mode: mode.to_string(),
             aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),
-            active_streams: (state == StreamStatus::Streaming).then(|| 1).unwrap_or(0),
+            active_streams: if state == StreamStatus::Streaming {
+                1
+            } else {
+                0
+            },
             total_streams: 1,
             itl_p50_ns: itl.p50() as u64,
             itl_p90_ns: itl.p90() as u64,
@@ -365,12 +403,33 @@ impl SpeedEngine {
     }
 
     /// All `iterations` runs (sequential — single-stream engine).
+    ///
+    /// While a [`ProgressBus`] is attached, each iteration publishes
+    /// `Iteration {i}/{total}` plus the running token count — the
+    /// Benchmark Sequence mirrors it into the TUI's progress bar.
     pub async fn run(&self) -> (GeneratedPrompt, Vec<SpeedResult>) {
         let prompt = self.generate_prompt();
         let iterations = self.cfg.iterations.max(1) as usize;
         let mut results = Vec::with_capacity(iterations);
-        for _ in 0..iterations {
-            results.push(self.run_iteration(&prompt).await);
+        let mut tokens = 0u64;
+        for i in 0..iterations {
+            if let Some(bus) = &self.progress {
+                bus.publish(EngineProgress::Speed {
+                    iteration: i + 1,
+                    total: iterations,
+                    tokens,
+                });
+            }
+            let r = self.run_iteration(&prompt).await;
+            tokens += r.completion_tokens;
+            if let Some(bus) = &self.progress {
+                bus.publish(EngineProgress::Speed {
+                    iteration: i + 1,
+                    total: iterations,
+                    tokens,
+                });
+            }
+            results.push(r);
         }
         (prompt, results)
     }
