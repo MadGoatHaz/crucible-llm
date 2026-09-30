@@ -44,5 +44,14 @@ default = []
 nvml = ["dep:nvml-wrapper"]
 
 [profile.release]
+# The standalone release binary (plan Chunk 19): thin LTO + a single
+# codegen unit for cross-crate optimization, stripped symbols, no debug
+# info. `panic = "abort"` is deliberately NOT set — the TUI relies on
+# `catch_unwind` to guarantee terminal restore, so unwind stays enabled.
+# Zero runtime dependencies: SQLite is bundled (no system lib), NVML is
+# feature-gated and absent by default (blueprint §3).
+opt-level = 3
 lto = "thin"
 codegen-units = 1
+strip = true
+debug = false
