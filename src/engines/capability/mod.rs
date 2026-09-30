@@ -14,6 +14,11 @@ pub mod niah;
 pub mod reasoning;
 pub mod structured;
 
+pub use niah::{
+    build_document, classify, Needle, NiahCell, NiahCellState, NiahDocument, NiahEngine,
+    NiahEngineConfig, NiahResult, NiahSlot, NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES,
+    PREFILL_THROTTLE_FACTOR,
+};
 pub use reasoning::{
     score_responses, Challenge, Checker, ReasoningEngine, ReasoningResult, ReasoningScore,
     REASONING_BANK, REASONING_MAX_GEN_TOKENS,

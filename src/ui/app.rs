@@ -19,8 +19,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::config::ExportFormat;
-use crate::engines::SweepResult;
+use crate::config::{Config, ExportFormat};
+use crate::engines::{NiahEngineConfig, NiahSlot, SweepResult};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
@@ -145,6 +145,13 @@ pub struct App {
     /// is first opened (lazy DB load) — or the DB is unavailable, in
     /// which case the view renders its placeholder.
     pub history: Option<HistoryState>,
+    /// Lock-free NIAH result holder (Chunk 15): the `n`-key background
+    /// runner publishes a completed matrix here; View 3 reads it
+    /// lock-free (measurement-isolation invariant, blueprint §4).
+    pub niah: Arc<NiahSlot>,
+    /// The NIAH-relevant config snapshot for spawning background runs
+    /// (`n` key). `None` until the entry point supplies one.
+    pub niah_config: Option<NiahEngineConfig>,
 }
 
 impl Default for App {
@@ -187,7 +194,16 @@ impl App {
             sweep: None,
             export_format: ExportFormat::default(),
             history: None,
+            niah: Arc::new(NiahSlot::new()),
+            niah_config: None,
         }
+    }
+
+    /// Supply the NIAH-relevant config snapshot (Chunk 15) so the `n`
+    /// key can spawn a background matrix run against the target endpoint.
+    pub fn with_niah_config(mut self, cfg: &Config) -> Self {
+        self.niah_config = Some(NiahEngineConfig::from_config(cfg));
+        self
     }
 
     /// Lazily load the History view state (Chunk 14): open the default
@@ -211,6 +227,65 @@ impl App {
     pub fn with_export_format(mut self, format: ExportFormat) -> Self {
         self.export_format = format;
         self
+    }
+
+    /// The `n` key (blueprint §6 footer: "[N] New Needle Test"): spawn a
+    /// background NIAH matrix run (Chunk 15, Engine C1).
+    ///
+    /// This is a *key-path* action (never the render path): the runner
+    /// task publishes its result to the lock-free [`NiahSlot`] when done,
+    /// and View 3 reads it — so a running matrix never perturbs the 60Hz
+    /// render loop or the timing path (measurement-isolation invariant,
+    /// blueprint §4). Re-pressing `n` while a run is in progress is a
+    /// no-op (logged).
+    pub fn start_niah(&mut self) {
+        if self.niah.is_running() {
+            self.push_log(
+                "[niah] already running — one size × depth cell at a time".to_string(),
+                style::value_warn(),
+            );
+            return;
+        }
+        let config = match self.niah_config.clone() {
+            Some(c) => c,
+            None => {
+                self.push_log(
+                    "[niah] no target configured — set --url first".to_string(),
+                    style::value_warn(),
+                );
+                return;
+            }
+        };
+        let engine = match config.engine() {
+            Ok(e) => e,
+            Err(e) => {
+                self.push_log(
+                    format!("[niah] engine init failed: {e}"),
+                    style::value_err(),
+                );
+                return;
+            }
+        };
+        let sizes = engine.sizes_list().to_vec();
+        let depths = engine.depths_list().to_vec();
+        let slot = self.niah.clone();
+        self.niah.set_running(true);
+        self.push_log(
+            format!(
+                "[niah] started: {} sizes × {} depths → {}",
+                sizes.len(),
+                depths.len(),
+                config.url
+            ),
+            style::value_ok(),
+        );
+        // The runner owns the slot handle; on completion it clears the
+        // running flag and publishes the scored grid.
+        tokio::spawn(async move {
+            let result = engine.run().await;
+            slot.set_running(false);
+            slot.store(result);
+        });
     }
 
     /// Handle one terminal key event (blueprint §6 footer key map).

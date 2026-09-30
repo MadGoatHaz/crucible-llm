@@ -97,10 +97,15 @@ impl EventLoop {
                                     );
                                 }
                             }
+                            // `n` (Chunk 15): spawn a background NIAH
+                            // matrix run; the runner publishes to the
+                            // lock-free slot View 3 reads.
+                            KeyAction::NewNeedle => {
+                                app.start_niah();
+                            }
                             KeyAction::Continue
                             | KeyAction::PauseResume
                             | KeyAction::StepConcurrency
-                            | KeyAction::NewNeedle
                             | KeyAction::HistoryNext
                             | KeyAction::HistoryPrev
                             | KeyAction::HistorySelectA

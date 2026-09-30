@@ -263,7 +263,9 @@ fn run_tui(cfg: &Config) -> bool {
             .expect("failed to build tokio runtime");
         runtime.block_on(async {
             let mut event_loop = EventLoop::new()?;
-            let mut app = App::new().with_export_format(export_format);
+            let mut app = App::new()
+                .with_export_format(export_format)
+                .with_niah_config(cfg);
             event_loop.run(&mut app).await?;
             event_loop.teardown()
         })

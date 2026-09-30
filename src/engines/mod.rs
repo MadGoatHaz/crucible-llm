@@ -19,9 +19,11 @@ pub mod hardware;
 pub mod speed;
 
 pub use capability::{
-    is_json_compliant, score_responses, Challenge, Checker, ReasoningEngine, ReasoningResult,
-    ReasoningScore, StructuredEngine, StructuredResult, REASONING_BANK, REASONING_MAX_GEN_TOKENS,
-    REQUIRED_FIELDS, STRUCTURED_MAX_GEN_TOKENS, STRUCTURED_TASK,
+    build_document, classify, is_json_compliant, score_responses, Challenge, Checker, Needle,
+    NiahCell, NiahCellState, NiahDocument, NiahEngine, NiahEngineConfig, NiahResult, NiahSlot,
+    ReasoningEngine, ReasoningResult, ReasoningScore, StructuredEngine, StructuredResult,
+    NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR, REASONING_BANK,
+    REASONING_MAX_GEN_TOKENS, REQUIRED_FIELDS, STRUCTURED_MAX_GEN_TOKENS, STRUCTURED_TASK,
 };
 pub use concurrency::{
     normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, DEFAULT_LADDER,
