@@ -264,6 +264,8 @@ impl ConfigState {
             headless: None,
             export: None,
             export_path: None,
+            // The log dir is a CLI/env concern — never persisted from the form.
+            log_dir: None,
             ladder,
             hardware: Some(self.hardware),
             engines: Some(EngineSelection {

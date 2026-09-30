@@ -30,12 +30,14 @@
 //! treats a closed channel as a stop signal, so a cancelled sweep tears the
 //! pool down cleanly.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::join_all;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::log::RunLogger;
 use crate::sse::{ParsedFrame, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -139,7 +141,7 @@ pub type WorkerSupervisor = JoinHandle<Vec<StreamOutcome>>;
 /// [`spawn`](Self::spawn) a level of the concurrency ladder. The pool is
 /// `Clone` (the `reqwest::Client` inside is a cheap `Arc`) so a sweep can
 /// reuse the same client across ladder levels.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkerPool {
     client: reqwest::Client,
     endpoint: String,
@@ -151,6 +153,30 @@ pub struct WorkerPool {
     retries: u32,
     /// Aggregate fan-in channel capacity.
     capacity: usize,
+    /// Optional run logger shared by every worker (HTTP / SSE lifecycle
+    /// lines). `Debug` is implemented manually below (`RunLogger` has no
+    /// `Clone`-free `Debug` derive issue, but the field is printed by
+    /// hand to keep the derive simple).
+    logger: Option<Arc<RunLogger>>,
+    /// The per-worker max lifetime (the sweep's timeout fix): a worker
+    /// that has not finished within this window is killed and recorded
+    /// as a timeout failure. `None` (the default) means no cap.
+    worker_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for WorkerPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerPool")
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("read_timeout", &self.read_timeout)
+            .field("retries", &self.retries)
+            .field("capacity", &self.capacity)
+            .field("logger", &self.logger.is_some())
+            .field("worker_timeout", &self.worker_timeout)
+            .finish()
+    }
 }
 
 impl WorkerPool {
@@ -175,6 +201,8 @@ impl WorkerPool {
             read_timeout: DEFAULT_READ_TIMEOUT,
             retries: 0,
             capacity: DEFAULT_AGGREGATE_CAPACITY,
+            logger: None,
+            worker_timeout: None,
         }
     }
 
@@ -202,6 +230,28 @@ impl WorkerPool {
         self
     }
 
+    /// Attach the shared run logger: every worker then records its HTTP /
+    /// SSE lifecycle lines (tagged with its worker tag).
+    pub fn logger(mut self, logger: Arc<RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// The per-worker max lifetime (the sweep's timeout fix). A worker
+    /// that has not finished within `d` is killed (`tokio::time::timeout`
+    /// drops its future, closing its socket) and recorded as a
+    /// [`StreamError::WorkerTimeout`] failure with its partial results.
+    /// `None` (the default) leaves workers unbounded.
+    pub fn worker_timeout(mut self, d: Duration) -> Self {
+        self.worker_timeout = Some(d);
+        self
+    }
+
+    /// The pool's per-worker max lifetime (for the sweep's step budget).
+    pub fn worker_timeout_cap(&self) -> Option<Duration> {
+        self.worker_timeout
+    }
+
     /// The pool's target endpoint.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -217,8 +267,14 @@ impl WorkerPool {
         self.max_tokens
     }
 
-    /// Build one [`StreamWorker`] for this pool's target.
+    /// Build one [`StreamWorker`] for this pool's target (tag `stream`).
     pub fn worker(&self) -> StreamWorker {
+        self.worker_tagged("stream")
+    }
+
+    /// Build one [`StreamWorker`] for this pool's target with the given
+    /// log tag (e.g. `B5-3` — Engine B, step 5, worker 3).
+    pub fn worker_tagged(&self, tag: &str) -> StreamWorker {
         let mut worker = StreamWorker::new(
             self.client.clone(),
             &self.endpoint,
@@ -227,49 +283,108 @@ impl WorkerPool {
             self.max_tokens,
         )
         .read_timeout(self.read_timeout)
-        .retries(self.retries);
+        .retries(self.retries)
+        .tag(tag);
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key.clone());
+        }
+        if let Some(logger) = &self.logger {
+            worker = worker.logger(logger.clone());
         }
         worker
     }
 
-    /// Spawn `n` concurrent workers.
+    /// Spawn `n` concurrent workers (log tag prefix `pool`).
     ///
     /// Returns:
     /// * the **aggregate** bounded receiver — one [`PoolEvent`] per worker
     ///   event, tagged with the worker id; it closes (yields `None`) when
-    ///   every worker has finished;
+    ///   every worker has finished (or been killed by the per-worker
+    ///   timeout, if one is set);
     /// * the [`WorkerSupervisor`] — awaiting it gives the per-worker
     ///   [`StreamOutcome`]s and marks the true end of the level.
     ///
     /// `n == 0` is valid (an empty level): the receiver closes immediately
     /// and the supervisor resolves to an empty outcome list.
     pub fn spawn(self, n: usize) -> (mpsc::Receiver<PoolEvent>, WorkerSupervisor) {
+        self.spawn_tagged(n, "pool")
+    }
+
+    /// [`spawn`](Self::spawn) with a per-worker log tag prefix: worker
+    /// `id` is tagged `{prefix}-{id}` in its HTTP / SSE log lines (the
+    /// sweep passes `B{step}` so a step-5 worker 3 logs as `B5-3`).
+    pub fn spawn_tagged(
+        self,
+        n: usize,
+        prefix: &str,
+    ) -> (mpsc::Receiver<PoolEvent>, WorkerSupervisor) {
+        // Owned by the `'static` worker tasks (the `&str` cannot escape).
+        let prefix = prefix.to_string();
         let (agg_tx, agg_rx) = mpsc::channel(self.capacity);
         let supervisor = tokio::spawn(async move {
             let mut tasks = Vec::with_capacity(n);
             for id in 0..n {
                 let agg = agg_tx.clone();
                 let pool = self.clone();
+                let prefix = prefix.clone();
                 tasks.push(tokio::spawn(async move {
                     let (wt, wr) = mpsc::channel(PRIVATE_CAPACITY);
-                    // The worker runs on its private channel; `run` takes
-                    // ownership of the sender and drops it when the
-                    // lifecycle ends, which is what closes the forwarder
-                    // below (after it has drained the buffer).
-                    let outcome = pool.worker().run(wt).await;
-                    let mut fwd = wr;
-                    while let Some(event) = fwd.recv().await {
-                        if agg
-                            .send(PoolEvent::from_event(event, id as u32))
-                            .await
-                            .is_err()
-                        {
-                            // Consumer gone: stop relaying.
-                            break;
+                    // The forwarder runs **concurrently** with the worker,
+                    // draining the private channel as frames arrive. (The
+                    // old sequential "run to completion, then drain" order
+                    // deadlocked any stream longer than the 128-slot
+                    // private buffer: the worker blocked on a full
+                    // channel with no consumer.)
+                    let fwd_task = tokio::spawn(async move {
+                        let mut fwd = wr;
+                        while let Some(event) = fwd.recv().await {
+                            if agg
+                                .send(PoolEvent::from_event(event, id as u32))
+                                .await
+                                .is_err()
+                            {
+                                // Consumer gone: stop relaying.
+                                break;
+                            }
                         }
-                    }
+                    });
+                    let tag = format!("{prefix}-{id}");
+                    // The per-worker timeout (the freeze fix): the whole
+                    // worker future is bounded; on expiry it is dropped
+                    // (the socket closes) and a synthesized `Failed`
+                    // terminal event is relayed so the consumer sees the
+                    // timeout as an ordinary stream failure.
+                    let keep = wt.clone();
+                    let outcome = match pool.worker_timeout {
+                        Some(d) => {
+                            match tokio::time::timeout(d, pool.worker_tagged(&tag).run(wt)).await {
+                                Ok(o) => o,
+                                Err(_elapsed) => {
+                                    let _ = keep
+                                        .send(StreamEvent::Failed {
+                                            timestamps: StreamTimestamps::default(),
+                                            error: StreamError::WorkerTimeout(d),
+                                        })
+                                        .await;
+                                    StreamOutcome {
+                                        timestamps: StreamTimestamps::default(),
+                                        usage: None,
+                                        premature: false,
+                                        malformed_frames: 0,
+                                        error: Some(StreamError::WorkerTimeout(d)),
+                                    }
+                                }
+                            }
+                        }
+                        None => pool.worker_tagged(&tag).run(wt).await,
+                    };
+                    // The worker dropped its sender; drop the timeout
+                    // clone too so the forwarder sees the channel close,
+                    // then let it drain the remainder. (A forwarder panic
+                    // is impossible — it only `recv`s and `send`s — the
+                    // `JoinError` is discarded.)
+                    drop(keep);
+                    let _ = fwd_task.await;
                     outcome
                 }));
             }
@@ -403,5 +518,147 @@ mod tests {
         // `worker()` builds a fully-configured StreamWorker (endpoint
         // normalization itself is covered by the Chunk 5 tests).
         let _w = pool.worker();
+        // No per-worker cap by default.
+        assert_eq!(pool.worker_timeout_cap(), None);
+        let capped = pool.worker_timeout(Duration::from_secs(5));
+        assert_eq!(capped.worker_timeout_cap(), Some(Duration::from_secs(5)));
+    }
+
+    // ── Live-network pool tests (loopback mock only) ─────────────────────
+
+    /// A minimal HTTP/1.1 mock: accepts one connection, reads the request
+    /// head, then writes `frames` SSE `data:` frames (plus `[DONE]`) and
+    /// closes. `hang` accepts but never writes (the stall scenario).
+    async fn mock_server(frames: usize, hang: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut sock = sock;
+                let mut buf = [0u8; 8192];
+                let mut acc = Vec::new();
+                while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    }
+                }
+                if hang {
+                    // The user's freeze scenario: the server stops sending
+                    // and never closes. Release the socket when the client
+                    // (the killed worker) disconnects, so no fd outlives
+                    // the test.
+                    let mut hb = [0u8; 64];
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                        _ = async {
+                            loop {
+                                match sock.read(&mut hb).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(_) => continue,
+                                }
+                            }
+                        } => {}
+                    }
+                    return;
+                }
+                let head =
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                let _ = sock.write_all(head).await;
+                for i in 0..frames {
+                    let frame = format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{i} \"}}}}]}}\n\n"
+                    );
+                    let _ = sock.write_all(frame.as_bytes()).await;
+                }
+                let _ = sock.write_all(b"data: [DONE]\n\n").await;
+                let _ = sock.shutdown().await;
+            });
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn long_stream_over_private_capacity_does_not_deadlock() {
+        // 300 frames > the 128-slot private channel: the forwarder must
+        // drain concurrently or the worker blocks forever (regression for
+        // the sequential run-then-drain deadlock).
+        let url = mock_server(300, false).await;
+        let (mut rx, supervisor) =
+            WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 300).spawn(1);
+        let mut terminal = None;
+        while let Some(event) = rx.recv().await {
+            if event.is_terminal() {
+                terminal = Some(event);
+            }
+        }
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), supervisor)
+            .await
+            .expect("a >128-frame stream must not deadlock the pool")
+            .unwrap();
+        assert!(outcomes[0].is_ok());
+        assert!(matches!(
+            terminal,
+            Some(PoolEvent::Complete {
+                premature: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_timeout_kills_a_hung_worker_and_reports_partial() {
+        // The user's freeze: the server accepts but stops sending. A 2s
+        // per-worker cap must kill the worker, close the level, and report
+        // a `WorkerTimeout` failure.
+        let url = mock_server(0, true).await;
+        let (mut rx, supervisor) = WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 64)
+            .read_timeout(Duration::from_secs(30)) // stall window > cap
+            .worker_timeout(Duration::from_secs(2))
+            .spawn(1);
+        let mut terminal = None;
+        while let Some(event) = rx.recv().await {
+            if event.is_terminal() {
+                terminal = Some(event);
+            }
+        }
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), supervisor)
+            .await
+            .expect("the per-worker timeout must end the level")
+            .unwrap();
+        assert!(matches!(
+            outcomes[0].error,
+            Some(StreamError::WorkerTimeout(_))
+        ));
+        assert!(matches!(
+            terminal,
+            Some(PoolEvent::Failed {
+                error: StreamError::WorkerTimeout(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_timeout_lets_fast_workers_finish() {
+        // A stream that completes well inside the cap is unaffected.
+        let url = mock_server(20, false).await;
+        let (mut rx, supervisor) = WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 64)
+            .worker_timeout(Duration::from_secs(10))
+            .spawn(1);
+        let mut terminals = 0;
+        while let Some(event) = rx.recv().await {
+            if event.is_terminal() {
+                terminals += 1;
+            }
+        }
+        let outcomes = supervisor.await.unwrap();
+        assert_eq!(terminals, 1);
+        assert!(outcomes[0].is_ok());
     }
 }

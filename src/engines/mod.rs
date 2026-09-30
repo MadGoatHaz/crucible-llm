@@ -194,7 +194,7 @@ pub async fn run_selected(cfg: &Config) -> RunReport {
     }
 
     if sel.concurrency {
-        if let Some(sweep) = build_sweep(cfg, None) {
+        if let Some(sweep) = build_sweep(cfg, None, None) {
             report.concurrency = Some(sweep.run().await);
         }
     }
@@ -223,10 +223,19 @@ pub async fn run_selected(cfg: &Config) -> RunReport {
 /// Build an Engine B [`Sweep`] from a config (shared client, the
 /// configured ladder, and the configured prompt). `metrics` (optional)
 /// wires the sweep to a [`MetricsState`] so it publishes live snapshots to
-/// the TUI while running (blueprint §4.2). `None` when the HTTP client (or
-/// an explicit tokenizer) cannot be built — the engine simply doesn't run
-/// (graceful degradation, never a panic).
-pub fn build_sweep(cfg: &Config, metrics: Option<Arc<MetricsState>>) -> Option<Sweep> {
+/// the TUI while running (blueprint §4.2). `logger` (optional) wires the
+/// run logger so the sweep records its per-step lifecycle. `None` when the
+/// HTTP client (or an explicit tokenizer) cannot be built — the engine
+/// simply doesn't run (graceful degradation, never a panic).
+///
+/// **The freeze fix is wired here:** every worker gets the configured
+/// `timeout` as its max lifetime (`worker_timeout`), so a hung
+/// connection can never hold a sweep level open forever.
+pub fn build_sweep(
+    cfg: &Config,
+    metrics: Option<Arc<MetricsState>>,
+    logger: Option<Arc<crate::log::RunLogger>>,
+) -> Option<Sweep> {
     use crate::client::pool::WorkerPool;
     use std::time::Duration;
 
@@ -252,14 +261,26 @@ pub fn build_sweep(cfg: &Config, metrics: Option<Arc<MetricsState>>) -> Option<S
         &prompt.text,
         speed::MAX_GEN_TOKENS,
     )
-    .read_timeout(Duration::from_secs(cfg.timeout.max(1)));
+    .read_timeout(Duration::from_secs(cfg.timeout.max(1)))
+    // Per-worker max lifetime: a worker that outlives the configured
+    // timeout is killed and recorded as a timeout failure (partial
+    // results are kept). This is what prevents a hung connection from
+    // freezing the sweep at a high concurrency level.
+    .worker_timeout(Duration::from_secs(cfg.timeout.max(1)));
     let pool = match &cfg.api_key {
         Some(key) => pool.api_key(key.clone()),
+        None => pool,
+    };
+    let pool = match &logger {
+        Some(l) => pool.logger(l.clone()),
         None => pool,
     };
     let mut sweep = Sweep::new(pool, cfg.ladder.clone());
     if let Some(state) = metrics {
         sweep = sweep.metrics(state);
+    }
+    if let Some(l) = logger {
+        sweep = sweep.logger(l);
     }
     Some(sweep)
 }

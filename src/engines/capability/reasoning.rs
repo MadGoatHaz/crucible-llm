@@ -313,6 +313,9 @@ pub struct ReasoningEngine {
     /// Optional `Space`-key pause gate: the bank waits on it before
     /// spawning each challenge's stream (in-flight challenges complete).
     pause: Option<Arc<RunPause>>,
+    /// Optional run logger (each challenge's worker records its HTTP /
+    /// SSE lifecycle; the engine records the bank start / score).
+    logger: Option<Arc<crate::log::RunLogger>>,
 }
 
 impl ReasoningEngine {
@@ -337,6 +340,7 @@ impl ReasoningEngine {
             progress: None,
             metrics: None,
             pause: None,
+            logger: None,
         })
     }
 
@@ -362,6 +366,13 @@ impl ReasoningEngine {
         self
     }
 
+    /// Attach the run logger (each challenge's stream then logs its
+    /// HTTP / SSE lifecycle).
+    pub fn logger(mut self, logger: Arc<crate::log::RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
     /// Run one challenge: spawn a worker, drain its channel, and return
     /// the concatenated response text plus the §7 timing deltas.
     async fn run_challenge(&self, challenge: &Challenge) -> (String, f64, f64) {
@@ -373,9 +384,13 @@ impl ReasoningEngine {
             challenge.prompt,
             REASONING_MAX_GEN_TOKENS,
         )
-        .read_timeout(Duration::from_secs(self.timeout.max(1)));
+        .read_timeout(Duration::from_secs(self.timeout.max(1)))
+        .tag(format!("C2:{}", challenge.id));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
+        }
+        if let Some(logger) = &self.logger {
+            worker = worker.logger(logger.clone());
         }
 
         let start = MonotonicInstant::now();
@@ -452,6 +467,15 @@ impl ReasoningEngine {
     /// `Challenge {n}/{total}` — the Benchmark Sequence mirrors it into
     /// the TUI's progress bar.
     pub async fn run(&self) -> ReasoningResult {
+        if let Some(l) = &self.logger {
+            l.info(
+                crate::log::Context::EngineC2,
+                format!(
+                    "Engine C2 (Reasoning) started — {} challenges",
+                    REASONING_BANK.len()
+                ),
+            );
+        }
         let mut responses = Vec::with_capacity(REASONING_BANK.len());
         let mut ttfts = Vec::with_capacity(REASONING_BANK.len());
         let mut tg_speeds = Vec::with_capacity(REASONING_BANK.len());
@@ -472,12 +496,23 @@ impl ReasoningEngine {
             ttfts.push(ttft);
             tg_speeds.push(tg_speed);
         }
-        ReasoningResult {
+        let result = ReasoningResult {
             score: score_responses(&responses),
             responses,
             ttfts,
             tg_speeds,
+        };
+        if let Some(l) = &self.logger {
+            l.info(
+                crate::log::Context::EngineC2,
+                format!(
+                    "Engine C2 complete — {} (avg {:.1} t/s)",
+                    result.score.label(),
+                    result.avg_tg_speed()
+                ),
+            );
         }
+        result
     }
 }
 

@@ -471,6 +471,9 @@ pub struct NiahEngine {
     /// Optional `Space`-key pause gate: the matrix waits on it before
     /// spawning each cell's stream (in-flight cells complete).
     pause: Option<Arc<RunPause>>,
+    /// Optional run logger (each cell's worker records its HTTP / SSE
+    /// lifecycle; the engine records the matrix start / result).
+    logger: Option<Arc<crate::log::RunLogger>>,
 }
 
 impl NiahEngine {
@@ -496,6 +499,7 @@ impl NiahEngine {
             progress: None,
             metrics: None,
             pause: None,
+            logger: None,
         })
     }
 
@@ -533,6 +537,13 @@ impl NiahEngine {
         self
     }
 
+    /// Attach the run logger (each cell's stream then logs its HTTP /
+    /// SSE lifecycle).
+    pub fn logger(mut self, logger: Arc<crate::log::RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
     /// The configured context sizes.
     pub fn sizes_list(&self) -> &[u32] {
         &self.sizes
@@ -552,6 +563,16 @@ impl NiahEngine {
     pub async fn run(&self) -> NiahResult {
         let mut result = NiahResult::new(self.sizes.clone(), self.depths.clone());
         let total_cells = self.sizes.len() * self.depths.len();
+        if let Some(l) = &self.logger {
+            l.info(
+                crate::log::Context::EngineC1,
+                format!(
+                    "Engine C1 (NIAH) started — {total_cells} cells ({} sizes × {} depths)",
+                    self.sizes.len(),
+                    self.depths.len()
+                ),
+            );
+        }
         for (si, size) in self.sizes.iter().enumerate() {
             for (di, depth) in self.depths.iter().enumerate() {
                 let cell_idx = si * self.depths.len() + di;
@@ -574,6 +595,12 @@ impl NiahEngine {
             }
         }
         result.compute_states();
+        if let Some(l) = &self.logger {
+            l.info(
+                crate::log::Context::EngineC1,
+                format!("Engine C1 complete — {}", result.accuracy_label()),
+            );
+        }
         result
     }
 
@@ -591,9 +618,13 @@ impl NiahEngine {
             &doc.text,
             NIAH_MAX_GEN_TOKENS,
         )
-        .read_timeout(Duration::from_secs(self.timeout.max(1)));
+        .read_timeout(Duration::from_secs(self.timeout.max(1)))
+        .tag(format!("C1:{size}k-d{depth}"));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
+        }
+        if let Some(logger) = &self.logger {
+            worker = worker.logger(logger.clone());
         }
 
         let start = MonotonicInstant::now();
@@ -770,6 +801,7 @@ impl NiahEngineConfig {
             progress: None,
             metrics: None,
             pause: None,
+            logger: None,
         })
     }
 }

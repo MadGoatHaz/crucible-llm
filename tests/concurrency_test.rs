@@ -192,6 +192,8 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         total_tokens: 100,
         completed_streams: concurrency,
         failed_streams: 0,
+        timed_out_streams: 0,
+        aborted: false,
         wall_ns: 1_000_000_000,
         streams: (0..concurrency as u32)
             .map(|id| StreamMetric {
@@ -556,4 +558,168 @@ async fn pool_fan_in_delivers_every_worker_and_closes() {
     assert_eq!(terminals, 3, "one terminal event per worker");
     assert_eq!(outcomes.len(), 3);
     assert!(outcomes.iter().all(|o| o.is_ok()));
+}
+
+// ── The freeze fix: hung servers must not hang the sweep ─────────────────
+
+/// A mock that accepts *many* concurrent connections, serves each one a
+/// vLLM-style SSE header + `frames` token frames, and then **hangs**: it
+/// holds the connection open and sends nothing more (no `[DONE]`, no
+/// close) — the user's "froze at level 16" scenario.
+///
+/// The hang ends as soon as the *client* disconnects (an aborted /
+/// timed-out worker drops its socket → the server read sees EOF), so no
+/// server-side fd outlives the test (fd-leak test isolation).
+async fn start_hang_mock(frames: usize) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (sock, _) = match listener.accept().await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut sock = sock;
+                drain_request(&mut sock).await;
+                write_all(
+                    &mut sock,
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                for i in 0..frames {
+                    write_chunk(
+                        &mut sock,
+                        format!("{content}\n\n", content = content_frame(i)).as_bytes(),
+                    )
+                    .await;
+                }
+                // The hang: send nothing, but release the socket as soon
+                // as the client goes away (or after 300 s at the latest).
+                let mut buf = [0u8; 64];
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                    _ = async {
+                        loop {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => continue,
+                            }
+                        }
+                    } => {}
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (format!("http://{addr}"), handle)
+}
+
+#[tokio::test]
+async fn hung_workers_are_killed_by_the_per_worker_timeout() {
+    // 2 workers against a server that goes silent after 3 frames. With a
+    // 2 s per-worker cap (and a 30 s stall window that would never fire
+    // first), both workers must be killed, the level must collect their
+    // partial tokens, and the sweep must complete — never hang.
+    let (url, server) = start_hang_mock(3).await;
+    let pool = WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 64)
+        .read_timeout(Duration::from_secs(30))
+        .worker_timeout(Duration::from_secs(2));
+    let sweep = Sweep::new(pool, [2]);
+    let result = tokio::time::timeout(Duration::from_secs(20), sweep.run())
+        .await
+        .expect("the sweep must not hang on hung workers");
+    server.abort();
+
+    assert_eq!(result.levels.len(), 1);
+    let lvl = &result.levels[0];
+    assert!(lvl.degraded(), "a level with killed workers is degraded");
+    assert_eq!(lvl.timed_out_streams, 2, "both workers hit the cap");
+    assert_eq!(lvl.failed_streams, 2);
+    assert_eq!(lvl.completed_streams, 0);
+    // Partial results were collected before the kill (3 frames each).
+    assert_eq!(lvl.total_tokens, 6);
+}
+
+#[tokio::test]
+async fn hung_step_is_aborted_by_the_step_budget_and_sweep_continues() {
+    // A 60 s per-worker cap (never reached), but a 1.5 s step-budget
+    // override: the watchdog (5 s ticks) sees the level past 2× budget
+    // and aborts it, and the sweep must proceed to the next level — the
+    // whole run is bounded (no hang, ever).
+    let (url, server) = start_hang_mock(2).await;
+    let pool = WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 64)
+        .read_timeout(Duration::from_secs(60))
+        .worker_timeout(Duration::from_secs(60));
+    let sweep = Sweep::new(pool, [2, 1]).step_budget(Duration::from_millis(1500));
+    let result = tokio::time::timeout(Duration::from_secs(30), sweep.run())
+        .await
+        .expect("the sweep must not hang on a hung step");
+    server.abort();
+
+    assert_eq!(
+        result.levels.len(),
+        2,
+        "the sweep continued past the bad step"
+    );
+    // The ladder normalizes to [1, 2]: level 0 has one worker, level 1 two.
+    let bad = &result.levels[0];
+    assert!(bad.aborted, "the over-budget step was aborted");
+    assert!(bad.degraded());
+    // The stranded workers were finalized as failures.
+    assert_eq!(bad.failed_streams, 1);
+    // The second step ran too (and was aborted the same way — the mock
+    // hangs every connection).
+    assert!(result.levels[1].aborted);
+    assert_eq!(result.levels[1].failed_streams, 2);
+}
+
+#[tokio::test]
+async fn sweep_with_logger_writes_step_lifecycle_to_the_run_log() {
+    // The run log the user reviews after a hang: step starts, the
+    // worker-kill warnings, and the per-step summary must all land in
+    // `latest.log`.
+    let dir = std::env::temp_dir().join(format!("crucible-runlog-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let logger = crucible_llm::log::RunLogger::start(Some(&dir));
+
+    let (url, server) = start_hang_mock(3).await;
+    let pool = WorkerPool::new(reqwest::Client::new(), &url, "m", "p", 64)
+        .read_timeout(Duration::from_secs(30))
+        .worker_timeout(Duration::from_secs(2))
+        .logger(logger.clone());
+    let sweep = Sweep::new(pool, [2]).logger(logger.clone());
+    let result = tokio::time::timeout(Duration::from_secs(20), sweep.run())
+        .await
+        .expect("bounded");
+    server.abort();
+    logger.finish();
+
+    let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+    assert!(
+        latest.contains("Engine B (Concurrency) started — ladder [2]"),
+        "{latest}"
+    );
+    assert!(
+        latest.contains("Step 1/1: concurrency=2, spawning 2 worker(s)"),
+        "{latest}"
+    );
+    // Per-worker HTTP lifecycle from the tagged workers (B1-0, B1-1).
+    assert!(
+        latest.contains("B1-0"),
+        "worker tags land in the log: {latest}"
+    );
+    assert!(latest.contains("B1-1"), "{latest}");
+    assert!(latest.contains("→ POST"), "{latest}");
+    assert!(
+        latest.contains("TIMEOUT"),
+        "the worker kills are logged: {latest}"
+    );
+    assert!(
+        latest.contains("[DEGRADED]"),
+        "the step summary flags the degradation"
+    );
+    assert_eq!(result.levels[0].timed_out_streams, 2);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -26,10 +26,11 @@ use crucible_llm::client::StreamEvent;
 use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
 use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
-    all_failed, format_result_box, format_summary, json_report, SpeedEngine,
+    all_failed, format_result_box, format_summary, json_report, SpeedEngine, MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{build_sweep, NiahEngine, ReasoningEngine, StructuredEngine};
 use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
+use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 use crucible_llm::timing::MonotonicInstant;
@@ -47,6 +48,15 @@ fn main() {
             process::exit(2);
         }
     };
+
+    // The file-based run log: `latest.log` (overwritten each run) + a
+    // `run-<timestamp>.log` archive in the log dir (default
+    // `~/.local/share/crucible/logs/`, configurable via `--log-dir` /
+    // `CRUCIBLE_LOG_DIR` / the config file). Created before dispatch so
+    // both the TUI and headless paths — and every engine they spawn —
+    // share the same run log. A logger that cannot create its files
+    // degrades to a silent no-op (logging never breaks a run).
+    let logger = RunLogger::start(cfg.log_dir.as_deref());
 
     // `--banner` (hidden, Chunk 20): the old bare-invocation banner path,
     // demoted to an explicit flag.
@@ -67,13 +77,44 @@ fn main() {
         if !headless {
             eprintln!("crucible-llm: stdout is not a TTY — running headless (use --tui to force the dashboard)");
         }
-        process::exit(run_headless(&cfg));
+        logger.info(
+            Context::Setup,
+            format!(
+                "run started — headless — url={} model={} mode={} iterations={} timeout={}s",
+                cfg.url,
+                cfg.model,
+                cfg.mode.label(),
+                cfg.iterations,
+                cfg.timeout
+            ),
+        );
+        let code = run_headless(&cfg, logger.clone());
+        logger.info(
+            Context::Setup,
+            format!("run ended — headless — exit code {code}"),
+        );
+        logger.finish(); // flush before `process::exit` skips drops
+        process::exit(code);
     }
 
     // Everything else — including a bare `crucible-llm` — launches the
     // TUI (Chunk 8).
-    let ok = run_tui(&cfg);
+    logger.info(
+        Context::Tui,
+        format!(
+            "run started — TUI — url={} model={} (log: {})",
+            cfg.url,
+            cfg.model,
+            logger
+                .path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        ),
+    );
+    let ok = run_tui(&cfg, logger.clone());
     EventLoop::restore(); // best-effort terminal restore on all paths
+    logger.info(Context::Tui, format!("run ended — TUI — ok={ok}"));
+    logger.finish(); // flush before exit (drops are skipped by process::exit)
     if !ok {
         process::exit(1);
     }
@@ -82,7 +123,7 @@ fn main() {
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
 /// and print the prototype's result box(es) / summary — or `--json` on
 /// stdout. Returns the process exit code (1 iff every run failed).
-fn run_headless(cfg: &Config) -> i32 {
+fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io() // the stream worker does real network I/O
@@ -117,9 +158,18 @@ fn run_headless(cfg: &Config) -> i32 {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("crucible-llm: {e}");
+                logger.error(Context::EngineA, format!("Engine A init failed: {e}"));
                 return 1;
             }
         };
+        let engine = engine.logger(logger.clone());
+        logger.info(
+            Context::EngineA,
+            format!(
+                "Engine A (Speed) started — {} iteration(s), {} max tokens",
+                cfg.iterations, MAX_GEN_TOKENS
+            ),
+        );
 
         let term = Term {
             color: !cfg.no_color && std::io::stdout().is_terminal(),
@@ -177,6 +227,14 @@ fn run_headless(cfg: &Config) -> i32 {
         if !cfg.json && iterations > 1 {
             term.clear_progress();
         }
+        logger.info(
+            Context::EngineA,
+            format!(
+                "Engine A complete — {}/{} run(s) succeeded",
+                results.iter().filter(|r| !r.is_failed()).count(),
+                results.len()
+            ),
+        );
 
         // Chunk 17: harvest the sampler's power trace (brief lock on the
         // run-completion path — never on the stream workers' timing path).
@@ -306,7 +364,7 @@ fn run_headless(cfg: &Config) -> i32 {
                 ));
             }
             if extra.concurrency {
-                if let Some(sweep) = build_sweep(cfg, None) {
+                if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
                     if !cfg.json {
                         term.dim(&format!(
                             "  [B] concurrency sweep [{}]…",
@@ -338,10 +396,13 @@ fn run_headless(cfg: &Config) -> i32 {
                         if !cfg.json {
                             term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
                         }
-                        let r = engine.run().await;
+                        let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!("  [C1] {}", r.accuracy_label()));
                     }
-                    Err(e) => term.warning(&format!("[C1] niah init failed: {e}")),
+                    Err(e) => {
+                        term.warning(&format!("[C1] niah init failed: {e}"));
+                        logger.error(Context::EngineC1, format!("niah init failed: {e}"));
+                    }
                 }
             }
             if extra.reasoning {
@@ -350,14 +411,17 @@ fn run_headless(cfg: &Config) -> i32 {
                         if !cfg.json {
                             term.dim("  [C2] reasoning bank (13 challenges)…");
                         }
-                        let r = engine.run().await;
+                        let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!(
                             "  [C2] {} · avg {:.1} t/s",
                             r.score.label(),
                             r.avg_tg_speed()
                         ));
                     }
-                    Err(e) => term.warning(&format!("[C2] reasoning init failed: {e}")),
+                    Err(e) => {
+                        term.warning(&format!("[C2] reasoning init failed: {e}"));
+                        logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
+                    }
                 }
             }
             if extra.structured {
@@ -366,13 +430,16 @@ fn run_headless(cfg: &Config) -> i32 {
                         if !cfg.json {
                             term.dim("  [C3] structured output (free-form vs constrained)…");
                         }
-                        let r = engine.run().await;
+                        let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!(
                             "  [C3] {:+.1}% penalty · compliant={}",
                             r.penalty_pct, r.compliant
                         ));
                     }
-                    Err(e) => term.warning(&format!("[C3] structured init failed: {e}")),
+                    Err(e) => {
+                        term.warning(&format!("[C3] structured init failed: {e}"));
+                        logger.error(Context::EngineC3, format!("structured init failed: {e}"));
+                    }
                 }
             }
         }
@@ -449,7 +516,7 @@ fn run_export(
 /// foreground terminal program, so a current-thread runtime is all it
 /// needs; the worker pool will run on its own multi-thread runtime in
 /// later chunks.
-fn run_tui(cfg: &Config) -> bool {
+fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
     let export_format = cfg.export.unwrap_or_default();
     // Chunk 17: probe the hardware once (NVML feature-gated + sysinfo).
     // Never fails — a driverless host simply runs with N/A GPU fields.
@@ -469,7 +536,8 @@ fn run_tui(cfg: &Config) -> bool {
             let mut app = App::new()
                 .with_export_format(export_format)
                 .with_config(cfg)
-                .with_hw(hw.clone());
+                .with_hw(hw.clone())
+                .with_logger(logger.clone());
             // The interactive Setup phase (full-screen takeover) opens
             // only when the target (URL + model) was *not* fully given
             // via CLI flags / env / config file: a bare `crucible-llm`

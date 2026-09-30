@@ -47,12 +47,14 @@
 //! only (blueprint §4). Nothing in this module touches the UI or the
 //! storage rings.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::log::{Context, Level, RunLogger};
 use crate::sse::{Chunk, ParsedFrame, SseParser, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -119,6 +121,11 @@ pub enum StreamError {
     /// No bytes arrived for the configured read timeout.
     #[error("stream stalled: no data for {0:?}")]
     Timeout(Duration),
+    /// The worker exceeded its max lifetime and was killed by the
+    /// concurrency sweep (per-worker timeout). Any tokens received before
+    /// the kill were relayed as partial results.
+    #[error("worker timed out after {0:?} (killed)")]
+    WorkerTimeout(Duration),
     /// A byte-stream read error before any data was received.
     #[error("stream read error: {0}")]
     Read(String),
@@ -182,6 +189,13 @@ pub struct StreamWorker {
     /// `"json_object"`) — Engine C3's grammar-constrained runs. `None`
     /// (the default) sends the body unchanged.
     response_format: Option<String>,
+    /// Optional run-log writer: when present, the worker logs its HTTP /
+    /// SSE lifecycle (request, TTFB, first token, every 50th token,
+    /// completion / failure) to the file-based [`RunLogger`].
+    logger: Option<Arc<RunLogger>>,
+    /// A short identifier for this worker's log lines (e.g. `A:2` for
+    /// Engine A iteration 2, `B5:3` for Engine B step 5 worker 3).
+    tag: String,
 }
 
 impl StreamWorker {
@@ -205,6 +219,8 @@ impl StreamWorker {
             read_timeout: DEFAULT_READ_TIMEOUT,
             retries: 0,
             response_format: None,
+            logger: None,
+            tag: "stream".to_string(),
         }
     }
 
@@ -234,6 +250,32 @@ impl StreamWorker {
     pub fn response_format(mut self, format: &str) -> Self {
         self.response_format = Some(format.to_string());
         self
+    }
+
+    /// Attach the shared run logger (file-based, non-blocking): the
+    /// worker then records its HTTP / SSE lifecycle lines.
+    pub fn logger(mut self, logger: Arc<RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// The short identifier for this worker's log lines.
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tag = tag.into();
+        self
+    }
+
+    /// Log one line (a no-op when no logger is attached).
+    fn logl(&self, level: Level, ctx: Context, msg: &str) {
+        let Some(l) = &self.logger else {
+            return;
+        };
+        match level {
+            Level::Debug => l.debug(ctx, msg),
+            Level::Info => l.info(ctx, msg),
+            Level::Warn => l.warn(ctx, msg),
+            Level::Error => l.error(ctx, msg),
+        }
     }
 
     /// Run the full stream lifecycle, emitting events on `tx`.
@@ -269,6 +311,15 @@ impl StreamWorker {
             ..StreamTimestamps::default()
         };
 
+        self.logl(
+            Level::Info,
+            Context::Http,
+            &format!(
+                "{} → POST {} (stream=true, model={}, tokens_target={})",
+                self.tag, self.endpoint, self.model, self.max_tokens
+            ),
+        );
+
         let resp = match self.send_request().await {
             Ok(r) => r,
             Err(e) => {
@@ -284,6 +335,11 @@ impl StreamWorker {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = truncate_body(&resp.text().await.unwrap_or_default(), 512);
+            self.logl(
+                Level::Error,
+                Context::Http,
+                &format!("{} ← {status} {body}", self.tag),
+            );
             ts.t_end = Some(MonotonicInstant::now());
             return self
                 .finish_failed(tx, ts, StreamError::Http { status, body })
@@ -335,6 +391,18 @@ impl StreamWorker {
         let head_at = MonotonicInstant::now();
         if ts.t2.is_none() {
             ts.t2 = Some(head_at);
+            // TTFB = first body byte − request write complete (T2 − T1).
+            let status = 200u16; // success was checked above
+            let ttfb_ms = ts
+                .t1
+                .map(|t1| t1.delta_nanos(&head_at))
+                .map(|ns| ns as f64 / 1e6)
+                .unwrap_or(0.0);
+            self.logl(
+                Level::Info,
+                Context::Http,
+                &format!("{} ← {status} OK (TTFB: {ttfb_ms:.0}ms)", self.tag),
+            );
         }
 
         if looks_like_sse(head.as_ref()) {
@@ -356,8 +424,13 @@ impl StreamWorker {
         stream: &mut (impl StreamExt<Item = reqwest::Result<impl AsRef<[u8]>>> + Unpin),
         tx: &mut mpsc::Sender<StreamEvent>,
     ) -> StreamOutcome {
+        let mut tokens = 0u64;
         let mut done = match emit_frames(parser.feed(head.as_ref()), &head_at, ts, tx).await {
-            Ok(d) => d,
+            Ok((d, tc)) => {
+                tokens += tc;
+                self.log_token_milestones(ts, tokens);
+                d
+            }
             Err(_) => {
                 // Receiver gone: stop measuring.
                 ts.t_end = Some(MonotonicInstant::now());
@@ -379,19 +452,11 @@ impl StreamWorker {
                 }
                 ChunkRead::Eof => {
                     // Clean EOF without `[DONE]`: premature close.
-                    if emit_frames(parser.finish(), &at, ts, tx).await.is_err() {
-                        ts.t_end = Some(at);
-                        return self
-                            .finish_complete(
-                                tx,
-                                ts,
-                                parser.usage(),
-                                true,
-                                parser.malformed_frames(),
-                            )
-                            .await;
+                    if let Ok((_, tc)) = emit_frames(parser.finish(), &at, ts, tx).await {
+                        tokens += tc;
                     }
                     ts.t_end = Some(at);
+                    self.log_stream_end(ts, tokens, true);
                     return self
                         .finish_complete(tx, ts, parser.usage(), true, parser.malformed_frames())
                         .await;
@@ -401,19 +466,11 @@ impl StreamWorker {
                         // Premature close mid-stream: a broken `chunked`
                         // close or connection reset. Flush the pending
                         // frame, keep every captured timestamp.
-                        if emit_frames(parser.finish(), &at, ts, tx).await.is_err() {
-                            ts.t_end = Some(at);
-                            return self
-                                .finish_complete(
-                                    tx,
-                                    ts,
-                                    parser.usage(),
-                                    true,
-                                    parser.malformed_frames(),
-                                )
-                                .await;
+                        if let Ok((_, tc)) = emit_frames(parser.finish(), &at, ts, tx).await {
+                            tokens += tc;
                         }
                         ts.t_end = Some(at);
+                        self.log_stream_end(ts, tokens, true);
                         return self
                             .finish_complete(
                                 tx,
@@ -432,7 +489,11 @@ impl StreamWorker {
                         ts.t2 = Some(at);
                     }
                     match emit_frames(parser.feed(b.as_ref()), &at, ts, tx).await {
-                        Ok(d) => done = d,
+                        Ok((d, tc)) => {
+                            done = d;
+                            tokens += tc;
+                            self.log_token_milestones(ts, tokens);
+                        }
                         Err(_) => {
                             ts.t_end = Some(at);
                             return self
@@ -452,8 +513,74 @@ impl StreamWorker {
 
         // `[DONE]` received: Tn — stream close.
         ts.t_end = Some(MonotonicInstant::now());
+        self.log_stream_end(ts, tokens, false);
         self.finish_complete(tx, ts, parser.usage(), false, parser.malformed_frames())
             .await
+    }
+
+    /// Log the first token and every 50th token of the stream (the
+    /// per-token hot path stays allocation-free: at most one formatted
+    /// line per 50 tokens per worker).
+    fn log_token_milestones(&self, ts: &StreamTimestamps, tokens: u64) {
+        if tokens == 1 {
+            let elapsed_ms = ts
+                .t0
+                .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            self.logl(
+                Level::Info,
+                Context::Sse,
+                &format!(
+                    "{} token #1 received (elapsed: {elapsed_ms:.0}ms)",
+                    self.tag
+                ),
+            );
+        } else if tokens.is_multiple_of(50) {
+            let now = MonotonicInstant::now();
+            let elapsed_s = ts
+                .t0
+                .map(|t0| t0.delta_nanos(&now) as f64 / 1e9)
+                .unwrap_or(0.0);
+            let rate = ts
+                .t3
+                .map(|t3| {
+                    let span = t3.delta_nanos(&now).max(1) as f64 / 1e9;
+                    tokens as f64 / span
+                })
+                .unwrap_or(0.0);
+            self.logl(
+                Level::Info,
+                Context::Sse,
+                &format!(
+                    "{} token #{tokens} received (elapsed: {elapsed_s:.1}s, rate: {rate:.1} t/s)",
+                    self.tag
+                ),
+            );
+        }
+    }
+
+    /// Log the stream's completion (total tokens over the T0→Tn window,
+    /// the decode rate over the T3→Tn window, and a `premature` marker
+    /// when the stream closed without `[DONE]`).
+    fn log_stream_end(&self, ts: &StreamTimestamps, tokens: u64, premature: bool) {
+        let (total_s, rate) = match (ts.t0, ts.t_end, ts.t3) {
+            (Some(t0), Some(end), Some(t3)) => {
+                let total = t0.delta_nanos(&end) as f64 / 1e9;
+                let span = t3.delta_nanos(&end).max(1) as f64 / 1e9;
+                (total, (tokens as f64 / span).max(0.0))
+            }
+            (Some(t0), Some(end), None) => (t0.delta_nanos(&end) as f64 / 1e9, 0.0),
+            _ => (0.0, 0.0),
+        };
+        let tag = if premature { " (premature close)" } else { "" };
+        self.logl(
+            Level::Info,
+            Context::Sse,
+            &format!(
+                "{} stream complete: {tokens} tokens in {total_s:.1}s ({rate:.1} t/s){tag}",
+                self.tag
+            ),
+        );
     }
 
     /// The non-SSE plain-JSON fallback: a server that ignored `stream: true`
@@ -505,11 +632,15 @@ impl StreamWorker {
                 }
                 // `emit_frames` stamps `t_nanos` and sets T3 on the first
                 // token (content) frame.
-                if emit_frames(&frames, &parsed_at, ts, tx).await.is_err() {
-                    ts.t_end = Some(parsed_at);
-                    return self.finish_complete(tx, ts, usage, true, 0).await;
-                }
+                let tokens = match emit_frames(&frames, &parsed_at, ts, tx).await {
+                    Ok((_, tc)) => tc,
+                    Err(_) => {
+                        ts.t_end = Some(parsed_at);
+                        return self.finish_complete(tx, ts, usage, true, 0).await;
+                    }
+                };
                 ts.t_end = Some(MonotonicInstant::now());
+                self.log_stream_end(ts, tokens, false);
                 // A complete plain-JSON response is a normal completion, not
                 // a premature one (there is no `[DONE]` to expect).
                 self.finish_complete(tx, ts, usage, false, 0).await
@@ -582,6 +713,11 @@ impl StreamWorker {
         ts: StreamTimestamps,
         error: StreamError,
     ) -> StreamOutcome {
+        self.logl(
+            Level::Error,
+            Context::Error,
+            &format!("{} failed: {error}", self.tag),
+        );
         let event = StreamEvent::Failed {
             timestamps: ts,
             error: error.clone(),
@@ -624,20 +760,25 @@ where
 ///
 /// `frame.t_nanos` is set to the arrival time in nanoseconds since `T0`
 /// (the parser leaves it `0` by contract); `T3` is latched on the first
-/// token frame. Returns `true` when a terminal `[DONE]` frame was among
-/// them.
+/// token frame. Returns `(done, token_frames)`: `true` when a terminal
+/// `[DONE]` frame was among them, plus the number of token frames emitted
+/// in this call (the worker's log-milestone counter).
 async fn emit_frames(
     frames: &[ParsedFrame],
     at: &MonotonicInstant,
     ts: &mut StreamTimestamps,
     tx: &mut mpsc::Sender<StreamEvent>,
-) -> Result<bool, ()> {
+) -> Result<(bool, u64), ()> {
     let mut done_seen = false;
+    let mut token_frames = 0u64;
     for frame in frames {
         let mut frame = frame.clone();
         frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(at));
-        if ts.t3.is_none() && is_token_frame(&frame.chunk) {
-            ts.t3 = Some(*at);
+        if is_token_frame(&frame.chunk) {
+            token_frames += 1;
+            if ts.t3.is_none() {
+                ts.t3 = Some(*at);
+            }
         }
         if frame.done {
             done_seen = true;
@@ -650,7 +791,7 @@ async fn emit_frames(
         .await
         .map_err(|_| ())?;
     }
-    Ok(done_seen)
+    Ok((done_seen, token_frames))
 }
 
 /// A frame carrying generated tokens (reasoning or content) — a
@@ -803,6 +944,7 @@ mod tests {
         }
         .is_retriable());
         assert!(!StreamError::Timeout(Duration::from_secs(1)).is_retriable());
+        assert!(!StreamError::WorkerTimeout(Duration::from_secs(120)).is_retriable());
         assert!(!StreamError::Read("reset".into()).is_retriable());
         assert!(!StreamError::InvalidJson("nope".into()).is_retriable());
     }

@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 use crate::client::{StreamError, StreamEvent, StreamOutcome, StreamWorker};
 use crate::config::{Config, Mode};
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
+use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
@@ -137,6 +138,9 @@ pub struct SpeedEngine {
     /// Optional `Space`-key pause gate: the run loop waits on it before
     /// spawning each new iteration (in-flight streams complete).
     pause: Option<Arc<RunPause>>,
+    /// Optional run logger: the engine records per-iteration start /
+    /// outcome (the worker itself logs the HTTP / SSE detail).
+    logger: Option<Arc<RunLogger>>,
 }
 
 impl SpeedEngine {
@@ -161,6 +165,7 @@ impl SpeedEngine {
             metrics: None,
             progress: None,
             pause: None,
+            logger: None,
         })
     }
 
@@ -185,6 +190,13 @@ impl SpeedEngine {
     /// before the worker is spawned (the headless path leaves it `None`).
     pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
         self.pause = Some(gate);
+        self
+    }
+
+    /// Attach the run logger: each iteration then logs its start and
+    /// outcome (the worker logs the HTTP / SSE lifecycle detail).
+    pub fn logger(mut self, logger: Arc<RunLogger>) -> Self {
+        self.logger = Some(logger);
         self
     }
 
@@ -214,6 +226,16 @@ impl SpeedEngine {
         &self,
         prompt: &GeneratedPrompt,
     ) -> (SpeedResult, Vec<StreamEvent>) {
+        self.run_iteration_events_tagged(prompt, "A").await
+    }
+
+    /// [`run_iteration_events`] with an explicit log tag prefix (the
+    /// sequence executor tags iterations `A:1`, `A:2`, …).
+    pub async fn run_iteration_events_tagged(
+        &self,
+        prompt: &GeneratedPrompt,
+        tag_prefix: &str,
+    ) -> (SpeedResult, Vec<StreamEvent>) {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
             self.client.clone(),
@@ -222,9 +244,13 @@ impl SpeedEngine {
             &prompt.text,
             MAX_GEN_TOKENS,
         )
-        .read_timeout(Duration::from_secs(self.cfg.timeout.max(1)));
+        .read_timeout(Duration::from_secs(self.cfg.timeout.max(1)))
+        .tag(tag_prefix);
         if let Some(key) = &self.cfg.api_key {
             worker = worker.api_key(key);
+        }
+        if let Some(logger) = &self.logger {
+            worker = worker.logger(logger.clone());
         }
 
         let start = MonotonicInstant::now();
@@ -436,7 +462,10 @@ impl SpeedEngine {
                     tokens,
                 });
             }
-            let r = self.run_iteration(&prompt).await;
+            let r = self
+                .run_iteration_events_tagged(&prompt, &format!("A:{}", i + 1))
+                .await
+                .0;
             tokens += r.completion_tokens;
             if let Some(bus) = &self.progress {
                 bus.publish(EngineProgress::Speed {
@@ -444,6 +473,31 @@ impl SpeedEngine {
                     total: iterations,
                     tokens,
                 });
+            }
+            if let Some(l) = &self.logger {
+                if r.is_failed() {
+                    l.error(
+                        Context::EngineA,
+                        format!(
+                            "Iteration {}/{} failed: {}",
+                            i + 1,
+                            iterations,
+                            r.error.as_deref().unwrap_or("unknown")
+                        ),
+                    );
+                } else {
+                    l.info(
+                        Context::EngineA,
+                        format!(
+                            "Iteration {}/{} complete: {} tok, {:.1} t/s decode, TTFT {:.0} ms",
+                            i + 1,
+                            iterations,
+                            r.completion_tokens,
+                            r.tg_speed,
+                            r.ttft * 1000.0
+                        ),
+                    );
+                }
             }
             results.push(r);
         }
@@ -552,6 +606,7 @@ pub fn aggregate(
             StreamError::Connection(_) => "Connection refused — is the server running?".to_string(),
             StreamError::Http { status, body } => format!("HTTP {status}: {body}"),
             StreamError::Timeout(d) => format!("Timed out after {d:?}"),
+            StreamError::WorkerTimeout(d) => format!("Worker killed after {d:?} (timeout)"),
             StreamError::Read(msg) => format!("Network error: {msg}"),
             StreamError::InvalidJson(msg) => format!("Invalid JSON response: {msg}"),
         }),

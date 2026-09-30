@@ -284,6 +284,11 @@ fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: 
     } else {
         "done".to_string()
     };
+    // A level with timed-out workers (or a step-abort) ran degraded:
+    // its numbers are partial — flag it so the user can see it.
+    if level.degraded() {
+        state.push_str(" · DEGRADED");
+    }
     if is_knee {
         state.push_str(" · KNEE");
     }
@@ -395,6 +400,8 @@ mod tests {
             total_tokens: 0,
             completed_streams: 0,
             failed_streams: 0,
+            timed_out_streams: 0,
+            aborted: false,
             wall_ns: 0,
             streams: Vec::new(),
         }

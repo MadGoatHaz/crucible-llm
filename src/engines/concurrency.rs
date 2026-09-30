@@ -29,9 +29,12 @@
 //! touches the timing path.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::client::pool::{PoolEvent, WorkerPool};
+use crate::client::StreamError;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
+use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::sse::{Chunk, Usage};
@@ -40,6 +43,15 @@ use crate::timing::MonotonicInstant;
 /// The default concurrency ladder (blueprint §5 Engine B:
 /// `1→2→4→8→16→32→64` simultaneous sessions).
 pub const DEFAULT_LADDER: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+
+/// The stall-detection window: a worker with no tokens for this long
+/// during a level is flagged (warned) as stalled. The per-worker timeout
+/// (the pool's `worker_timeout`) is what eventually kills it.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The cadence of the sweep's stall / step-budget checks (the drain
+/// loop wakes on this interval between events).
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Normalize a user-supplied ladder: drop non-positive entries, remove
 /// duplicates, sort ascending.
@@ -71,6 +83,12 @@ pub struct SweepLevel {
     pub completed_streams: usize,
     /// Streams that failed (HTTP / connection / timeout / read error).
     pub failed_streams: usize,
+    /// Workers killed by the per-worker timeout (the freeze fix). Their
+    /// partial tokens are included in `total_tokens`.
+    pub timed_out_streams: usize,
+    /// `true` when the step-level timeout aborted the level (the sweep
+    /// collected whatever it had and moved on to the next step).
+    pub aborted: bool,
     /// Wall time of the level (spawn → last worker finished), in ns.
     pub wall_ns: u64,
     /// Per-stream detail (View 1 stream-matrix rows; blueprint §8
@@ -107,6 +125,15 @@ impl SweepLevel {
     /// Level wall time in seconds.
     pub fn wall_secs(&self) -> f64 {
         self.wall_ns as f64 / 1_000_000_000.0
+    }
+
+    /// `true` when the level ran degraded: at least one worker was
+    /// killed by the per-worker timeout, or the step was aborted by the
+    /// step-level timeout. Its curve point is still usable (partial
+    /// results were collected), but it should be treated with care in
+    /// knee detection / the envelope.
+    pub fn degraded(&self) -> bool {
+        self.timed_out_streams > 0 || self.aborted
     }
 }
 
@@ -232,7 +259,7 @@ pub struct Envelope {
 /// the ladder level by level; each level runs to completion before the
 /// next starts, so every curve point measures a steady population of
 /// `n` concurrent streams.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Sweep {
     pool: WorkerPool,
     ladder: Vec<usize>,
@@ -246,6 +273,29 @@ pub struct Sweep {
     /// Optional `Space`-key pause gate: the sweep waits on it before
     /// spawning each ladder level (in-flight streams complete).
     pause: Option<Arc<RunPause>>,
+    /// Optional run logger: the sweep records step starts / completions,
+    /// per-worker timeouts, stalls, and step aborts.
+    logger: Option<Arc<RunLogger>>,
+    /// The stall-detection window (no tokens for this long → warn).
+    stall_timeout: Duration,
+    /// Optional hard cap on the computed step budget (tests use it to
+    /// make a hanging level abort quickly; production leaves it `None`).
+    step_budget_override: Option<Duration>,
+}
+
+impl std::fmt::Debug for Sweep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sweep")
+            .field("pool", &self.pool)
+            .field("ladder", &self.ladder)
+            .field("metrics", &self.metrics.is_some())
+            .field("progress", &self.progress.is_some())
+            .field("pause", &self.pause.is_some())
+            .field("logger", &self.logger.is_some())
+            .field("stall_timeout", &self.stall_timeout)
+            .field("step_budget_override", &self.step_budget_override)
+            .finish()
+    }
 }
 
 impl Sweep {
@@ -258,6 +308,9 @@ impl Sweep {
             metrics: None,
             progress: None,
             pause: None,
+            logger: None,
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
+            step_budget_override: None,
         }
     }
 
@@ -289,24 +342,150 @@ impl Sweep {
         self
     }
 
+    /// Attach the run logger: the sweep then records its per-step
+    /// lifecycle (start, worker timeouts, stalls, step aborts, summary)
+    /// to the file-based log.
+    pub fn logger(mut self, logger: Arc<RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// Override the stall-detection window (default
+    /// [`DEFAULT_STALL_TIMEOUT`]).
+    pub fn stall_timeout(mut self, d: Duration) -> Self {
+        self.stall_timeout = d;
+        self
+    }
+
+    /// Cap the computed step budget from above (a test hook: a hanging
+    /// level can then be made to abort in seconds instead of minutes).
+    pub fn step_budget(mut self, d: Duration) -> Self {
+        self.step_budget_override = Some(d);
+        self
+    }
+
+    fn logi(&self, ctx: Context, msg: String) {
+        if let Some(l) = &self.logger {
+            l.info(ctx, msg);
+        }
+    }
+
+    fn logw(&self, ctx: Context, msg: String) {
+        if let Some(l) = &self.logger {
+            l.warn(ctx, msg);
+        }
+    }
+
+    fn loge(&self, ctx: Context, msg: String) {
+        if let Some(l) = &self.logger {
+            l.error(ctx, msg);
+        }
+    }
+
     /// Run the full sweep: one level at a time, in ladder order.
+    ///
+    /// **The freeze fix:** each level is bounded three ways —
+    ///
+    /// 1. **per-worker timeout** (the pool's `worker_timeout`): a worker
+    ///    that does not finish in time is killed and reported as a
+    ///    `WorkerTimeout` failure with its partial tokens;
+    /// 2. **stall detection**: a worker with no tokens for
+    ///    [`DEFAULT_STALL_TIMEOUT`] is flagged with a warning (it
+    ///    distinguishes a slow server from a hung connection — the
+    ///    kill comes from #1);
+    /// 3. **step-level timeout**: if the whole level runs past its budget
+    ///    (3× the previous step, floored at the worker cap), it is
+    ///    warned, and at 2× the budget the level is *aborted* — partial
+    ///    results are collected, the level is marked `degraded`, and the
+    ///    sweep continues to the next step. The sweep can never hang on
+    ///    one bad level again.
     pub async fn run(&self) -> SweepResult {
         let mut levels = Vec::with_capacity(self.ladder.len());
+        let mut prev_wall_ns = 0u64;
+        self.logi(
+            Context::EngineB,
+            format!(
+                "Engine B (Concurrency) started — ladder [{}]",
+                self.ladder
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
         for (i, &n) in self.ladder.iter().enumerate() {
             // The `Space`-key pause: hold before the next level's streams
             // go out (an in-flight level always completes).
             if let Some(gate) = &self.pause {
                 gate.wait_while_paused().await;
             }
-            levels.push(self.run_level(n, i + 1, self.ladder.len()).await);
+            let level = self
+                .run_level(n, i + 1, self.ladder.len(), prev_wall_ns)
+                .await;
+            prev_wall_ns = level.wall_ns;
+            levels.push(level);
         }
+        self.logi(
+            Context::EngineB,
+            format!(
+                "Engine B complete — {} level(s), {} degraded",
+                levels.len(),
+                levels.iter().filter(|l| l.degraded()).count()
+            ),
+        );
         SweepResult { levels }
+    }
+
+    /// The step-level budget: `max(worker cap, 3× the previous step's
+    /// wall time)` — a level that is 3× slower than the one before it is
+    /// suspect (saturation / a hung level); with no worker cap set, the
+    /// budget is `3× previous` (or a generous 5-minute floor on the first
+    /// step).
+    /// The effective step budget: the computed value
+    /// (`max(worker cap, 3× previous step)`) capped by the optional
+    /// [`step_budget`](Self::step_budget) override.
+    pub fn effective_step_budget(&self, prev_wall_ns: u64) -> Duration {
+        const NO_CAP_FLOOR: Duration = Duration::from_secs(300);
+        let computed = match self.pool.worker_timeout_cap() {
+            Some(cap) => {
+                if prev_wall_ns > 0 {
+                    cap.max(Duration::from_nanos(prev_wall_ns.saturating_mul(3)))
+                } else {
+                    cap
+                }
+            }
+            None => {
+                if prev_wall_ns > 0 {
+                    Duration::from_nanos(prev_wall_ns.saturating_mul(3))
+                } else {
+                    NO_CAP_FLOOR
+                }
+            }
+        };
+        self.step_budget_override
+            .map(|o| o.min(computed))
+            .unwrap_or(computed)
     }
 
     /// Run one ladder level: spawn `n` workers, drain the aggregate channel
     /// into a [`LevelAccumulator`], and fold the level's metrics.
-    async fn run_level(&self, n: usize, step: usize, total_steps: usize) -> SweepLevel {
+    ///
+    /// The drain loop is a `tokio::select!` between the event channel and
+    /// a 5 s watchdog tick (stall detection + step-budget enforcement), so
+    /// a level always ends: either every worker terminates (the channel
+    /// closes) or the step timeout aborts it.
+    async fn run_level(
+        &self,
+        n: usize,
+        step: usize,
+        total_steps: usize,
+        prev_wall_ns: u64,
+    ) -> SweepLevel {
         let start = MonotonicInstant::now();
+        self.logi(
+            Context::EngineB,
+            format!("Step {step}/{total_steps}: concurrency={n}, spawning {n} worker(s)"),
+        );
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::Concurrency {
                 level: n,
@@ -315,38 +494,94 @@ impl Sweep {
                 active: 0,
             });
         }
-        let (mut rx, supervisor) = self.pool.clone().spawn(n);
+        let (mut rx, supervisor) = self.pool.clone().spawn_tagged(n, &format!("B{step}"));
         let mut acc = LevelAccumulator::new(n, self.pool.max_tokens());
+        let budget = self.effective_step_budget(prev_wall_ns);
+        let mut stall_tick = tokio::time::interval(STALL_CHECK_INTERVAL);
+        stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut step_warned = false;
+        let mut aborted = false;
         let mut batch = 0u32;
-        while let Some(event) = rx.recv().await {
-            acc.on_event(&event);
-            batch += 1;
-            if let Some(state) = &self.metrics {
-                // Batched publish (blueprint §4.2: the engine "pushes
-                // unified snapshots per batch") — every 16 events, plus a
-                // final one when the level finishes.
-                if batch >= 16 {
-                    state.update(self.live_snapshot(&acc, n, &start, StreamStatus::Streaming));
-                    batch = 0;
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Some(e) => {
+                            acc.on_event(&e);
+                            self.log_pool_event(&e, &acc, step, total_steps);
+                            batch += 1;
+                            if let Some(state) = &self.metrics {
+                                // Batched publish (blueprint §4.2: the
+                                // engine "pushes unified snapshots per
+                                // batch") — every 16 events, plus a final
+                                // one when the level finishes.
+                                if batch >= 16 {
+                                    state.update(self.live_snapshot(&acc, n, &start, StreamStatus::Streaming));
+                                    batch = 0;
+                                }
+                            }
+                            // The progress bus shares the batch cadence:
+                            // the live stream count is the "alive" signal
+                            // while a level runs.
+                            if let Some(bus) = &self.progress {
+                                if batch >= 16 {
+                                    bus.publish(EngineProgress::Concurrency {
+                                        level: n,
+                                        step,
+                                        total_steps,
+                                        active: acc.active(),
+                                    });
+                                }
+                            }
+                        }
+                        // Channel closed ⇒ every worker has ended (or was
+                        // killed); the level is done.
+                        None => break,
+                    }
                 }
-            }
-            // The progress bus shares the batch cadence: the live stream
-            // count is the "alive" signal while a level runs.
-            if let Some(bus) = &self.progress {
-                if batch >= 16 {
-                    bus.publish(EngineProgress::Concurrency {
-                        level: n,
-                        step,
-                        total_steps,
-                        active: acc.active(),
-                    });
+                _ = stall_tick.tick() => {
+                    self.check_stalls(&mut acc, step, total_steps, &start);
+                    let elapsed = start.elapsed();
+                    if elapsed > budget {
+                        if !step_warned {
+                            step_warned = true;
+                            self.logw(
+                                Context::EngineB,
+                                format!(
+                                    "Step {step}/{total_steps}: running {:.1}s — past the {:.0}s budget (3× previous step / worker cap); workers still alive",
+                                    elapsed.as_secs_f64(),
+                                    budget.as_secs_f64()
+                                ),
+                            );
+                        }
+                        if elapsed > budget * 2 {
+                            self.loge(
+                                Context::EngineB,
+                                format!(
+                                    "Step {step}/{total_steps}: STEP TIMEOUT after {:.1}s (2× the {:.0}s budget) — aborting level, collecting partial results",
+                                    elapsed.as_secs_f64(),
+                                    budget.as_secs_f64()
+                                ),
+                            );
+                            // Kill the supervisor task: it owns the worker
+                            // tasks (its spawned children), so they are
+                            // aborted with it; their sockets close.
+                            supervisor.abort();
+                            aborted = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
-        // Channel closed ⇒ every worker has ended; the supervisor resolves
-        // at the true end of the level.
+        // On the normal path the supervisor resolves at the true end of
+        // the level; after an `abort()` it returns a `JoinError`
+        // immediately.
         let _outcomes: Option<Vec<crate::client::StreamOutcome>> = supervisor.await.ok();
         let wall_ns = start.delta_nanos(&MonotonicInstant::now());
+        // Any worker still in flight (only possible after an abort) is
+        // marked as a failed stream so the level's counts add up.
+        acc.finalize_incomplete(aborted);
         if let Some(state) = &self.metrics {
             let status = if acc.failed() == n {
                 StreamStatus::Error
@@ -363,7 +598,122 @@ impl Sweep {
                 active: acc.active(),
             });
         }
-        acc.finish(wall_ns)
+        let level = acc.finish(wall_ns, aborted);
+        self.logi(
+            Context::EngineB,
+            format!(
+                "Step {step}/{total_steps}: aggregate={:.1} t/s, p50={:.1}ms, p99={:.1}ms, {} completed, {} failed, {} timed out, {:.1}s{}",
+                level.aggregate_tps,
+                level.p50_tpot_ms(),
+                level.p99_tpot_ms(),
+                level.completed_streams,
+                level.failed_streams,
+                level.timed_out_streams,
+                level.wall_secs(),
+                if level.degraded() { " [DEGRADED]" } else { "" }
+            ),
+        );
+        level
+    }
+
+    /// Stall detection: warn (once per worker) when a live worker has
+    /// produced no tokens for [`stall_timeout`](Self::stall_timeout).
+    ///
+    /// A warning only — the kill comes from the per-worker timeout, so a
+    /// *slow* server (tokens every 40 s) is distinguished from a *hung*
+    /// connection (no tokens, ever) in the log.
+    fn check_stalls(
+        &self,
+        acc: &mut LevelAccumulator,
+        step: usize,
+        total_steps: usize,
+        start: &MonotonicInstant,
+    ) {
+        if self.logger.is_none() {
+            return; // no observer → no work
+        }
+        let now = MonotonicInstant::now();
+        for t in &mut acc.trackers {
+            if t.finished {
+                continue;
+            }
+            let ref_t = t.last_token_at.unwrap_or(*start);
+            let idle_ns = ref_t.delta_nanos(&now);
+            if (idle_ns as u128) >= self.stall_timeout.as_nanos() && !t.stall_warned {
+                t.stall_warned = true;
+                let last = t
+                    .last_token_wall
+                    .map(|w| {
+                        let ms = w
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        crate::log::format_timestamp(ms, false)
+                    })
+                    .unwrap_or_else(|| "no token yet".to_string());
+                self.logw(
+                    Context::EngineB,
+                    format!(
+                        "Step {step}/{total_steps}: worker #{} no tokens for {:.0}s (last token at {last})",
+                        t.id,
+                        idle_ns as f64 / 1e9
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Log the per-worker terminal events (stream complete / failure).
+    /// Token-reception milestones (first token, every 50th) are logged by
+    /// the workers themselves (the `B{step}-{id}` tags).
+    fn log_pool_event(
+        &self,
+        e: &PoolEvent,
+        acc: &LevelAccumulator,
+        step: usize,
+        total_steps: usize,
+    ) {
+        match e {
+            PoolEvent::Complete { stream, .. } => {
+                let tokens = acc
+                    .trackers
+                    .get(*stream as usize)
+                    .map(|t| t.tokens())
+                    .unwrap_or(0);
+                self.logi(
+                    Context::Sse,
+                    format!("B{step}-{stream} stream complete: {tokens} tokens"),
+                );
+            }
+            PoolEvent::Failed { stream, error, .. } => {
+                let tokens = acc
+                    .trackers
+                    .get(*stream as usize)
+                    .map(|t| t.tokens())
+                    .unwrap_or(0);
+                match error {
+                    StreamError::WorkerTimeout(d) => self.logw(
+                        Context::EngineB,
+                        format!(
+                            "Step {step}/{total_steps}: worker #{stream} TIMEOUT after {d:?} — collected {tokens} tokens (killed)",
+                        ),
+                    ),
+                    StreamError::Timeout(d) => self.logw(
+                        Context::EngineB,
+                        format!(
+                            "Step {step}/{total_steps}: worker #{stream} stalled — no data for {d:?} (killed)",
+                        ),
+                    ),
+                    other => self.loge(
+                        Context::EngineB,
+                        format!(
+                            "Step {step}/{total_steps}: worker #{stream} failed: {other} (collected {tokens} tokens)",
+                        ),
+                    ),
+                }
+            }
+            PoolEvent::Frame { .. } => {}
+        }
     }
 
     /// The live (in-level) snapshot published to the TUI seam.
@@ -400,6 +750,9 @@ struct StreamTracker {
     /// All data frames received (MTP packet denominator, blueprint §7).
     packets: u64,
     last_token_at: Option<MonotonicInstant>,
+    /// Wall-clock time of the last token (the stall log's "last token at
+    /// HH:MM:SS" — a display concern, never on the quanta timing path).
+    last_token_wall: Option<SystemTime>,
     ttft_ns: Option<u64>,
     t3: Option<MonotonicInstant>,
     t_end: Option<MonotonicInstant>,
@@ -407,6 +760,10 @@ struct StreamTracker {
     premature: bool,
     error: Option<String>,
     finished: bool,
+    /// The stall warning has fired for this worker (once per worker).
+    stall_warned: bool,
+    /// `true` when this worker was killed by the per-worker timeout.
+    timed_out: bool,
 }
 
 impl StreamTracker {
@@ -418,6 +775,7 @@ impl StreamTracker {
             content_frames: 0,
             packets: 0,
             last_token_at: None,
+            last_token_wall: None,
             ttft_ns: None,
             t3: None,
             t_end: None,
@@ -425,6 +783,8 @@ impl StreamTracker {
             premature: false,
             error: None,
             finished: false,
+            stall_warned: false,
+            timed_out: false,
         }
     }
 
@@ -553,6 +913,7 @@ impl LevelAccumulator {
                         self.itl.record(ns);
                     }
                     t.last_token_at = Some(*at);
+                    t.last_token_wall = Some(SystemTime::now());
                     if t.t3.is_none() {
                         t.t3 = Some(*at);
                     }
@@ -595,6 +956,7 @@ impl LevelAccumulator {
                 if t.ttft_ns.is_none() {
                     t.ttft_ns = timestamps.ttft_nanos();
                 }
+                t.timed_out = matches!(error, crate::client::StreamError::WorkerTimeout(_));
                 t.error = Some(error.to_string());
                 t.state = StreamStatus::Error;
                 t.finished = true;
@@ -636,8 +998,29 @@ impl LevelAccumulator {
         &self.itl
     }
 
+    /// Mark every worker that never reached a terminal event as failed.
+    ///
+    /// Only reachable after a step-level abort (on the normal channel-close
+    /// path every worker has emitted exactly one terminal event, so there
+    /// is nothing to finalize).
+    fn finalize_incomplete(&mut self, aborted: bool) {
+        for t in &mut self.trackers {
+            if t.finished {
+                continue;
+            }
+            t.finished = true;
+            t.state = StreamStatus::Error;
+            t.t_end = Some(MonotonicInstant::now());
+            t.error = Some(if aborted {
+                "aborted (step timeout)".to_string()
+            } else {
+                "incomplete (level ended)".to_string()
+            });
+        }
+    }
+
     /// Fold the finished level into its [`SweepLevel`] curve point.
-    fn finish(mut self, wall_ns: u64) -> SweepLevel {
+    fn finish(mut self, wall_ns: u64, aborted: bool) -> SweepLevel {
         let total_tokens: u64 = self.trackers.iter().map(|t| t.tokens()).sum();
         for t in &self.trackers {
             if let Some(ns) = t.ttft_ns {
@@ -660,6 +1043,8 @@ impl LevelAccumulator {
                 .filter(|t| t.state == StreamStatus::Done)
                 .count(),
             failed_streams: self.failed(),
+            timed_out_streams: self.trackers.iter().filter(|t| t.timed_out).count(),
+            aborted,
             wall_ns,
             streams: self.stream_rows(),
         }
@@ -798,7 +1183,7 @@ mod tests {
             acc.on_event(e);
         }
         // 30 ms wall time.
-        let level = acc.finish(30_000_000);
+        let level = acc.finish(30_000_000, false);
         assert_eq!(level.concurrency, 2);
         // usage (3 + 3) is the token source of truth.
         assert_eq!(level.total_tokens, 6);
@@ -825,7 +1210,7 @@ mod tests {
         for e in &events {
             acc.on_event(e);
         }
-        let level = acc.finish(30_000_000);
+        let level = acc.finish(30_000_000, false);
         // TTFTs: stream 0 → 5 ms (t3 - t1 from its first frame's
         // timestamps), stream 1 → 15 ms — each inside its histogram bucket.
         assert!(
@@ -893,7 +1278,7 @@ mod tests {
                 premature: false,
                 malformed_frames: 0,
             });
-            let level = acc.finish(5_000_000);
+            let level = acc.finish(5_000_000, false);
             assert_eq!(level.failed_streams, 1);
             assert_eq!(level.completed_streams, 1);
             assert_eq!(level.streams[0].state, StreamStatus::Error);
@@ -926,7 +1311,7 @@ mod tests {
                 premature: true,
                 malformed_frames: 0,
             });
-            let level = acc.finish(10_000_000);
+            let level = acc.finish(10_000_000, false);
             // Premature is a completion, not a failure (Chunk 5 contract:
             // partial data is preserved).
             assert_eq!(level.completed_streams, 1);
@@ -939,7 +1324,7 @@ mod tests {
     #[test]
     fn empty_level_yields_zeroed_point() {
         let acc = LevelAccumulator::new(0, 16);
-        let level = acc.finish(1_000_000);
+        let level = acc.finish(1_000_000, false);
         assert_eq!(level.concurrency, 0);
         assert_eq!(level.total_tokens, 0);
         assert_eq!(level.aggregate_tps, 0.0);
@@ -959,6 +1344,8 @@ mod tests {
             total_tokens: 0,
             completed_streams: 0,
             failed_streams: 0,
+            timed_out_streams: 0,
+            aborted: false,
             wall_ns: 0,
             streams: Vec::new(),
         };
@@ -983,6 +1370,8 @@ mod tests {
             total_tokens: 100,
             completed_streams: concurrency,
             failed_streams: 0,
+            timed_out_streams: 0,
+            aborted: false,
             wall_ns: 1_000_000_000,
             streams: Vec::new(),
         }
@@ -1130,5 +1519,222 @@ mod tests {
         let sweep = Sweep::new(pool, Vec::<usize>::new());
         let result = sweep.run().await;
         assert!(result.is_empty());
+    }
+
+    // ── The freeze fix: step budget, finalize, timeouts, stalls ─────────
+
+    fn pool_with_cap(cap: Option<u64>) -> WorkerPool {
+        let mut pool = WorkerPool::new(reqwest::Client::new(), "http://127.0.0.1:1", "m", "p", 16);
+        if let Some(s) = cap {
+            pool = pool.worker_timeout(Duration::from_secs(s));
+        }
+        pool
+    }
+
+    #[test]
+    fn step_budget_uses_the_worker_cap_as_a_floor() {
+        let sweep = Sweep::new(pool_with_cap(Some(120)), [1]);
+        // First step (no previous): the cap is the budget.
+        assert_eq!(sweep.effective_step_budget(0), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn step_budget_scales_with_the_previous_step() {
+        let sweep = Sweep::new(pool_with_cap(Some(120)), [1]);
+        // Previous step ran 60 s → 3× (180 s) beats the 120 s cap.
+        assert_eq!(
+            sweep.effective_step_budget(60_000_000_000),
+            Duration::from_secs(180)
+        );
+        // Previous step ran 10 s → the 120 s cap wins.
+        assert_eq!(
+            sweep.effective_step_budget(10_000_000_000),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn step_budget_without_a_cap_uses_the_three_x_rule() {
+        let sweep = Sweep::new(pool_with_cap(None), [1]);
+        // No worker cap, no previous step: the 5-minute floor.
+        assert_eq!(sweep.effective_step_budget(0), Duration::from_secs(300));
+        // No worker cap, previous 100 s: 3×.
+        assert_eq!(
+            sweep.effective_step_budget(100_000_000_000),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn step_budget_override_caps_the_computed_value() {
+        let sweep =
+            Sweep::new(pool_with_cap(Some(120)), [1]).step_budget(Duration::from_millis(1500));
+        assert_eq!(sweep.effective_step_budget(0), Duration::from_millis(1500));
+        assert_eq!(
+            sweep.effective_step_budget(60_000_000_000),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn finalize_incomplete_marks_stranded_workers_as_failed() {
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let mut acc = LevelAccumulator::new(2, 16);
+            // Stream 0 completes cleanly.
+            acc.on_event(&frame_event(0, ts_with_ttft(t0, t0)));
+            acc.on_event(&PoolEvent::Complete {
+                stream: 0,
+                timestamps: StreamTimestamps {
+                    t0: Some(t0),
+                    t1: Some(t0),
+                    t2: Some(t0),
+                    t3: Some(t0),
+                    t_end: Some(t0),
+                },
+                usage: None,
+                premature: false,
+                malformed_frames: 0,
+            });
+            // Stream 1 never finished (the step was aborted).
+            acc.finalize_incomplete(true);
+            assert!(acc.trackers[0].finished);
+            assert!(acc.trackers[1].finished);
+            assert_eq!(acc.trackers[0].state, StreamStatus::Done);
+            assert_eq!(acc.trackers[1].state, StreamStatus::Error);
+            assert!(acc.trackers[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("aborted"));
+            let level = acc.finish(1_000_000, true);
+            assert!(level.aborted);
+            assert!(level.degraded());
+            assert_eq!(level.completed_streams, 1);
+            assert_eq!(level.failed_streams, 1);
+        });
+    }
+
+    #[test]
+    fn fold_level_counts_worker_timeouts_and_flags_degraded() {
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let mut acc = LevelAccumulator::new(3, 16);
+            // Stream 0: one token, then killed by the per-worker timeout.
+            acc.on_event(&frame_event(0, ts_with_ttft(t0, t0)));
+            acc.on_event(&PoolEvent::Failed {
+                stream: 0,
+                timestamps: StreamTimestamps {
+                    t0: Some(t0),
+                    t1: Some(t0),
+                    t2: Some(t0),
+                    t3: Some(t0),
+                    t_end: Some(t0),
+                },
+                error: crate::client::StreamError::WorkerTimeout(Duration::from_secs(120)),
+            });
+            // Streams 1 and 2 complete cleanly.
+            for s in [1u32, 2] {
+                acc.on_event(&frame_event(s, ts_with_ttft(t0, t0)));
+                acc.on_event(&PoolEvent::Complete {
+                    stream: s,
+                    timestamps: StreamTimestamps {
+                        t0: Some(t0),
+                        t1: Some(t0),
+                        t2: Some(t0),
+                        t3: Some(t0),
+                        t_end: Some(t0),
+                    },
+                    usage: None,
+                    premature: false,
+                    malformed_frames: 0,
+                });
+            }
+            let level = acc.finish(1_000_000, false);
+            assert_eq!(level.timed_out_streams, 1);
+            assert_eq!(level.completed_streams, 2);
+            assert_eq!(level.failed_streams, 1);
+            assert!(!level.aborted);
+            assert!(level.degraded(), "a worker timeout degrades the level");
+            // The timed-out stream's partial token still counts.
+            assert_eq!(level.total_tokens, 3);
+        });
+    }
+
+    #[test]
+    fn clean_level_is_not_degraded() {
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let mut acc = LevelAccumulator::new(1, 16);
+            acc.on_event(&frame_event(0, ts_with_ttft(t0, t0)));
+            acc.on_event(&PoolEvent::Complete {
+                stream: 0,
+                timestamps: StreamTimestamps {
+                    t0: Some(t0),
+                    t1: Some(t0),
+                    t2: Some(t0),
+                    t3: Some(t0),
+                    t_end: Some(t0),
+                },
+                usage: None,
+                premature: false,
+                malformed_frames: 0,
+            });
+            let level = acc.finish(1_000_000, false);
+            assert!(!level.degraded());
+        });
+    }
+
+    #[test]
+    fn check_stalls_warns_once_per_worker_and_only_when_idle() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-runlog-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let sweep = Sweep::new(pool_with_cap(Some(120)), [2]).logger(logger.clone());
+
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let mut acc = LevelAccumulator::new(2, 16);
+            // Stream 0 got a token 6 s before the check (fresh: 29 s idle
+            // < the 30 s window); stream 1 has had no token since the
+            // level start (35 s idle ≥ 30 s → stalled).
+            let ts1 = ts_with_ttft(t0, t0);
+            acc.on_event(&frame_event(0, ts1));
+            {
+                let t = &mut acc.trackers[0];
+                mock.increment(6_000_000_000);
+                t.last_token_at = Some(MonotonicInstant::now());
+                t.last_token_wall = Some(std::time::SystemTime::now());
+                t.state = StreamStatus::Streaming;
+            }
+            acc.trackers[1].last_token_wall = Some(std::time::SystemTime::now());
+            mock.increment(29_000_000_000); // now = t0 + 35 s
+
+            // First check: only stream 1 warns.
+            sweep.check_stalls(&mut acc, 1, 7, &t0);
+            assert!(acc.trackers[1].stall_warned);
+            assert!(!acc.trackers[0].stall_warned);
+            // Second check: the warning fires once (no repeat spam).
+            sweep.check_stalls(&mut acc, 1, 7, &t0);
+            assert!(acc.trackers[1].stall_warned);
+
+            logger.finish();
+            // The writer flushes on every newline; read after finish.
+            let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+            assert!(
+                latest.contains("worker #1 no tokens for 35s"),
+                "stall warning missing: {latest}"
+            );
+            assert!(
+                !latest.contains("worker #0 no tokens"),
+                "fresh worker must not stall"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

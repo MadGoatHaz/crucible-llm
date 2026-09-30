@@ -42,6 +42,7 @@ use crate::engines::hardware::profile;
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::HwPoller;
+use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
 
 /// The cooperative pause gate (the `Space` key, TUI): shared between the
@@ -441,6 +442,9 @@ pub struct BenchmarkSequence {
     /// The `Space`-key pause gate shared with every engine (the engines
     /// wait on it before spawning each new request unit).
     pause: Arc<RunPause>,
+    /// The file-based run logger (the executor records engine
+    /// transitions; a `disabled` logger makes this a no-op).
+    logger: Arc<RunLogger>,
     /// The ordered engine queue (selection-filtered, canonical order).
     engines: Vec<Engine>,
     /// The queue index the ticker is mirroring (the current engine).
@@ -483,6 +487,7 @@ impl BenchmarkSequence {
         slots: RunSlots,
         log: Option<mpsc::Sender<String>>,
         pause: Arc<RunPause>,
+        logger: Arc<RunLogger>,
     ) -> Self {
         let engines = queue_for(&cfg.engines);
         Self {
@@ -494,6 +499,7 @@ impl BenchmarkSequence {
             slots,
             log,
             pause,
+            logger,
             engines,
             current: Arc::new(AtomicUsize::new(0)),
             completed: Arc::new(Mutex::new(Vec::new())),
@@ -542,9 +548,23 @@ impl BenchmarkSequence {
     pub async fn run(self) {
         if self.engines.is_empty() {
             self.log_line("[seq] no engines selected — enable some in the Config view".into());
+            self.logger
+                .warn(Context::Sequence, "no engines selected — nothing to run");
             self.slot.set_running(false);
             return;
         }
+        self.logger.info(
+            Context::Sequence,
+            format!(
+                "sequence started — {} engine(s): {}",
+                self.engines.len(),
+                self.engines
+                    .iter()
+                    .map(|e| e.label())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            ),
+        );
 
         // The 10 Hz ticker: mirror the progress bus into the state slot
         // while a run is active. It exits when the sequence finishes.
@@ -595,6 +615,15 @@ impl BenchmarkSequence {
                 i + 1,
                 self.engines.len()
             ));
+            self.logger.info(
+                Context::Sequence,
+                format!(
+                    "▶ {} — starting (engine {} of {})",
+                    engine.label(),
+                    i + 1,
+                    self.engines.len()
+                ),
+            );
             self.publish_state(SeqPhase::Running, *engine, "");
 
             // Mark the engine's result slot running (the views show the
@@ -621,6 +650,10 @@ impl BenchmarkSequence {
                 g.push((*engine, summary.clone()));
             }
             self.log_line(format!("[seq] ✓ {} — {summary}", engine.label()));
+            self.logger.info(
+                Context::Sequence,
+                format!("✓ {} — {summary}", engine.label()),
+            );
             self.publish_state(SeqPhase::Complete, *engine, &summary);
 
             // Brief summary hold so the user sees the result before the
@@ -643,6 +676,10 @@ impl BenchmarkSequence {
             &final_summary,
         );
         self.log_line(format!("[seq] ✓ all benchmarks complete — {final_summary}"));
+        self.logger.info(
+            Context::Sequence,
+            format!("sequence complete — {final_summary}"),
+        );
     }
 
     // ── Per-engine runners (one at a time) ─────────────────────────────
@@ -653,13 +690,16 @@ impl BenchmarkSequence {
             Ok(e) => e,
             Err(e) => {
                 self.slots.speed.set_running(false);
+                self.logger
+                    .error(Context::EngineA, format!("Engine A init failed: {e}"));
                 return format!("init failed: {e}");
             }
         };
         let engine = engine
             .metrics(self.metrics.clone())
             .progress(self.bus.clone())
-            .pause(self.pause.clone());
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
         let (_, results) = engine.run().await;
         self.slots.speed.set_running(false);
         self.slots.speed.store(results.clone());
@@ -667,10 +707,21 @@ impl BenchmarkSequence {
     }
 
     async fn run_concurrency(&self) -> String {
-        let Some(mut sweep) = build_sweep(&self.cfg, Some(self.metrics.clone())) else {
+        let Some(mut sweep) = build_sweep(
+            &self.cfg,
+            Some(self.metrics.clone()),
+            Some(self.logger.clone()),
+        ) else {
+            self.logger.error(
+                Context::EngineB,
+                "Engine B init failed (client build) — sweep skipped",
+            );
             return "sweep init failed (client build)".to_string();
         };
-        sweep = sweep.progress(self.bus.clone()).pause(self.pause.clone());
+        sweep = sweep
+            .progress(self.bus.clone())
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
         self.slots.concurrency.set_running(true);
         let result = sweep.run().await;
         self.slots.concurrency.set_running(false);
@@ -684,13 +735,16 @@ impl BenchmarkSequence {
             Ok(e) => e,
             Err(e) => {
                 self.slots.niah.set_running(false);
+                self.logger
+                    .error(Context::EngineC1, format!("Engine C1 init failed: {e}"));
                 return format!("init failed: {e}");
             }
         };
         let engine = engine
             .progress(self.bus.clone())
             .metrics(self.metrics.clone())
-            .pause(self.pause.clone());
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
         let result = engine.run().await;
         self.slots.niah.set_running(false);
         self.slots.niah.store(result.clone());
@@ -703,13 +757,16 @@ impl BenchmarkSequence {
             Ok(e) => e,
             Err(e) => {
                 self.slots.reasoning.set_running(false);
+                self.logger
+                    .error(Context::EngineC2, format!("Engine C2 init failed: {e}"));
                 return format!("init failed: {e}");
             }
         };
         let engine = engine
             .progress(self.bus.clone())
             .metrics(self.metrics.clone())
-            .pause(self.pause.clone());
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
         let result = engine.run().await;
         self.slots.reasoning.set_running(false);
         self.slots.reasoning.store(result.clone());
@@ -726,13 +783,16 @@ impl BenchmarkSequence {
             Ok(e) => e,
             Err(e) => {
                 self.slots.structured.set_running(false);
+                self.logger
+                    .error(Context::EngineC3, format!("Engine C3 init failed: {e}"));
                 return format!("init failed: {e}");
             }
         };
         let engine = engine
             .progress(self.bus.clone())
             .metrics(self.metrics.clone())
-            .pause(self.pause.clone());
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
         let result = engine.run().await;
         self.slots.structured.set_running(false);
         self.slots.structured.store(result.clone());
@@ -747,6 +807,10 @@ impl BenchmarkSequence {
     /// Silicon Efficiency Metric over the whole trace. Returns the
     /// one-line summary (`J/token`, or `N/A` on a driverless host).
     async fn run_hardware(&self, total_tokens: u64) -> String {
+        self.logger.info(
+            Context::EngineD,
+            format!("Engine D (Energy) started — 3s sampling window over {total_tokens} tokens"),
+        );
         const WINDOW: Duration = Duration::from_secs(3);
         let start = std::time::Instant::now();
         while start.elapsed() < WINDOW {
@@ -764,7 +828,7 @@ impl BenchmarkSequence {
             None => (Vec::new(), None),
         };
         let energy = profile(&trace, None, total_tokens);
-        match energy.joules_per_token {
+        let summary = match energy.joules_per_token {
             Some(jpt) => {
                 let peak = energy
                     .peak_power_w
@@ -773,7 +837,10 @@ impl BenchmarkSequence {
                 format!("{jpt:.3} J/token{peak}")
             }
             None => "N/A (no power telemetry)".to_string(),
-        }
+        };
+        self.logger
+            .info(Context::EngineD, format!("Engine D complete — {summary}"));
+        summary
     }
 }
 
@@ -862,6 +929,7 @@ mod tests {
             },
             None,
             Arc::new(RunPause::new()),
+            crate::log::RunLogger::disabled(),
         )
     }
 
@@ -1155,6 +1223,8 @@ mod tests {
             total_tokens: 100,
             completed_streams: c,
             failed_streams: 0,
+            timed_out_streams: 0,
+            aborted: false,
             wall_ns: 1_000_000_000,
             streams: Vec::new(),
         };
@@ -1199,6 +1269,7 @@ mod tests {
             },
             None,
             Arc::new(RunPause::new()),
+            crate::log::RunLogger::disabled(),
         );
         s.run().await;
         assert!(!slot.is_running(), "the slot clears when the run ends");

@@ -7,6 +7,7 @@ pub mod client;
 pub mod config;
 pub mod engines;
 pub mod hw;
+pub mod log;
 pub mod metrics;
 pub mod prompt;
 pub mod sse;

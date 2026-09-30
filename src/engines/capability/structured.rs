@@ -87,6 +87,9 @@ pub struct StructuredEngine {
     /// Optional `Space`-key pause gate: each of the two runs waits on it
     /// before its stream is spawned (in-flight runs complete).
     pause: Option<Arc<RunPause>>,
+    /// Optional run logger (each run's worker records its HTTP / SSE
+    /// lifecycle; the engine records the evaluation start / result).
+    logger: Option<Arc<crate::log::RunLogger>>,
 }
 
 impl StructuredEngine {
@@ -104,6 +107,7 @@ impl StructuredEngine {
             progress: None,
             metrics: None,
             pause: None,
+            logger: None,
         })
     }
 
@@ -129,6 +133,13 @@ impl StructuredEngine {
         self
     }
 
+    /// Attach the run logger (each run's stream then logs its HTTP /
+    /// SSE lifecycle).
+    pub fn logger(mut self, logger: Arc<crate::log::RunLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
     /// One run: spawn a worker (optionally with the JSON `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
     async fn run_once(&self, constrained: bool) -> (String, f64, f64) {
@@ -140,9 +151,17 @@ impl StructuredEngine {
             STRUCTURED_TASK,
             STRUCTURED_MAX_GEN_TOKENS,
         )
-        .read_timeout(Duration::from_secs(self.timeout.max(1)));
+        .read_timeout(Duration::from_secs(self.timeout.max(1)))
+        .tag(if constrained {
+            "C3:constrained"
+        } else {
+            "C3:free"
+        });
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
+        }
+        if let Some(logger) = &self.logger {
+            worker = worker.logger(logger.clone());
         }
         if constrained {
             worker = worker.response_format("json_object");
@@ -222,6 +241,12 @@ impl StructuredEngine {
     /// `Run {n}/2` — the Benchmark Sequence mirrors it into the TUI's
     /// progress bar.
     pub async fn run(&self) -> StructuredResult {
+        if let Some(l) = &self.logger {
+            l.info(
+                crate::log::Context::EngineC3,
+                "Engine C3 (Structured) started — free-form vs constrained",
+            );
+        }
         // The `Space`-key pause: hold before each run's request goes out
         // (an in-flight run always completes).
         if let Some(gate) = &self.pause {

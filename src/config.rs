@@ -70,6 +70,9 @@ pub mod env_vars {
     /// Comma-separated engine selection (Chunk 18): `speed`,
     /// `concurrency`, `niah`, `reasoning`, `structured`, `hardware`.
     pub const ENGINE: &str = "CRUCIBLE_ENGINE";
+    /// Directory for the run log (`latest.log` + `run-<timestamp>.log`
+    /// archives). Default: `data_dir()/crucible/logs`.
+    pub const LOG_DIR: &str = "CRUCIBLE_LOG_DIR";
 }
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
@@ -338,6 +341,10 @@ pub struct Cli {
     /// default — it degrades to N/A on a driverless host).
     #[arg(long)]
     pub no_hardware: bool,
+    /// Directory for the run log (`latest.log` + `run-<timestamp>.log`
+    /// archives). Default: `~/.local/share/crucible/logs`.
+    #[arg(long)]
+    pub log_dir: Option<PathBuf>,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -382,6 +389,9 @@ pub struct Config {
     /// default mode) — it no longer prints the banner.
     #[serde(skip)]
     pub target_explicit: bool,
+    /// The run-log directory (`latest.log` + `run-<timestamp>.log`
+    /// archives). `None` → the default `data_dir()/crucible/logs`.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -408,6 +418,7 @@ impl Default for Config {
             hardware: true,
             engines: EngineSelection::default(),
             target_explicit: false,
+            log_dir: None,
         }
     }
 }
@@ -479,6 +490,8 @@ pub struct ConfigFile {
     pub hardware: Option<bool>,
     /// Which engines a run orchestrates (Chunk 18).
     pub engines: Option<EngineSelection>,
+    /// The run-log directory (default `data_dir()/crucible/logs`).
+    pub log_dir: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -542,6 +555,9 @@ impl ConfigFile {
         }
         if let Some(v) = self.engines {
             c.engines = v;
+        }
+        if let Some(v) = &self.log_dir {
+            c.log_dir = Some(v.clone());
         }
         c.target_explicit = self.url.is_some();
         c
@@ -759,6 +775,15 @@ pub fn layer(
             .or_else(|| file.and_then(|f| f.export_path.clone()))
     };
 
+    // ── run-log directory ──
+    let log_dir = if explicit("log_dir") {
+        cli.log_dir.clone()
+    } else {
+        env_get(env_vars::LOG_DIR)
+            .map(PathBuf::from)
+            .or_else(|| file.and_then(|f| f.log_dir.clone()))
+    };
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -831,6 +856,7 @@ pub fn layer(
         hardware,
         engines,
         target_explicit,
+        log_dir,
     })
 }
 

@@ -42,6 +42,7 @@ use crate::engines::{
     StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD,
 };
 use crate::hw::HwPoller;
+use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
@@ -264,6 +265,11 @@ pub struct App {
     /// §5D): the log line fires once when occupancy crosses the
     /// threshold and re-arms once it falls 5 points below it.
     vram_warned: bool,
+    /// The file-based run logger (shared with every engine the App
+    /// spawns): setup / discovery / launch events land in
+    /// `latest.log` + the run archive. A `disabled` logger (the
+    /// `App::new()` default for tests) makes every call a no-op.
+    pub logger: Arc<RunLogger>,
 }
 
 impl Default for App {
@@ -310,7 +316,18 @@ impl App {
             pending_niah: false,
             log_rx: None,
             vram_warned: false,
+            // Tests use `App::new()` directly: a disabled logger keeps
+            // them off the filesystem (the entry point attaches the real
+            // one via `with_logger`).
+            logger: RunLogger::disabled(),
         }
+    }
+
+    /// Attach the run logger (the entry point calls this with the
+    /// process's `RunLogger::start(...)` instance).
+    pub fn with_logger(mut self, logger: Arc<RunLogger>) -> Self {
+        self.logger = logger;
+        self
     }
 
     /// Supply the NIAH-relevant config snapshot (Chunk 15) so the `n`
@@ -413,6 +430,27 @@ impl App {
         self.push_log(
             format!("[setup] launching: {} / {}", cfg.url, cfg.model),
             style::value_ok(),
+        );
+        // The setup summary the run log is reviewed for: the exact target
+        // and parameters the run was launched with.
+        self.logger.info(
+            Context::Setup,
+            format!(
+                "setup complete — url={} model={} mode={} tokens={} iterations={} timeout={}s nocache={} ladder=[{}] engines=[{}]",
+                cfg.url,
+                cfg.model,
+                cfg.mode.label(),
+                cfg.tokens,
+                cfg.iterations,
+                cfg.timeout,
+                cfg.nocache,
+                cfg.ladder
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                cfg.engines.iter_labels().collect::<Vec<_>>().join(",")
+            ),
         );
         self.start_run();
     }
@@ -523,8 +561,16 @@ impl App {
         );
         // The runner owns the slot handle; on completion it clears the
         // running flag and publishes the scored grid.
-        let engine = engine.pause(self.pause.clone());
+        let logger = self.logger.clone();
+        let engine = engine.pause(self.pause.clone()).logger(logger.clone());
         tokio::spawn(async move {
+            logger.info(
+                Context::EngineC1,
+                format!(
+                    "standalone NIAH run started — {requests} requests → {url}",
+                    url = config.url
+                ),
+            );
             let result = engine.run().await;
             slot.set_running(false);
             slot.store(result);
@@ -560,18 +606,34 @@ impl App {
         let api_key = cfg.api_key.clone();
         let slot = self.models.clone();
         let err_slot = self.discovery_error.clone();
+        let logger = self.logger.clone();
         slot.set_running(true);
         self.push_log(
             format!("[discovery] listing models at {url}/models"),
             style::value_ok(),
         );
+        logger.info(Context::Discovery, format!("→ GET {url}/models"));
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
             match crate::client::models::list_models(&url, api_key.as_deref()).await {
                 Ok(models) => {
                     slot.set_running(false);
-                    slot.store(models);
+                    slot.store(models.clone());
                     // A successful discovery clears any stale error.
                     err_slot.store(None);
+                    logger.info(
+                        Context::Discovery,
+                        format!(
+                            "← 200 ({} ms) — {} model(s) found: {}",
+                            started.elapsed().as_millis(),
+                            models.len(),
+                            models
+                                .iter()
+                                .map(|m| m.id.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    );
                 }
                 Err(e) => {
                     // Clear the running flag; keep any previously
@@ -580,6 +642,10 @@ impl App {
                     // the setup flow can surface it in the UI.
                     slot.set_running(false);
                     err_slot.store(Some(Arc::new(e.to_string())));
+                    logger.error(
+                        Context::Discovery,
+                        format!("← failed after {} ms: {e}", started.elapsed().as_millis()),
+                    );
                     eprintln!("[discovery] failed: {e}");
                 }
             }
@@ -651,6 +717,14 @@ impl App {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         self.log_rx = Some(rx);
+        self.logger.info(
+            Context::Sequence,
+            format!(
+                "run started — {} engine(s): {}",
+                cfg.engines.count(),
+                cfg.engines.iter_labels().collect::<Vec<_>>().join(" → ")
+            ),
+        );
         let seq = BenchmarkSequence::new(
             cfg,
             self.metrics.clone(),
@@ -666,6 +740,7 @@ impl App {
             },
             Some(tx),
             self.pause.clone(),
+            self.logger.clone(),
         );
         tokio::spawn(async move {
             seq.run().await;
@@ -677,6 +752,7 @@ impl App {
         // Ctrl-C quits globally — in the dashboard *and* the Setup
         // takeover (where `q` and `Esc` are phase keys, not quit keys).
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.logger.info(Context::Tui, "quit (Ctrl-C)");
             self.running = false;
             return KeyAction::Quit;
         }
@@ -695,12 +771,18 @@ impl App {
                 // into the shared form, then fire the async discovery.
                 SetupKeyResult::Discover | SetupKeyResult::Retry => {
                     self.config.url = self.setup.url.trim().to_string();
+                    self.logger
+                        .info(Context::Setup, format!("URL entered: {}", self.config.url));
                     self.start_discovery();
                     KeyAction::Continue
                 }
                 // Stage 2 `Enter`: the picked (or typed) model is the target.
                 SetupKeyResult::Selected => {
                     self.config.model = self.setup.confirmed_model().unwrap_or_default();
+                    self.logger.info(
+                        Context::Setup,
+                        format!("model selected: {}", self.config.model),
+                    );
                     self.config.cursor = 0;
                     self.setup.form_field = 0;
                     KeyAction::Continue
@@ -740,6 +822,8 @@ impl App {
         // `q` / `Esc` quit — even inside the Config view
         // (where `q` would otherwise be typed into a field).
         if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+            self.logger
+                .info(Context::Tui, format!("quit ({:?})", key.code));
             self.running = false;
             return KeyAction::Quit;
         }
@@ -789,6 +873,10 @@ impl App {
                     self.push_log(
                         format!("[config] saved → {}", self.config.config_path.display()),
                         style::value_ok(),
+                    );
+                    self.logger.info(
+                        Context::Setup,
+                        format!("config saved → {}", self.config.config_path.display()),
                     );
                     return KeyAction::Continue;
                 }
