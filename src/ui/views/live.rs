@@ -1,13 +1,15 @@
 //! View 1 — Live Monitor & Telemetry (blueprint §6):
-//! telemetry gauges, ITL latency distribution, active-streams matrix,
-//! rolling throughput chart, and the log/event stream.
+//! telemetry gauges, ITL percentile gauge bars + latency distribution,
+//! active-streams matrix, a rolling throughput sparkline (unicode block
+//! ramp with a green/yellow/red gradient), a large token counter, and the
+//! log/event stream.
 //!
 //! Every panel reads the shared `ArcSwap<MetricsSnapshot>` (Chunk 6) lock-free
 //! via `MetricsState::load()`; the panel geometry matches the blueprint
 //! mockup.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -28,16 +30,16 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(30), // telemetry gauges | ITL distribution
+            Constraint::Percentage(30), // telemetry gauges | ITL gauge bars + distribution
             Constraint::Percentage(30), // active streams monitor
-            Constraint::Percentage(25), // rolling throughput chart
+            Constraint::Percentage(25), // throughput sparkline | token counter
             Constraint::Percentage(15), // log & event stream
         ])
         .split(area);
 
     render_top(rows[0], m, f);
     render_streams(rows[1], m, f);
-    render_throughput(rows[2], m, f);
+    render_bottom(rows[2], m, f);
     render_log(rows[3], app, f);
 }
 
@@ -131,22 +133,41 @@ fn render_gauges(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     );
 }
 
-/// Top-right: ITL percentiles + histogram sparkline.
+/// Top-right: ITL percentile gauge bars (p50/p90/p99) + histogram.
+///
+/// The three one-row [`Gauge`] bars are scaled against the widest
+/// percentile (p99.9) and carry the green (p50) → yellow (p90) → red
+/// (p99) gradient; each bar's centered label shows the value in ms.
 fn render_itl(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(area);
 
-    let line = Line::from(vec![
-        Span::styled(" p50: ", style::label()),
-        Span::styled(format!("{:.1} ms", m.itl_p50_ms()), style::value()),
-        Span::styled("  |  p90: ", style::label()),
-        Span::styled(format!("{:.1} ms", m.itl_p90_ms()), style::value()),
-        Span::styled("  |  p99: ", style::label()),
-        Span::styled(format!("{:.1} ms", m.itl_p99_ms()), style::value_warn()),
-    ]);
-    f.render_widget(Paragraph::new(line), chunks[0]);
+    let scale = m
+        .itl_p999_ns
+        .max(m.itl_p99_ns)
+        .max(m.itl_p90_ns)
+        .max(m.itl_p50_ns)
+        .max(1) as f64;
+    let gauges = [
+        (m.itl_p50_ns, "p50", palette::OK),
+        (m.itl_p90_ns, "p90", palette::WARN),
+        (m.itl_p99_ns, "p99", palette::ERR),
+    ];
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1); 3])
+        .split(chunks[0]);
+    for (rect, (ns, name, color)) in rows.iter().zip(gauges) {
+        f.render_widget(
+            Gauge::default()
+                .ratio((ns as f64 / scale).clamp(0.0, 1.0))
+                .gauge_style(Style::default().fg(color))
+                .label(format!("{name}  {:.1} ms", ns as f64 / 1_000_000.0)),
+            *rect,
+        );
+    }
 
     let points: Vec<(f64, f64)> = m
         .itl_bins
@@ -252,57 +273,105 @@ fn stream_row(s: &StreamMetric) -> Row<'_> {
     ])
 }
 
-/// Bottom chart: rolling aggregate tokens/sec over the test epoch.
+/// Bottom chart row: rolling throughput sparkline (left) + token
+/// counter (right).
+fn render_bottom(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+    render_throughput(cols[0], m, f);
+    render_tokens(cols[1], m, f);
+}
+
+/// Bottom-left: rolling aggregate tokens/sec over the last 60 seconds as
+/// a unicode-block sparkline (`▁▂▃▄▅▆▇█`, one sample per column,
+/// right-aligned so the newest sample sits at the right edge), color
+/// graded green (high) → yellow (medium) → red (low) against the
+/// window maximum, with the current value labeled.
 fn render_throughput(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
-    let max = m
-        .throughput_series
-        .iter()
-        .cloned()
-        .fold(0.0_f64, f64::max)
-        .max(100.0);
-    let points: Vec<(f64, f64)> = m
-        .throughput_series
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| (i as f64, v))
-        .collect();
-    let data = Dataset::default()
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
-        .style(palette::ACCENT)
-        .data(&points);
-    f.render_widget(
-        Chart::new(vec![data])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style::border())
-                    .title("REAL-TIME SYSTEM PERFORMANCE (TOKENS/SEC OVER TIME)"),
-            )
-            .x_axis(
-                Axis::default()
-                    .style(style::footer())
-                    .bounds([0.0, 60.0])
-                    .labels(vec![
-                        Line::from("0s"),
-                        Line::from("15s"),
-                        Line::from("30s"),
-                        Line::from("45s"),
-                        Line::from("60s"),
-                    ]),
-            )
-            .y_axis(
-                Axis::default()
-                    .style(style::footer())
-                    .bounds([0.0, max * 1.1])
-                    .labels(vec![
-                        Line::from("0"),
-                        Line::from(format!("{:.0}", (max * 0.55).round())),
-                        Line::from(format!("{:.0}", (max * 1.1).round())),
-                    ]),
-            ),
-        area,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style::border())
+        .title("REAL-TIME SYSTEM PERFORMANCE — TOKENS/SEC (LAST 60s)");
+    if area.width < 6 || area.height < 4 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+
+    let series = &m.throughput_series;
+    let max = series.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+    let current = series.last().copied().unwrap_or(m.aggregate_tps);
+    let peak = series.iter().cloned().fold(0.0_f64, f64::max);
+
+    // One sample per column; left-pad so the window stays right-aligned
+    // while it fills.
+    let width = (area.width - 2) as usize;
+    let n = width.min(series.len());
+    let mut spans: Vec<Span> = Vec::with_capacity(width);
+    for _ in 0..width - n {
+        spans.push(Span::raw(" "));
+    }
+    for &v in &series[series.len() - n..] {
+        let ratio = v / max;
+        spans.push(Span::styled(
+            block_char(ratio).to_string(),
+            Style::default().fg(throughput_color(ratio)),
+        ));
+    }
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("now ", style::label()),
+            Span::styled(format!("{current:.1} t/s"), style::value()),
+            Span::styled("  |  peak ", style::footer()),
+            Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+        ]),
+        Line::from(spans),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// Bottom-right: total tokens generated — large number display.
+///
+/// The counter reads `1,332` at a glance (thousands-separated); the
+/// reasoning and prompt splits sit beneath it.
+fn render_tokens(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style::border())
+        .title("TOKENS GENERATED");
+    if area.width < 6 || area.height < 4 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+    let lines = vec![
+        Line::from(Span::styled(grouped(m.completion_tokens), style::value())),
+        Line::from(Span::styled(
+            format!("reasoning {}", grouped(m.reasoning_tokens)),
+            style::highlight(),
+        )),
+        Line::from(Span::styled(
+            format!("prompt {}", grouped(m.prompt_tokens)),
+            style::footer(),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// Format an integer with thousands separators (`1332 → "1,332"`) for the
+/// large-number token display.
+fn grouped(v: u64) -> String {
+    let s = v.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 /// Bottom: scrolling log / event stream.
@@ -318,4 +387,51 @@ fn render_log(area: Rect, app: &App, f: &mut Frame) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+/// The 8-step unicode block ramp used by the sparklines.
+const BLOCK_RAMP: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Map a `0.0..=1.0` ratio to the nearest block-ramp character
+/// (`0.0 → ▁`, `1.0 → █`); out-of-range ratios clamp to the ramp ends.
+pub(crate) fn block_char(ratio: f64) -> char {
+    let idx = (ratio.clamp(0.0, 1.0) * (BLOCK_RAMP.len() - 1) as f64).round() as usize;
+    BLOCK_RAMP[idx]
+}
+
+/// Color gradient for the throughput sparkline: green (high) → yellow
+/// (medium) → red (low), relative to the rolling-window maximum.
+pub(crate) fn throughput_color(ratio: f64) -> Color {
+    if ratio >= 0.75 {
+        palette::OK
+    } else if ratio >= 0.40 {
+        palette::WARN
+    } else {
+        palette::ERR
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_char_maps_ratio_onto_the_ramp() {
+        assert_eq!(block_char(0.0), '▁');
+        assert_eq!(block_char(0.5), '▅');
+        assert_eq!(block_char(1.0), '█');
+        // Out-of-range ratios clamp to the ramp ends.
+        assert_eq!(block_char(-3.0), '▁');
+        assert_eq!(block_char(4.0), '█');
+    }
+
+    #[test]
+    fn throughput_color_is_a_green_yellow_red_gradient() {
+        assert_eq!(throughput_color(1.0), palette::OK);
+        assert_eq!(throughput_color(0.75), palette::OK);
+        assert_eq!(throughput_color(0.5), palette::WARN);
+        assert_eq!(throughput_color(0.4), palette::WARN);
+        assert_eq!(throughput_color(0.2), palette::ERR);
+        assert_eq!(throughput_color(0.0), palette::ERR);
+    }
 }

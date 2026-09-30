@@ -22,6 +22,8 @@
 use std::time::Duration;
 
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use ratatui::Terminal;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -159,16 +161,19 @@ fn socket_fd_count() -> Option<usize> {
     Some(count)
 }
 
-/// Render the Concurrency view at 120x40 and return the flat buffer text.
-fn render_concurrency(app: &App) -> String {
-    let backend = TestBackend::new(120, 40);
+/// Render the Concurrency view at `w`x`h` and return the resulting buffer.
+fn render_concurrency_at(app: &App, w: u16, h: u16) -> Buffer {
+    let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
     terminal
         .draw(|f| concurrency::render(f.area(), app, f))
         .expect("render frame");
-    terminal
-        .backend()
-        .buffer()
+    terminal.backend().buffer().clone()
+}
+
+/// Render the Concurrency view at 120x40 and return the flat buffer text.
+fn render_concurrency(app: &App) -> String {
+    render_concurrency_at(app, 120, 40)
         .content()
         .iter()
         .map(|c| c.symbol())
@@ -432,6 +437,105 @@ fn view2_survives_a_partial_failure_level() {
 }
 
 // ── Pool fan-in sanity (all workers complete, channel closes) ─────────────
+
+// ── View 2: throughput vs concurrency curve (block plot) ────────────────
+
+#[test]
+fn view2_curve_shows_placeholder_before_a_sweep() {
+    let mut app = App::new();
+    app.view = View::Concurrency;
+    let text = render_concurrency(&app);
+    assert!(text.contains("THROUGHPUT VS CONCURRENCY"));
+    assert!(text.contains("Run a sweep"));
+}
+
+#[test]
+fn view2_curve_marks_sweet_spot_and_knee() {
+    let mut app = App::new();
+    app.view = View::Concurrency;
+    app.sweep.store(SweepResult {
+        levels: vec![
+            level(1, 100.0, 5.0),
+            level(2, 350.0, 8.0),
+            level(4, 340.0, 20.0),
+        ],
+    });
+    let buf = render_concurrency_at(&app, 120, 40);
+    let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+    assert!(text.contains("THROUGHPUT VS CONCURRENCY"));
+    // Sweet spot (2): a green ● cap. Knee (4): a red ▲ cap.
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
+        "sweet spot is a green ●"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "▲" && c.fg == Color::Red),
+        "knee is a red ▲"
+    );
+    // The other level: a cyan • cap; the bars are vertical strokes.
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "•" && c.fg == Color::Cyan),
+        "other levels are cyan •"
+    );
+    assert!(text.contains('│'));
+    // x labels: every ladder step appears on the plot.
+    for c in ["1", "2", "4"] {
+        assert!(text.contains(c));
+    }
+}
+
+#[test]
+fn view2_curve_renders_the_full_ladder() {
+    let mut app = App::new();
+    app.view = View::Concurrency;
+    app.sweep.store(SweepResult {
+        levels: vec![
+            level(1, 100.0, 5.0),
+            level(2, 190.0, 6.0),
+            level(4, 280.0, 7.0),
+            level(8, 340.0, 10.0),
+            level(16, 345.0, 30.0),
+            level(32, 342.0, 60.0),
+            level(64, 338.0, 90.0),
+        ],
+    });
+    let buf = render_concurrency_at(&app, 120, 40);
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
+        "sweet spot (8) is a green ●"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "▲" && c.fg == Color::Red),
+        "knee (16) is a red ▲"
+    );
+    assert!(
+        buf.content().iter().filter(|c| c.symbol() == "•").count() >= 5,
+        "the five non-special levels get cyan • caps"
+    );
+}
+
+#[test]
+fn view2_curve_survives_small_terminals() {
+    let mut app = App::new();
+    app.view = View::Concurrency;
+    app.sweep.store(SweepResult {
+        levels: vec![level(1, 100.0, 5.0), level(2, 350.0, 8.0)],
+    });
+    for (w, h) in [(40, 10), (20, 6), (80, 24)] {
+        let _ = render_concurrency_at(&app, w, h);
+    }
+}
 
 #[tokio::test]
 async fn pool_fan_in_delivers_every_worker_and_closes() {
