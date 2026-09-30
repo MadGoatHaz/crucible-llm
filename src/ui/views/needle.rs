@@ -79,20 +79,35 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
     );
 }
 
-/// Legend + run status / accuracy note.
+/// Legend + run status / accuracy note (state-aware): locked while a
+/// benchmark sequence runs (NIAH is Engine C1 in that queue), the live
+/// request count while a standalone run is in flight, and the `[N]`
+/// confirmation hint when idle.
 fn render_legend(area: Rect, app: &App, f: &mut Frame) {
     let slot = &app.niah;
-    let status = if slot.is_running() {
-        "Running NIAH matrix… (one stream per size × depth cell)".to_string()
+    let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
+    let status = if app.seq.is_running() {
+        "Locked — NIAH runs as Engine C1 in the active benchmark sequence ([N] disabled)"
+            .to_string()
+    } else if slot.is_running() {
+        format!(
+            "Running NIAH matrix… {requests} requests ({} sizes × {} depths), one stream per cell · [Space] pauses",
+            NIAH_SIZES.len(),
+            NIAH_DEPTHS.len()
+        )
     } else if let Some(r) = &*slot.load() {
         format!(
-            "Accuracy: {} · {} sizes × {} depths · [N] re-runs the matrix",
+            "Accuracy: {} · {} sizes × {} depths · [N] re-runs the matrix (confirms)",
             r.accuracy_label(),
             r.sizes.len(),
             r.depths.len()
         )
     } else {
-        "[N] queues a new NIAH test (7 sizes × 11 depths)".to_string()
+        format!(
+            "[N] runs a new NIAH test — {requests} requests ({} sizes × {} depths); [Y] confirms",
+            NIAH_SIZES.len(),
+            NIAH_DEPTHS.len()
+        )
     };
     let lines = Text::from(vec![
         Line::from(vec![

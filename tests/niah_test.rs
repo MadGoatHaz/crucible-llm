@@ -337,11 +337,13 @@ fn view3_shows_running_status_and_empty_grid_before_a_run() {
     let mut app = App::new();
     app.view = View::Needle;
 
-    // Nothing run yet: every cell is the dimmed placeholder.
+    // Nothing run yet: every cell is the dimmed placeholder, and the
+    // legend advertises the request count + confirmation.
     let buf = render_needle(&app, 120, 40);
     let text = buf_text(&buf);
     assert!(text.contains("···"));
-    assert!(text.contains("[N] queues a new NIAH test"));
+    assert!(text.contains("[N] runs a new NIAH test"));
+    assert!(text.contains("77 requests (7 sizes × 11 depths)"));
 
     // A run in progress: the status line switches.
     app.niah.set_running(true);

@@ -3,6 +3,20 @@
 //! views, `Space` pause/resume, `+` step concurrency, `n` new needle,
 //! `e` export, `q`/`Esc` quit).
 //!
+//! **State-aware key guards** (the TUI interaction audit): a benchmark
+//! is a *server-load* event, so while a `BenchmarkSequence` (or any
+//! standalone engine run) is in progress the keys that would add load —
+//! `n` (NIAH matrix), `+` (concurrency step), `c` (setup takeover, whose
+//! URL stage fires an HTTP discovery) — are locked and log why. The
+//! always-available keys are view switching (`1`-`5`), `Space`
+//! (pause/resume: the shared [`RunPause`] gate holds each engine before
+//! its next request, in-flight streams complete, resume continues where
+//! it left off), `e` (local file export), and `q`/`Esc` (quit). The
+//! `n` key additionally requires a `[Y/N]` confirmation that shows the
+//! request count (default matrix: 7 sizes × 11 depths = 77), and the
+//! footer + status bar reflect the current state (Idle / BUSY / Paused /
+//! confirming).
+//!
 //! The `App` holds the shared `Arc<MetricsState>` — the `ArcSwap`
 //! double-buffered [`MetricsSnapshot`] pipeline (Chunk 6). The render loop
 //! only ever *reads* the snapshot via `MetricsState::load()` (a lock-free
@@ -24,8 +38,8 @@ use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
 use crate::engines::{
     fragmentation_warning, queue_for, BenchmarkSequence, NiahEngineConfig, NiahSlot, ProgressBus,
-    ReasoningResult, ResultSlot, RunSlots, SeqPhase, SeqState, SeqStateSlot, SpeedResult,
-    StructuredResult, SweepResult, VRAM_FRAGMENTATION_THRESHOLD,
+    ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState, SeqStateSlot, SpeedResult,
+    StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD,
 };
 use crate::hw::HwPoller;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
@@ -130,7 +144,8 @@ pub enum KeyAction {
     PauseResume,
     /// `+` — step the concurrency ladder up.
     StepConcurrency,
-    /// `n` — queue a new needle test.
+    /// `n` — open the NIAH confirmation prompt (idle only; the `y`
+    /// answer is what actually spawns the run).
     NewNeedle,
     /// `e` — export results (JSON/MD/CSV).
     Export,
@@ -228,6 +243,19 @@ pub struct App {
     /// [`crate::engines::EngineProgress`] here, and the executor's 10 Hz
     /// ticker mirrors it into [`seq`](Self::seq).
     pub seq_bus: Arc<ProgressBus>,
+    /// The `Space`-key cooperative pause gate shared with every engine
+    /// run loop: while set, engines hold *before* spawning the next
+    /// request unit (in-flight streams complete; resume continues exactly
+    /// where it left off — no state is corrupted). The key path toggles
+    /// it; the render loop never touches it (measurement-isolation
+    /// invariant, blueprint §4).
+    pub pause: Arc<RunPause>,
+    /// `true` while the `n`-key confirmation prompt is on screen
+    /// ("Run NIAH test? [Y/N]") — a modal that swallows every key but
+    /// `y`/`Enter` (confirm) and anything else (cancel). Set only when
+    /// the system is idle (never during a benchmark sequence), so a
+    /// single confirmed press can spawn at most one NIAH run.
+    pub pending_niah: bool,
     /// The executor's log pipe: the sequence task *sends* real events;
     /// the tick path *drains* them into [`log`](Self::log) (the bounded
     /// line list the Live view renders). `None` until the first run.
@@ -278,6 +306,8 @@ impl App {
             discovery_error: Arc::new(ArcSwapOption::empty()),
             seq: Arc::new(SeqStateSlot::new()),
             seq_bus: Arc::new(ProgressBus::new()),
+            pause: Arc::new(RunPause::new()),
+            pending_niah: false,
             log_rx: None,
             vram_warned: false,
         }
@@ -429,15 +459,34 @@ impl App {
     }
 
     /// The `n` key (blueprint §6 footer: "[N] New Needle Test"): spawn a
-    /// background NIAH matrix run (Chunk 15, Engine C1).
+    /// background NIAH matrix run (Chunk 15, Engine C1) — **after** the
+    /// key path shows the `[Y/N]` confirmation prompt (the default matrix
+    /// is 7 sizes × 11 depths = 77 sequential requests, so it never
+    /// fires blindly).
     ///
     /// This is a *key-path* action (never the render path): the runner
     /// task publishes its result to the lock-free [`NiahSlot`] when done,
     /// and View 3 reads it — so a running matrix never perturbs the 60Hz
     /// render loop or the timing path (measurement-isolation invariant,
-    /// blueprint §4). Re-pressing `n` while a run is in progress is a
-    /// no-op (logged).
+    /// blueprint §4).
+    ///
+    /// **Guards** (defense in depth — `handle_key` enforces them first):
+    /// * a `BenchmarkSequence` in progress locks `n` (the matrix would
+    ///   otherwise hit the endpoint *alongside* the running engine);
+    /// * an in-progress standalone NIAH run locks `n` (one run at a
+    ///   time);
+    /// * the runner shares the `Space`-key [`RunPause`] gate, so a
+    ///   confirmed standalone run pauses/resumes like the sequence.
     pub fn start_niah(&mut self) {
+        if self.seq.is_running() {
+            self.push_log(
+                "[niah] locked while a benchmark sequence is running — \
+                 it runs as Engine C1 in the queue"
+                    .to_string(),
+                style::value_warn(),
+            );
+            return;
+        }
         if self.niah.is_running() {
             self.push_log(
                 "[niah] already running — one size × depth cell at a time".to_string(),
@@ -460,11 +509,12 @@ impl App {
         };
         let sizes = engine.sizes_list().to_vec();
         let depths = engine.depths_list().to_vec();
+        let requests = sizes.len() * depths.len();
         let slot = self.niah.clone();
         self.niah.set_running(true);
         self.push_log(
             format!(
-                "[niah] started: {} sizes × {} depths → {}",
+                "[niah] started: {requests} requests ({} sizes × {} depths) → {}",
                 sizes.len(),
                 depths.len(),
                 config.url
@@ -473,6 +523,7 @@ impl App {
         );
         // The runner owns the slot handle; on completion it clears the
         // running flag and publishes the scored grid.
+        let engine = engine.pause(self.pause.clone());
         tokio::spawn(async move {
             let result = engine.run().await;
             slot.set_running(false);
@@ -614,6 +665,7 @@ impl App {
                 structured: self.structured_slot.clone(),
             },
             Some(tx),
+            self.pause.clone(),
         );
         tokio::spawn(async move {
             seq.run().await;
@@ -661,7 +713,31 @@ impl App {
             };
         }
 
-        // Dashboard: `q` / `Esc` quit — even inside the Config view
+        // Dashboard: the NIAH confirmation prompt is a **modal** — while
+        // it is on screen, `y`/`Enter` confirms (spawning exactly one
+        // run) and every other key cancels it (so a stray keypress can
+        // never both answer the prompt *and* trigger a second action).
+        // It is checked before the quit keys: `Esc` cancels the prompt
+        // instead of quitting.
+        if self.pending_niah {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.pending_niah = false;
+                    self.start_niah();
+                    return KeyAction::NewNeedle;
+                }
+                _ => {
+                    self.pending_niah = false;
+                    self.push_log(
+                        "[niah] cancelled — no requests sent".to_string(),
+                        style::value_warn(),
+                    );
+                    return KeyAction::Continue;
+                }
+            }
+        }
+
+        // `q` / `Esc` quit — even inside the Config view
         // (where `q` would otherwise be typed into a field).
         if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
             self.running = false;
@@ -669,8 +745,19 @@ impl App {
         }
 
         // `c` — re-open the interactive Setup takeover. Scoped away from
-        // View 5, where `c` is a typeable character in a field.
+        // View 5, where `c` is a typeable character in a field. Locked
+        // while a benchmark sequence runs: the takeover's URL stage
+        // fires an HTTP discovery request, which must not land on the
+        // endpoint mid-benchmark.
         if key.code == KeyCode::Char('c') && self.view != View::Config {
+            if self.seq.is_running() {
+                self.push_log(
+                    "[setup] locked while a benchmark is running — press Space to pause, Q to quit"
+                        .to_string(),
+                    style::value_warn(),
+                );
+                return KeyAction::Continue;
+            }
             self.open_setup();
             return KeyAction::Continue;
         }
@@ -725,15 +812,63 @@ impl App {
                 }
                 KeyAction::Continue
             }
+            // `Space` — pause/resume. The shared [`RunPause`] gate is the
+            // real mechanism: every engine run loop holds *before*
+            // spawning its next request unit, so in-flight streams
+            // complete and the run resumes exactly where it left off.
+            // (The render clock also freezes, as before.)
             KeyCode::Char(' ') => {
                 self.paused = !self.paused;
+                self.pause.set(self.paused);
+                let msg = if self.paused {
+                    "[pause] run paused — in-flight requests finish, no new ones start".to_string()
+                } else {
+                    "[pause] run resumed".to_string()
+                };
+                self.push_log(msg, style::value_warn());
                 KeyAction::PauseResume
             }
+            // `+` — step the concurrency target. Locked while a sequence
+            // runs: the Engine B sweep owns the concurrency ladder, and
+            // a mid-run edit would desynchronize the run from the form.
             KeyCode::Char('+') | KeyCode::Char('=') => {
+                if self.seq.is_running() {
+                    self.push_log(
+                        "[concurrency] locked while a benchmark is running — the sweep owns the ladder"
+                            .to_string(),
+                        style::value_warn(),
+                    );
+                    return KeyAction::Continue;
+                }
                 self.concurrency_target = (self.concurrency_target * 2).min(128);
                 KeyAction::StepConcurrency
             }
-            KeyCode::Char('n') => KeyAction::NewNeedle,
+            // `n` — request a standalone NIAH matrix run. It never fires
+            // directly: the key opens a `[Y/N]` confirmation that shows
+            // the request count (default 7 sizes × 11 depths = 77), and
+            // it is locked entirely while a benchmark sequence runs
+            // (the matrix would otherwise hit the endpoint alongside
+            // the running engine) or while another NIAH run is in
+            // progress (one run at a time).
+            KeyCode::Char('n') => {
+                if self.seq.is_running() {
+                    self.push_log(
+                        "[niah] locked while a benchmark is running — it runs as Engine C1 in the queue"
+                            .to_string(),
+                        style::value_warn(),
+                    );
+                    return KeyAction::Continue;
+                }
+                if self.niah.is_running() {
+                    self.push_log(
+                        "[niah] already running — one size × depth cell at a time".to_string(),
+                        style::value_warn(),
+                    );
+                    return KeyAction::Continue;
+                }
+                self.pending_niah = true;
+                KeyAction::NewNeedle
+            }
             KeyCode::Char('e') => KeyAction::Export,
             // Chunk 18: `r` runs the engines selected in the Config view.
             KeyCode::Char('r') => {
@@ -972,6 +1107,17 @@ impl App {
             Span::styled(" | ", style::tab_separator()),
             Span::styled(format!("Mode: {} ", m.mode), style::label()),
         ];
+        // State indicators: `▸ BUSY` while any benchmark load is in
+        // flight (sequence running, or a standalone NIAH run), `|| PAUSED`
+        // when the Space gate is holding.
+        if self.seq.is_running() || self.niah.is_running() {
+            spans.push(Span::styled(
+                " ▸ BUSY ",
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.paused {
             spans.push(Span::styled(" || PAUSED ", style::value_warn()));
         }
@@ -999,20 +1145,84 @@ impl App {
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Bottom key-hint footer (blueprint §6).
+    /// Bottom key-hint footer (blueprint §6) — **state-aware**: it shows
+    /// exactly which keys are live in the current state, and locks the
+    /// server-load keys (`N` / `C` / `+` / `R`) with a visible marker
+    /// while a benchmark is in flight.
     fn render_footer(&self, area: Rect, f: &mut Frame) {
-        let line = Line::from(vec![
-            Span::styled(" [Space] Pause/Resume", style::footer()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled("[+] Step Concurrency", style::footer()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled("[N] New Needle Test", style::footer()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled("[E] Export", style::footer()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled("[Q] Quit", style::footer()),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(self.footer_line()), area);
+    }
+
+    /// The footer line for the current state (pure — testable without a
+    /// terminal):
+    ///
+    /// * **confirming** (`n` pressed, `[Y/N]` on screen): the prompt
+    ///   itself, with the request count and the two live keys;
+    /// * **running** (sequence or standalone NIAH in flight): views,
+    ///   pause/resume, export, quit — with `N`/`C`/`+`/`R` shown locked;
+    /// * **idle**: views, run, NIAH (with its request count), config,
+    ///   export, quit.
+    pub fn footer_line(&self) -> Line<'static> {
+        let sep = Span::styled(" | ", style::tab_separator());
+        let live = |t: &str| Span::styled(t.to_string(), style::footer());
+        let locked = |t: &str| {
+            Span::styled(
+                t.to_string(),
+                Style::default()
+                    .fg(palette::MUTED)
+                    .add_modifier(Modifier::DIM),
+            )
+        };
+
+        if self.pending_niah {
+            let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
+            return Line::from(vec![
+                live(&format!(
+                    " [Y] Run NIAH test? {requests} requests ({s} sizes × {d} depths) ",
+                    s = NIAH_SIZES.len(),
+                    d = NIAH_DEPTHS.len()
+                )),
+                sep.clone(),
+                live(" [N/Esc] Cancel "),
+                sep.clone(),
+                live("[Q] Quit"),
+            ]);
+        }
+
+        let busy = self.seq.is_running() || self.niah.is_running();
+        if busy {
+            let space_key = if self.paused {
+                live("[Space] Resume")
+            } else {
+                live("[Space] Pause")
+            };
+            return Line::from(vec![
+                live("[1-5] Views"),
+                sep.clone(),
+                space_key,
+                sep.clone(),
+                live("[E] Export"),
+                sep.clone(),
+                live("[Q] Quit"),
+                sep.clone(),
+                locked("[N] [C] [+] [R] locked"),
+            ]);
+        }
+
+        let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
+        Line::from(vec![
+            live("[1-5] Views"),
+            sep.clone(),
+            live("[R] Run Benchmark"),
+            sep.clone(),
+            live(&format!("[N] NIAH ({requests} req, confirms)")),
+            sep.clone(),
+            live("[C] Config"),
+            sep.clone(),
+            live("[E] Export"),
+            sep.clone(),
+            live("[Q] Quit"),
+        ])
     }
 }
 
@@ -1317,5 +1527,200 @@ mod tests {
         assert_eq!(app.phase, Phase::Dashboard);
         assert_eq!(app.view, View::Live);
         assert!(app.seq.is_running());
+    }
+
+    // ── TUI interaction guards (the key-spam audit) ─────────────────────
+
+    /// The footer line's plain text (spans concatenated).
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn n_key_when_idle_opens_the_confirmation_not_a_run() {
+        let mut app = App::new();
+        let r = app.handle_key(&char_key('n'));
+        assert_eq!(r, KeyAction::NewNeedle);
+        assert!(app.pending_niah, "idle n opens the [Y/N] prompt");
+        assert!(
+            !app.niah.is_running(),
+            "the prompt alone must never spawn requests"
+        );
+    }
+
+    #[test]
+    fn n_key_is_locked_while_a_sequence_runs() {
+        let mut app = App::new();
+        app.seq.set_running(true); // e.g. Engine A in progress
+        app.handle_key(&char_key('n'));
+        assert!(!app.pending_niah, "no confirmation may open mid-sequence");
+        assert!(
+            !app.niah.is_running(),
+            "a second NIAH runner must not hit the server alongside the sequence"
+        );
+        assert!(app
+            .log
+            .iter()
+            .any(|l| line_text(l).contains("locked while a benchmark is running")));
+    }
+
+    #[test]
+    fn n_key_is_locked_while_a_standalone_niah_run_is_active() {
+        let mut app = App::new();
+        app.niah.set_running(true);
+        app.handle_key(&char_key('n'));
+        assert!(!app.pending_niah, "one NIAH run at a time");
+    }
+
+    #[tokio::test]
+    async fn n_confirmation_y_fires_exactly_one_run() {
+        let mut app = App::new();
+        // Unreachable endpoint: the spawned run fails fast, no load.
+        app.config.url = "http://127.0.0.1:9/v1".to_string();
+        app.handle_key(&char_key('n'));
+        assert!(app.pending_niah);
+        app.handle_key(&char_key('y'));
+        assert!(!app.pending_niah);
+        assert!(app.niah.is_running(), "confirmed y spawns the run");
+        // A further press while running stays locked.
+        app.handle_key(&char_key('n'));
+        assert!(!app.pending_niah);
+    }
+
+    #[test]
+    fn n_confirmation_n_cancels_and_sends_nothing() {
+        let mut app = App::new();
+        app.handle_key(&char_key('n'));
+        assert!(app.pending_niah);
+        app.handle_key(&char_key('n')); // the prompt's own cancel key
+        assert!(!app.pending_niah);
+        assert!(!app.niah.is_running());
+    }
+
+    #[test]
+    fn n_confirmation_esc_cancels_instead_of_quitting() {
+        let mut app = App::new();
+        app.handle_key(&char_key('n'));
+        assert!(app.pending_niah);
+        let r = app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(
+            r,
+            KeyAction::Continue,
+            "Esc answers the prompt, not the app"
+        );
+        assert!(!app.pending_niah);
+        assert!(app.running, "the app keeps running");
+        assert!(!app.niah.is_running());
+    }
+
+    #[test]
+    fn n_confirmation_other_keys_cancel_and_are_swallowed() {
+        let mut app = App::new();
+        app.handle_key(&char_key('n'));
+        assert!(app.pending_niah);
+        app.handle_key(&char_key('1')); // a stray key
+        assert!(!app.pending_niah);
+        assert!(!app.niah.is_running());
+        assert_eq!(
+            app.view,
+            View::Live,
+            "the swallowed key must not double-act (no view switch)"
+        );
+    }
+
+    #[test]
+    fn plus_key_is_locked_while_a_sequence_runs() {
+        let mut app = App::new();
+        app.seq.set_running(true);
+        let before = app.concurrency_target;
+        app.handle_key(&char_key('+'));
+        assert_eq!(
+            app.concurrency_target, before,
+            "the sweep owns the ladder mid-run"
+        );
+    }
+
+    #[test]
+    fn plus_key_steps_up_when_idle() {
+        let mut app = App::new();
+        app.handle_key(&char_key('+'));
+        assert_eq!(app.concurrency_target, 2);
+        app.handle_key(&char_key('='));
+        assert_eq!(app.concurrency_target, 4);
+    }
+
+    #[test]
+    fn c_key_is_locked_while_a_sequence_runs() {
+        let mut app = App::new();
+        app.seq.set_running(true);
+        app.handle_key(&char_key('c'));
+        assert_eq!(
+            app.phase,
+            Phase::Dashboard,
+            "no setup takeover (and no discovery request) mid-run"
+        );
+    }
+
+    #[test]
+    fn space_toggles_the_shared_pause_gate() {
+        let mut app = App::new();
+        assert!(!app.pause.is_paused());
+        let r = app.handle_key(&char_key(' '));
+        assert_eq!(r, KeyAction::PauseResume);
+        assert!(app.paused);
+        assert!(
+            app.pause.is_paused(),
+            "the engine gate is set with the flag"
+        );
+        app.handle_key(&char_key(' '));
+        assert!(!app.paused);
+        assert!(!app.pause.is_paused(), "resume clears the gate");
+    }
+
+    // ── state-aware footer ───────────────────────────────────────────────
+
+    #[test]
+    fn footer_is_idle_when_nothing_runs() {
+        let app = App::new();
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("[R] Run Benchmark"), "{t}");
+        assert!(t.contains("[N] NIAH (77 req, confirms)"), "{t}");
+        assert!(t.contains("[C] Config"), "{t}");
+        assert!(!t.contains("locked"), "{t}");
+    }
+
+    #[test]
+    fn footer_locks_the_server_keys_while_running() {
+        let app = App::new();
+        app.seq.set_running(true);
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("[Space] Pause"), "{t}");
+        assert!(t.contains("[1-5] Views"), "{t}");
+        assert!(t.contains("locked"), "{t}");
+    }
+
+    #[test]
+    fn footer_shows_resume_when_paused() {
+        let mut app = App::new();
+        app.seq.set_running(true);
+        app.handle_key(&char_key(' '));
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("[Space] Resume"), "{t}");
+        assert!(t.contains("locked"), "{t}");
+    }
+
+    #[test]
+    fn footer_shows_the_confirmation_prompt() {
+        let mut app = App::new();
+        app.handle_key(&char_key('n'));
+        let t = line_text(&app.footer_line());
+        assert!(
+            t.contains("[Y] Run NIAH test? 77 requests (7 sizes × 11 depths)"),
+            "{t}"
+        );
+        assert!(t.contains("[N/Esc] Cancel"), "{t}");
     }
 }

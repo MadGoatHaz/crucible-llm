@@ -97,12 +97,15 @@ impl EventLoop {
                                     );
                                 }
                             }
-                            // `n` (Chunk 15): spawn a background NIAH
-                            // matrix run; the runner publishes to the
-                            // lock-free slot View 3 reads.
-                            KeyAction::NewNeedle => {
-                                app.start_niah();
-                            }
+                            // `n` (Chunk 15 + interaction audit): the
+                            // *key path* owns this action — `handle_key`
+                            // opens a `[Y/N]` confirmation (with the
+                            // request count) when idle, and only the
+                            // confirmed `y` calls `start_niah`. Nothing
+                            // to do here (the runner, once spawned,
+                            // publishes to the lock-free slot View 3
+                            // reads).
+                            KeyAction::NewNeedle => {}
                             // `r` / `F5` (Chunk 18): `start_run` is already
                             // invoked inside `handle_key`; nothing to do here.
                             KeyAction::Continue

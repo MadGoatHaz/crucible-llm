@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamEvent, StreamWorker};
 use crate::config::Config;
-use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
 use crate::sse::Chunk;
@@ -84,6 +84,9 @@ pub struct StructuredEngine {
     /// [`MetricsState`] snapshots while a run, so the Live Monitor shows
     /// the current run's real stream data.
     metrics: Option<Arc<MetricsState>>,
+    /// Optional `Space`-key pause gate: each of the two runs waits on it
+    /// before its stream is spawned (in-flight runs complete).
+    pause: Option<Arc<RunPause>>,
 }
 
 impl StructuredEngine {
@@ -100,6 +103,7 @@ impl StructuredEngine {
             timeout: cfg.timeout,
             progress: None,
             metrics: None,
+            pause: None,
         })
     }
 
@@ -115,6 +119,13 @@ impl StructuredEngine {
     /// matrix / gauges show the current run's real data).
     pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
         self.metrics = Some(state);
+        self
+    }
+
+    /// Attach the `Space`-key pause gate: each run waits on it before
+    /// its stream is spawned (the headless path leaves it `None`).
+    pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
+        self.pause = Some(gate);
         self
     }
 
@@ -211,10 +222,18 @@ impl StructuredEngine {
     /// `Run {n}/2` — the Benchmark Sequence mirrors it into the TUI's
     /// progress bar.
     pub async fn run(&self) -> StructuredResult {
+        // The `Space`-key pause: hold before each run's request goes out
+        // (an in-flight run always completes).
+        if let Some(gate) = &self.pause {
+            gate.wait_while_paused().await;
+        }
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::Structured { run: 1, total: 2 });
         }
         let (free_body, free_ttft, free_tps) = self.run_once(false).await;
+        if let Some(gate) = &self.pause {
+            gate.wait_while_paused().await;
+        }
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::Structured { run: 2, total: 2 });
         }

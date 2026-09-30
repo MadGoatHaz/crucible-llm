@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use crate::client::{StreamEvent, StreamWorker};
 use crate::config::Config;
-use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
 use crate::prompt::PromptGenerator;
@@ -310,6 +310,9 @@ pub struct ReasoningEngine {
     /// [`MetricsState`] snapshots while a challenge runs, so the Live
     /// Monitor shows the current challenge's real stream data.
     metrics: Option<Arc<MetricsState>>,
+    /// Optional `Space`-key pause gate: the bank waits on it before
+    /// spawning each challenge's stream (in-flight challenges complete).
+    pause: Option<Arc<RunPause>>,
 }
 
 impl ReasoningEngine {
@@ -333,6 +336,7 @@ impl ReasoningEngine {
             generator,
             progress: None,
             metrics: None,
+            pause: None,
         })
     }
 
@@ -348,6 +352,13 @@ impl ReasoningEngine {
     /// matrix / gauges show the current challenge's real data).
     pub fn metrics(mut self, state: Arc<MetricsState>) -> Self {
         self.metrics = Some(state);
+        self
+    }
+
+    /// Attach the `Space`-key pause gate: each challenge waits on it
+    /// before its stream is spawned (the headless path leaves it `None`).
+    pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
+        self.pause = Some(gate);
         self
     }
 
@@ -445,6 +456,11 @@ impl ReasoningEngine {
         let mut ttfts = Vec::with_capacity(REASONING_BANK.len());
         let mut tg_speeds = Vec::with_capacity(REASONING_BANK.len());
         for (i, challenge) in REASONING_BANK.iter().enumerate() {
+            // The `Space`-key pause: hold before the next challenge's
+            // request goes out (an in-flight challenge always completes).
+            if let Some(gate) = &self.pause {
+                gate.wait_while_paused().await;
+            }
             if let Some(bus) = &self.progress {
                 bus.publish(EngineProgress::Reasoning {
                     challenge: i + 1,

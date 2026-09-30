@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use crate::client::pool::{PoolEvent, WorkerPool};
-use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::sse::{Chunk, Usage};
@@ -243,6 +243,9 @@ pub struct Sweep {
     /// streams active to the [`ProgressBus`] the Benchmark Sequence
     /// mirrors into the TUI's progress bar.
     progress: Option<Arc<ProgressBus>>,
+    /// Optional `Space`-key pause gate: the sweep waits on it before
+    /// spawning each ladder level (in-flight streams complete).
+    pause: Option<Arc<RunPause>>,
 }
 
 impl Sweep {
@@ -254,6 +257,7 @@ impl Sweep {
             ladder: normalize_ladder(ladder),
             metrics: None,
             progress: None,
+            pause: None,
         }
     }
 
@@ -277,10 +281,23 @@ impl Sweep {
         self
     }
 
+    /// Attach the `Space`-key pause gate: each ladder level waits on it
+    /// before its `n` workers are spawned (the headless path leaves it
+    /// `None`).
+    pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
+        self.pause = Some(gate);
+        self
+    }
+
     /// Run the full sweep: one level at a time, in ladder order.
     pub async fn run(&self) -> SweepResult {
         let mut levels = Vec::with_capacity(self.ladder.len());
         for (i, &n) in self.ladder.iter().enumerate() {
+            // The `Space`-key pause: hold before the next level's streams
+            // go out (an in-flight level always completes).
+            if let Some(gate) = &self.pause {
+                gate.wait_while_paused().await;
+            }
             levels.push(self.run_level(n, i + 1, self.ladder.len()).await);
         }
         SweepResult { levels }

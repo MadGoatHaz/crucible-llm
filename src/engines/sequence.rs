@@ -44,6 +44,48 @@ use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::HwPoller;
 use crate::metrics::state::MetricsState;
 
+/// The cooperative pause gate (the `Space` key, TUI): shared between the
+/// App's key path and every engine run loop.
+///
+/// While set, each engine's run loop yields (100 ms poll) **before
+/// spawning the next request unit** — the in-flight stream(s) complete
+/// normally, and no new requests hit the endpoint. Clearing the gate
+/// resumes exactly where the loop left off (the iteration/level/cell
+/// counter is untouched — no state is corrupted by a pause).
+///
+/// Measurement-isolation note (blueprint §4): the gate is *polled by the
+/// engine tasks*, never by the render loop or the tick path — a pause
+/// can never perturb the quanta timing path.
+#[derive(Debug, Default)]
+pub struct RunPause {
+    inner: AtomicBool,
+}
+
+impl RunPause {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the pause state (key path: `Space` toggles it).
+    pub fn set(&self, paused: bool) {
+        self.inner.store(paused, Ordering::Relaxed);
+    }
+
+    /// `true` while the user has paused the run.
+    pub fn is_paused(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
+    }
+
+    /// Yield until the gate is cleared. Called by each engine run loop
+    /// immediately before spawning a new request unit (iteration / ladder
+    /// level / matrix cell / challenge / structured run).
+    pub async fn wait_while_paused(&self) {
+        while self.is_paused() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// The six benchmark engines (blueprint §5) in the canonical run order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Engine {
@@ -396,6 +438,9 @@ pub struct BenchmarkSequence {
     slots: RunSlots,
     /// The App log pipe (the executor sends, the App drains on tick).
     log: Option<mpsc::Sender<String>>,
+    /// The `Space`-key pause gate shared with every engine (the engines
+    /// wait on it before spawning each new request unit).
+    pause: Arc<RunPause>,
     /// The ordered engine queue (selection-filtered, canonical order).
     engines: Vec<Engine>,
     /// The queue index the ticker is mirroring (the current engine).
@@ -428,6 +473,7 @@ impl BenchmarkSequence {
     /// engines in the canonical A → B → C1 → C2 → C3 → D order; an empty
     /// selection yields an empty queue (the run is a no-op that logs a
     /// warning).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: Config,
         metrics: Arc<MetricsState>,
@@ -436,6 +482,7 @@ impl BenchmarkSequence {
         bus: Arc<ProgressBus>,
         slots: RunSlots,
         log: Option<mpsc::Sender<String>>,
+        pause: Arc<RunPause>,
     ) -> Self {
         let engines = queue_for(&cfg.engines);
         Self {
@@ -446,6 +493,7 @@ impl BenchmarkSequence {
             bus,
             slots,
             log,
+            pause,
             engines,
             current: Arc::new(AtomicUsize::new(0)),
             completed: Arc::new(Mutex::new(Vec::new())),
@@ -610,7 +658,8 @@ impl BenchmarkSequence {
         };
         let engine = engine
             .metrics(self.metrics.clone())
-            .progress(self.bus.clone());
+            .progress(self.bus.clone())
+            .pause(self.pause.clone());
         let (_, results) = engine.run().await;
         self.slots.speed.set_running(false);
         self.slots.speed.store(results.clone());
@@ -621,7 +670,7 @@ impl BenchmarkSequence {
         let Some(mut sweep) = build_sweep(&self.cfg, Some(self.metrics.clone())) else {
             return "sweep init failed (client build)".to_string();
         };
-        sweep = sweep.progress(self.bus.clone());
+        sweep = sweep.progress(self.bus.clone()).pause(self.pause.clone());
         self.slots.concurrency.set_running(true);
         let result = sweep.run().await;
         self.slots.concurrency.set_running(false);
@@ -640,7 +689,8 @@ impl BenchmarkSequence {
         };
         let engine = engine
             .progress(self.bus.clone())
-            .metrics(self.metrics.clone());
+            .metrics(self.metrics.clone())
+            .pause(self.pause.clone());
         let result = engine.run().await;
         self.slots.niah.set_running(false);
         self.slots.niah.store(result.clone());
@@ -658,7 +708,8 @@ impl BenchmarkSequence {
         };
         let engine = engine
             .progress(self.bus.clone())
-            .metrics(self.metrics.clone());
+            .metrics(self.metrics.clone())
+            .pause(self.pause.clone());
         let result = engine.run().await;
         self.slots.reasoning.set_running(false);
         self.slots.reasoning.store(result.clone());
@@ -680,7 +731,8 @@ impl BenchmarkSequence {
         };
         let engine = engine
             .progress(self.bus.clone())
-            .metrics(self.metrics.clone());
+            .metrics(self.metrics.clone())
+            .pause(self.pause.clone());
         let result = engine.run().await;
         self.slots.structured.set_running(false);
         self.slots.structured.store(result.clone());
@@ -809,6 +861,7 @@ mod tests {
                 structured: Arc::new(ResultSlot::new()),
             },
             None,
+            Arc::new(RunPause::new()),
         )
     }
 
@@ -1145,8 +1198,42 @@ mod tests {
                 structured: Arc::new(ResultSlot::new()),
             },
             None,
+            Arc::new(RunPause::new()),
         );
         s.run().await;
         assert!(!slot.is_running(), "the slot clears when the run ends");
+    }
+
+    // ── the Space-key pause gate ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pause_gate_blocks_until_cleared() {
+        let gate = Arc::new(RunPause::new());
+        gate.set(true);
+        let waiter = {
+            let g = gate.clone();
+            tokio::spawn(async move {
+                g.wait_while_paused().await;
+            })
+        };
+        // While set, the waiter must still be blocked (no work proceeds).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished(), "gate set → engine work is held");
+        // Clearing the gate releases it (resume where it left off).
+        gate.set(false);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter released")
+            .expect("waiter task panicked");
+    }
+
+    #[test]
+    fn pause_gate_defaults_to_running() {
+        let gate = RunPause::new();
+        assert!(!gate.is_paused());
+        gate.set(true);
+        assert!(gate.is_paused());
+        gate.set(false);
+        assert!(!gate.is_paused());
     }
 }

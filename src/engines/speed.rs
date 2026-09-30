@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamError, StreamEvent, StreamOutcome, StreamWorker};
 use crate::config::{Config, Mode};
-use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
@@ -134,6 +134,9 @@ pub struct SpeedEngine {
     /// tokens) to the [`ProgressBus`] the Benchmark Sequence mirrors into
     /// the TUI's sequence header (the render loop reads it lock-free).
     progress: Option<Arc<ProgressBus>>,
+    /// Optional `Space`-key pause gate: the run loop waits on it before
+    /// spawning each new iteration (in-flight streams complete).
+    pause: Option<Arc<RunPause>>,
 }
 
 impl SpeedEngine {
@@ -157,6 +160,7 @@ impl SpeedEngine {
             generator,
             metrics: None,
             progress: None,
+            pause: None,
         })
     }
 
@@ -174,6 +178,13 @@ impl SpeedEngine {
     /// (the TUI's progress bar). The headless path leaves it `None`.
     pub fn progress(mut self, bus: Arc<ProgressBus>) -> Self {
         self.progress = Some(bus);
+        self
+    }
+
+    /// Attach the `Space`-key pause gate: each iteration waits on it
+    /// before the worker is spawned (the headless path leaves it `None`).
+    pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
+        self.pause = Some(gate);
         self
     }
 
@@ -413,6 +424,11 @@ impl SpeedEngine {
         let mut results = Vec::with_capacity(iterations);
         let mut tokens = 0u64;
         for i in 0..iterations {
+            // The `Space`-key pause: hold before the next request goes out
+            // (an in-flight iteration always completes).
+            if let Some(gate) = &self.pause {
+                gate.wait_while_paused().await;
+            }
             if let Some(bus) = &self.progress {
                 bus.publish(EngineProgress::Speed {
                     iteration: i + 1,

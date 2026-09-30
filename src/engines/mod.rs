@@ -53,8 +53,8 @@ pub use hardware::{
     VRAM_FRAGMENTATION_THRESHOLD,
 };
 pub use sequence::{
-    queue_for, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunSlots, SeqPhase,
-    SeqState, SeqStateSlot,
+    queue_for, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunPause, RunSlots,
+    SeqPhase, SeqState, SeqStateSlot,
 };
 pub use speed::{
     aggregate, all_failed, format_result_box, format_summary, json_report, EngineError,

@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{StreamEvent, StreamWorker};
 use crate::config::Config;
-use crate::engines::sequence::{EngineProgress, ProgressBus};
+use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
 use crate::prompt::{count_tokens, Tokenizer, BASE_SENTENCES, FILLER};
@@ -468,6 +468,9 @@ pub struct NiahEngine {
     /// [`crate::metrics::state::MetricsSnapshot`]s while a cell runs, so
     /// the Live Monitor shows the current cell's real stream data.
     metrics: Option<Arc<MetricsState>>,
+    /// Optional `Space`-key pause gate: the matrix waits on it before
+    /// spawning each cell's stream (in-flight cells complete).
+    pause: Option<Arc<RunPause>>,
 }
 
 impl NiahEngine {
@@ -492,6 +495,7 @@ impl NiahEngine {
             depths: NIAH_DEPTHS.to_vec(),
             progress: None,
             metrics: None,
+            pause: None,
         })
     }
 
@@ -522,6 +526,13 @@ impl NiahEngine {
         self
     }
 
+    /// Attach the `Space`-key pause gate: each matrix cell waits on it
+    /// before its stream is spawned (the headless path leaves it `None`).
+    pub fn pause(mut self, gate: Arc<RunPause>) -> Self {
+        self.pause = Some(gate);
+        self
+    }
+
     /// The configured context sizes.
     pub fn sizes_list(&self) -> &[u32] {
         &self.sizes
@@ -544,6 +555,11 @@ impl NiahEngine {
         for (si, size) in self.sizes.iter().enumerate() {
             for (di, depth) in self.depths.iter().enumerate() {
                 let cell_idx = si * self.depths.len() + di;
+                // The `Space`-key pause: hold before the next cell's
+                // request goes out (an in-flight cell always completes).
+                if let Some(gate) = &self.pause {
+                    gate.wait_while_paused().await;
+                }
                 if let Some(bus) = &self.progress {
                     bus.publish(EngineProgress::Niah {
                         size: *size,
@@ -753,6 +769,7 @@ impl NiahEngineConfig {
             depths: NIAH_DEPTHS.to_vec(),
             progress: None,
             metrics: None,
+            pause: None,
         })
     }
 }
