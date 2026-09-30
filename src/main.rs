@@ -12,13 +12,19 @@
 use std::io::IsTerminal;
 use std::panic;
 use std::process;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use crucible_llm::client::StreamEvent;
 use crucible_llm::config::{Config, ConfigError, ExportFormat};
+use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine,
 };
+use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
+use crucible_llm::timing::MonotonicInstant;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
 
@@ -65,6 +71,24 @@ fn run_headless(cfg: &Config) -> i32 {
             return 1;
         }
     };
+    // Chunk 17: the 100 ms hardware sampler (blueprint §4.3) runs for the
+    // whole headless run; its power trace is sliced per-iteration into the
+    // Silicon Efficiency Metric (Joules/Token). Never fails — a driverless
+    // host simply yields N/A and the run proceeds normally.
+    let hw = Arc::new(Mutex::new(HwPoller::new()));
+    rt.spawn({
+        let hw = hw.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
+            loop {
+                interval.tick().await;
+                if let Ok(mut p) = hw.lock() {
+                    p.poll();
+                }
+            }
+        }
+    });
+
     rt.block_on(async {
         let engine = match SpeedEngine::new(cfg) {
             Ok(e) => e,
@@ -101,23 +125,24 @@ fn run_headless(cfg: &Config) -> i32 {
             }
         }
 
-        // With `--export`, also keep each iteration's raw worker events —
-        // the per-packet arrival timestamps the CSV export dumps (Chunk 13).
-        // Without it the channel is drained and dropped (zero extra cost).
-        let capture_events = cfg.export.is_some();
+        // Keep each iteration's raw worker events (Chunk 13 CSV export +
+        // Chunk 17 energy windows): the per-packet arrival timestamps the
+        // CSV dumps, and the (T0, Tn) lifecycle window that slices the
+        // hardware power trace into per-iteration Joules/Token.
+        let capture_packets = cfg.export.is_some();
         let mut results = Vec::with_capacity(iterations);
         let mut packets: Vec<PacketSample> = Vec::new();
+        let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> =
+            Vec::with_capacity(iterations);
         for i in 0..iterations {
             if !cfg.json && iterations > 1 {
                 term.progress(&format!("  [{}/{}] Running...", i + 1, iterations));
             }
-            let result = if capture_events {
-                let (result, events) = engine.run_iteration_events(&prompt).await;
+            let (result, events) = engine.run_iteration_events(&prompt).await;
+            if capture_packets {
                 packets.extend(export::samples_from_events(&events, (i + 1) as u64));
-                result
-            } else {
-                engine.run_iteration(&prompt).await
-            };
+            }
+            windows.push(run_window(&events));
             if cfg.verbose && !cfg.json {
                 term.dim(&format!(
                     "  chunks={} content={} reasoning={}",
@@ -129,6 +154,18 @@ fn run_headless(cfg: &Config) -> i32 {
         if !cfg.json && iterations > 1 {
             term.clear_progress();
         }
+
+        // Chunk 17: harvest the sampler's power trace (brief lock on the
+        // run-completion path — never on the stream workers' timing path).
+        let hw_trace = hw
+            .lock()
+            .ok()
+            .map(|g| g.trace().to_vec())
+            .unwrap_or_default();
+        let gpu_name = hw
+            .lock()
+            .ok()
+            .and_then(|g| g.gpu_name().map(str::to_string));
 
         if cfg.json {
             println!("{v}", v = json_report(cfg, &results));
@@ -152,6 +189,27 @@ fn run_headless(cfg: &Config) -> i32 {
             if let Some(summary) = format_summary(&results, term.color) {
                 print!("{summary}");
             }
+            // Chunk 17: run-level energy summary (blueprint §5D) — shown
+            // only when power telemetry was present (a driverless host
+            // prints nothing: the N/A rule, never a spurious 0.0).
+            let energy = profile(
+                &hw_trace,
+                None,
+                results.iter().map(|r| r.completion_tokens).sum(),
+            );
+            if let Some(jpt) = energy.joules_per_token {
+                let peak = energy
+                    .peak_power_w
+                    .map(|w| format!(" · peak {w:.0} W"))
+                    .unwrap_or_default();
+                term.dim(&format!(
+                    "  Energy: {:.1} J ({:.3} J/token{peak})",
+                    energy.joules, jpt
+                ));
+            }
+            if let Some(w) = &energy.fragmentation_warning {
+                term.warning(&format!("VRAM: {w}"));
+            }
         }
 
         // Persist the completed run (Chunk 12): one `benchmark_sessions`
@@ -165,14 +223,22 @@ fn run_headless(cfg: &Config) -> i32 {
             model_name: cfg.model.clone(),
             backend_type: None,
             quantization: None,
-            system_gpu: None,
+            system_gpu: gpu_name,
             total_duration_sec: Some(results.iter().map(|r| r.stream_time).sum()),
         };
         // Single-stream headless engine: every iteration runs at
-        // concurrency level 1.
+        // concurrency level 1. Chunk 17: each row carries the
+        // Silicon Efficiency Metric for that iteration's (T0, Tn) window
+        // (N/A when no power telemetry was available).
         let rows: Vec<StreamMetricRow> = results
             .iter()
-            .map(|r| StreamMetricRow::from_speed_result(r, &session.session_id, 1))
+            .enumerate()
+            .map(|(i, r)| {
+                let mut row = StreamMetricRow::from_speed_result(r, &session.session_id, 1);
+                row.joules_per_token = windows[i]
+                    .and_then(|w| joules_per_token(&hw_trace, Some(w), r.completion_tokens));
+                row
+            })
             .collect();
         match Database::open_default() {
             Ok(mut db) => {
@@ -212,6 +278,27 @@ fn run_headless(cfg: &Config) -> i32 {
         }
         0
     })
+}
+
+/// Chunk 17: the (T0, Tn) lifecycle window of one iteration, extracted
+/// from its worker events — the slice of the hardware power trace over
+/// which the Silicon Efficiency Metric integrates. `None` when the run
+/// never recorded a full window (e.g. it failed before both milestones).
+fn run_window(events: &[StreamEvent]) -> Option<(MonotonicInstant, MonotonicInstant)> {
+    let t0 = events.iter().find_map(|e| match e {
+        StreamEvent::Frame { timestamps, .. } => timestamps.t0,
+        _ => None,
+    });
+    let t_end = events.iter().rev().find_map(|e| match e {
+        StreamEvent::Complete { timestamps, .. } | StreamEvent::Failed { timestamps, .. } => {
+            timestamps.t_end
+        }
+        _ => None,
+    });
+    match (t0, t_end) {
+        (Some(start), Some(end)) => Some((start, end)),
+        _ => None,
+    }
 }
 
 /// Chunk 13: write the `--export` file for a just-persisted run,
@@ -256,6 +343,9 @@ fn run_export(
 /// later chunks.
 fn run_tui(cfg: &Config) -> bool {
     let export_format = cfg.export.unwrap_or_default();
+    // Chunk 17: probe the hardware once (NVML feature-gated + sysinfo).
+    // Never fails — a driverless host simply runs with N/A GPU fields.
+    let hw = Arc::new(Mutex::new(HwPoller::new()));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -265,7 +355,25 @@ fn run_tui(cfg: &Config) -> bool {
             let mut event_loop = EventLoop::new()?;
             let mut app = App::new()
                 .with_export_format(export_format)
-                .with_niah_config(cfg);
+                .with_niah_config(cfg)
+                .with_hw(hw.clone());
+            // The 100 ms hardware telemetry task (blueprint §4.3): it
+            // polls and merges into the `ArcSwap<MetricsSnapshot>` the
+            // views read lock-free. It never touches the stream
+            // workers' quanta timing path (measurement isolation,
+            // blueprint §4); a lock failure is a no-op.
+            let state = app.metrics.clone();
+            let poller = hw;
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
+                loop {
+                    interval.tick().await;
+                    if let Ok(mut p) = poller.lock() {
+                        p.tick(&state);
+                    }
+                }
+            });
             event_loop.run(&mut app).await?;
             event_loop.teardown()
         })

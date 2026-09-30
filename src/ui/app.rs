@@ -10,7 +10,7 @@
 //! The render loop never writes the snapshot and never touches the timing
 //! path (measurement-isolation invariant, blueprint §4).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -20,7 +20,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::config::{Config, ExportFormat};
-use crate::engines::{NiahEngineConfig, NiahSlot, SweepResult};
+use crate::engines::{
+    fragmentation_warning, NiahEngineConfig, NiahSlot, SweepResult, VRAM_FRAGMENTATION_THRESHOLD,
+};
+use crate::hw::HwPoller;
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
@@ -152,6 +155,15 @@ pub struct App {
     /// The NIAH-relevant config snapshot for spawning background runs
     /// (`n` key). `None` until the entry point supplies one.
     pub niah_config: Option<NiahEngineConfig>,
+    /// The 100 ms hardware telemetry poller (Chunk 17): a background
+    /// task publishes VRAM / power / clock / J-token into the shared
+    /// `ArcSwap<MetricsSnapshot>`; the views read it lock-free. `None`
+    /// until the entry point attaches one.
+    pub hw: Option<Arc<Mutex<HwPoller>>>,
+    /// Hysteresis latch for the VRAM fragmentation warning (blueprint
+    /// §5D): the log line fires once when occupancy crosses the
+    /// threshold and re-arms once it falls 5 points below it.
+    vram_warned: bool,
 }
 
 impl Default for App {
@@ -196,6 +208,8 @@ impl App {
             history: None,
             niah: Arc::new(NiahSlot::new()),
             niah_config: None,
+            hw: None,
+            vram_warned: false,
         }
     }
 
@@ -203,6 +217,14 @@ impl App {
     /// key can spawn a background matrix run against the target endpoint.
     pub fn with_niah_config(mut self, cfg: &Config) -> Self {
         self.niah_config = Some(NiahEngineConfig::from_config(cfg));
+        self
+    }
+
+    /// Attach the hardware telemetry poller (Chunk 17). The entry point
+    /// spawns the 100 ms task that drives `hw.tick(&app.metrics)`; the
+    /// render path only ever reads the resulting snapshot.
+    pub fn with_hw(mut self, hw: Arc<Mutex<HwPoller>>) -> Self {
+        self.hw = Some(hw);
         self
     }
 
@@ -370,6 +392,23 @@ impl App {
     /// export carries the metrics rows only.
     pub fn export(&mut self) -> Result<std::path::PathBuf, String> {
         let snap = self.metrics.load();
+        // Chunk 17: with the hardware poller attached, the export rows
+        // carry the live silicon-efficiency reading (cumulative joules ÷
+        // tokens generated so far) and the session carries the GPU name.
+        // A poisoned/absent poller degrades to N/A (`None`) — never a
+        // failure of the export itself. The guard is scoped so it drops
+        // before the `push_log` below reborrows `self` mutably.
+        let (live_jpt, gpu_name) = {
+            let poller = self.hw.as_ref().and_then(|h| h.lock().ok());
+            (
+                poller
+                    .as_ref()
+                    .and_then(|g| g.live_joules_per_token(snap.completion_tokens)),
+                poller
+                    .as_ref()
+                    .and_then(|g| g.gpu_name().map(str::to_string)),
+            )
+        };
         let session = BenchmarkSession {
             session_id: uuid::Uuid::new_v4().to_string(),
             timestamp: None,
@@ -377,7 +416,7 @@ impl App {
             model_name: snap.model.clone(),
             backend_type: (!snap.backend.is_empty()).then(|| snap.backend.clone()),
             quantization: None,
-            system_gpu: None,
+            system_gpu: gpu_name,
             total_duration_sec: None,
         };
         let metrics: Vec<StreamMetricRow> = snap
@@ -393,7 +432,7 @@ impl App {
                 ttft_ms: s.ttft_s.map(|v| v * 1000.0),
                 tpot_ms: s.gen_tps.filter(|v| *v > 0.0).map(|v| 1000.0 / v),
                 mtp_efficiency: s.mtp,
-                joules_per_token: None,
+                joules_per_token: live_jpt,
                 cache_hit: None,
             })
             .collect();
@@ -422,16 +461,41 @@ impl App {
 
     /// Advance the 60Hz render clock.
     ///
-    /// The metric snapshot itself is *not* touched here: it is published by
-    /// the stream worker / engine via `MetricsState::update()` and read
-    /// lock-free in the render path (`render` → views → `MetricsState::load`).
-    /// Keeping the write out of the render loop is the measurement-isolation
-    /// invariant (blueprint §4). `Space` (paused) freezes the clock.
+    /// The metric snapshot itself is *not* written here: it is published by
+    /// the stream worker / engine / hardware poller via
+    /// `MetricsState::update()` and read lock-free in the render path
+    /// (`render` → views → `MetricsState::load`). Keeping the write out of
+    /// the render loop is the measurement-isolation invariant (blueprint
+    /// §4). `Space` (paused) freezes the clock.
+    ///
+    /// The one derived event this tick path emits (Chunk 17): the
+    /// VRAM-fragmentation warning (blueprint §5D) — logged once when
+    /// occupancy crosses [`VRAM_FRAGMENTATION_THRESHOLD`], re-armed after
+    /// a 5-point drop. Reading the snapshot here is a plain lock-free
+    /// load; no timing path is touched.
     pub fn on_tick(&mut self) {
         if self.paused {
             return;
         }
         self.tick += 1;
+
+        let m = self.metrics.load();
+        let ratio = if m.vram_total_gb > 0.0 {
+            (m.vram_used_gb / m.vram_total_gb).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if ratio >= VRAM_FRAGMENTATION_THRESHOLD && !self.vram_warned {
+            self.vram_warned = true;
+            if let Some(w) = fragmentation_warning(
+                (m.vram_used_gb * 1e9) as u64,
+                (m.vram_total_gb * 1e9) as u64,
+            ) {
+                self.push_log(format!("Warning: {w}"), style::value_warn());
+            }
+        } else if ratio < VRAM_FRAGMENTATION_THRESHOLD * 0.95 {
+            self.vram_warned = false;
+        }
     }
 
     /// Draw the full frame: status bar, tab bar, current view, footer.
