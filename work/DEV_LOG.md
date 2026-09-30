@@ -9,7 +9,7 @@
 
 ## Active Work
 
-None — UX refactor complete. `branch/tui-setup` (Chunk B) and `branch/tui-graphs` (Chunk C) merged into `master` (`b019110`) and deleted; merged-tree QA fully green (354/354 tests, clippy+fmt clean).
+- [ACTIVE] ID: tokio-io-fix | AGENT: general (Implementation Agent) | BRANCH: branch/tokio-io-fix | FILES: src/main.rs
 
 
 ## Completed Milestones

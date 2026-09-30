@@ -457,6 +457,7 @@ fn run_tui(cfg: &Config) -> bool {
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .enable_io() // the TUI's model discovery (reqwest HTTP) needs the IO driver
             .build()
             .expect("failed to build tokio runtime");
         runtime.block_on(async {
