@@ -178,7 +178,7 @@ impl Engine {
                 "JSON compliance. Tests whether the model follows\nthe response_format instruction — reliability for API\nand agent tool-calling."
             }
             Engine::Hardware => {
-                "GPU power profiling. Measures watts and joules-per-token\nduring inference. Needs NVIDIA telemetry (NVML);\ndegrades to N/A without it."
+                "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
             }
         }
     }

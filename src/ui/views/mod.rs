@@ -31,14 +31,11 @@ pub fn render_current(area: Rect, app: &App, f: &mut Frame) {
     }
 }
 
-/// The dimmed `ℹ` info lines for one engine's
-/// [`description`](Engine::description) (the setup / config engine
-/// selection shows the focused engine's note; the first line carries the
-/// `ℹ` marker, continuation lines are indented).
-pub fn engine_info_lines(engine: Engine) -> Vec<Line<'static>> {
-    engine
-        .description()
-        .lines()
+/// The dimmed `ℹ` info lines for a multi-line help / description text
+/// (the first line carries the `ℹ` marker, continuation lines are
+/// indented two spaces).
+pub fn info_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
         .enumerate()
         .map(|(i, l)| {
             Line::from(Span::styled(
@@ -51,4 +48,12 @@ pub fn engine_info_lines(engine: Engine) -> Vec<Line<'static>> {
             ))
         })
         .collect()
+}
+
+/// The dimmed `ℹ` info lines for one engine's
+/// [`description`](Engine::description) (the setup / config engine
+/// selection shows the focused engine's note; the first line carries the
+/// `ℹ` marker, continuation lines are indented).
+pub fn engine_info_lines(engine: Engine) -> Vec<Line<'static>> {
+    info_lines(engine.description())
 }

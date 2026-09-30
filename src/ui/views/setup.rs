@@ -16,6 +16,9 @@
 //!    the six engine switches): `Tab`/`↑↓` move the focus, `Space` toggles,
 //!    `←→`/`+-` step numbers, typing edits. Edits write through to the
 //!    shared [`ConfigState`] so `F5`/`r` semantics carry over unchanged.
+//!    The focused field shows a dimmed `ℹ` explanation below the form
+//!    (scalar fields carry their own help text; engine fields reuse
+//!    `Engine::description()`).
 //! 4. **Confirm** — a summary of every selected setting; `Enter` launches
 //!    the benchmark (transition to the Live view + `start_run`), `Esc`
 //!    goes back to modify.
@@ -144,6 +147,29 @@ impl SetupField {
             SetupField::EngineReasoning => Some(Engine::Reasoning),
             SetupField::EngineStructured => Some(Engine::Structured),
             SetupField::EngineHardware => Some(Engine::Hardware),
+            _ => None,
+        }
+    }
+
+    /// The dimmed `ℹ` explanation shown below the field while it has
+    /// focus (the scalar fields; the engine fields return `None` and
+    /// reuse [`Engine::description`](Self::engine) instead).
+    ///
+    /// Kept to at most three lines — the config panel wraps to fit.
+    pub fn explanation(self) -> Option<&'static str> {
+        match self {
+            SetupField::Mode => Some(
+                "\"short\" = brief prompt (~100 tokens) for quick TTFT measurement.\n\"long\" = extended prompt (your token target) for sustained throughput.\nUse \"short\" to test responsiveness, \"long\" to test sustained generation speed.",
+            ),
+            SetupField::Tokens => Some(
+                "Target number of tokens to generate per request. Higher = longer test,\nmore stable averages. 256 = quick test, 2000 = standard, 8192+ = stress.\nThis is the MAX_tokens sent to the server — actual output may vary.",
+            ),
+            SetupField::Iterations => Some(
+                "How many times to repeat the benchmark. More iterations = more reliable\naverages (reduces variance from scheduling, caching, thermal throttling).\n1 = quick check, 5 = reliable, 10+ = publication-grade.",
+            ),
+            SetupField::Ladder => Some(
+                "Concurrency levels to test, in order. Each level spawns that many\nsimultaneous requests. The sweep finds where your server saturates.\nDefault: 1,2,4,8,16,32,64 (doubles); custom: 1,4,16,64 (wider gaps).",
+            ),
             _ => None,
         }
     }
@@ -846,11 +872,17 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
             Span::styled(value, vstyle),
         ]));
     }
-    // The focused engine's description (dimmed `ℹ` note) — so the user
-    // can see what a benchmark measures before toggling it.
-    if let Some(engine) = s.current_field().engine() {
+    // The focused field's explanation (dimmed `ℹ` note): the engine
+    // fields show `Engine::description()` (what a benchmark measures),
+    // the scalar fields show their own help text — every field explains
+    // itself as the user tabs through the form.
+    let field = s.current_field();
+    if let Some(engine) = field.engine() {
         lines.push(Line::raw(""));
         lines.extend(crate::ui::views::engine_info_lines(engine));
+    } else if let Some(text) = field.explanation() {
+        lines.push(Line::raw(""));
+        lines.extend(crate::ui::views::info_lines(text));
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
@@ -1430,19 +1462,57 @@ mod tests {
     fn config_stage_tracks_the_focus_across_engines() {
         // form_field 9 = Engine D (Hardware).
         let app = setup_app_at_config(9);
-        let text = render_setup_text(&app, 100, 30);
+        let text = render_setup_text(&app, 120, 30);
         assert!(text.contains("GPU power profiling"), "{text}");
+        assert!(text.contains("MUST run"), "{text}");
+        assert!(text.contains("NVML"), "{text}");
+        assert!(text.contains("Remote users"), "{text}");
+    }
+
+    // ── stage 3: rendering the focused scalar field's explanation ──────
+
+    #[test]
+    fn config_stage_shows_the_focused_mode_explanation() {
+        // form_field 0 = Mode.
+        let app = setup_app_at_config(0);
+        let text = render_setup_text(&app, 120, 30);
+        assert!(
+            text.contains('ℹ'),
+            "focused scalar field gets an info note: {text}"
+        );
+        assert!(text.contains("brief prompt"), "{text}");
+        assert!(text.contains("TTFT"), "{text}");
+        assert!(text.contains("sustained generation speed"), "{text}");
     }
 
     #[test]
-    fn config_stage_hides_the_description_for_non_engine_fields() {
-        // form_field 0 = Mode.
-        let app = setup_app_at_config(0);
-        let text = render_setup_text(&app, 100, 30);
-        assert!(
-            !text.contains('ℹ'),
-            "no info note for a non-engine field: {text}"
-        );
+    fn config_stage_shows_the_focused_tokens_explanation() {
+        // form_field 1 = Tokens.
+        let app = setup_app_at_config(1);
+        let text = render_setup_text(&app, 120, 30);
+        assert!(text.contains('ℹ'), "{text}");
+        assert!(text.contains("more stable averages"), "{text}");
+        assert!(text.contains("MAX_tokens"), "{text}");
+    }
+
+    #[test]
+    fn config_stage_shows_the_focused_iterations_explanation() {
+        // form_field 2 = Iterations.
+        let app = setup_app_at_config(2);
+        let text = render_setup_text(&app, 120, 30);
+        assert!(text.contains('ℹ'), "{text}");
+        assert!(text.contains("thermal throttling"), "{text}");
+        assert!(text.contains("publication-grade"), "{text}");
+    }
+
+    #[test]
+    fn config_stage_shows_the_focused_ladder_explanation() {
+        // form_field 3 = Ladder.
+        let app = setup_app_at_config(3);
+        let text = render_setup_text(&app, 120, 30);
+        assert!(text.contains('ℹ'), "{text}");
+        assert!(text.contains("1,2,4,8,16,32,64"), "{text}");
+        assert!(text.contains("1,4,16,64"), "{text}");
     }
 
     // ── step indicator ───────────────────────────────────────────────────
