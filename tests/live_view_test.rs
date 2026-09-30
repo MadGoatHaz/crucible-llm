@@ -237,3 +237,100 @@ fn vram_gauge_color_tracks_usage_thresholds() {
     check(0.8, Color::Yellow, Color::Green);
     check(0.95, Color::Red, Color::Yellow);
 }
+
+// ---- graph rendering: throughput sparkline (block ramp + color gradient) ----
+
+#[test]
+fn throughput_sparkline_renders_block_ramp_with_color_gradient() {
+    let mut s = MetricsSnapshot::sample();
+    // A high/medium/low mix across the rolling window so all three
+    // gradient colors appear.
+    s.throughput_series = vec![900.0, 100.0, 480.0, 950.0, 60.0, 420.0];
+    let app = app_with(s);
+    let buf = render_live(&app, W, H);
+    let text = buf_text(&buf);
+
+    assert!(text.contains("REAL-TIME SYSTEM PERFORMANCE"));
+    // Block ramp: the max sample is a full block, the min a sliver.
+    assert!(text.contains('█'), "max sample renders a full block");
+    assert!(text.contains('▁'), "min sample renders the smallest block");
+    // Current value label (last sample of the window).
+    assert!(text.contains("now 420.0 t/s"));
+    // Color gradient: green cells at the top of the ramp, red at the
+    // bottom, yellow in between.
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
+        "high samples are green"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "▁" && c.fg == Color::Red),
+        "low samples are red"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.fg == Color::Yellow && c.symbol() != " "),
+        "medium samples are yellow"
+    );
+}
+
+#[test]
+fn throughput_sparkline_degrades_gracefully_when_empty() {
+    // Zeroed snapshot: no rolling samples, no throughput.
+    let app = app_with(MetricsSnapshot::default());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("REAL-TIME SYSTEM PERFORMANCE"));
+    assert!(text.contains("now 0.0 t/s"));
+    // Tiny terminal: the guarded render path never panics.
+    let _ = render_live(&app, 12, 8);
+}
+
+// ---- graph rendering: ITL percentile gauge bars ----
+
+#[test]
+fn itl_gauge_bars_render_percentile_values() {
+    let app = app_with(MetricsSnapshot::sample());
+    let buf = render_live(&app, W, H);
+    let text = buf_text(&buf);
+    assert!(text.contains("p50"));
+    assert!(text.contains("p90"));
+    assert!(text.contains("p99"));
+    assert!(text.contains("12.1 ms"));
+    assert!(text.contains("16.4 ms"));
+    assert!(text.contains("41.2 ms"));
+    // The three gauge bars carry the green/yellow/red gradient.
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
+        "p50 gauge bar is green"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Yellow),
+        "p90 gauge bar is yellow"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Red),
+        "p99 gauge bar is red"
+    );
+}
+
+// ---- graph rendering: token counter ----
+
+#[test]
+fn token_counter_shows_total_generated() {
+    let app = app_with(MetricsSnapshot::sample());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("TOKENS GENERATED"));
+    assert!(text.contains("1,332"));
+    assert!(text.contains("1,152"));
+    assert!(text.contains("4,096"));
+}
