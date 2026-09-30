@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crucible_llm::client::StreamEvent;
-use crucible_llm::config::{Config, ConfigError, ExportFormat};
+use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
 use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine,
@@ -469,6 +469,15 @@ fn run_tui(cfg: &Config) -> bool {
                 .with_export_format(export_format)
                 .with_config(cfg)
                 .with_hw(hw.clone());
+            // The interactive Setup phase (full-screen takeover) opens
+            // only when the target (URL + model) was *not* fully given
+            // via CLI flags / env / config file: a bare `crucible-llm`
+            // starts at the URL prompt, while `--url … --model …` jumps
+            // straight to the Live view (`c` re-opens Setup from there).
+            // The placeholder model name ("default") counts as absent.
+            if !(cfg.target_explicit && cfg.model != DEFAULT_MODEL) {
+                app = app.with_setup(cfg);
+            }
             // The 100 ms hardware telemetry task (blueprint §4.3): it
             // polls and merges into the `ArcSwap<MetricsSnapshot>` the
             // views read lock-free. It never touches the stream

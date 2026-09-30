@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -34,6 +35,7 @@ use crate::ui::theme::{palette, style};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigState};
 use crate::ui::views::history::HistoryState;
+use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
 /// The five dashboard views (blueprint §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,6 +95,26 @@ impl View {
             _ => None,
         }
     }
+}
+
+/// The TUI phase: the pre-dashboard **Setup** takeover, or the
+/// five-view dashboard itself.
+///
+/// Setup is *not* a sixth tab: it is a full-screen flow (URL → model
+/// discovery/selection → benchmark config → launch) that occupies the
+/// whole frame with its own top bar and footer. `App::new()` starts in
+/// [`Phase::Dashboard`] (the previous behavior); the entry point moves it
+/// to [`Phase::Setup`] when the target (URL + model) was not given
+/// explicitly, and the `c` key re-opens Setup from any dashboard view
+/// (except View 5, where `c` is a typeable character).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Phase {
+    /// The interactive setup flow (full-screen takeover).
+    Setup,
+    /// The five-view dashboard (Live / Concurrency / Needle / History /
+    /// Config).
+    #[default]
+    Dashboard,
 }
 
 /// Semantic key actions the engine layer consumes (plumbed to the worker
@@ -186,6 +208,16 @@ pub struct App {
     /// completes; a failed discovery leaves the previous list (if any)
     /// in place — the picker degrades to free text (N/A-never-fail).
     pub models: Arc<ResultSlot<Vec<ModelInfo>>>,
+    /// The TUI phase: the Setup takeover or the dashboard (the
+    /// entry point picks; `c` re-opens Setup from the dashboard).
+    pub phase: Phase,
+    /// The interactive setup flow state (the four-stage URL → model →
+    /// config → launch sequence). Mutated only in the key/tick path.
+    pub setup: SetupState,
+    /// The last model-discovery error message (lock-free; `None` on
+    /// success). The setup flow surfaces it in the manual-entry stage
+    /// (N/A-never-fail: a failed discovery degrades to free text).
+    pub discovery_error: Arc<ArcSwapOption<String>>,
     /// Hysteresis latch for the VRAM fragmentation warning (blueprint
     /// §5D): the log line fires once when occupancy crosses the
     /// threshold and re-arms once it falls 5 points below it.
@@ -240,6 +272,12 @@ impl App {
             config: ConfigState::default(),
             hw: None,
             models: Arc::new(ResultSlot::new()),
+            // `App::new()` keeps the classic behavior (dashboard first);
+            // the entry point switches to Setup via `with_setup` when the
+            // target was not fully pre-configured.
+            phase: Phase::Dashboard,
+            setup: SetupState::new(),
+            discovery_error: Arc::new(ArcSwapOption::empty()),
             vram_warned: false,
         }
     }
@@ -268,6 +306,73 @@ impl App {
     pub fn with_hw(mut self, hw: Arc<Mutex<HwPoller>>) -> Self {
         self.hw = Some(hw);
         self
+    }
+
+    /// Enter the interactive **Setup** phase (the full-screen
+    /// pre-dashboard takeover), pre-filling from the resolved [`Config`]:
+    ///
+    /// * an *explicitly* provided URL is pre-filled in stage 1 (a
+    ///   built-in default is not — the setup flow starts with an empty
+    ///   prompt, per the recon's "no leaked LAN IP" rule);
+    /// * a non-placeholder model name is pre-filled as the stage-2
+    ///   manual-entry text.
+    ///
+    /// The entry point calls this only when the target (URL + model) was
+    /// not fully given on the command line / env / config file.
+    pub fn with_setup(mut self, cfg: &Config) -> Self {
+        self.phase = Phase::Setup;
+        if cfg.target_explicit {
+            self.setup.url = cfg.url.clone();
+            self.setup.url_cursor = self.setup.url.chars().count();
+        }
+        if cfg.model != crate::config::DEFAULT_MODEL {
+            self.setup.model_query = cfg.model.clone();
+            self.setup.model_query_cursor = self.setup.model_query.chars().count();
+        }
+        self
+    }
+
+    /// Re-open the Setup phase from the dashboard (the `c` key):
+    /// re-seed the flow from the current Configuration form and start at
+    /// the benchmark-configuration stage — `Esc` walks back through
+    /// model selection and the URL prompt.
+    pub fn open_setup(&mut self) {
+        self.setup.url = self.config.url.clone();
+        self.setup.url_cursor = self.setup.url.chars().count();
+        self.setup.models = self
+            .model_list()
+            .map(|v| v.into_iter().map(|m| m.id).collect())
+            .unwrap_or_default();
+        self.setup.model_query = self.config.model.clone();
+        self.setup.model_query_cursor = self.setup.model_query.chars().count();
+        self.setup.model_cursor = 0;
+        self.setup.error = None;
+        self.setup.form_field = 0;
+        self.setup.phase = crate::ui::views::setup::SetupPhase::Config;
+        self.phase = Phase::Setup;
+    }
+
+    /// Stage-4 `Enter`: leave the Setup takeover, land on the Live view,
+    /// and start the benchmark (the selected engines run against the
+    /// shared Configuration form the setup flow just filled in).
+    pub fn launch(&mut self) {
+        self.phase = Phase::Dashboard;
+        self.view = View::Live;
+        self.paused = false;
+        self.push_log(
+            format!(
+                "[setup] launching: {} / {}",
+                self.config.url, self.config.model
+            ),
+            style::value_ok(),
+        );
+        self.start_run();
+    }
+
+    /// The last model-discovery error message (lock-free read; `None`
+    /// until a discovery fails, cleared by a successful one).
+    pub fn discovery_error(&self) -> Option<String> {
+        self.discovery_error.load().as_deref().cloned()
     }
 
     /// The discovered model list (Chunk 20): a lock-free read of the
@@ -385,6 +490,7 @@ impl App {
         let url = cfg.url.clone();
         let api_key = cfg.api_key.clone();
         let slot = self.models.clone();
+        let err_slot = self.discovery_error.clone();
         slot.set_running(true);
         self.push_log(
             format!("[discovery] listing models at {url}/models"),
@@ -395,11 +501,16 @@ impl App {
                 Ok(models) => {
                     slot.set_running(false);
                     slot.store(models);
+                    // A successful discovery clears any stale error.
+                    err_slot.store(None);
                 }
                 Err(e) => {
                     // Clear the running flag; keep any previously
                     // discovered list (the view falls back to free text).
+                    // The message lands in the lock-free error slot so
+                    // the setup flow can surface it in the UI.
                     slot.set_running(false);
+                    err_slot.store(Some(Arc::new(e.to_string())));
                     eprintln!("[discovery] failed: {e}");
                 }
             }
@@ -545,14 +656,57 @@ impl App {
 
     /// Handle one terminal key event (blueprint §6 footer key map).
     pub fn handle_key(&mut self, key: &KeyEvent) -> KeyAction {
-        // Global quit always works — even inside the Config view (where
-        // `q` would otherwise be typed into a field).
-        if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
-            || key.code == KeyCode::Char('q')
-            || key.code == KeyCode::Esc
-        {
+        // Ctrl-C quits globally — in the dashboard *and* the Setup
+        // takeover (where `q` and `Esc` are phase keys, not quit keys).
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.running = false;
             return KeyAction::Quit;
+        }
+
+        // Setup phase (full-screen takeover): every other key routes to
+        // the four-stage flow. `q` types into a field; `Esc` walks back
+        // one stage (quitting only at stage 1).
+        if self.phase == Phase::Setup {
+            return match self.setup.handle_key(key, &mut self.config) {
+                SetupKeyResult::Inert => KeyAction::Continue,
+                SetupKeyResult::Quit => {
+                    self.running = false;
+                    KeyAction::Quit
+                }
+                // Stage 1 `Enter` / stage 2 `d`: sync the entered target
+                // into the shared form, then fire the async discovery.
+                SetupKeyResult::Discover | SetupKeyResult::Retry => {
+                    self.config.url = self.setup.url.trim().to_string();
+                    self.start_discovery();
+                    KeyAction::Continue
+                }
+                // Stage 2 `Enter`: the picked (or typed) model is the target.
+                SetupKeyResult::Selected => {
+                    self.config.model = self.setup.confirmed_model().unwrap_or_default();
+                    self.config.cursor = 0;
+                    self.setup.form_field = 0;
+                    KeyAction::Continue
+                }
+                // Stage 4 `Enter`: leave the takeover and run.
+                SetupKeyResult::Launched => {
+                    self.launch();
+                    KeyAction::Run
+                }
+            };
+        }
+
+        // Dashboard: `q` / `Esc` quit — even inside the Config view
+        // (where `q` would otherwise be typed into a field).
+        if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+            self.running = false;
+            return KeyAction::Quit;
+        }
+
+        // `c` — re-open the interactive Setup takeover. Scoped away from
+        // View 5, where `c` is a typeable character in a field.
+        if key.code == KeyCode::Char('c') && self.view != View::Config {
+            self.open_setup();
+            return KeyAction::Continue;
         }
 
         // Config view (Chunk 18): `PageDown`/`PageUp` switch views (so the
@@ -751,10 +905,25 @@ impl App {
     /// a 5-point drop. Reading the snapshot here is a plain lock-free
     /// load; no timing path is touched.
     pub fn on_tick(&mut self) {
-        if self.paused {
+        // The render clock freezes on `Space` only in the dashboard; the
+        // setup flow keeps ticking (the discovery spinner advances and
+        // the stage-2 hand-off below must fire).
+        if self.paused && self.phase == Phase::Dashboard {
             return;
         }
         self.tick += 1;
+
+        // Setup stage 2: the discovery request finished — materialize
+        // the model list and move to the picker (tick path, never the
+        // render path). A failed discovery degrades to manual entry
+        // (N/A-never-fail rule).
+        if self.phase == Phase::Setup
+            && self.setup.phase == crate::ui::views::setup::SetupPhase::Discover
+            && !self.discovery_running()
+        {
+            self.setup
+                .complete_discovery(self.model_list(), self.discovery_error());
+        }
 
         let m = self.metrics.load();
         let ratio = if m.vram_total_gb > 0.0 {
@@ -775,8 +944,17 @@ impl App {
         }
     }
 
-    /// Draw the full frame: status bar, tab bar, current view, footer.
+    /// Draw the full frame.
+    ///
+    /// The Setup phase is a **full-screen takeover** (not one of the five
+    /// tabs): it draws its own top bar, centered panel, and key-hint
+    /// footer across the entire frame. The dashboard keeps the classic
+    /// status bar / tab bar / view / footer layout.
     pub fn render(&self, f: &mut Frame) {
+        if self.phase == Phase::Setup {
+            views::setup::render(f.area(), self, f);
+            return;
+        }
         let area = f.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -899,5 +1077,263 @@ pub mod fmt {
             }
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::views::setup::SetupPhase;
+    use crossterm::event::KeyEventKind;
+    use crossterm::event::KeyEventState;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn char_key(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    // ── phase selection at launch ───────────────────────────────────────
+
+    #[test]
+    fn new_app_starts_in_the_dashboard() {
+        assert_eq!(App::new().phase, Phase::Dashboard);
+    }
+
+    #[test]
+    fn with_setup_bare_config_starts_at_url_with_empty_prompt() {
+        // A bare `crucible-llm` (built-in default URL, placeholder model)
+        // must not leak the default into the setup prompt.
+        let app = App::new().with_setup(&Config::default());
+        assert_eq!(app.phase, Phase::Setup);
+        assert_eq!(app.setup.phase, SetupPhase::Url);
+        assert!(app.setup.url.is_empty());
+    }
+
+    #[test]
+    fn with_setup_prefills_an_explicit_url_and_model() {
+        let cfg = Config {
+            url: "http://myhost:8000/v1".to_string(),
+            model: "qwen3-72b".to_string(),
+            target_explicit: true,
+            ..Config::default()
+        };
+        let app = App::new().with_setup(&cfg);
+        assert_eq!(app.setup.url, "http://myhost:8000/v1");
+        assert_eq!(app.setup.url_cursor, app.setup.url.chars().count());
+        assert_eq!(app.setup.model_query, "qwen3-72b");
+    }
+
+    #[test]
+    fn with_setup_leaves_the_placeholder_model_blank() {
+        let cfg = Config {
+            target_explicit: false,
+            ..Config::default()
+        }; // model == "default" (placeholder)
+        let app = App::new().with_setup(&cfg);
+        assert!(app.setup.model_query.is_empty());
+    }
+
+    // ── `c` re-opens setup from the dashboard ───────────────────────────
+
+    #[test]
+    fn c_key_opens_setup_at_the_config_stage() {
+        let mut app = App::new();
+        app.config.url = "http://host:1/v1".to_string();
+        app.config.model = "m1".to_string();
+        let r = app.handle_key(&char_key('c'));
+        assert_eq!(r, KeyAction::Continue);
+        assert_eq!(app.phase, Phase::Setup);
+        assert_eq!(app.setup.phase, SetupPhase::Config);
+        assert_eq!(app.setup.url, "http://host:1/v1");
+        assert_eq!(app.setup.model_query, "m1");
+    }
+
+    #[test]
+    fn c_key_in_the_config_view_types_into_the_field() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 0; // URL field
+        let before = app.config.url.clone();
+        app.handle_key(&char_key('c'));
+        assert_eq!(
+            app.phase,
+            Phase::Dashboard,
+            "`c` must not steal setup from View 5"
+        );
+        assert_eq!(app.config.url, format!("{before}c"));
+    }
+
+    // ── setup-phase key routing ─────────────────────────────────────────
+
+    #[test]
+    fn setup_q_types_into_the_url_instead_of_quitting() {
+        let mut app = App::new().with_setup(&Config::default());
+        let r = app.handle_key(&char_key('q'));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(app.running, "q is printable in setup, not a quit");
+        assert_eq!(app.setup.url, "q");
+    }
+
+    #[test]
+    fn setup_ctrl_c_still_quits() {
+        let mut app = App::new().with_setup(&Config::default());
+        let r = app.handle_key(&key(KeyCode::Char('c')));
+        // (Ctrl-C check requires the CONTROL modifier; a bare `c` types.)
+        assert_eq!(r, KeyAction::Continue);
+        assert_eq!(app.setup.url, "c");
+        let mut ctrl = key(KeyCode::Char('c'));
+        ctrl.modifiers = KeyModifiers::CONTROL;
+        let r = app.handle_key(&ctrl);
+        assert_eq!(r, KeyAction::Quit);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn setup_esc_at_url_stage_quits() {
+        let mut app = App::new().with_setup(&Config::default());
+        let r = app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(r, KeyAction::Quit);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn setup_esc_in_model_stage_walks_back_to_url() {
+        let mut app = App::new().with_setup(&Config::default());
+        app.setup.phase = SetupPhase::Model;
+        let r = app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(app.running);
+        assert_eq!(app.setup.phase, SetupPhase::Url);
+    }
+
+    #[test]
+    fn setup_esc_in_confirm_stage_walks_back_to_config() {
+        let mut app = App::new().with_setup(&Config::default());
+        app.setup.phase = SetupPhase::Confirm;
+        app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(app.setup.phase, SetupPhase::Config);
+    }
+
+    // ── discovery hand-off (tick path) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn url_enter_fires_the_async_discovery() {
+        let mut app = App::new().with_setup(&Config::default());
+        for c in "http://127.0.0.1:1/v1".chars() {
+            app.handle_key(&char_key(c));
+        }
+        let r = app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(r, KeyAction::Continue);
+        assert_eq!(app.setup.phase, SetupPhase::Discover);
+        // The URL synced into the shared form before the spawn.
+        assert_eq!(app.config.url, "http://127.0.0.1:1/v1");
+        assert!(app.discovery_running());
+    }
+
+    #[test]
+    fn on_tick_completes_a_successful_discovery_into_the_picker() {
+        let mut app = App::new().with_setup(&Config::default());
+        app.setup.phase = SetupPhase::Discover;
+        app.models.set_running(false);
+        app.models.store(vec![ModelInfo {
+            id: "qwen3-72b".into(),
+            ..Default::default()
+        }]);
+        app.on_tick();
+        assert_eq!(app.setup.phase, SetupPhase::Model);
+        assert_eq!(app.setup.models, vec!["qwen3-72b"]);
+        assert!(app.setup.error.is_none());
+    }
+
+    #[test]
+    fn on_tick_degrades_a_failed_discovery_to_manual_entry() {
+        let mut app = App::new().with_setup(&Config::default());
+        app.setup.phase = SetupPhase::Discover;
+        app.models.set_running(false);
+        app.discovery_error
+            .store(Some(Arc::new("connection failed: refused".to_string())));
+        app.on_tick();
+        assert_eq!(app.setup.phase, SetupPhase::Model);
+        assert!(app.setup.models.is_empty());
+        assert_eq!(
+            app.setup.error.as_deref(),
+            Some("connection failed: refused")
+        );
+    }
+
+    // ── launch (stage 4 `Enter`) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn confirm_enter_leaves_setup_and_runs_the_benchmark() {
+        let mut app = App::new().with_setup(&Config::default());
+        app.config.url = "http://127.0.0.1:1/v1".to_string();
+        app.config.model = "m1".to_string();
+        app.setup.phase = SetupPhase::Confirm;
+        let r = app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(r, KeyAction::Run);
+        assert_eq!(app.phase, Phase::Dashboard);
+        assert_eq!(app.view, View::Live);
+        assert!(app.running);
+        // The selected engines (default: speed) are running now.
+        assert!(app.speed_slot.is_running());
+    }
+
+    // ── full walk-through: URL → model → config → launch ────────────────
+
+    #[tokio::test]
+    async fn full_setup_walk_through_reaches_the_live_view() {
+        let mut app = App::new().with_setup(&Config::default());
+
+        // Stage 1: type the URL, Enter.
+        for c in "http://127.0.0.1:1/v1".chars() {
+            app.handle_key(&char_key(c));
+        }
+        app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(app.setup.phase, SetupPhase::Discover);
+
+        // The discovery "completes" (simulated slot publish).
+        app.models.set_running(false);
+        app.models.store(vec![
+            ModelInfo {
+                id: "llama-3-70b".into(),
+                ..Default::default()
+            },
+            ModelInfo {
+                id: "qwen3-72b".into(),
+                ..Default::default()
+            },
+        ]);
+        app.on_tick();
+        assert_eq!(app.setup.phase, SetupPhase::Model);
+
+        // Stage 2: pick the second model.
+        app.handle_key(&key(KeyCode::Down));
+        app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(app.setup.phase, SetupPhase::Config);
+        assert_eq!(app.config.model, "qwen3-72b");
+
+        // Stage 3: bump the iterations, Enter.
+        app.setup.form_field = 2; // Iterations
+        app.handle_key(&key(KeyCode::Right));
+        assert_eq!(app.config.iterations, 2);
+        app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(app.setup.phase, SetupPhase::Confirm);
+
+        // Stage 4: Esc back, then Enter to launch.
+        app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(app.setup.phase, SetupPhase::Config);
+        app.handle_key(&key(KeyCode::Enter));
+        app.handle_key(&key(KeyCode::Enter));
+        assert_eq!(app.phase, Phase::Dashboard);
+        assert_eq!(app.view, View::Live);
+        assert!(app.speed_slot.is_running());
     }
 }
