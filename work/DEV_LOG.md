@@ -9,7 +9,11 @@
 
 ## Active Work
 
-- [ACTIVE] ID: tokio-io-fix | AGENT: general (Implementation Agent) | BRANCH: branch/tokio-io-fix | FILES: src/main.rs
+None.
+
+## Completed Milestones
+
+- **tokio-io-fix** — TUI runtime (`run_tui`, `src/main.rs`) was built with `.enable_time()` only; the `tokio::spawn`ed model-discovery task (reqwest HTTP) panicked with "A Tokio 1.x context was found, but IO is disabled". Added `.enable_io()` to the builder (one-line fix, `380962f`). Build clean, 354/354 tests green.
 
 
 ## Completed Milestones
