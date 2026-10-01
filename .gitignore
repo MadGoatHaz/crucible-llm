@@ -4,6 +4,8 @@ work/sysops/
 
 # Rust build artifacts
 target/
+# Release binaries + checksums (uploaded to GitHub Releases, never committed)
+/crucible-llm-*
 # Local benchmark database (persisted at runtime)
 benchmarks.db
 
