@@ -431,10 +431,7 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                             term.dim("  [C3] structured output (free-form vs constrained)…");
                         }
                         let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!(
-                            "  [C3] {:+.1}% penalty · compliant={}",
-                            r.penalty_pct, r.compliant
-                        ));
+                        term.info(&format!("  [C3] {}", r.summary_line()));
                     }
                     Err(e) => {
                         term.warning(&format!("[C3] structured init failed: {e}"));

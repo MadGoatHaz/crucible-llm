@@ -154,12 +154,16 @@ async fn start_mock(mode: MockMode) -> String {
                 }
                 MockMode::Structured => {
                     if body.contains("response_format") {
-                        respond_sse(
-                            &mut sock,
-                            r#"{"name": "Ada", "age": 36, "city": "London"}"#,
-                            40,
-                        )
-                        .await;
+                        // Dispatch on which of the three C3 cases the prompt
+                        // asks for, returning a *valid* answer for each shape.
+                        let answer = if body.contains("exactly 3 objects") {
+                            r#"[{"id": 1, "label": "one", "active": true}, {"id": 2, "label": "two", "active": false}, {"id": 3, "label": "three", "active": true}]"#
+                        } else if body.contains("orders") {
+                            r#"{"user": {"name": "Ada", "email": "ada@x.com"}, "orders": [{"id": 1, "total": 50.5, "items": ["a", "b"]}]}"#
+                        } else {
+                            r#"{"name": "Ada", "age": 36}"#
+                        };
+                        respond_sse(&mut sock, answer, 40).await;
                     } else {
                         respond_sse(
                             &mut sock,
@@ -319,19 +323,16 @@ async fn structured_run_reports_tps_penalty_and_compliance() {
     // The penalty is a finite percentage (sign depends on the mock's
     // relative timing; it must be *computed*, not NaN/inf).
     assert!(result.penalty_pct.is_finite());
-    // Compliance: the constrained output is a JSON object with all
-    // required fields.
-    assert!(result.compliant, "valid JSON object must be compliant");
-    assert!(is_json_compliant(
-        &result.constrained_body,
-        &["name", "age", "city"]
-    ));
+    // Compliance: every case's constrained output is valid JSON matching its
+    // schema → all three compliant.
+    assert!(
+        result.fully_compliant(),
+        "valid JSON for every case must be compliant"
+    );
+    assert_eq!(result.score(), (3, 0, 0));
     assert!(result.constrained_body.contains("Ada"));
     // The free-form run (no constraint) is prose, not JSON.
-    assert!(!is_json_compliant(
-        &result.free_body,
-        &["name", "age", "city"]
-    ));
+    assert!(!is_json_compliant(&result.free_body, &["name", "age"]));
 }
 
 #[tokio::test]
@@ -342,9 +343,10 @@ async fn structured_run_flags_non_compliant_output() {
 
     assert!(result.constrained_tps > 0.0);
     assert!(
-        !result.compliant,
+        !result.fully_compliant(),
         "non-JSON constrained output must fail compliance"
     );
+    assert_eq!(result.score(), (0, 0, 3));
 }
 
 #[tokio::test]

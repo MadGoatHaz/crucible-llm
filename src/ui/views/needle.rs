@@ -10,7 +10,7 @@
 //! blueprint §4).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
@@ -43,14 +43,16 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
     // the `n` key, never this path).
     let result = &*app.niah.load();
 
-    let mut header: Vec<Cell> = vec![Cell::from("CTX")];
+    let mut header: Vec<Cell> = vec![Cell::from("SIZE")];
     for &d in &DEPTHS {
         header.push(Cell::from(format!("{d:>3}%")));
     }
+    header.push(Cell::from("PASS %"));
     let mut rows: Vec<Row> = vec![Row::new(header).style(style::muted_title())];
 
-    let mut widths = vec![Constraint::Percentage(12)];
-    widths.extend(std::iter::repeat_n(Constraint::Percentage(8), DEPTHS.len()));
+    let mut widths = vec![Constraint::Percentage(9)];
+    widths.extend(std::iter::repeat_n(Constraint::Percentage(6), DEPTHS.len()));
+    widths.push(Constraint::Percentage(11));
 
     for (i, label) in SIZE_LABELS.iter().enumerate() {
         let mut cells = vec![Cell::from(*label).style(style::value())];
@@ -65,6 +67,16 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
             };
             cells.push(Cell::from(glyph).style(st));
         }
+        // The per-size pass rate, color-coded by the ≥80 / 50–79 / <50 bar
+        // (`--` until the row has been run).
+        let (pr_text, pr_style) = match result
+            .as_ref()
+            .and_then(|r| r.size_pass_rate(NIAH_SIZES[i]))
+        {
+            Some(p) => (format!("{p:.1}%"), Style::default().fg(pass_rate_color(p))),
+            None => ("--".to_string(), Style::default().fg(palette::MUTED)),
+        };
+        cells.push(Cell::from(pr_text).style(pr_style));
         rows.push(Row::new(cells));
     }
 
@@ -77,6 +89,17 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
         ),
         area,
     );
+}
+
+/// Pass-rate color: green (≥80%), yellow (50–79%), red (<50%).
+fn pass_rate_color(p: f64) -> Color {
+    if p >= 80.0 {
+        palette::OK
+    } else if p >= 50.0 {
+        palette::WARN
+    } else {
+        palette::ERR
+    }
 }
 
 /// Legend + run status / accuracy note (state-aware): locked while a
@@ -129,6 +152,15 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
         format!("ℹ {NIAH_INFO}"),
         style::info(),
     )));
+    // The practical interpretation: the "reliable up to ~Xk" threshold
+    // computed from the actual grid (shown once a result exists).
+    if let Some(r) = &*slot.load() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("ℹ {}", r.interpretation()),
+            style::info(),
+        )));
+    }
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(
@@ -164,5 +196,48 @@ mod tests {
         assert!(text.contains("LEGEND"), "{text}");
         assert!(text.contains('ℹ'), "long-context info note: {text}");
         assert!(text.contains("long-context memory"), "{text}");
+    }
+
+    #[test]
+    fn grid_shows_pass_rate_column_and_interpretation() {
+        use crate::engines::capability::{NiahCellState, NiahResult};
+        let mut app = crate::ui::app::App::new();
+        app.view = crate::ui::app::View::Needle;
+
+        // 2k: both depths retrieved (100%); 4k: one of two (50%).
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        for c in &mut r.cells[0..2] {
+            c.target_tokens = 2000;
+            c.retrieved = true;
+            c.ttft_s = 0.1;
+            c.state = NiahCellState::Nominal;
+        }
+        r.cells[2].target_tokens = 4000;
+        r.cells[2].retrieved = true;
+        r.cells[2].ttft_s = 0.2;
+        r.cells[2].state = NiahCellState::Nominal;
+        r.cells[3].target_tokens = 4000;
+        r.cells[3].retrieved = false;
+        r.cells[3].state = NiahCellState::Failed;
+        app.niah.store(r);
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The PASS % header and the per-row percentages.
+        assert!(text.contains("PASS %"), "{text}");
+        assert!(text.contains("100.0%"), "2k row is 100%: {text}");
+        assert!(text.contains("50.0%"), "4k row is 50%: {text}");
+        // The practical interpretation line names the reliable threshold.
+        assert!(text.contains("Reliable retrieval up to"), "{text}");
     }
 }

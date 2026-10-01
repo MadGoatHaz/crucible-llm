@@ -876,10 +876,7 @@ impl BenchmarkSequence {
         let result = engine.run().await;
         self.slots.structured.set_running(false);
         self.slots.structured.store(result.clone());
-        format!(
-            "{:+.1}% penalty · compliant={}",
-            result.penalty_pct, result.compliant
-        )
+        result.summary_line()
     }
 
     /// Engine D — the continuous energy profiler: a short final sampling

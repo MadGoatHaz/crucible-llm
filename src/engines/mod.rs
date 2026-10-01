@@ -38,11 +38,12 @@ pub mod sequence;
 pub mod speed;
 
 pub use capability::{
-    build_document, classify, is_json_compliant, score_responses, Challenge, Checker, Needle,
-    NiahCell, NiahCellState, NiahDocument, NiahEngine, NiahEngineConfig, NiahResult, NiahSlot,
-    ReasoningEngine, ReasoningResult, ReasoningScore, StructuredEngine, StructuredResult,
-    NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR, REASONING_BANK,
-    REASONING_MAX_GEN_TOKENS, REQUIRED_FIELDS, STRUCTURED_MAX_GEN_TOKENS, STRUCTURED_TASK,
+    build_document, classify, evaluate_case, is_json_compliant, score_responses, CaseCheck,
+    CaseVerdict, Challenge, Checker, Needle, NiahCell, NiahCellState, NiahDocument, NiahEngine,
+    NiahEngineConfig, NiahResult, NiahSlot, ReasoningEngine, ReasoningResult, ReasoningScore,
+    StructuredCase, StructuredCaseResult, StructuredEngine, StructuredResult, NIAH_DEPTHS,
+    NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR, REASONING_BANK,
+    REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
 };
 pub use concurrency::{
     normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, DEFAULT_LADDER,
@@ -160,10 +161,7 @@ impl RunReport {
             parts.push(format!("C2: {}", r.score.label()));
         }
         if let Some(s) = &self.structured {
-            parts.push(format!(
-                "C3: {:+.1}% penalty, compliant={}",
-                s.penalty_pct, s.compliant
-            ));
+            parts.push(format!("C3: {}", s.summary_line()));
         }
         if parts.is_empty() {
             "no engines selected".to_string()
@@ -379,7 +377,17 @@ mod tests {
                 penalty_pct: 30.0,
                 free_ttft: 0.1,
                 constrained_ttft: 0.12,
-                compliant: true,
+                cases: vec![
+                    evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+                    evaluate_case(
+                        "Medium",
+                        r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+                    ),
+                    evaluate_case(
+                        "Complex",
+                        r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+                    ),
+                ],
                 constrained_body: "{}".into(),
                 free_body: "hi".into(),
             }),
@@ -388,6 +396,7 @@ mod tests {
         let line = r.summary_line();
         assert!(line.contains("C2: 9/13 solved"), "{line}");
         assert!(line.contains("C3: +30.0% penalty"), "{line}");
+        assert!(line.contains("3/3 compliant"), "{line}");
     }
 
     #[test]

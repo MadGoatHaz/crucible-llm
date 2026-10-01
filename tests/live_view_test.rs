@@ -27,8 +27,8 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 
 use crucible_llm::engines::{
-    Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState, StructuredResult,
-    SweepLevel, SweepResult,
+    evaluate_case, Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState,
+    StructuredResult, SweepLevel, SweepResult,
 };
 use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
@@ -365,7 +365,11 @@ fn capability_scores_show_for_c_engines() {
         penalty_pct: -0.3,
         free_ttft: 0.1,
         constrained_ttft: 0.101,
-        compliant: false,
+        cases: vec![
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+            evaluate_case("Medium", "not json"),
+            evaluate_case("Complex", "also not json"),
+        ],
         constrained_body: "{}".into(),
         free_body: "hi".into(),
     });
@@ -390,7 +394,7 @@ fn capability_scores_show_for_c_engines() {
     );
     // The stored results render their values.
     assert!(text.contains("12/13"), "reasoning score");
-    assert!(text.contains("FAIL"), "structured verdict");
+    assert!(text.contains("compliant"), "structured score");
     // The ⚠ warning marks the poor scores.
     assert!(text.contains('⚠'), "warning on poor scores");
     // The practical OVERALL summary.

@@ -30,11 +30,12 @@
 use std::sync::Arc;
 
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::engines::capability::CaseVerdict;
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
 use crate::ui::app::App;
@@ -61,6 +62,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 
     let show_concurrency = should_show_concurrency(&seq, app);
     let show_capabilities = should_show_capabilities(&seq, app);
+    // The structured-output detail sub-section (per-case checks + verdict)
+    // needs more vertical room than a plain bar, so the capability panel
+    // gets a larger share when C3 has run.
+    let structured_detail = app.structured_slot.load().as_ref().is_some();
 
     // (panel id, constraint). The hero row is the largest slice; the
     // key-metrics panel carries a two-line-per-metric description, so it
@@ -72,7 +77,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         plan.push((2, Constraint::Percentage(23))); // concurrency curve
     }
     if show_capabilities {
-        plan.push((3, Constraint::Percentage(23))); // capability scores
+        plan.push((
+            3,
+            Constraint::Percentage(if structured_detail { 32 } else { 23 }),
+        ));
     }
     plan.push((4, Constraint::Length(4))); // compact event log
 
@@ -605,6 +613,14 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
     for s in &scores {
         lines.extend(build_cap_lines(s));
     }
+    // The structured-output detail sub-section (per-case checks, the
+    // truncated actual output for failures, speed impact, and the
+    // practical verdict) — appended only when C3 has run.
+    let detail = build_structured_detail_lines(app);
+    if !detail.is_empty() {
+        lines.push(Line::raw(""));
+        lines.extend(detail);
+    }
     if tall {
         let divider = "─".repeat(area.width.saturating_sub(4) as usize);
         lines.push(Line::from(Span::styled(divider, style::border())));
@@ -662,25 +678,31 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot) -> Vec<CapScore> {
         });
     }
 
-    // Structured Out (C3) — compliant (100%) or not (0%).
+    // Structured Out (C3) — the score across the three schema cases
+    // (compliant / partial / failed), with the practical verdict carried by
+    // the detail sub-section below.
     if let Some(r) = app.structured_slot.load().as_ref() {
-        let ok = r.compliant;
+        let (c, _p, _f) = r.score();
+        let total = r.cases.len();
+        let pct = if total > 0 {
+            c as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         v.push(CapScore {
             label: "Structured Out",
-            pct: Some(if ok { 100.0 } else { 0.0 }),
-            detail: if ok {
-                "PASS".to_string()
-            } else {
-                "FAIL (non-compliant)".to_string()
-            },
-            detail_style: if ok {
+            pct: Some(pct),
+            detail: r.score_label(),
+            detail_style: if c == total {
                 style::value_ok()
-            } else {
+            } else if c == 0 {
                 style::value_err()
+            } else {
+                style::value_warn()
             },
-            color: score_color(Some(if ok { 100.0 } else { 0.0 })),
-            info: "JSON format adherence. Required for API / agent tool-calling.",
-            warn: (!ok).then_some("The model does not follow response_format instructions."),
+            color: score_color(Some(pct)),
+            info: "JSON schema adherence (3 cases). Required for API / agent tool-calling.",
+            warn: (c < total).then_some("See the detail below for which cases fail."),
         });
     }
 
@@ -731,6 +753,99 @@ fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
     ]
 }
 
+/// The `✓ label  ✗ label  …` check spans for one structured case.
+fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult) -> Vec<Span<'static>> {
+    case.checks
+        .iter()
+        .map(|c| {
+            let glyph = if c.passed { '✓' } else { '✗' };
+            let color = if c.passed { palette::OK } else { palette::ERR };
+            Span::styled(format!(" {glyph} {} ", c.label), Style::default().fg(color))
+        })
+        .collect()
+}
+
+/// The structured-output detail sub-section for the Live capability panel:
+/// a header, one line per case (its checks + verdict glyph), the
+/// (truncated) actual output for any non-compliant case, the speed-impact
+/// line, and the auto-generated practical verdict. `empty` when C3 has not
+/// run (the render path never shows an empty box).
+fn build_structured_detail_lines(app: &App) -> Vec<Line<'static>> {
+    let binding = app.structured_slot.load();
+    let Some(r) = binding.as_ref() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "STRUCTURED DETAIL (C3) — schema adherence",
+        style::muted_title(),
+    )));
+    for (i, case) in r.cases.iter().enumerate() {
+        let (glyph, color) = match case.verdict {
+            CaseVerdict::Compliant => ("✓", palette::OK),
+            CaseVerdict::Partial => ("⚠", palette::WARN),
+            CaseVerdict::Failed => ("✗", palette::ERR),
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!("  Case {} ({}):  ", i + 1, case.name),
+                style::label(),
+            ),
+            Span::styled(glyph.to_string(), Style::default().fg(color)),
+        ];
+        spans.extend(case_check_spans(case));
+        lines.push(Line::from(spans));
+        // Show the actual output (truncated to 3 lines) for any case that is
+        // not fully compliant, so the user sees *what* went wrong.
+        if !case.is_compliant() && !case.output.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    actual output:",
+                style::info(),
+            )));
+            for ol in case.output.split('\n').take(3) {
+                let trimmed = ol.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("    │ {trimmed}"),
+                    style::info(),
+                )));
+            }
+        }
+    }
+    // Speed impact: free-form vs constrained decode.
+    lines.push(Line::from(vec![
+        Span::styled("  Speed: ", style::label()),
+        Span::styled(
+            format!(
+                "free-form {:.1} → constrained {:.1} t/s",
+                r.free_tps, r.constrained_tps
+            ),
+            style::value(),
+        ),
+        Span::styled(format!(" ({:+.1}%)", r.penalty_pct), style::footer()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "  ℹ JSON mode adds slight overhead due to format constraints.",
+        style::info(),
+    )));
+    // The auto-generated practical verdict.
+    let verdict = r.verdict_line();
+    let vcolor = if verdict.starts_with('✓') {
+        palette::OK
+    } else if verdict.starts_with('✗') {
+        palette::ERR
+    } else {
+        palette::WARN
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  VERDICT: {verdict}"),
+        Style::default().fg(vcolor).add_modifier(Modifier::BOLD),
+    )));
+    lines
+}
+
 /// The **OVERALL** practical summary under the capability bars: what the
 /// scores mean for actually using the model (pure — unit-testable).
 fn capability_overall(scores: &[CapScore]) -> String {
@@ -769,6 +884,9 @@ fn capability_overall(scores: &[CapScore]) -> String {
                 if let Some(p) = s.pct {
                     if p >= 100.0 {
                         parts.push("reliable JSON output".to_string());
+                    } else if p >= 66.0 {
+                        parts.push("simple-only JSON output".to_string());
+                        caveats.push("Unreliable for complex schemas".to_string());
                     } else {
                         parts.push("unreliable JSON output".to_string());
                         caveats.push(
@@ -1170,7 +1288,14 @@ mod tests {
                 penalty_pct: -0.3,
                 free_ttft: 0.1,
                 constrained_ttft: 0.101,
-                compliant: false,
+                cases: vec![
+                    crate::engines::capability::evaluate_case(
+                        "Simple",
+                        r#"{"name": "Ada", "age": 36}"#,
+                    ),
+                    crate::engines::capability::evaluate_case("Medium", "not json"),
+                    crate::engines::capability::evaluate_case("Complex", "also not json"),
+                ],
                 constrained_body: "{}".into(),
                 free_body: "hi".into(),
             });
@@ -1184,8 +1309,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(details.contains("12/13"), "reasoning detail: {details}");
-        assert!(details.contains("FAIL"), "structured detail: {details}");
-        // The failing structured score carries a ⚠ warning.
+        assert!(
+            details.contains("compliant"),
+            "structured detail: {details}"
+        );
+        // The non-fully-compliant structured score carries a ⚠ warning.
         let structured = scores
             .iter()
             .find(|s| s.label == "Structured Out")

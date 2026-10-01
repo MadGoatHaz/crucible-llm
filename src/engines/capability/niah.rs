@@ -395,6 +395,52 @@ impl NiahResult {
         format!("{r}/{t} retrieved ({pct:.1}%)")
     }
 
+    /// The pass rate (0..=100) for one context size across all its depths —
+    /// the per-row percentage View 3 shows in its `PASS %` column. `None`
+    /// when the size has no *run* cells (an unrun row shows `--`).
+    pub fn size_pass_rate(&self, size: u32) -> Option<f64> {
+        let si = self.sizes.iter().position(|s| *s == size)?;
+        let start = si * self.depths.len();
+        let cells = &self.cells[start..start + self.depths.len()];
+        // Unrun cells are the `unrun()` placeholder (`target_tokens == 0`).
+        let run = cells.iter().filter(|c| c.target_tokens > 0).count();
+        if run == 0 {
+            return None;
+        }
+        let retrieved = cells.iter().filter(|c| c.retrieved).count();
+        Some(retrieved as f64 / run as f64 * 100.0)
+    }
+
+    /// The largest context size whose pass rate is >= `min_pct` — the
+    /// "reliable up to ~Xk" threshold for the practical interpretation line.
+    /// `None` when no size clears the bar.
+    pub fn reliable_up_to(&self, min_pct: f64) -> Option<u32> {
+        self.sizes
+            .iter()
+            .copied()
+            .filter(|s| self.size_pass_rate(*s).is_some_and(|p| p >= min_pct))
+            .max()
+    }
+
+    /// The plain-language interpretation of the matrix: how far the model
+    /// reliably retrieves, and what that means for RAG / long-document use.
+    /// Pure over the grid (unit-testable).
+    pub fn interpretation(&self) -> String {
+        match self.reliable_up_to(80.0) {
+            Some(size) => format!(
+                "Reliable retrieval up to ~{}k tokens. Beyond that, the model \
+                 loses track of embedded information. For RAG: limit context \
+                 windows to {}k or use a model with better long-context training.",
+                size / 1000,
+                size / 1000
+            ),
+            None => "No context size met the 80% reliability bar — this model is \
+                     not dependable for retrieval in any tested length. Avoid RAG / \
+                     long-document QA, or choose a better long-context model."
+                .to_string(),
+        }
+    }
+
     /// Assign every cell's state: the *smallest* context size is the
     /// baseline for the linear prefill expectation (blueprint §5 C1:
     /// "the decay curve of prefill processing speed as context length
@@ -1014,6 +1060,55 @@ mod tests {
         assert_eq!(row.depth_percent, Some(50.0));
         assert_eq!(row.retrieved_successfully, Some(true));
         assert_eq!(row.latency_ms, Some(250.0));
+    }
+
+    // ── Per-size pass rate / reliable threshold ───────────────────────────
+
+    #[test]
+    fn size_pass_rate_and_reliable_up_to() {
+        let mut r = NiahResult::new(vec![2000, 4000, 8000], vec![0, 50, 100]);
+        // 2k: all 3 retrieved.
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        r.cells[1] = cell(2000, 50, true, 0.1);
+        r.cells[2] = cell(2000, 100, true, 0.1);
+        // 4k: 2 of 3 retrieved.
+        r.cells[3] = cell(4000, 0, true, 0.2);
+        r.cells[4] = cell(4000, 50, true, 0.2);
+        r.cells[5] = cell(4000, 100, false, 0.2);
+        // 8k: 1 of 3 retrieved.
+        r.cells[6] = cell(8000, 0, true, 0.4);
+        r.cells[7] = cell(8000, 50, false, 0.4);
+        r.cells[8] = cell(8000, 100, false, 0.4);
+
+        assert_eq!(r.size_pass_rate(2000), Some(100.0));
+        assert!((r.size_pass_rate(4000).unwrap() - 66.666).abs() < 0.1);
+        assert!((r.size_pass_rate(8000).unwrap() - 33.333).abs() < 0.1);
+        // Only 2k (100%) clears 80%; 4k (66.7%) clears 60%.
+        assert_eq!(r.reliable_up_to(80.0), Some(2000));
+        assert_eq!(r.reliable_up_to(60.0), Some(4000));
+        assert_eq!(r.reliable_up_to(101.0), None);
+    }
+
+    #[test]
+    fn unrun_size_has_no_pass_rate() {
+        let r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        // Nothing run (all `unrun()` placeholders → target_tokens == 0).
+        assert_eq!(r.size_pass_rate(2000), None);
+        assert_eq!(r.size_pass_rate(4000), None);
+        assert_eq!(r.reliable_up_to(80.0), None);
+        assert!(r.interpretation().contains("No context size met"));
+    }
+
+    #[test]
+    fn interpretation_names_the_reliable_threshold() {
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        r.cells[1] = cell(2000, 100, true, 0.1);
+        r.cells[2] = cell(4000, 0, true, 0.2);
+        r.cells[3] = cell(4000, 100, true, 0.2);
+        let interp = r.interpretation();
+        assert!(interp.contains("up to ~4k"), "{interp}");
+        assert!(interp.contains("For RAG"), "{interp}");
     }
 
     // ── Slot ──────────────────────────────────────────────────────────────
