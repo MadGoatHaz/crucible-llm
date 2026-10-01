@@ -1,27 +1,36 @@
-//! Chunk 9 — View 1 (Live Monitor & Telemetry) acceptance tests.
+//! View 1 (Live Monitor & Telemetry) acceptance tests — the **remote-user**
+//! redesign.
 //!
-//! Verifies the blueprint §6 View 1 layout against *injected/synthetic*
-//! metrics (the same `MetricsState::update` writer seam the stream worker
-//! uses):
+//! The remote operator does not sit on the GPU machine, so the panels that
+//! read `N/A` off-box (VRAM gauge, GPU clock, power, the per-stream monitor
+//! matrix, the ITL braille histogram, the benchmark queue) are gone. The
+//! view now shows, top to bottom:
 //!
-//! - all five panels (telemetry gauges, ITL distribution, active-streams
-//!   matrix, rolling throughput chart, log/event stream) render;
-//! - the ITL histogram and the rolling throughput chart reflect changing
-//!   snapshot data across repaints;
-//! - the stream matrix shows the per-stream PP/TG split and MTP rate;
-//! - the view survives a 60 Hz frame sequence (the Chunk 8 event-loop
-//!   cadence) and degenerate terminal sizes without panicking.
+//! * the **BENCHMARK SEQUENCE** header (current engine + progress bar);
+//! * the **throughput hero** (a large real-time tokens/sec block chart)
+//!   beside the **KEY METRICS** readout;
+//! * the **CONCURRENCY CURVE** (Engine B) — shown while B runs / after the
+//!   run / when a sweep is on screen;
+//! * the **CAPABILITY SCORES** (C1/C2/C3/D horizontal bars) — shown while a
+//!   C/D engine runs / after the run / when a result is on screen;
+//! * a compact **EVENT LOG**.
 //!
-//! Rendering runs against `ratatui::backend::TestBackend`, so the suite is
-//! fully offline and deterministic — no terminal attached.
+//! These tests verify the layout against *injected/synthetic* metrics and
+//! result slots (the same lock-free writer seams the engines use) and confirm
+//! the engine-adaptive visibility: panels that don't apply are hidden, never
+//! rendered empty. Rendering runs against `ratatui::backend::TestBackend`, so
+//! the suite is fully offline and deterministic — no terminal attached.
 
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use ratatui::Terminal;
 
-use crucible_llm::engines::{Engine, EngineProgress, SeqPhase, SeqState};
-use crucible_llm::metrics::{MetricsSnapshot, StreamMetric, StreamStatus};
+use crucible_llm::engines::{
+    Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState, StructuredResult,
+    SweepLevel, SweepResult,
+};
+use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::live;
 
@@ -51,13 +60,8 @@ fn app_with(snap: MetricsSnapshot) -> App {
     app
 }
 
-/// A synthetic snapshot with known values for the Live view tests
-/// (replaces the removed `test_snapshot()` blueprint mock).
+/// A synthetic snapshot with known values for the Live view tests.
 fn test_snapshot() -> MetricsSnapshot {
-    let itl_bins = [
-        0.92, 0.86, 0.79, 0.71, 0.62, 0.53, 0.44, 0.36, 0.29, 0.23, 0.18, 0.14, 0.11, 0.08, 0.06,
-        0.045, 0.033, 0.024, 0.017, 0.012, 0.008, 0.005, 0.003, 0.002,
-    ];
     MetricsSnapshot {
         endpoint: "http://127.0.0.1:8000/v1".into(),
         backend: "vLLM".into(),
@@ -66,358 +70,59 @@ fn test_snapshot() -> MetricsSnapshot {
         aggregate_tps: 842.3,
         active_streams: 16,
         total_streams: 16,
-        vram_used_gb: 21.4,
-        vram_total_gb: 24.0,
-        power_w: 285.0,
-        joules_per_token: 0.338,
-        gpu_clock_mhz: 1410.0,
         itl_p50_ns: 12_100_000,
         itl_p90_ns: 16_400_000,
         itl_p99_ns: 41_200_000,
         itl_p999_ns: 55_000_000,
-        itl_bins: itl_bins.to_vec(),
         prompt_tokens: 4096,
         completion_tokens: 1332,
         reasoning_tokens: 1152,
-        status: StreamStatus::Streaming,
         streams: vec![
-            StreamMetric {
-                id: 1,
-                kind: "Reasoning".into(),
-                state: StreamStatus::Streaming,
-                pp_tokens: Some(2048),
-                tg_tokens: Some(312),
-                ttft_s: Some(0.182),
-                gen_tps: Some(72.4),
-                mtp: Some(1.84),
-                progress: 0.55,
-            },
-            StreamMetric {
-                id: 2,
-                kind: "Content".into(),
-                state: StreamStatus::Streaming,
-                pp_tokens: Some(512),
-                tg_tokens: Some(180),
-                ttft_s: Some(0.045),
-                gen_tps: Some(88.1),
-                mtp: Some(1.02),
-                progress: 0.70,
-            },
-            StreamMetric {
-                id: 3,
-                kind: "Tool-Call".into(),
-                state: StreamStatus::Waiting,
-                pp_tokens: Some(4096),
-                tg_tokens: None,
-                ttft_s: None,
-                gen_tps: None,
-                mtp: None,
-                progress: 0.0,
-            },
-            StreamMetric {
-                id: 4,
-                kind: "Reasoning".into(),
-                state: StreamStatus::Done,
-                pp_tokens: Some(2048),
-                tg_tokens: Some(840),
-                ttft_s: Some(0.191),
-                gen_tps: Some(68.9),
-                mtp: Some(1.79),
-                progress: 1.0,
-            },
+            stream(1, Some(0.2)),
+            stream(2, Some(0.2)),
+            stream(3, Some(0.2)),
         ],
         throughput_series: (0..60)
             .map(|i| 842.3 + 18.0 * ((i as f64) * 0.31).sin())
             .collect(),
+        ..MetricsSnapshot::default()
     }
 }
 
-// ---- acceptance: all five panels render with injected metrics ----
-
-#[test]
-fn all_five_panels_render_with_synthetic_metrics() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    for title in [
-        "TELEMETRY GAUGES",
-        "INTER-TOKEN LATENCY (ITL) DISTRIBUTION",
-        "ACTIVE STREAMS MONITOR",
-        "REAL-TIME SYSTEM PERFORMANCE",
-        "LOG & EVENT STREAM",
-    ] {
-        assert!(text.contains(title), "missing panel: {title}");
+/// A minimal stream row (only the TTFT is exercised by the key metrics).
+fn stream(id: u32, ttft: Option<f64>) -> crucible_llm::metrics::StreamMetric {
+    crucible_llm::metrics::StreamMetric {
+        id,
+        kind: "Content".into(),
+        state: crucible_llm::metrics::StreamStatus::Streaming,
+        pp_tokens: Some(1024),
+        tg_tokens: Some(128),
+        ttft_s: ttft,
+        gen_tps: Some(72.4),
+        mtp: Some(1.0),
+        progress: 0.5,
     }
 }
 
-// ---- acceptance: top-left key metrics (blueprint §6) ----
-
-#[test]
-fn gauge_panel_shows_key_metrics() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("Total Aggregate"));
-    assert!(text.contains("842.3 t/s"));
-    assert!(text.contains("Active Streams"));
-    assert!(text.contains("16 / 16"));
-    assert!(text.contains("GPU Clock"));
-    assert!(text.contains("1410 MHz"));
-    assert!(text.contains("Current Power"));
-    assert!(text.contains("285 W (0.338 J/token)"));
-    // VRAM capacity bar label.
-    assert!(text.contains("21.4 / 24.0 GB (89%)"));
-}
-
-#[test]
-fn gpu_clock_shows_na_without_telemetry() {
-    // Zeroed snapshot = no GPU/driver telemetry (the 0.0 sentinel,
-    // blueprint §5D graceful degradation).
-    let app = app_with(MetricsSnapshot::default());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("GPU Clock"));
-    assert!(text.contains("N/A"));
-}
-
-// ---- acceptance: ITL percentiles + histogram reflect changing data ----
-
-#[test]
-fn itl_percentiles_render_from_snapshot() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("12.1 ms"));
-    assert!(text.contains("16.4 ms"));
-    assert!(text.contains("41.2 ms"));
-}
-
-#[test]
-fn itl_histogram_and_rolling_chart_reflect_changing_data() {
-    let app = app_with(test_snapshot());
-    let before = render_live(&app, W, H);
-
-    // Publish a second snapshot: mirrored ITL distribution, shifted
-    // throughput series, new percentile values.
-    let mut s = test_snapshot();
-    s.itl_bins.reverse();
-    s.throughput_series = s.throughput_series.iter().map(|v| v + 400.0).collect();
-    s.itl_p50_ns = 99_000_000;
-    s.itl_p90_ns = 120_000_000;
-    s.itl_p99_ns = 180_000_000;
-    app.metrics.update(s);
-
-    let after = render_live(&app, W, H);
-    assert_ne!(
-        before, after,
-        "repaint must reflect the newly published snapshot"
-    );
-    let text = buf_text(&after);
-    assert!(text.contains("99.0 ms"));
-    assert!(text.contains("120.0 ms"));
-    assert!(text.contains("180.0 ms"));
-}
-
-// ---- acceptance: stream matrix shows PP/TG split and MTP rate ----
-
-#[test]
-fn stream_matrix_shows_pp_tg_split_and_mtp() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    // Row #01: Reasoning, streaming, 2048 PP / 312 TG.
-    assert!(text.contains("#01"));
-    assert!(text.contains("Reasoning"));
-    assert!(text.contains("Streaming"));
-    assert!(text.contains("2048/312"));
-    assert!(text.contains("0.182 s"));
-    assert!(text.contains("72.4 t/s"));
-    assert!(text.contains("1.84 x"));
-    // Row #02: Content split.
-    assert!(text.contains("512/180"));
-    assert!(text.contains("1.02 x"));
-    // Row #03: waiting — TG not started, so `--` placeholder cells.
-    assert!(text.contains("Waiting"));
-    assert!(text.contains("4096/--"));
-    // Row #04: done, 2048 PP / 840 TG.
-    assert!(text.contains("Done"));
-    assert!(text.contains("2048/840"));
-    assert!(text.contains("1.79 x"));
-}
-
-// ---- acceptance: updates at the 60 Hz render cadence ----
-
-#[test]
-fn live_view_survives_60hz_frame_sequence() {
-    let app = app_with(test_snapshot());
-    for frame in 0..60u64 {
-        // Simulate the engine publishing a fresh snapshot each tick, then
-        // the 60 Hz render loop painting one frame from it.
-        let tps = 842.3 + frame as f64;
-        let mut s = test_snapshot();
-        s.aggregate_tps = tps;
-        s.throughput_series.push(tps.round());
-        s.throughput_series.remove(0);
-        app.metrics.update(s);
-
-        let buf = render_live(&app, W, H);
-        let text = buf_text(&buf);
-        assert!(text.contains("TELEMETRY GAUGES"));
-        // Every frame must show the *latest* published aggregate.
-        assert!(text.contains(&format!("{tps:.1} t/s")));
+/// One sweep level (concurrency, aggregate t/s, p90 TPOT in ms).
+fn lvl(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
+    SweepLevel {
+        concurrency,
+        aggregate_tps: tps,
+        p50_tpot_ns: 0,
+        p90_tpot_ns: (p90_ms * 1e6) as u64,
+        p99_tpot_ns: 0,
+        ttft_p50_ns: 0,
+        ttft_p90_ns: 0,
+        total_tokens: 0,
+        completed_streams: 0,
+        failed_streams: 0,
+        timed_out_streams: 0,
+        aborted: false,
+        wall_ns: 0,
+        streams: Vec::new(),
     }
 }
-
-// ---- robustness: degenerate terminal sizes never panic ----
-
-#[test]
-fn renders_at_small_terminals_without_panic() {
-    let app = app_with(test_snapshot());
-    for (w, h) in [(40, 10), (20, 6), (80, 24)] {
-        let _ = render_live(&app, w, h);
-    }
-}
-
-// ---- VRAM gauge color tracks the usage thresholds ----
-
-#[test]
-fn vram_gauge_color_tracks_usage_thresholds() {
-    let check = |ratio: f64, want: Color, not: Color| {
-        let mut s = test_snapshot();
-        s.vram_total_gb = 24.0;
-        s.vram_used_gb = 24.0 * ratio;
-        let app = app_with(s);
-        let buf = render_live(&app, W, H);
-
-        // Locate the "Target GPU VRAM" title, then inspect the gauge bar
-        // rows directly below it. `find` yields a *byte* offset; the buffer
-        // text holds multi-byte box-drawing/braille/█ glyphs, so convert to
-        // a char offset before mapping onto the W x H cell grid.
-        let text = buf_text(&buf);
-        let byte_idx = text
-            .find("Target GPU VRAM")
-            .expect("VRAM gauge title in buffer");
-        let char_idx = text[..byte_idx].chars().count();
-        let title_row = char_idx / (W as usize);
-        let mut saw_want = false;
-        let mut saw_other = false;
-        for (i, cell) in buf.content().iter().enumerate() {
-            // `content()` is row-major over a W x H buffer.
-            let row = i / (W as usize);
-            if !(title_row..title_row + 3).contains(&row) {
-                continue;
-            }
-            if cell.fg == want {
-                saw_want = true;
-            }
-            if cell.fg == not {
-                saw_other = true;
-            }
-        }
-        assert!(saw_want, "expected {want:?} in VRAM gauge at ratio {ratio}");
-        assert!(
-            !saw_other,
-            "unexpected {not:?} in VRAM gauge at ratio {ratio}"
-        );
-    };
-    check(0.5, Color::Green, Color::Yellow);
-    check(0.8, Color::Yellow, Color::Green);
-    check(0.95, Color::Red, Color::Yellow);
-}
-
-// ---- graph rendering: throughput sparkline (block ramp + color gradient) ----
-
-#[test]
-fn throughput_sparkline_renders_block_ramp_with_color_gradient() {
-    let mut s = test_snapshot();
-    // A high/medium/low mix across the rolling window so all three
-    // gradient colors appear.
-    s.throughput_series = vec![900.0, 100.0, 480.0, 950.0, 60.0, 420.0];
-    let app = app_with(s);
-    let buf = render_live(&app, W, H);
-    let text = buf_text(&buf);
-
-    assert!(text.contains("REAL-TIME SYSTEM PERFORMANCE"));
-    // Block ramp: the max sample is a full block, the min a sliver.
-    assert!(text.contains('█'), "max sample renders a full block");
-    assert!(text.contains('▁'), "min sample renders the smallest block");
-    // Current value label (last sample of the window).
-    assert!(text.contains("now 420.0 t/s"));
-    // Color gradient: green cells at the top of the ramp, red at the
-    // bottom, yellow in between.
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
-        "high samples are green"
-    );
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "▁" && c.fg == Color::Red),
-        "low samples are red"
-    );
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.fg == Color::Yellow && c.symbol() != " "),
-        "medium samples are yellow"
-    );
-}
-
-#[test]
-fn throughput_sparkline_degrades_gracefully_when_empty() {
-    // Zeroed snapshot: no rolling samples, no throughput.
-    let app = app_with(MetricsSnapshot::default());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("REAL-TIME SYSTEM PERFORMANCE"));
-    assert!(text.contains("now 0.0 t/s"));
-    // Tiny terminal: the guarded render path never panics.
-    let _ = render_live(&app, 12, 8);
-}
-
-// ---- graph rendering: ITL percentile gauge bars ----
-
-#[test]
-fn itl_gauge_bars_render_percentile_values() {
-    let app = app_with(test_snapshot());
-    let buf = render_live(&app, W, H);
-    let text = buf_text(&buf);
-    assert!(text.contains("p50"));
-    assert!(text.contains("p90"));
-    assert!(text.contains("p99"));
-    assert!(text.contains("12.1 ms"));
-    assert!(text.contains("16.4 ms"));
-    assert!(text.contains("41.2 ms"));
-    // The three gauge bars carry the green/yellow/red gradient.
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
-        "p50 gauge bar is green"
-    );
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Yellow),
-        "p90 gauge bar is yellow"
-    );
-    assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Red),
-        "p99 gauge bar is red"
-    );
-}
-
-// ---- graph rendering: token counter ----
-
-#[test]
-fn token_counter_shows_total_generated() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("TOKENS GENERATED"));
-    assert!(text.contains("1,332"));
-    assert!(text.contains("1,152"));
-    assert!(text.contains("4,096"));
-}
-
-// ---- benchmark sequence: header, progress bar, queue panel ----
 
 /// A full A→D queue in the given phase (the shape the executor publishes).
 fn seq_state(
@@ -435,6 +140,304 @@ fn seq_state(
         completed,
     }
 }
+
+// ---- acceptance: the default (idle) view shows only the core panels ----
+
+#[test]
+fn default_view_shows_hero_key_metrics_and_log() {
+    let app = app_with(test_snapshot());
+    let text = buf_text(&render_live(&app, W, H));
+    for title in [
+        "BENCHMARK SEQUENCE",
+        "THROUGHPUT",
+        "KEY METRICS",
+        "EVENT LOG",
+    ] {
+        assert!(text.contains(title), "missing panel: {title}");
+    }
+    // The removed hardware / on-local panels are gone.
+    assert!(!text.contains("Target GPU VRAM"), "VRAM panel removed");
+    assert!(
+        !text.contains("ACTIVE STREAMS MONITOR"),
+        "stream matrix removed"
+    );
+    assert!(!text.contains("ITL) DISTRIBUTION"), "ITL histogram removed");
+    assert!(!text.contains("BENCHMARK QUEUE"), "queue panel removed");
+    // No engine running → the adaptive panels stay hidden (not empty).
+    assert!(
+        !text.contains("CONCURRENCY CURVE"),
+        "concurrency hidden when idle"
+    );
+    assert!(
+        !text.contains("CAPABILITY SCORES"),
+        "capabilities hidden when idle"
+    );
+}
+
+// ---- acceptance: key metrics show real data (no N/A hardware) ----
+
+#[test]
+fn key_metrics_panel_shows_real_data() {
+    let app = app_with(test_snapshot());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("Throughput"));
+    assert!(text.contains("842.3 t/s"));
+    // TTFT is the mean of the streams' TTFBs (3 × 0.2 s → 200 ms).
+    assert!(text.contains("TTFT"));
+    assert!(text.contains("200 ms"));
+    assert!(text.contains("ITL p50"));
+    assert!(text.contains("12.1 ms"));
+    assert!(text.contains("ITL p99"));
+    assert!(text.contains("41.2 ms"));
+    assert!(text.contains("Tokens"));
+    assert!(text.contains("1,332"));
+    assert!(text.contains("Streams"));
+    assert!(text.contains("16 active"));
+    // The one-line dimmed note explains the aggregate figure.
+    assert!(text.contains('ℹ'), "key-metrics info note");
+}
+
+#[test]
+fn key_metrics_show_placeholders_without_telemetry() {
+    // A zeroed snapshot (no streams, no ITL) must degrade to `--`, never
+    // panic or show a fake value.
+    let app = app_with(MetricsSnapshot::default());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("KEY METRICS"));
+    assert!(text.contains("0.0 t/s"));
+    assert!(text.contains("--"), "missing metrics show `--`");
+}
+
+// ---- acceptance: throughput hero (block chart + axes + gradient) ----
+
+#[test]
+fn throughput_hero_renders_block_chart_with_axes() {
+    let mut s = test_snapshot();
+    // A high/medium/low mix across the window so all three gradient colors
+    // appear and the y-axis shows the max.
+    s.throughput_series = vec![900.0, 100.0, 480.0, 950.0, 60.0, 420.0];
+    let app = app_with(s);
+    let buf = render_live(&app, W, H);
+    let text = buf_text(&buf);
+
+    assert!(text.contains("THROUGHPUT"));
+    // The `now | peak` value line (last sample = 420.0, max = 950.0).
+    assert!(text.contains("now 420.0 t/s"), "{text}");
+    assert!(text.contains("peak 950.0 t/s"), "{text}");
+    // The block chart body + the x-axis time labels.
+    assert!(text.contains('█'), "bars rendered");
+    assert!(text.contains("0s"), "x-axis start");
+    assert!(text.contains("60s"), "x-axis end");
+    // Color gradient: green at the top of the ramp, red at the bottom.
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
+        "high samples are green"
+    );
+    assert!(
+        buf.content()
+            .iter()
+            .any(|c| c.symbol() == "█" && c.fg == Color::Red),
+        "low samples are red"
+    );
+}
+
+#[test]
+fn throughput_hero_degrades_gracefully_when_empty() {
+    // Zeroed snapshot: no rolling samples, no throughput.
+    let app = app_with(MetricsSnapshot::default());
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("THROUGHPUT"));
+    assert!(text.contains("now 0.0 t/s"));
+    // Tiny terminal: the guarded render path never panics.
+    let _ = render_live(&app, 12, 8);
+}
+
+// ---- acceptance: concurrency curve is engine-adaptive ----
+
+#[test]
+fn concurrency_curve_shows_while_engine_b_runs() {
+    let app = app_with(test_snapshot());
+    // A completed sweep on screen + Engine B running.
+    app.sweep.store(SweepResult {
+        levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)],
+    });
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Concurrency,
+        Some(EngineProgress::Concurrency {
+            level: 4,
+            step: 3,
+            total_steps: 7,
+            active: 4,
+        }),
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("CONCURRENCY CURVE"), "curve panel visible");
+    // The curve plots the sweep (markers for sweet spot / knee).
+    assert!(
+        text.contains('●') || text.contains('▲') || text.contains('•'),
+        "curve markers rendered"
+    );
+}
+
+#[test]
+fn concurrency_curve_hidden_during_engine_a() {
+    let app = app_with(test_snapshot());
+    // Sweep data exists, but Engine A is running → the curve is hidden
+    // (never shown empty for the wrong engine).
+    app.sweep.store(SweepResult {
+        levels: vec![lvl(1, 100.0, 5.0)],
+    });
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Speed,
+        None,
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(
+        !text.contains("CONCURRENCY CURVE"),
+        "hidden during Engine A: {text}"
+    );
+}
+
+#[test]
+fn concurrency_curve_shows_in_progress_note_mid_sweep() {
+    let app = app_with(test_snapshot());
+    // Engine B running but no sweep result published yet.
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Concurrency,
+        Some(EngineProgress::Concurrency {
+            level: 8,
+            step: 2,
+            total_steps: 7,
+            active: 8,
+        }),
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("CONCURRENCY CURVE"), "panel visible");
+    assert!(
+        text.contains("in progress"),
+        "mid-sweep shows an in-progress note: {text}"
+    );
+}
+
+// ---- acceptance: capability scores are engine-adaptive ----
+
+#[test]
+fn capability_scores_show_for_c_engines() {
+    let app = app_with(test_snapshot());
+    app.reasoning_slot.store(ReasoningResult {
+        responses: vec![],
+        ttfts: vec![],
+        tg_speeds: vec![85.0],
+        score: ReasoningScore {
+            total: 13,
+            solved: 12,
+            by_category: [(5, 5), (4, 4), (3, 4)],
+        },
+    });
+    app.structured_slot.store(StructuredResult {
+        free_tps: 100.0,
+        constrained_tps: 98.0,
+        penalty_pct: -0.3,
+        free_ttft: 0.1,
+        constrained_ttft: 0.101,
+        compliant: false,
+        constrained_body: "{}".into(),
+        free_body: "hi".into(),
+    });
+    // Engine C2 (Reasoning) running → the capability panel is visible.
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Reasoning,
+        Some(EngineProgress::Reasoning {
+            challenge: 5,
+            total: 13,
+        }),
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("CAPABILITY SCORES"), "panel visible");
+    // All four capability bars are present.
+    for label in ["Reasoning", "NIAH", "Structured", "Energy"] {
+        assert!(text.contains(label), "missing bar: {label}");
+    }
+    // The stored results render their values.
+    assert!(text.contains("12/13"), "reasoning score");
+    assert!(text.contains("NON-COMPLIANT"), "structured verdict");
+}
+
+#[test]
+fn capability_scores_hidden_during_engine_a() {
+    let app = app_with(test_snapshot());
+    app.reasoning_slot.store(ReasoningResult {
+        responses: vec![],
+        ttfts: vec![],
+        tg_speeds: vec![85.0],
+        score: ReasoningScore {
+            total: 13,
+            solved: 12,
+            by_category: [(5, 5), (4, 4), (3, 4)],
+        },
+    });
+    // Engine A running → capabilities hidden even though data exists.
+    app.seq.store(seq_state(
+        SeqPhase::Running,
+        Engine::Speed,
+        None,
+        Vec::new(),
+    ));
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(
+        !text.contains("CAPABILITY SCORES"),
+        "hidden during Engine A: {text}"
+    );
+}
+
+// ---- acceptance: after all complete, the full summary shows every panel ----
+
+#[test]
+fn all_complete_shows_the_full_summary() {
+    let app = app_with(test_snapshot());
+    app.sweep.store(SweepResult {
+        levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0)],
+    });
+    app.reasoning_slot.store(ReasoningResult {
+        responses: vec![],
+        ttfts: vec![],
+        tg_speeds: vec![85.0],
+        score: ReasoningScore {
+            total: 13,
+            solved: 12,
+            by_category: [(5, 5), (4, 4), (3, 4)],
+        },
+    });
+    let mut state = seq_state(SeqPhase::AllComplete, Engine::Hardware, None, Vec::new());
+    state.summary = "6 of 6 engines complete".to_string();
+    app.seq.store(state);
+
+    let text = buf_text(&render_live(&app, W, H));
+    assert!(text.contains("ALL BENCHMARKS COMPLETE"), "header");
+    assert!(text.contains("THROUGHPUT"), "hero");
+    assert!(text.contains("KEY METRICS"), "key metrics");
+    assert!(
+        text.contains("CONCURRENCY CURVE"),
+        "concurrency in the summary"
+    );
+    assert!(
+        text.contains("CAPABILITY SCORES"),
+        "capabilities in the summary"
+    );
+    assert!(text.contains("EVENT LOG"), "log");
+}
+
+// ---- benchmark sequence: header, progress bar ----
 
 #[test]
 fn sequence_header_shows_running_engine_progress_and_bar() {
@@ -520,39 +523,6 @@ fn sequence_header_shows_each_engine_progress_shape() {
 }
 
 #[test]
-fn sequence_queue_marks_completed_running_and_queued() {
-    let app = app_with(test_snapshot());
-    app.seq.store(seq_state(
-        SeqPhase::Running,
-        Engine::Niah,
-        Some(EngineProgress::Niah {
-            size: 4000,
-            depth: 3,
-            total_depths: 11,
-            cell: 13,
-            total_cells: 77,
-        }),
-        vec![
-            (Engine::Speed, "847 t/s decode".to_string()),
-            (Engine::Concurrency, "sweet spot 16 streams".to_string()),
-        ],
-    ));
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("BENCHMARK QUEUE"), "queue panel");
-    // Completed entries carry a check + summary.
-    assert!(text.contains("A: Speed"), "completed A in queue");
-    assert!(text.contains("847 t/s decode"), "A's summary");
-    assert!(text.contains("B: Concurrency"), "completed B in queue");
-    assert!(text.contains("sweet spot 16 streams"), "B's summary");
-    // The running entry is highlighted; the rest are queued.
-    assert!(text.contains("▶"), "running marker");
-    assert!(text.contains("C1: NIAH"), "running C1 in queue");
-    assert!(text.contains("○"), "queued marker");
-    assert!(text.contains("C2: Reasoning"), "queued C2 in queue");
-    assert!(text.contains("D: Energy"), "queued D in queue");
-}
-
-#[test]
 fn sequence_all_complete_header_wins() {
     let app = app_with(test_snapshot());
     let mut state = seq_state(SeqPhase::AllComplete, Engine::Hardware, None, Vec::new());
@@ -566,102 +536,43 @@ fn sequence_all_complete_header_wins() {
 #[test]
 fn sequence_idle_before_any_run_shows_a_hint() {
     // A fresh App has never started a sequence: the header offers the
-    // launch hint and the queue shows the full default list, dimmed.
+    // launch hint.
     let app = app_with(test_snapshot());
     let text = buf_text(&render_live(&app, W, H));
     assert!(text.contains("No benchmark running"));
-    assert!(text.contains("A: Speed"));
-    assert!(text.contains("D: Energy"));
 }
 
+// ---- robustness: degenerate terminal sizes never panic ----
+
 #[test]
-fn sequence_ui_survives_small_terminals() {
+fn live_view_survives_60hz_frame_sequence() {
     let app = app_with(test_snapshot());
-    app.seq.store(seq_state(
-        SeqPhase::Running,
-        Engine::Speed,
-        Some(EngineProgress::Speed {
-            iteration: 2,
-            total: 5,
-            tokens: 248,
-        }),
-        Vec::new(),
-    ));
-    for (w, h) in [(40, 10), (20, 6), (80, 24)] {
-        let _ = render_live(&app, w, h);
+    for frame in 0..60u64 {
+        // Simulate the engine publishing a fresh snapshot each tick, then
+        // the 60 Hz render loop painting one frame from it.
+        let tps = 842.3 + frame as f64;
+        let mut s = test_snapshot();
+        s.aggregate_tps = tps;
+        s.throughput_series.push(tps.round());
+        s.throughput_series.remove(0);
+        app.metrics.update(s);
+
+        let buf = render_live(&app, W, H);
+        let text = buf_text(&buf);
+        assert!(text.contains("THROUGHPUT"));
+        // Every frame must show the *latest* published aggregate.
+        assert!(text.contains(&format!("{tps:.1} t/s")));
     }
 }
 
-// ---- engine results panel: data lines + dimmed ℹ info notes ----
-
 #[test]
-fn engine_results_panel_fills_in_as_engines_complete() {
+fn renders_at_small_terminals_without_panic() {
     let app = app_with(test_snapshot());
-    app.speed_slot
-        .store(vec![crucible_llm::engines::SpeedResult {
-            ttft: 0.25,
-            prompt_tokens: 128,
-            completion_tokens: 256,
-            pp_speed: 1000.0,
-            tg_speed: 60.6,
-            mtp_efficiency: 1.0,
-            stream_time: 4.2,
-            total_chunks: 256,
-            content_chunks: 256,
-            reasoning_chunks: 0,
-            other_chunks: 0,
-            estimated: false,
-            model: "test-model".into(),
-            mode: "short".into(),
-            error: None,
-        }]);
-    app.reasoning_slot
-        .store(crucible_llm::engines::ReasoningResult {
-            responses: vec![],
-            ttfts: vec![],
-            tg_speeds: vec![85.0],
-            score: crucible_llm::engines::ReasoningScore {
-                total: 13,
-                solved: 12,
-                by_category: [(5, 5), (4, 4), (3, 4)],
-            },
-        });
-    app.structured_slot
-        .store(crucible_llm::engines::StructuredResult {
-            free_tps: 100.0,
-            constrained_tps: 98.0,
-            penalty_pct: -0.3,
-            free_ttft: 0.1,
-            constrained_ttft: 0.101,
-            compliant: false,
-            constrained_body: "{}".into(),
-            free_body: "hi".into(),
-        });
-
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("ENGINE RESULTS"), "results panel title");
-    // Each completed engine: its headline number …
-    assert!(text.contains("A: Speed"), "{text}");
-    assert!(text.contains("60.6 t/s decode"), "{text}");
-    assert!(text.contains("C2: Reasoning"), "{text}");
-    assert!(text.contains("12/13 solved"), "{text}");
-    assert!(text.contains("C3: Structured"), "{text}");
-    assert!(text.contains("compliant: NO"), "{text}");
-    // … and the dimmed ℹ note explaining what it means.
-    assert!(text.contains('ℹ'), "{text}");
-    assert!(text.contains("Single-stream throughput"), "{text}");
-    assert!(text.contains("Logical reasoning accuracy"), "{text}");
-    assert!(text.contains("JSON compliance"), "{text}");
-    // Engine D was never requested (no poller, no summary) → the results
-    // panel carries no energy value ("D: Energy" also appears in the
-    // queue panel's default list, so assert on the data value instead).
-    assert!(!text.contains("N/A (no GPU telemetry)"), "{text}");
-}
-
-#[test]
-fn engine_results_panel_placeholder_before_any_engine() {
-    let app = app_with(test_snapshot());
-    let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("ENGINE RESULTS"), "{text}");
-    assert!(text.contains("No engines completed yet"), "{text}");
+    // Also exercise the all-complete (every panel) layout at small sizes.
+    let mut state = seq_state(SeqPhase::AllComplete, Engine::Hardware, None, Vec::new());
+    state.summary = "6 of 6".to_string();
+    app.seq.store(state);
+    for (w, h) in [(40, 10), (20, 6), (80, 24)] {
+        let _ = render_live(&app, w, h);
+    }
 }
