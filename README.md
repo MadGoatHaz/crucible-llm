@@ -45,14 +45,16 @@ By default a run executes **A, B, C1, C2, C3** (Engine D is opt-in, since it mus
 
 ### TUI Interface
 
-The default mode. A keyboard-first, 60 Hz dashboard (vim-style navigation):
+The **default mode** — a bare `crucible-llm` opens it, no flag required. A keyboard-first, 60 Hz dashboard (vim-style navigation) with five views (`1`–`5`):
 
-- **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker.
-- **Real-time throughput graph** with auto-scaling y-axis and engine-transition markers.
-- **Concurrency sweep visualization** with a practical sweet-spot recommendation.
+- **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker (first run only; a saved config skips straight to the dashboard).
+- **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
+- **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 40 t/s), not just the aggregate throughput knee.
+- **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
+- **View 4 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
+- **View 5 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
-- **Live event log** and a per-engine **benchmark queue** panel.
-- **Pause/resume**, view switching (`1`–`5`), and one-key export (`e`).
+- **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 
 ### Headless / CLI Mode
 
@@ -87,16 +89,22 @@ The release binary is fully self-contained: SQLite is bundled (no system `libsql
 
 ### Run (TUI)
 
+The TUI is the **default** — no flag needed:
+
 ```bash
 ./target/release/crucible-llm
 ```
+
+On your **first run** (no saved config) the interactive Setup flow walks you through it:
 
 1. Enter your server URL (e.g. `http://localhost:8000/v1`).
 2. Pick a model from the auto-discovered list (or type it).
 3. Configure the benchmark (or accept the defaults).
 4. Press **Enter** to launch — watch the live dashboard run A → B → C1 → C2 → C3.
 
-> Pass `--url … --model …` on the command line to skip straight to the dashboard. A bare invocation always opens the interactive Setup flow.
+On **subsequent runs**, a saved config (`~/.config/crucible/config.json`) with a URL + model skips Setup and opens the dashboard directly. Re-open Setup any time with `c`.
+
+> Pass `--url … --model …` on the command line to skip straight to the dashboard.
 
 ### Run (Headless)
 

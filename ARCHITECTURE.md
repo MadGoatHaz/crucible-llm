@@ -154,6 +154,16 @@ The SSE parser is a manual, incremental line-buffer state machine — zero exter
 
 Each parsed frame is classified into one of four `Chunk` types: `Content(text)`, `Reasoning(text)`, `Usage({prompt_tokens, completion_tokens})`, or `Control`. The parser returns frames through an internal ring buffer, so a steady stream causes no per-frame heap allocation. The parser leaves `t_nanos` at zero by contract — the stream worker stamps arrival times with the quanta clock after each `feed` call (measurement-isolation invariant).
 
+### Run Completion & the Metrics Freeze
+
+The metrics pipeline has a **freeze-on-completion** behavior. While a run is active, the stream workers keep publishing fresh `MetricsSnapshot`s and the hardware poller keeps sampling, so the dashboard shows live, moving numbers. The moment a run **completes**, the `MetricsState` is **frozen** (`MetricsState::freeze()`):
+
+- the render loop keeps showing the **final** snapshot — the numbers stop drifting, so the values you read at the end of a run are stable and reproducible;
+- the 100 ms hardware poller **goes idle** (it checks the freeze latch each tick and skips the sample/merge work while frozen), so it stops perturbing the system;
+- the frozen state persists until the **next run starts**, which calls `MetricsState::unfreeze()` to re-arm the pipeline.
+
+This applies to every run shape — the full `A → B → C1 → C2 → C3 (→ D)` sequence and a standalone `n`-key NIAH run. The freeze is a **read-side** concern (it only gates how often snapshots are refreshed); it never touches the `quanta` timing path, so the measurement-isolation invariant holds.
+
 ## Engine A: Speed
 
 ### What It Measures
@@ -471,6 +481,30 @@ When no power telemetry is available (no GPU, no driver, feature off), all deriv
 - The **metrics path** is a one-way pipeline: workers → bounded channel → engine core → `MetricsState::update()` → `ArcSwap` → TUI `load()`. The TUI never writes.
 - The **hardware poller** merges its samples into the same `MetricsState` via `load() → clone → merge → update()`. It never touches the stream workers.
 - The **storage layer** receives completed results from the engine core after the stream finishes. It is not on the timing path.
+- The **History view** reads completed runs back from the storage layer on the key path only (cached in view state) — the 60 Hz render loop never opens the database.
+
+## Configuration Persistence
+
+Crucible is a **single-source-of-truth** tool: one `Config` feeds the headless path, the TUI path, and the export path identically. Every field resolves from the first source that provides it:
+
+```
+CLI flag  >  environment variable  >  config file  >  built-in default
+```
+
+The **config file** (`~/.config/crucible/config.json`) is the persistence seam. It is read on every start, and it is written from the **TUI Config view (View 5)** — `F2` (or `Esc` while editing) persists the current form back to the file through the same serde layer, so a value edited in the UI flows end-to-end into the next run, the SQLite persistence, and the `--export` output.
+
+**Skip-Setup on subsequent runs:** when a config file already carries a `url` **and** a non-placeholder `model`, a bare `crucible-llm` opens straight onto the dashboard — the interactive Setup walkthrough (URL → model discovery → config → launch) is **skipped**. Setup still runs on the first invocation (no file / no explicit target), and can be re-opened any time with `c`. This is what makes the tool "set it up once, then just run it."
+
+## History & Comparison
+
+Every completed run is persisted to the SQLite store (`~/.local/share/crucible/benchmarks.db`), and **View 4 (History)** reads it back. The view has four modes:
+
+- **List** — the stored sessions, newest first, with a cursor (`j`/`↓`, `k`/`↑`).
+- **Detail** (`Enter`) — one run's per-engine summary (mean TTFT, gen t/s, prompt t/s, MTP, J/token, plus the NIAH pass count).
+- **Compare** (`C`, then `Enter` to pick the second run) — two runs side-by-side with **signed % deltas** for TTFT, gen t/s, prompt t/s, MTP, and J/token. Green = improvement, red = regression (TTFT and J/token improve when *lower*).
+- **Delete** (`D`, then `y`/`n`) — remove a stored run, with a confirmation prompt.
+
+**Measurement isolation:** all DB I/O happens on the key path (user-driven, rare) and the results are cached in the view's state, so the 60 Hz render loop never touches the database — it renders a pure `&App` read.
 
 ## Technology Stack
 

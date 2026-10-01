@@ -14,9 +14,11 @@ cargo test
 
 ```
 src/
+├── lib.rs            # Library crate root (modules shared by the binary & tests)
 ├── main.rs           # Entry point, CLI parsing, TUI/headless dispatch
 ├── config.rs         # Configuration (CLI > env > file > defaults)
 ├── timing.rs         # High-resolution timing (quanta)
+├── log.rs            # File-based run logger (latest.log + run archives)
 ├── client/
 │   ├── mod.rs
 │   ├── stream.rs     # StreamWorker (HTTP + SSE + timing)
