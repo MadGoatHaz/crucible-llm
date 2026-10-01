@@ -22,7 +22,6 @@
 //! the suite is fully offline and deterministic — no terminal attached.
 
 use ratatui::buffer::Buffer;
-use ratatui::style::Color;
 
 use crucible_llm::engines::{
     evaluate_case, Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState,
@@ -30,6 +29,7 @@ use crucible_llm::engines::{
 };
 use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
+use crucible_llm::ui::theme::palette;
 use crucible_llm::ui::views::live;
 
 mod common;
@@ -246,18 +246,17 @@ fn throughput_hero_renders_block_chart_with_axes() {
     assert!(text.contains('█'), "bars rendered");
     assert!(text.contains("0s"), "x-axis start");
     assert!(text.contains("5s"), "x-axis end");
-    // Color gradient: green at the top of the ramp, red at the bottom.
+    // The layered gradient: a hot white/cyan cap on the tall bars, a dim
+    // blue floor at the base of each bar (glowing from within).
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Green),
-        "high samples are green"
+            .any(|c| c.symbol() == "█" && c.fg == palette::TEXT),
+        "the hot cap is bright white/cyan"
     );
     assert!(
-        buf.content()
-            .iter()
-            .any(|c| c.symbol() == "█" && c.fg == Color::Red),
-        "low samples are red"
+        buf.content().iter().any(|c| c.fg == palette::FLOOR),
+        "the dim blue floor is present"
     );
 }
 
@@ -297,7 +296,7 @@ fn concurrency_curve_shows_while_engine_b_runs() {
     assert!(text.contains("CONCURRENCY CURVE"), "curve panel visible");
     // The curve plots the sweep (markers for sweet spot / knee).
     assert!(
-        text.contains('●') || text.contains('▲') || text.contains('•'),
+        text.contains('◆') || text.contains('▲'),
         "curve markers rendered"
     );
 }
@@ -398,8 +397,8 @@ fn capability_scores_show_for_c_engines() {
     // The stored results render their values.
     assert!(text.contains("12/13"), "reasoning score");
     assert!(text.contains("compliant"), "structured score");
-    // The ⚠ warning marks the poor scores.
-    assert!(text.contains('⚠'), "warning on poor scores");
+    // The ⚡ warning marks the poor scores.
+    assert!(text.contains('⚡'), "warning on poor scores");
     // The practical OVERALL summary.
     assert!(text.contains("OVERALL"), "overall summary");
 }

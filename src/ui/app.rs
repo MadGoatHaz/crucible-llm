@@ -52,7 +52,7 @@ use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, glyph, palette, style};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::{HistoryMode, HistoryState};
@@ -1434,9 +1434,10 @@ impl App {
         let overlay = Rect::new(x, y, w, h);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(
                 Style::default()
-                    .fg(palette::WARN)
+                    .fg(palette::CALLOUT)
                     .add_modifier(Modifier::BOLD),
             )
             .title(" QUIT? ");
@@ -1445,7 +1446,7 @@ impl App {
             Line::from(Span::styled(
                 "Quit crucible-llm?",
                 Style::default()
-                    .fg(palette::WARN)
+                    .fg(palette::CALLOUT)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
@@ -1463,31 +1464,34 @@ impl App {
     fn render_status_bar(&self, area: Rect, f: &mut Frame) {
         let m = self.metrics.load();
         let mut spans = vec![
+            Span::styled(" ▐ ", style::tab_separator()),
+            Span::styled("CRUCIBLE", style::title()),
             Span::styled(
-                format!(" Crucible-LLM v{} ", env!("CARGO_PKG_VERSION")),
+                "·LLM",
                 Style::default()
-                    .fg(palette::HIGHLIGHT)
+                    .fg(palette::SECONDARY)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("[{}] ", m.backend), style::value()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled(format!("Target: {} ", m.model), style::label()),
-            Span::styled(" | ", style::tab_separator()),
-            Span::styled(format!("Mode: {} ", m.mode), style::label()),
+            Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), style::footer()),
+            Span::styled(format!("  ▐ [{}]", m.backend), style::value()),
+            Span::styled(" ▐ ", style::tab_separator()),
+            Span::styled(format!("Target: {}", m.model), style::label()),
+            Span::styled(" ▐ ", style::tab_separator()),
+            Span::styled(format!("Mode: {}", m.mode), style::label()),
         ];
-        // State indicators: `▸ BUSY` while any benchmark load is in
-        // flight (sequence running, or a standalone NIAH run), `|| PAUSED`
+        // State indicators: `◉ RUNNING` while any benchmark load is in
+        // flight (sequence running, or a standalone NIAH run), `‖ PAUSED`
         // when the Space gate is holding.
         if self.seq.is_running() || self.niah.is_running() {
             spans.push(Span::styled(
-                " ▸ BUSY ",
+                format!("  {} RUNNING", glyph::RUN),
                 Style::default()
                     .fg(palette::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ));
         }
         if self.paused {
-            spans.push(Span::styled(" || PAUSED ", style::value_warn()));
+            spans.push(Span::styled(" ‖ PAUSED ", style::value_warn()));
         }
         f.render_widget(
             Paragraph::new(Line::from(spans)).style(style::status_bar()),
@@ -1499,15 +1503,20 @@ impl App {
     fn render_tab_bar(&self, area: Rect, f: &mut Frame) {
         let mut spans = vec![Span::raw(" ")];
         for (i, view) in View::ALL.iter().enumerate() {
-            let label = format!("[{}] {}", i + 1, view.label());
-            let st = if *view == self.view {
+            let active = *view == self.view;
+            let label = if active {
+                format!("{} [{}] {}", glyph::PREFIX, i + 1, view.label())
+            } else {
+                format!("[{}] {}", i + 1, view.label())
+            };
+            let st = if active {
                 style::tab_active()
             } else {
                 style::tab_inactive()
             };
             spans.push(Span::styled(label, st));
             if i + 1 < View::ALL.len() {
-                spans.push(Span::styled(" | ", style::tab_separator()));
+                spans.push(Span::styled(" │ ", style::tab_separator()));
             }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1580,13 +1589,20 @@ impl App {
             .iter()
             .enumerate()
             .flat_map(|(i, v)| {
+                let active = *v == self.view;
                 let label = format!("[{}]{}", i + 1, footer_view_label(*v));
-                let st = if *v == self.view {
-                    style::title()
+                let st = if active {
+                    style::tab_active()
                 } else {
                     style::footer()
                 };
-                vec![Span::styled(label, st), Span::raw(" ")]
+                let mut out: Vec<Span<'static>> = Vec::new();
+                if active {
+                    out.push(Span::styled(glyph::PREFIX.to_string(), st));
+                }
+                out.push(Span::styled(label, st));
+                out.push(Span::raw(" "));
+                out
             })
             .collect()
     }
@@ -1631,10 +1647,15 @@ impl App {
         } else {
             "[R]Run"
         };
+        // Action keys: electric purple (the "do something" keys); the
+        // navigation tabs above stay dim blue.
+        let key_style = Style::default()
+            .fg(palette::SECONDARY)
+            .add_modifier(Modifier::BOLD);
         vec![
-            Span::styled(primary.to_string(), style::footer()),
+            Span::styled(primary.to_string(), key_style),
             Span::raw(" "),
-            Span::styled("[q]Quit".to_string(), style::footer()),
+            Span::styled("[q]Quit".to_string(), key_style),
         ]
     }
 }

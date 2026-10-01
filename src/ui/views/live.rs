@@ -40,7 +40,7 @@ use crate::engines::capability::CaseVerdict;
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, glyph, palette, style};
 use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
 
 /// Render the Live view into `area`.
@@ -350,23 +350,13 @@ fn build_throughput_chart(
 
     let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
 
-    // y-axis labels: top = max, middle = max/2, bottom = 0.
-    let mut place_y = |row: usize, val: f64| {
-        let text = format!("{}", val.round());
-        let start = Y_AXIS_W.saturating_sub(text.len());
-        for (i, ch) in text.chars().enumerate() {
-            let col = start + i;
-            if col < w && row < h {
-                grid[row][col] = (ch, Some(palette::MUTED));
-            }
-        }
-    };
-    place_y(0, max);
-    place_y(plot_h / 2, max / 2.0);
-    place_y(plot_h.saturating_sub(1), 0.0);
+    // (The y-axis numbers are drawn last, via `write_y_label`, so they win
+    // in the gutter over the avg/peak line tags.)
 
-    // One bar per plot column; right-aligned so the newest sample sits at the
-    // right edge. Columns left of the filled region stay blank.
+    // One **layered gradient bar** per plot column; right-aligned so the
+    // newest sample sits at the right edge. Each bar ramps dim-blue floor →
+    // blue → cyan → bright → a hot white cap, so it glows from within.
+    // Columns left of the filled region stay blank.
     for col in 0..plot_w {
         let idx = series.len().saturating_sub(plot_w - col);
         if idx >= series.len() {
@@ -375,12 +365,28 @@ fn build_throughput_chart(
         let v = series[idx];
         let ratio = (v / max).clamp(0.0, 1.0);
         let height = (ratio * plot_h as f64).round() as usize;
-        let color = throughput_color(ratio);
-        for row in 0..height {
-            let grid_row = plot_h.saturating_sub(1).saturating_sub(row);
-            let grid_col = Y_AXIS_W + col;
+        if height == 0 {
+            continue;
+        }
+        let is_now = col == plot_w - 1; // the live sample (right edge)
+        let grid_col = Y_AXIS_W + col;
+        for r in 0..height {
+            let grid_row = plot_h.saturating_sub(1).saturating_sub(r);
             if grid_row < h && grid_col < w {
-                grid[grid_row][grid_col] = ('█', Some(color));
+                let frac = (r as f64 + 0.5) / height as f64;
+                let (ch, color) = gradient_layer(frac, is_now);
+                grid[grid_row][grid_col] = (ch, Some(color));
+            }
+        }
+    }
+
+    // The "now" cursor: a bright vertical line at the newest sample, rising
+    // from the baseline above the bar — the live position on the chart.
+    let now_col = Y_AXIS_W + plot_w.saturating_sub(1);
+    if now_col < w {
+        for row in grid.iter_mut().take(plot_h) {
+            if row[now_col].0 == ' ' {
+                row[now_col] = ('│', Some(palette::TEXT));
             }
         }
     }
@@ -406,23 +412,52 @@ fn build_throughput_chart(
         }
     }
 
-    // A dashed horizontal line at the window average, tagged in the gutter.
+    // A dashed deep-blue line at the window average, tagged in the gutter.
     if avg > 0.0 {
         let ratio = (avg / max).clamp(0.0, 1.0);
         let row = plot_h
             .saturating_sub(1)
             .saturating_sub((ratio * plot_h as f64).round() as usize)
             .min(plot_h.saturating_sub(1));
-        for cell in &mut grid[row][Y_AXIS_W..] {
-            *cell = ('┄', Some(palette::HIGHLIGHT));
+        for (i, cell) in grid[row][Y_AXIS_W..].iter_mut().enumerate() {
+            if cell.0 == ' ' && i % 2 == 1 {
+                *cell = ('┄', Some(palette::DATA));
+            }
         }
         for (i, ch) in "avg".chars().enumerate() {
             let cc = Y_AXIS_W.saturating_sub(3) + i;
             if cc < Y_AXIS_W {
-                grid[row][cc] = (ch, Some(palette::HIGHLIGHT));
+                grid[row][cc] = (ch, Some(palette::DATA));
             }
         }
     }
+
+    // A dashed magenta line at the window peak — the "hot" callout line.
+    let peak = series.iter().cloned().fold(0.0_f64, f64::max);
+    if peak > 0.0 {
+        let ratio = (peak / max).clamp(0.0, 1.0);
+        let row = plot_h
+            .saturating_sub(1)
+            .saturating_sub((ratio * plot_h as f64).round() as usize)
+            .min(plot_h.saturating_sub(1));
+        for (i, cell) in grid[row][Y_AXIS_W..].iter_mut().enumerate() {
+            if cell.0 == ' ' && i % 2 == 0 {
+                *cell = ('═', Some(palette::CALLOUT));
+            }
+        }
+        for (i, ch) in "peak".chars().enumerate() {
+            let cc = Y_AXIS_W.saturating_sub(4) + i;
+            if cc < Y_AXIS_W {
+                grid[row][cc] = (ch, Some(palette::CALLOUT));
+            }
+        }
+    }
+
+    // The y-axis numbers, drawn last so they win over the avg/peak gutter
+    // tags (top = max, middle = max/2, bottom = 0).
+    write_y_label(&mut grid, 0, max, w, h);
+    write_y_label(&mut grid, plot_h / 2, max / 2.0, w, h);
+    write_y_label(&mut grid, plot_h.saturating_sub(1), 0.0, w, h);
 
     // x-axis: a baseline + time labels spanning the *actual* window
     // (0 … N−1 s, where N = series.len()), skipping overlaps.
@@ -685,7 +720,7 @@ struct CapScore {
 /// non-percentage).
 fn score_color(pct: Option<f64>) -> Color {
     match pct {
-        Some(p) if p > 80.0 => palette::OK,
+        Some(p) if p >= 80.0 => palette::OK,
         Some(p) if p >= 50.0 => palette::WARN,
         Some(_) => palette::ERR,
         None => palette::MUTED,
@@ -844,25 +879,49 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
 }
 
 /// Render one capability score as two lines:
-/// `Label   [████████████████████]  detail  ⚠ warning`
+/// `Label   [▰▰▰▰▰▰▰▰│▱▱▱▱▱▱▱▱]  detail  ⚡ warning`
 /// `        ℹ what it measures`
+/// (the segmented `▰`/`▱` bar with a bright needle at the exact fill.)
 fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
     const BAR_W: usize = 20;
     let filled = s
         .pct
         .map(|p| (p.clamp(0.0, 100.0) / 100.0 * BAR_W as f64).round() as usize)
+        .map(|x| x.min(BAR_W))
         .unwrap_or(0);
-    let mut bar = String::with_capacity(BAR_W);
-    for i in 0..BAR_W {
-        bar.push(if i < filled { '█' } else { '░' });
-    }
+    // A thin bright "needle" at the exact fill boundary.
+    let needle = if filled > 0 && filled < BAR_W {
+        Span::styled(
+            "│".to_string(),
+            Style::default()
+                .fg(palette::TEXT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw(String::new())
+    };
     let mut line1: Vec<Span> = vec![
         Span::styled(format!("{:<16}", s.label), style::label()),
-        Span::styled(format!("[{bar}] "), Style::default().fg(s.color)),
+        Span::styled("[".to_string(), Style::default().fg(palette::MUTED)),
+        Span::styled(
+            glyph::SEG_ON.to_string().repeat(filled),
+            Style::default().fg(s.color),
+        ),
+        needle,
+        Span::styled(
+            glyph::SEG_OFF
+                .to_string()
+                .repeat(BAR_W.saturating_sub(filled)),
+            Style::default().fg(palette::MUTED),
+        ),
+        Span::styled("] ".to_string(), Style::default().fg(palette::MUTED)),
         Span::styled(s.detail.clone(), s.detail_style),
     ];
     if let Some(w) = s.warn {
-        line1.push(Span::styled(format!("  ⚠ {w}"), style::value_warn()));
+        line1.push(Span::styled(
+            format!("  {} {w}", glyph::WARN),
+            style::value_warn(),
+        ));
     }
     vec![
         Line::from(line1),
@@ -906,9 +965,9 @@ fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'
     )));
     for (i, case) in r.cases.iter().enumerate() {
         let (glyph, color) = match case.verdict {
-            CaseVerdict::Compliant => ("✓", palette::OK),
-            CaseVerdict::Partial => ("⚠", palette::WARN),
-            CaseVerdict::Failed => ("✗", palette::ERR),
+            CaseVerdict::Compliant => (glyph::DONE, palette::OK),
+            CaseVerdict::Partial => (glyph::WARN, palette::WARN),
+            CaseVerdict::Failed => (glyph::ERR, palette::ERR),
         };
         let mut spans = vec![
             Span::styled(
@@ -1105,20 +1164,33 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
     ];
     if bar_width > 0 {
         let filled = (ratio.clamp(0.0, 1.0) * bar_width as f64).round() as usize;
-        let bar_color = match ratio {
-            1.0 => palette::HIGHLIGHT,
-            _ => palette::ACCENT,
-        };
-        let mut bar = String::with_capacity(bar_width + 3);
-        bar.push('[');
-        for i in 0..bar_width {
-            bar.push(if i < filled { '█' } else { '░' });
-        }
-        bar.push(']');
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(bar, Style::default().fg(bar_color)));
         spans.push(Span::styled(
-            format!("{:4.0}%", ratio * 100.0),
+            "[".to_string(),
+            Style::default().fg(palette::MUTED),
+        ));
+        for i in 0..bar_width {
+            if i < filled {
+                let frac = if bar_width > 0 {
+                    i as f64 / bar_width as f64
+                } else {
+                    0.0
+                };
+                let (ch, color) = progress_layer(frac);
+                spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+            } else {
+                spans.push(Span::styled(
+                    glyph::SEG_OFF.to_string(),
+                    Style::default().fg(palette::FLOOR),
+                ));
+            }
+        }
+        spans.push(Span::styled(
+            "]".to_string(),
+            Style::default().fg(palette::MUTED),
+        ));
+        spans.push(Span::styled(
+            format!(" {:4.0}%", ratio * 100.0),
             style::value(),
         ));
     }
@@ -1129,7 +1201,7 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
                 theme::panel_title("BENCHMARK SEQUENCE"),
                 border_style,
             ))
-            .style(Style::default().bg(Color::Black)),
+            .style(Style::default().bg(palette::BG)),
         area,
     );
 }
@@ -1166,7 +1238,7 @@ fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Styl
                 ),
                 style::value(),
                 ratio,
-                style::active_border(),
+                theme::pulsing_border(tick),
             )
         }
         SeqPhase::Complete => (
@@ -1212,15 +1284,58 @@ fn render_log(area: Rect, app: &App, f: &mut Frame) {
 
 // ── Shared formatting helpers ──────────────────────────────────────────────
 
-/// Color gradient for the throughput chart: green (high) → yellow (medium)
-/// → red (low), relative to the rolling-window maximum.
-pub(crate) fn throughput_color(ratio: f64) -> Color {
-    if ratio >= 0.75 {
-        palette::OK
-    } else if ratio >= 0.40 {
-        palette::WARN
+/// Write a y-axis value label into the grid at `row` (right-aligned in the
+/// 5-column gutter). A free function (not a closure) so each call borrows
+/// `grid` only for its own duration — the labels are drawn last, after the
+/// avg/peak lines, so the numbers always win in the gutter.
+fn write_y_label(
+    grid: &mut [Vec<(char, Option<Color>)>],
+    row: usize,
+    val: f64,
+    w: usize,
+    h: usize,
+) {
+    const Y_AXIS_W: usize = 5;
+    let text = format!("{}", val.round());
+    let start = Y_AXIS_W.saturating_sub(text.len());
+    for (i, ch) in text.chars().enumerate() {
+        let col = start + i;
+        if col < w && row < h {
+            grid[row][col] = (ch, Some(palette::MUTED));
+        }
+    }
+}
+
+/// The (char, color) for one vertical position of a throughput bar:
+/// `frac` runs 0 at the base → 1 at the top. The layered ramp
+/// (dim-blue floor → blue → cyan → bright → a hot white cap) is what gives
+/// each bar its "glowing from within" depth. The live `now` sample gets a
+/// hotter (taller) white cap.
+fn gradient_layer(frac: f64, now: bool) -> (char, Color) {
+    let top = if now { 0.85 } else { 0.95 };
+    if frac < 0.18 {
+        (glyph::FLOOR, palette::FLOOR)
+    } else if frac < 0.42 {
+        (glyph::LOW, palette::DATA)
+    } else if frac < 0.72 {
+        (glyph::MID, palette::ACCENT)
+    } else if frac < top {
+        (glyph::HIGH, palette::BRIGHT)
     } else {
-        palette::ERR
+        (glyph::HIGH, palette::TEXT)
+    }
+}
+
+/// The (char, color) for one position of a segmented progress bar:
+/// `frac` runs 0 (left) → 1 (right) across the filled region — a left-to-
+/// right cyan ramp that reads as the bar "charging up".
+fn progress_layer(frac: f64) -> (char, Color) {
+    if frac < 0.4 {
+        (glyph::SEG_ON, palette::ACCENT)
+    } else if frac < 0.8 {
+        (glyph::SEG_ON, palette::BRIGHT)
+    } else {
+        (glyph::SEG_ON, palette::TEXT)
     }
 }
 
@@ -1621,8 +1736,10 @@ mod tests {
             .iter()
             .map(|sp| sp.content.as_ref().to_string())
             .collect();
-        // 20-wide bar at 50% → 10 filled, 10 empty.
-        assert!(text.contains("[██████████░░░░░░░░░░]"), "{text}");
+        // 20-wide segmented bar at 50% → 10 filled, a needle, 10 empty.
+        assert!(text.contains("▰▰▰▰▰▰▰▰▰▰"), "10 filled segments: {text}");
+        assert!(text.contains("▱▱▱▱▱▱▱▱▱▱"), "10 empty segments: {text}");
+        assert!(text.contains('│'), "needle at the fill boundary: {text}");
         // The second line is the dimmed explanation.
         let info: String = lines[1]
             .spans

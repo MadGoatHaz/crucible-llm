@@ -27,7 +27,7 @@ use ratatui::Frame;
 
 use crate::engines::concurrency::{Envelope, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, glyph, palette, style};
 
 /// Render the Concurrency view into `area`.
 ///
@@ -67,6 +67,7 @@ fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope
     // The primary title is uppercase + accent; the descriptive subtitle keeps
     // its natural casing (the "… vs Parallel Users" phrasing).
     let title = Line::from(vec![
+        Span::styled(format!("{} ", glyph::PREFIX), style::title()),
         Span::styled("CONCURRENCY SWEEP — ", style::title()),
         Span::styled("Aggregate Throughput vs Parallel Users", style::title()),
     ]);
@@ -185,16 +186,16 @@ pub(crate) fn build_curve_lines(
                 if c > k {
                     palette::ERR
                 } else if c == s {
-                    palette::WARN
+                    palette::ACCENT
                 } else if c > s {
-                    palette::ERR
+                    palette::CALLOUT
                 } else {
                     palette::OK
                 }
             }
             (Some(s), None) => {
                 if c == s {
-                    palette::WARN
+                    palette::ACCENT
                 } else if c > s {
                     palette::ERR
                 } else {
@@ -229,7 +230,7 @@ pub(crate) fn build_curve_lines(
             x: x as u16,
             y: y as u16,
             color: zone_color(l.concurrency),
-            marker: if is_knee { '▲' } else { '●' },
+            marker: if is_knee { glyph::KNEE } else { glyph::POINT },
             value: fmt::format_rate(l.aggregate_tps),
             label: l.concurrency.to_string(),
             knee_note: is_knee.then(|| format!("KNEE @ {}", l.concurrency)),
@@ -263,23 +264,40 @@ pub(crate) fn build_curve_lines(
     place_y((top_row + base_row) / 2, max_tps / 2.0);
     place_y(base_row, 0.0);
 
-    // Stems + markers, and the dimmed `─` connector through the
-    // diminishing-returns zone (past the knee / past the sweet spot).
+    // Stems + markers + the dim area fill under the curve, and the
+    // dim-cyan `─` connector between points. Past the knee the area turns
+    // dim purple — the diminishing-returns / degraded zone.
     for (i, p) in pts.iter().enumerate() {
-        for row in grid.iter_mut().take(base_row + 1).skip(p.y as usize) {
-            row[p.x as usize] = ('│', Some(p.color));
-        }
-        grid[p.y as usize][p.x as usize] = (p.marker, Some(p.color));
+        // Area fill under this segment: from the base up to the lower of
+        // the two endpoints (never above the curve).
         if i > 0 {
             let prev = &pts[i - 1];
-            // Dimmed (MUTED) past the knee — the diminishing-returns zone.
-            let line_color = if p.color == palette::ERR {
-                palette::MUTED
+            let fill_top = (p.y as usize).min(prev.y as usize);
+            let degraded = p.color == palette::ERR || p.color == palette::CALLOUT;
+            let fill = if degraded {
+                palette::SECONDARY
             } else {
-                p.color
+                palette::FLOOR
             };
+            for row in grid.iter_mut().take(base_row + 1).skip(fill_top) {
+                for cell in row.iter_mut().take(p.x as usize).skip(prev.x as usize + 1) {
+                    if cell.0 == ' ' {
+                        *cell = (glyph::FLOOR, Some(fill));
+                    }
+                }
+            }
+        }
+        // Vertical stem (dim cyan).
+        for row in grid.iter_mut().take(base_row + 1).skip(p.y as usize) {
+            row[p.x as usize] = ('│', Some(palette::BORDER_ACTIVE));
+        }
+        // The marker at the top of the stem.
+        grid[p.y as usize][p.x as usize] = (p.marker, Some(p.color));
+        // The dim-cyan `─` connector through the segment.
+        if i > 0 {
+            let prev = &pts[i - 1];
             for cell in &mut grid[p.y as usize][(prev.x as usize + 1)..(p.x as usize).min(w)] {
-                *cell = ('─', Some(line_color));
+                *cell = ('─', Some(palette::BORDER_ACTIVE));
             }
         }
     }
@@ -370,9 +388,9 @@ pub(crate) fn build_curve_lines(
     }
     if let Some(r) = legend_row {
         let legend: [(&str, Color); 3] = [
-            ("● measured", palette::OK),
-            ("▲ knee (saturation)", palette::ERR),
-            ("── diminishing returns", palette::MUTED),
+            ("◆ measured", palette::OK),
+            ("▲ knee", palette::CALLOUT),
+            ("── diminishing returns", palette::SECONDARY),
         ];
         let mut col = Y_AXIS_W;
         for (text, color) in legend {
@@ -712,18 +730,18 @@ fn sweep_row<'a>(
 fn per_stream_status(per: f64, baseline: f64) -> (String, Style) {
     let ratio = if baseline > 0.0 { per / baseline } else { 1.0 };
     if ratio >= 0.85 {
-        ("● optimal".to_string(), style::value_ok())
+        ("◆ optimal".to_string(), style::value_ok())
     } else if ratio >= 0.50 {
-        ("● good".to_string(), style::value_warn())
+        ("◆ good".to_string(), style::value_warn())
     } else if ratio >= 0.25 {
         (
             "▲ knee".to_string(),
             Style::default()
-                .fg(palette::WARN)
+                .fg(palette::CALLOUT)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("✗ saturated".to_string(), style::value_err())
+        ("✕ saturated".to_string(), style::value_err())
     }
 }
 
@@ -846,8 +864,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Measured points are ● (sweet spot + regular), the knee is ▲.
-        assert!(text.contains('●'), "measured-point marker");
+        // Measured points are ◆ (sweet spot + regular), the knee is ▲.
+        assert!(text.contains('◆'), "measured-point marker");
         assert!(text.contains('▲'), "knee marker");
         assert!(text.contains('│'), "vertical stem");
         assert!(text.contains('─'), "axis / connector line");
@@ -1026,8 +1044,8 @@ mod tests {
             .collect();
         let grid: Vec<&Vec<char>> = rows[1..8].iter().collect();
         let marker_rows: Vec<usize> = (0..rows[0].len())
-            .filter(|&col| grid.iter().any(|r| r[col] == '●'))
-            .map(|col| grid.iter().position(|r| r[col] == '●').unwrap())
+            .filter(|&col| grid.iter().any(|r| r[col] == '◆'))
+            .map(|col| grid.iter().position(|r| r[col] == '◆').unwrap())
             .collect();
         assert_eq!(marker_rows.len(), 2, "one marker per level");
         assert_ne!(
@@ -1041,13 +1059,13 @@ mod tests {
     #[test]
     fn per_stream_status_tracks_the_baseline() {
         // Baseline 100 t/s (the single-user rate).
-        assert_eq!(per_stream_status(100.0, 100.0).0, "● optimal");
-        assert_eq!(per_stream_status(90.0, 100.0).0, "● optimal"); // 0.90
-        assert_eq!(per_stream_status(60.0, 100.0).0, "● good"); // 0.60
+        assert_eq!(per_stream_status(100.0, 100.0).0, "◆ optimal");
+        assert_eq!(per_stream_status(90.0, 100.0).0, "◆ optimal"); // 0.90
+        assert_eq!(per_stream_status(60.0, 100.0).0, "◆ good"); // 0.60
         assert_eq!(per_stream_status(40.0, 100.0).0, "▲ knee"); // 0.40
-        assert_eq!(per_stream_status(20.0, 100.0).0, "✗ saturated"); // 0.20
+        assert_eq!(per_stream_status(20.0, 100.0).0, "✕ saturated"); // 0.20
                                                                      // No baseline → treated as optimal (ratio 1.0).
-        assert_eq!(per_stream_status(50.0, 0.0).0, "● optimal");
+        assert_eq!(per_stream_status(50.0, 0.0).0, "◆ optimal");
     }
 
     #[test]
