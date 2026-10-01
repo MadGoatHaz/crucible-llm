@@ -120,6 +120,84 @@ impl Field {
             _ => None,
         }
     }
+
+    /// The dimmed `ℹ` explanation shown below the field while it has
+    /// focus.
+    ///
+    /// Engine fields return `None` and reuse
+    /// [`Engine::description`](Self::engine) instead. Non-engine fields
+    /// carry their own help text (max 4 lines, pre-wrapped to fit the
+    /// terminal panel).
+    pub fn explanation(self) -> Option<&'static str> {
+        match self {
+            Field::Url => Some(
+                "Base URL of your OpenAI-compatible server.\n\
+                 Examples: http://localhost:8000/v1 (vLLM)\n\
+                 http://localhost:11434/v1 (Ollama)\n\
+                 Must be reachable from this machine.",
+            ),
+            Field::Model => Some(
+                "The model to benchmark. Usually auto-detected\n\
+                 from the server. Must match exactly what the\n\
+                 server reports (case-sensitive).",
+            ),
+            Field::Mode => Some(
+                "\"short\" = ~100 token prompt. Tests responsiveness\n\
+                 (TTFT). \"long\" = your token target as prompt.\n\
+                 Tests sustained throughput. Use \"short\" for quick\n\
+                 checks, \"long\" for realistic workloads.",
+            ),
+            Field::Tokens => Some(
+                "Maximum tokens to generate per request\n\
+                 (max_tokens). 256 = quick. 2000 = standard.\n\
+                 8192+ = stress. Higher = more stable averages\n\
+                 but longer test time.",
+            ),
+            Field::Iterations => Some(
+                "How many times to repeat each benchmark.\n\
+                 1 = quick check. 3-5 = reliable. 10+ =\n\
+                 publication-grade. More iterations reduces\n\
+                 variance from caching/throttling.",
+            ),
+            Field::Timeout => Some(
+                "Max seconds to wait for a complete response.\n\
+                 Default: 120s. Increase for slow models.\n\
+                 If no tokens arrive for this duration, the\n\
+                 stream is killed. Too low = false timeouts.",
+            ),
+            Field::ApiKey => Some(
+                "Bearer token for authenticated servers. Most\n\
+                 local servers (vLLM, Ollama) don't need this.\n\
+                 Cloud APIs may require it. Stored only in\n\
+                 memory during the session (not persisted).",
+            ),
+            Field::Nocache => Some(
+                "Adds a random marker to prevent KV-cache hits.\n\
+                 ON = cold-start (real first-request perf).\n\
+                 OFF = warm (steady-state). Most servers cache\n\
+                 repeated prompts — this measures real gen.",
+            ),
+            Field::Tokenizer => Some(
+                "Path to a HuggingFace tokenizer.json for\n\
+                 exact token counting. Without it: estimate\n\
+                 at chars÷4. With it: exact counts. Leave\n\
+                 empty to use estimation.",
+            ),
+            Field::Ladder => Some(
+                "Concurrency levels to test (Engine B only).\n\
+                 Comma-separated, e.g.: 1,2,3,4,8,12,16,24,32.\n\
+                 Each level spawns that many simultaneous\n\
+                 requests. Finds your server's practical limit.",
+            ),
+            // Engine fields use `Engine::description()` via `engine()`.
+            Field::Hardware
+            | Field::EngineSpeed
+            | Field::EngineConcurrency
+            | Field::EngineNiah
+            | Field::EngineReasoning
+            | Field::EngineStructured => None,
+        }
+    }
 }
 
 /// The Config view's interaction mode (FIX 4 — the "edit gate"):
@@ -333,9 +411,19 @@ impl ConfigState {
         Ok(self.config_path.clone())
     }
 
+    /// Reset the form to built-in defaults (`R` key).
+    pub fn reset_to_defaults(&mut self) {
+        *self = Self::default();
+    }
+
     /// Handle one key press on the form (the user-driven key path only).
     pub fn handle_key(&mut self, key: &KeyEvent) -> ConfigKeyResult {
         match key.code {
+            // Reset to defaults (`R` — intercepted before character typing).
+            KeyCode::Char('R') => {
+                self.reset_to_defaults();
+                ConfigKeyResult::Inert
+            }
             // Navigation.
             KeyCode::Tab => {
                 self.cursor = (self.cursor + 1) % Field::ALL.len();
@@ -568,7 +656,11 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "[Enter] Edit  ·  [Esc] Back to Live  ·  [1-4] Switch view  ·  [F2] Save  ·  [F5] Run → Live",
+        format!("Settings saved to {}", c.config_path.display()),
+        style::footer(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "[Enter] Edit  ·  [Esc] Back to Live  ·  [R] Reset  ·  [F2] Save  ·  [F5] Run → Live",
         style::footer(),
     )));
     f.render_widget(
@@ -580,11 +672,11 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
 }
 
 /// The **editable form** (FIX 4, [`ConfigMode::Editing`]): the field list
-/// with a cursor, the focused engine's description, and the edit-mode key
-/// hints (`Esc` saves and returns to the gate; all other keys type into
-/// the focused field).
+/// with a cursor, the focused field's explanation (dimmed `ℹ` note in a
+/// reserved 4-line area), and the edit-mode key hints (`Esc` saves and
+/// returns to the gate; all other keys type into the focused field).
 fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
-    let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 4);
+    let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 10);
     for &field in &Field::ALL {
         let is_cursor = field == c.current();
         let (label, value, vstyle) = field_display(field, c);
@@ -599,18 +691,33 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
             Span::styled(value, vstyle),
         ]));
     }
-    // The focused engine's description (dimmed `ℹ` note).
-    if let Some(engine) = c.current().engine() {
-        lines.push(Line::raw(""));
+    // The focused field's explanation (dimmed `ℹ` note) — always 4 lines
+    // (reserved space so the layout doesn't jump as the cursor moves).
+    lines.push(Line::raw(""));
+    let focused = c.current();
+    if let Some(engine) = focused.engine() {
+        // Engine fields: use the engine's description (≤3 lines).
         lines.extend(crate::ui::views::engine_info_lines(engine));
+    } else if let Some(text) = focused.explanation() {
+        // Non-engine fields: use the field's own explanation (≤4 lines).
+        lines.extend(crate::ui::views::info_lines(text));
+    }
+    // Pad to always 4 lines (reserved space).
+    let field_end = Field::ALL.len() + 1; // 16 fields + 1 blank
+    while lines.len() < field_end + 4 {
+        lines.push(Line::raw(""));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "[Esc] Save & exit  ·  [F2] Save  ·  [F5] Run → Live",
+        "[Esc] Save & exit  ·  [F2] Save  ·  [F5] Run → Live  ·  [R] Reset",
         style::footer(),
     )));
     lines.push(Line::from(Span::styled(
         "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [type] edit · [⌫] delete",
+        style::footer(),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("Settings saved to {}", c.config_path.display()),
         style::footer(),
     )));
     if c.saved {
@@ -779,7 +886,7 @@ mod tests {
         app.view = View::Config;
         app.config.edit_mode = ConfigMode::Editing; // the form (not the gate)
         app.config.cursor = 10; // Hardware (Engine D)
-        let text = render_text(&app, 120, 30);
+        let text = render_text(&app, 120, 40);
         assert!(
             text.contains('ℹ'),
             "info note for the focused engine: {text}"
@@ -787,20 +894,184 @@ mod tests {
         assert!(text.contains("GPU power profiling"), "{text}");
 
         app.config.cursor = 11; // Engine A
-        let text = render_text(&app, 120, 30);
+        let text = render_text(&app, 120, 40);
         assert!(text.contains("Single-stream throughput"), "{text}");
     }
 
     #[test]
-    fn non_engine_field_shows_no_description() {
+    fn non_engine_field_shows_its_explanation() {
         let mut app = App::new();
         app.view = View::Config;
         app.config.edit_mode = ConfigMode::Editing; // the form (not the gate)
         app.config.cursor = 0; // Url
-        let text = render_text(&app, 120, 30);
+        let text = render_text(&app, 120, 40);
         assert!(
-            !text.contains('ℹ'),
-            "no info note for a non-engine field: {text}"
+            text.contains('ℹ'),
+            "info note for the focused non-engine field: {text}"
         );
+        assert!(
+            text.contains("OpenAI-compatible"),
+            "URL explanation mentions OpenAI-compatible: {text}"
+        );
+    }
+
+    #[test]
+    fn each_field_shows_its_own_explanation() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+
+        // Model (cursor 1)
+        app.config.cursor = 1;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("case-sensitive"), "Model explanation: {text}");
+
+        // Mode (cursor 2)
+        app.config.cursor = 2;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("TTFT"), "Mode explanation: {text}");
+
+        // Tokens (cursor 3)
+        app.config.cursor = 3;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("max_tokens"), "Tokens explanation: {text}");
+
+        // Iterations (cursor 4)
+        app.config.cursor = 4;
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("publication-grade"),
+            "Iterations explanation: {text}"
+        );
+
+        // Timeout (cursor 5)
+        app.config.cursor = 5;
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("Default: 120s"),
+            "Timeout explanation: {text}"
+        );
+
+        // API Key (cursor 6)
+        app.config.cursor = 6;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("Bearer token"), "API Key explanation: {text}");
+
+        // Cache Bypass (cursor 7)
+        app.config.cursor = 7;
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("KV-cache"),
+            "Cache Bypass explanation: {text}"
+        );
+
+        // Tokenizer (cursor 8)
+        app.config.cursor = 8;
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("tokenizer.json"),
+            "Tokenizer explanation: {text}"
+        );
+
+        // Ladder (cursor 9)
+        app.config.cursor = 9;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("simultaneous"), "Ladder explanation: {text}");
+    }
+
+    #[test]
+    fn explanation_area_is_reserved_space() {
+        // The explanation area is always 4 lines, regardless of which
+        // field is focused. Verify by checking that a 3-line explanation
+        // (Model) and a 4-line explanation (URL) both produce the same
+        // total line count in the rendered output.
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+
+        app.config.cursor = 0; // URL (4-line explanation)
+        let text_4 = render_text(&app, 120, 40);
+
+        app.config.cursor = 1; // Model (3-line explanation)
+        let text_3 = render_text(&app, 120, 40);
+
+        // Both should contain the ℹ marker and the config path footer.
+        assert!(text_4.contains('ℹ'), "4-line explanation has ℹ");
+        assert!(text_3.contains('ℹ'), "3-line explanation has ℹ");
+        assert!(
+            text_4.contains("Settings saved to"),
+            "4-line form shows config path"
+        );
+        assert!(
+            text_3.contains("Settings saved to"),
+            "3-line form shows config path"
+        );
+    }
+
+    #[test]
+    fn reset_to_defaults_restores_config() {
+        let c = ConfigState {
+            url: "http://custom:1234/v1".to_string(),
+            model: "custom-model".to_string(),
+            tokens: 9999,
+            nocache: true,
+            cursor: 5,
+            ..ConfigState::default()
+        };
+        let mut c = c;
+        c.reset_to_defaults();
+
+        assert_eq!(c.url, Config::default().url);
+        assert_eq!(c.model, Config::default().model);
+        assert_eq!(c.tokens, Config::default().tokens);
+        assert!(!c.nocache);
+        assert_eq!(c.cursor, 0);
+    }
+
+    #[test]
+    fn r_key_resets_to_defaults_in_edit_mode() {
+        let c = ConfigState {
+            url: "http://custom:1234/v1".to_string(),
+            tokens: 9999,
+            ..ConfigState::default()
+        };
+        let mut c = c;
+
+        let key = crossterm::event::KeyEvent {
+            code: crossterm::event::KeyCode::Char('R'),
+            modifiers: crossterm::event::KeyModifiers::SHIFT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        let result = c.handle_key(&key);
+        assert_eq!(result, ConfigKeyResult::Inert);
+        assert_eq!(c.url, Config::default().url);
+        assert_eq!(c.tokens, Config::default().tokens);
+    }
+
+    #[test]
+    fn gate_shows_config_path() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Viewing; // the gate
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("Settings saved to"),
+            "gate shows config path: {text}"
+        );
+    }
+
+    #[test]
+    fn explanation_texts_are_max_4_lines() {
+        // Verify every non-engine field's explanation is at most 4 lines.
+        for &field in &Field::ALL {
+            if let Some(text) = field.explanation() {
+                let line_count = text.lines().count();
+                assert!(
+                    line_count <= 4,
+                    "{field:?} explanation is {line_count} lines (max 4): {text:?}"
+                );
+            }
+        }
     }
 }

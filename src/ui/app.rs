@@ -983,6 +983,15 @@ impl App {
                         self.config.edit_mode = ConfigMode::Viewing;
                         return KeyAction::Run;
                     }
+                    // `R` — reset to built-in defaults.
+                    KeyCode::Char('R') => {
+                        self.config.reset_to_defaults();
+                        self.push_log(
+                            "[config] reset to defaults".to_string(),
+                            style::value_warn(),
+                        );
+                        return KeyAction::Continue;
+                    }
                     // Everything else is ignored at the gate.
                     _ => return KeyAction::Continue,
                 },
