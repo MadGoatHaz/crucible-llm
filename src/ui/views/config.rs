@@ -122,6 +122,24 @@ impl Field {
     }
 }
 
+/// The Config view's interaction mode (FIX 4 — the "edit gate"):
+///
+/// * [`Viewing`] — the default on entry. The form is shown **read-only**
+///   behind a gate ("press [Enter] to edit"). Only `Enter` (→ edit),
+///   `Esc` (→ back to Live), `1`–`4` (→ switch view), `5` (stay), `F2`
+///   (save) and `F5` (run) are live; every other key is ignored, so the
+///   view can never capture the number keys and trap the user.
+/// * [`Editing`] — the form is editable. `Esc` / `1`–`4` save and exit
+///   (to the gate / to that view); `5` saves and returns to the gate;
+///   `q` always quits; character / Tab / arrow / `F2` / `F5` keys edit the
+///   focused field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfigMode {
+    #[default]
+    Viewing,
+    Editing,
+}
+
 /// The outcome of a Config-view key press (consumed by `App::handle_key`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKeyResult {
@@ -164,6 +182,10 @@ pub struct ConfigState {
     pub config_path: PathBuf,
     /// `true` right after a successful save (drives the "saved" flash).
     pub saved: bool,
+    /// The interaction mode (FIX 4): [`ConfigMode::Viewing`] (the read-only
+    /// gate, the default on entry) or [`ConfigMode::Editing`] (fields live).
+    /// (Named `edit_mode` to avoid colliding with the benchmark `mode`.)
+    pub edit_mode: ConfigMode,
 }
 
 impl ConfigState {
@@ -202,6 +224,8 @@ impl ConfigState {
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
+            // FIX 4: every entry into the Config view starts at the gate.
+            edit_mode: ConfigMode::Viewing,
         }
     }
 
@@ -491,9 +515,70 @@ impl Default for ConfigState {
 }
 
 /// Render the Configuration view into `area` (a pure `&App` read).
+///
+/// FIX 4: the view has two modes. [`ConfigMode::Viewing`] shows the
+/// **read-only gate** (current settings + "press Enter to edit");
+/// [`ConfigMode::Editing`] shows the editable form. The gate is what the
+/// user sees on entry, so the number keys can never be captured by field
+/// editing (the user can always leave with `Esc` / `1`–`4`).
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let c = &app.config;
-    let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 3);
+    if c.edit_mode == ConfigMode::Viewing {
+        render_gate(area, c, f);
+    } else {
+        render_form(area, c, f);
+    }
+}
+
+/// The read-only **gate** (FIX 4): the current settings, a "press Enter to
+/// edit" prompt, and the always-available exit keys. No field is focused,
+/// so no key can be swallowed by the editor and the user can never get
+/// stuck.
+fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style::border())
+        .title(" CONFIG (read-only — press Enter to edit) ");
+    if area.width < 10 || area.height < 3 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 4);
+    lines.push(Line::from(Span::styled(
+        "You are in Config view. [Enter] to edit settings, or [Esc] / [1-4] to return to monitoring.",
+        style::value_warn(),
+    )));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Current settings:",
+        style::label(),
+    )));
+    for &field in &Field::ALL {
+        let (label, value, vstyle) = field_display(field, c);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{label:<22} "), style::label()),
+            Span::styled(value, vstyle),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "[Enter] Edit  ·  [Esc] Back to Live  ·  [1-4] Switch view  ·  [F2] Save  ·  [F5] Run",
+        style::footer(),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+/// The **editable form** (FIX 4, [`ConfigMode::Editing`]): the field list
+/// with a cursor, the focused engine's description, and the edit-mode key
+/// hints (`Esc` / `1`–`4` save and exit; `5` returns to the gate).
+fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
+    let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 4);
     for &field in &Field::ALL {
         let is_cursor = field == c.current();
         let (label, value, vstyle) = field_display(field, c);
@@ -515,13 +600,13 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
+        "[Esc] Save & exit  ·  [1-4] Switch view  ·  [5] Gate  ·  [F2] Save  ·  [F5] Run",
+        style::footer(),
+    )));
+    lines.push(Line::from(Span::styled(
         "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [type] edit · [⌫] delete",
         style::footer(),
     )));
-    lines.push(Line::from(vec![Span::styled(
-        "[F2] Save to config file  ·  [F5] Run selected engines",
-        style::footer(),
-    )]));
     if c.saved {
         lines.push(Line::from(Span::styled("✓ saved", style::value_ok())));
     }
@@ -536,7 +621,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(border)
-                    .title("CONFIGURATION (edit a field, then F2 to save)"),
+                    .title(" CONFIG (editing — Esc to save & exit) "),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -671,6 +756,7 @@ mod tests {
     fn focused_engine_field_shows_its_description() {
         let mut app = App::new();
         app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing; // the form (not the gate)
         app.config.cursor = 10; // Hardware (Engine D)
         let text = render_text(&app, 120, 30);
         assert!(
@@ -688,6 +774,7 @@ mod tests {
     fn non_engine_field_shows_no_description() {
         let mut app = App::new();
         app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing; // the form (not the gate)
         app.config.cursor = 0; // Url
         let text = render_text(&app, 120, 30);
         assert!(

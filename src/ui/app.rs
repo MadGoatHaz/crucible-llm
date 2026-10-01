@@ -49,7 +49,7 @@ use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
-use crate::ui::views::config::{ConfigKeyResult, ConfigState, Field as ConfigField};
+use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::HistoryState;
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
@@ -823,11 +823,18 @@ impl App {
             }
         }
 
-        // `q` / `Esc` quit — even inside the Config view
-        // (where `q` would otherwise be typed into a field).
-        if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-            self.logger
-                .info(Context::Tui, format!("quit ({:?})", key.code));
+        // `q` quits globally — even inside the Config view (where `q` would
+        // otherwise be typed into a field).
+        if key.code == KeyCode::Char('q') {
+            self.logger.info(Context::Tui, "quit (q)".to_string());
+            self.running = false;
+            return KeyAction::Quit;
+        }
+        // `Esc` quits — EXCEPT in the Config view, where it leaves the
+        // config (to the gate / Live) instead of killing the app (FIX 4:
+        // the view must never trap the user; `q` is the quit key there).
+        if key.code == KeyCode::Esc && self.view != View::Config {
+            self.logger.info(Context::Tui, "quit (Esc)".to_string());
             self.running = false;
             return KeyAction::Quit;
         }
@@ -850,90 +857,120 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // Config view (Chunk 18): `PageDown`/`PageUp` and the `1`-`5`
-        // digits switch views (so the user can always leave); everything
-        // else is delegated to the editor (`F2` saves, `F5` runs,
-        // arrows/typing edit the focused field). Digits keep *typing*
-        // into the focused field when it is a text field (URL, model,
-        // API key, tokenizer path, ladder — all of which need digits),
-        // and switch views from the step/toggle fields (Mode, Tokens,
-        // Iterations, Timeout, Nocache, Hardware, engines).
+        // Config view (Chunk 18 + FIX 4): the view has an **edit gate**.
+        // On entry it is [`ConfigMode::Viewing`] — a read-only "press
+        // Enter to edit" screen. The number keys `1`–`4` *always* switch
+        // views (they are never captured by field editing), `Esc` leaves
+        // the config, and `q` quits (handled above) — so the user can
+        // never get stuck. Only after `Enter` does [`ConfigMode::Editing`]
+        // make the fields live (there `Esc` / `1`–`4` save and exit).
         if self.view == View::Config {
-            match key.code {
-                KeyCode::PageDown => {
-                    self.view = View::ALL[(self.view.index() + 1) % View::ALL.len()];
-                    if self.view == View::History {
-                        self.ensure_history();
-                    }
-                    return KeyAction::Continue;
+            // PageDown / PageUp cycle to the neighbouring view (always
+            // available, even at the gate) and reset to the read-only gate.
+            if key.code == KeyCode::PageDown || key.code == KeyCode::PageUp {
+                let delta = if key.code == KeyCode::PageDown {
+                    1
+                } else {
+                    View::ALL.len() - 1
+                };
+                self.view = View::ALL[(self.view.index() + delta) % View::ALL.len()];
+                self.config.edit_mode = ConfigMode::Viewing;
+                if self.view == View::History {
+                    self.ensure_history();
                 }
-                KeyCode::PageUp => {
-                    self.view =
-                        View::ALL[(self.view.index() + View::ALL.len() - 1) % View::ALL.len()];
-                    if self.view == View::History {
-                        self.ensure_history();
-                    }
-                    return KeyAction::Continue;
-                }
-                KeyCode::Char(c @ '1'..='5') => {
-                    let field = self.config.current();
-                    let text_field = matches!(
-                        field,
-                        ConfigField::Url
-                            | ConfigField::Model
-                            | ConfigField::ApiKey
-                            | ConfigField::Tokenizer
-                            | ConfigField::Ladder
-                    );
-                    if text_field {
-                        // The focused field needs the digit: type it.
-                        return match self.config.handle_key(key) {
-                            ConfigKeyResult::Saved => {
-                                self.push_log(
-                                    format!(
-                                        "[config] saved → {}",
-                                        self.config.config_path.display()
-                                    ),
-                                    style::value_ok(),
-                                );
-                                KeyAction::Continue
-                            }
-                            ConfigKeyResult::Run => {
-                                self.start_run();
-                                KeyAction::Run
-                            }
-                            ConfigKeyResult::Inert => KeyAction::Continue,
-                        };
-                    }
-                    // `c as u8` is the code point (49 for '1'); use the
-                    // digit's value for the view lookup.
-                    if let Some(view) = View::from_digit(c.to_digit(10).unwrap() as u8) {
-                        self.view = view;
-                        if view == View::History {
-                            self.ensure_history();
-                        }
-                    }
-                    return KeyAction::Continue;
-                }
-                _ => {}
+                return KeyAction::Continue;
             }
-            match self.config.handle_key(key) {
-                ConfigKeyResult::Saved => {
-                    self.push_log(
-                        format!("[config] saved → {}", self.config.config_path.display()),
-                        style::value_ok(),
-                    );
-                    self.logger.info(
-                        Context::Setup,
-                        format!("config saved → {}", self.config.config_path.display()),
-                    );
-                    return KeyAction::Continue;
+
+            match self.config.edit_mode {
+                // ── The gate (read-only). ──
+                ConfigMode::Viewing => match key.code {
+                    // `1`–`4` always switch views (never typed into a field).
+                    KeyCode::Char(c @ '1'..='4') => {
+                        if let Some(d) = c.to_digit(10) {
+                            if let Some(view) = View::from_digit(d as u8) {
+                                self.view = view;
+                                self.config.edit_mode = ConfigMode::Viewing;
+                                if view == View::History {
+                                    self.ensure_history();
+                                }
+                            }
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // `5` stays at the gate.
+                    KeyCode::Char('5') => return KeyAction::Continue,
+                    // `Enter` opens the editor.
+                    KeyCode::Enter => {
+                        self.config.edit_mode = ConfigMode::Editing;
+                        return KeyAction::Continue;
+                    }
+                    // `Esc` leaves the config (back to Live).
+                    KeyCode::Esc => {
+                        self.view = View::Live;
+                        self.config.edit_mode = ConfigMode::Viewing;
+                        return KeyAction::Continue;
+                    }
+                    // Quick actions on the current form (no editing needed).
+                    KeyCode::F(2) => {
+                        if self.config.save().is_ok() {
+                            self.push_log(
+                                format!("[config] saved → {}", self.config.config_path.display()),
+                                style::value_ok(),
+                            );
+                        }
+                        return KeyAction::Continue;
+                    }
+                    KeyCode::F(5) => {
+                        self.start_run();
+                        return KeyAction::Run;
+                    }
+                    // Everything else is ignored at the gate.
+                    _ => return KeyAction::Continue,
+                },
+                // ── Editing (the fields are live). ──
+                ConfigMode::Editing => {
+                    // `1`–`4` ALWAYS exit the config and switch views
+                    // (saving first) — they are never typed into a field.
+                    if let KeyCode::Char(c @ '1'..='4') = key.code {
+                        let _ = self.config.save();
+                        if let Some(d) = c.to_digit(10) {
+                            if let Some(view) = View::from_digit(d as u8) {
+                                self.view = view;
+                                self.config.edit_mode = ConfigMode::Viewing;
+                                if view == View::History {
+                                    self.ensure_history();
+                                }
+                            }
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // `5` / `Esc`: save and return to the gate.
+                    if key.code == KeyCode::Char('5') || key.code == KeyCode::Esc {
+                        let _ = self.config.save();
+                        self.config.edit_mode = ConfigMode::Viewing;
+                        return KeyAction::Continue;
+                    }
+                    // Everything else delegates to the field editor
+                    // (Tab / arrows / F2 / F5 / typing / backspace).
+                    match self.config.handle_key(key) {
+                        ConfigKeyResult::Saved => {
+                            self.push_log(
+                                format!("[config] saved → {}", self.config.config_path.display()),
+                                style::value_ok(),
+                            );
+                            self.logger.info(
+                                Context::Setup,
+                                format!("config saved → {}", self.config.config_path.display()),
+                            );
+                            return KeyAction::Continue;
+                        }
+                        ConfigKeyResult::Run => {
+                            self.start_run();
+                            return KeyAction::Run;
+                        }
+                        ConfigKeyResult::Inert => return KeyAction::Continue,
+                    }
                 }
-                ConfigKeyResult::Run => {
-                    self.start_run();
-                    return KeyAction::Run;
-                }
-                ConfigKeyResult::Inert => return KeyAction::Continue,
             }
         }
 
@@ -943,6 +980,11 @@ impl App {
                 // the digit's *value* (1) for the view lookup.
                 if let Some(view) = View::from_digit(c.to_digit(10).unwrap() as u8) {
                     self.view = view;
+                    // Entering the Config view always lands on the read-only
+                    // gate (FIX 4), never mid-edit.
+                    if view == View::Config {
+                        self.config.edit_mode = ConfigMode::Viewing;
+                    }
                     // Chunk 14: entering the History view loads the stored
                     // session list once (key path, not the render path).
                     if view == View::History {
@@ -1498,18 +1540,29 @@ mod tests {
     }
 
     #[test]
-    fn c_key_in_the_config_view_types_into_the_field() {
+    fn c_key_in_the_config_view_is_scoped_to_editing() {
+        // FIX 4: at the gate (Viewing), `c` is ignored (and never opens
+        // Setup). In Editing, `c` types into the focused field.
         let mut app = App::new();
-        app.view = View::Config;
-        app.config.cursor = 0; // URL field
-        let before = app.config.url.clone();
+        app.view = View::Config; // gate
+        app.config.cursor = 0; // URL
+        app.config.url.clear(); // start from a known-empty field
         app.handle_key(&char_key('c'));
         assert_eq!(
             app.phase,
             Phase::Dashboard,
-            "`c` must not steal setup from View 5"
+            "`c` must not open Setup from the gate"
         );
-        assert_eq!(app.config.url, format!("{before}c"));
+        assert_eq!(app.config.url, "", "the gate ignores typing");
+
+        app.config.edit_mode = ConfigMode::Editing;
+        app.handle_key(&char_key('c'));
+        assert_eq!(
+            app.phase,
+            Phase::Dashboard,
+            "`c` must not open Setup in Editing"
+        );
+        assert_eq!(app.config.url, "c", "`c` types into the URL in Editing");
     }
 
     // ── setup-phase key routing ─────────────────────────────────────────
@@ -1892,29 +1945,32 @@ mod tests {
     }
 
     #[test]
-    fn config_view_digits_type_into_text_fields() {
-        // URL / model / API key / tokenizer / ladder need digits: typing
-        // is preserved on those fields (they never switch views).
+    fn config_view_digits_always_switch_views() {
+        // FIX 4: number keys 1-4 are NEVER captured by the config editor —
+        // they always switch views, from the gate *and* from edit mode.
+        // From the gate, `1` leaves straight to Live.
+        let mut app = App::new();
+        app.view = View::Config; // gate (Viewing)
+        app.handle_key(&char_key('1'));
+        assert_eq!(app.view, View::Live, "digit 1 exits the gate to Live");
+
+        // In Editing mode, a non-navigation digit (8) still types into the
+        // focused field, but a 1-4 digit exits and switches views.
         let mut app = App::new();
         app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
         app.config.cursor = 9; // Field::Ladder
         app.config.ladder.clear();
-        app.handle_key(&char_key('1'));
-        app.handle_key(&char_key('6'));
-        assert_eq!(
-            app.view,
-            View::Config,
-            "digits type, they do not switch views"
-        );
-        assert_eq!(app.config.ladder, "16");
-
-        let mut app = App::new();
-        app.view = View::Config;
-        app.config.cursor = 0; // Field::Url
-        app.config.url.clear();
+        // Point the save (digit-exit saves) at a temp path so the test
+        // never touches the real config file.
+        app.config.config_path =
+            std::env::temp_dir().join(format!("crucible-digit-{}.json", std::process::id()));
         app.handle_key(&char_key('8'));
-        assert_eq!(app.view, View::Config);
-        assert_eq!(app.config.url, "8");
+        assert_eq!(app.view, View::Config, "8 types into the field");
+        assert_eq!(app.config.ladder, "8");
+        app.handle_key(&char_key('1'));
+        assert_eq!(app.view, View::Live, "1 exits the config and switches");
+        let _ = std::fs::remove_file(&app.config.config_path);
     }
 
     #[test]

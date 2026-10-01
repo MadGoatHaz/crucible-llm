@@ -151,7 +151,7 @@ fn default_view_shows_hero_key_metrics_and_log() {
     for title in [
         "BENCHMARK SEQUENCE",
         "THROUGHPUT",
-        "KEY METRICS",
+        "OVERALL METRICS",
         "EVENT LOG",
     ] {
         assert!(text.contains(title), "missing panel: {title}");
@@ -178,38 +178,46 @@ fn default_view_shows_hero_key_metrics_and_log() {
 // ---- acceptance: key metrics show real data (no N/A hardware) ----
 
 #[test]
-fn key_metrics_panel_shows_real_data() {
-    let app = app_with(test_snapshot());
+fn overall_metrics_panel_shows_cumulative_stats() {
+    // FIX 1: the panel shows *cumulative* stats across all engines. Give it
+    // three **completed** streams (state = Done) so the overall accumulator
+    // records per-stream gen / TTFT / tokens, plus the aggregate prompt /
+    // ITL / active samples.
+    let mut s = test_snapshot();
+    for st in &mut s.streams {
+        st.state = crucible_llm::metrics::StreamStatus::Done;
+    }
+    let app = app_with(s);
     let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("Throughput"));
-    assert!(text.contains("842.3 t/s"));
-    // TTFT is the mean of the streams' TTFBs (3 × 0.2 s → 200 ms).
-    assert!(text.contains("TTFT"));
-    assert!(text.contains("200 ms"));
-    assert!(text.contains("ITL p50"));
-    assert!(text.contains("12.1 ms"));
-    assert!(text.contains("ITL p99"));
-    assert!(text.contains("41.2 ms"));
-    assert!(text.contains("Tokens"));
-    assert!(text.contains("1,332"));
-    assert!(text.contains("Streams"));
-    assert!(text.contains("16 active"));
-    // Prompt throughput is derived: 4096 prompt tokens / 0.2 s mean TTFT.
-    assert!(text.contains("Prompt Throughput"));
-    assert!(text.contains("20480 t/s"), "prompt throughput: {text}");
-    // Every metric carries a dimmed `ℹ` explanation.
-    assert!(text.contains('ℹ'), "key-metrics info note");
-    assert!(text.contains("generation speed"), "gen explanation");
-    assert!(text.contains("prefill"), "prefill explanation");
+
+    // The panel is clearly cumulative (max / avg / p5, not the live value).
+    assert!(text.contains("OVERALL METRICS"), "{text}");
+    // Per-stream gen throughput (72.4 t/s from each stream row).
+    assert!(text.contains("72.4"), "gen throughput: {text}");
+    // TTFT: 0.2 s → 200 ms.
+    assert!(text.contains("200"), "TTFT ms: {text}");
+    // ITL p50 / p99 (12.1 / 41.2 ms).
+    assert!(text.contains("12.1"), "ITL p50: {text}");
+    assert!(text.contains("41.2"), "ITL p99: {text}");
+    // Total tokens = the sum of the server-reported stream tokens (3 × 128).
+    assert!(text.contains("384"), "total tokens: {text}");
+    // Prompt throughput: 4096 prompt tokens / 0.2 s mean TTFT.
+    assert!(text.contains("20480"), "prompt throughput: {text}");
+    // Active streams (16).
+    assert!(text.contains("16"), "active streams: {text}");
+    // The cumulative legend explains avg / max / p5.
+    assert!(text.contains("5th percentile"), "p5 legend: {text}");
+    assert!(text.contains('ℹ'), "overall info note");
 }
 
 #[test]
-fn key_metrics_show_placeholders_without_telemetry() {
+fn overall_metrics_show_placeholders_without_telemetry() {
     // A zeroed snapshot (no streams, no ITL) must degrade to `--`, never
     // panic or show a fake value.
     let app = app_with(MetricsSnapshot::default());
     let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("KEY METRICS"));
+    assert!(text.contains("OVERALL METRICS"));
+    // The hero header still shows the live `now` (0.0 t/s).
     assert!(text.contains("0.0 t/s"));
     assert!(text.contains("--"), "missing metrics show `--`");
 }
@@ -229,12 +237,14 @@ fn throughput_hero_renders_block_chart_with_axes() {
     let text = buf_text(&buf);
 
     assert!(text.contains("THROUGHPUT"));
+    // FIX 2: the header is now / peak / avg (lowercase, not `PEAK:`).
     assert!(text.contains("now 420.0 t/s"), "{text}");
-    assert!(text.contains("PEAK: 950.0 t/s"), "{text}");
-    // The block chart body + the x-axis time labels.
+    assert!(text.contains("peak 950.0 t/s"), "{text}");
+    // The block chart body + the x-axis time labels (spanning the *actual*
+    // 6-sample → 5 s window).
     assert!(text.contains('█'), "bars rendered");
     assert!(text.contains("0s"), "x-axis start");
-    assert!(text.contains("60s"), "x-axis end");
+    assert!(text.contains("5s"), "x-axis end");
     // Color gradient: green at the top of the ramp, red at the bottom.
     assert!(
         buf.content()
@@ -439,7 +449,7 @@ fn all_complete_shows_the_full_summary() {
     let text = buf_text(&render_live(&app, W, H));
     assert!(text.contains("ALL BENCHMARKS COMPLETE"), "header");
     assert!(text.contains("THROUGHPUT"), "hero");
-    assert!(text.contains("KEY METRICS"), "key metrics");
+    assert!(text.contains("OVERALL METRICS"), "overall metrics");
     assert!(
         text.contains("CONCURRENCY CURVE"),
         "concurrency in the summary"

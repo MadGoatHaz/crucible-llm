@@ -36,7 +36,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
-use crate::metrics::state::MetricsSnapshot;
+use crate::metrics::state::{EngineMarker, MetricsSnapshot};
 use crate::ui::app::App;
 use crate::ui::theme::{palette, style};
 use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
@@ -81,7 +81,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     for (i, (id, _)) in plan.iter().enumerate() {
         match *id {
             0 => render_sequence_header(rects[i], app, f),
-            1 => render_throughput_row(rects[i], m, app, f),
+            1 => render_throughput_row(rects[i], m, f),
             2 => render_concurrency_curve(rects[i], app, f),
             3 => render_capability_scores(rects[i], app, m, f),
             4 => render_log(rects[i], app, f),
@@ -128,28 +128,34 @@ fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
 
 // ── Throughput hero + key metrics (the top row) ────────────────────────────
 
-/// The top row: the throughput hero chart (left) + the key-metrics
-/// readout (right, with a dimmed `ℹ` description under every number).
-fn render_throughput_row(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
+/// The top row: the throughput hero chart (left, the *live* rolling
+/// window) + the overall-metrics readout (right, *cumulative* across all
+/// engines — FIX 1).
+fn render_throughput_row(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        // 50/50 so the overall panel's `avg │ max │ p5` rows (the widest
+        // content) fit without wrapping and clipping the footer (FIX 1).
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
     render_throughput_hero(cols[0], m, f);
-    render_key_metrics(cols[1], m, app, f);
+    render_overall_metrics(cols[1], m, f);
 }
 
-/// The hero: a large real-time aggregate tokens/sec block chart. One column
-/// per sample (right-aligned, newest at the right edge), each a vertical run
-/// of `█` graded green (high) → yellow (medium) → red (low) against the
-/// window maximum, with a `now | PEAK` value line, a prefill
-/// (prompt-throughput) line, and y/x axis labels so it reads at a glance.
-/// An empty rolling series renders a flat line at 0 (never a blank panel).
+/// The hero: a large **real-time** aggregate tokens/sec block chart
+/// (FIX 2). One column per sample (right-aligned, newest at the right
+/// edge), each a vertical run of `█` graded green (high) → yellow (medium)
+/// → red (low) against the *auto-scaled* window maximum (with headroom),
+/// a `now │ peak │ avg` header line, a dashed horizontal line at the
+/// window average, and vertical markers at engine transitions. The
+/// y-axis auto-scales to the data (never a fixed axis); the x-axis spans
+/// the *actual* data window. An empty series shows
+/// "Awaiting first tokens…" (never a blank panel).
 fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::active_border())
-        .title(" THROUGHPUT — tokens/sec (last 60s)  ● live ");
+        .title(" LIVE THROUGHPUT — real-time generation speed (tokens/sec) ");
     if area.width < 8 || area.height < 5 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -160,70 +166,88 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         vertical: 1,
     });
 
-    // The `now · PEAK` value line: `now` is the latest published
-    // aggregate (always fresh), `PEAK` the window maximum.
     let series = &m.throughput_series;
     let current = m.aggregate_tps;
     let peak = series.iter().cloned().fold(0.0_f64, f64::max);
+    let avg = if series.is_empty() {
+        0.0
+    } else {
+        series.iter().sum::<f64>() / series.len() as f64
+    };
+
+    // The header line: the *live* now / peak / avg for the window.
     let value_line = Line::from(vec![
         Span::styled("now ", style::label()),
         Span::styled(format!("{current:.1} t/s"), style::value()),
-        Span::styled("  ·  PEAK: ", style::footer()),
+        Span::styled("  │  peak ", style::footer()),
         Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+        Span::styled("  │  avg ", style::footer()),
+        Span::styled(format!("{avg:.1} t/s"), style::value()),
     ]);
 
-    // The prefill line: prompt throughput (prompt_tokens / TTFT) — how
-    // fast the server digests the input, the rig-builder's key number.
-    let prefill_line = if m.prompt_throughput > 0.0 {
-        Line::from(vec![
-            Span::styled("prefill ", style::label()),
-            Span::styled(
-                format!("{:.0} t/s", m.prompt_throughput),
-                style::highlight(),
-            ),
-            Span::styled("  (prompt tokens / TTFT)", style::info()),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "prefill --  (no prompt data yet)",
-            style::info(),
-        ))
-    };
+    // Engine-transition markers positioned in the current window: the
+    // window starts `elapsed − (len−1)` seconds ago (one sample/sec).
+    let window_start = m.elapsed_sec - (series.len().saturating_sub(1)) as f64;
+    let markers: Vec<(f64, String)> = m
+        .engine_markers
+        .iter()
+        .map(|mk: &EngineMarker| (mk.at_sec, mk.label.clone()))
+        .collect();
 
-    // The block chart fills the inner area below the two value lines;
-    // all of it is rendered together inside the hero's bordered block
-    // (title + accent border) so the panel reads as the view's centerpiece.
-    let chart = build_throughput_chart(series, inner.width, inner.height.saturating_sub(2));
-    let mut lines = vec![value_line, prefill_line];
+    // The chart fills the inner area below the header line; it carries its
+    // own axes, the average line, and the transition markers.
+    let chart = build_throughput_chart(
+        series,
+        inner.width,
+        inner.height.saturating_sub(1),
+        avg,
+        &markers,
+        window_start,
+    );
+    let mut lines = vec![value_line];
     lines.extend(chart);
 
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 /// Build the throughput block chart as lines of styled single-character
-/// spans: a y-axis (max / max÷2 / 0), one `█` bar per sample column
-/// (right-aligned), and an x-axis of time labels (0s…60s). Pure over the
-/// series (unit-testable, no terminal).
-fn build_throughput_chart(series: &[f64], w: u16, h: u16) -> Vec<Line<'static>> {
+/// spans (FIX 2): a **y-axis that auto-scales to the data** (with 10%
+/// headroom — never a fixed axis), one `█` bar per sample column
+/// (right-aligned, newest at the right edge, graded green→yellow→red), a
+/// dashed horizontal line at the **window average**, **vertical markers at
+/// engine transitions**, and an x-axis spanning the *actual* data window
+/// (`0 … N−1 s`). An empty series renders "Awaiting first tokens…".
+/// Pure over its inputs (unit-testable, no terminal).
+fn build_throughput_chart(
+    series: &[f64],
+    w: u16,
+    h: u16,
+    avg: f64,
+    markers: &[(f64, String)],
+    window_start_sec: f64,
+) -> Vec<Line<'static>> {
     const Y_AXIS_W: usize = 5;
     let w = w as usize;
     let h = h as usize;
     if w < Y_AXIS_W + 3 || h < 3 {
         return vec![Line::from("chart too small")];
     }
+    // No samples yet: a friendly prompt, never a blank chart.
+    if series.is_empty() {
+        return vec![Line::from(Span::styled(
+            "Awaiting first tokens…",
+            style::info(),
+        ))];
+    }
+
     let plot_w = w - Y_AXIS_W;
     let plot_h = h - 1; // bottom row reserved for the x-axis
-    let max = series.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
+                        // Auto-scale to the window maximum with 10% headroom (a `max(1.0)`
+                        // floor keeps a tiny signal from blowing the axis up to absurdity).
+    let max = series.iter().cloned().fold(0.0_f64, f64::max) * 1.1;
+    let max = max.max(1.0);
 
     let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
-
-    // No samples yet: a flat line at 0 across the plot (the panel must
-    // never be blank — "0 t/s so far" is information).
-    if series.is_empty() {
-        for cell in &mut grid[plot_h.saturating_sub(1)][Y_AXIS_W..] {
-            *cell = ('▁', Some(palette::MUTED));
-        }
-    }
 
     // y-axis labels: top = max, middle = max/2, bottom = 0.
     let mut place_y = |row: usize, val: f64| {
@@ -260,29 +284,66 @@ fn build_throughput_chart(series: &[f64], w: u16, h: u16) -> Vec<Line<'static>> 
         }
     }
 
-    // x-axis time labels along the bottom row, skipping overlaps.
-    let x_labels = [
-        ("0s", 0.0),
-        ("15s", 0.25),
-        ("30s", 0.5),
-        ("45s", 0.75),
-        ("60s", 1.0),
-    ];
+    // Engine-transition markers: a vertical `┊` line at the marker's
+    // position in the current window, with a short label at the top.
+    for (at_sec, label) in markers {
+        let col = (*at_sec - window_start_sec).round() as i64;
+        if col < 0 || (col as usize) >= plot_w {
+            continue;
+        }
+        let c = Y_AXIS_W + col as usize;
+        if c < w {
+            for cell in grid.iter_mut().take(plot_h) {
+                cell[c] = ('┊', Some(palette::ACCENT));
+            }
+        }
+        for (i, ch) in label.chars().take(4).enumerate() {
+            let cc = c + 1 + i;
+            if cc < w {
+                grid[0][cc] = (ch, Some(palette::ACCENT));
+            }
+        }
+    }
+
+    // A dashed horizontal line at the window average, tagged in the gutter.
+    if avg > 0.0 {
+        let ratio = (avg / max).clamp(0.0, 1.0);
+        let row = plot_h
+            .saturating_sub(1)
+            .saturating_sub((ratio * plot_h as f64).round() as usize)
+            .min(plot_h.saturating_sub(1));
+        for cell in &mut grid[row][Y_AXIS_W..] {
+            *cell = ('┄', Some(palette::HIGHLIGHT));
+        }
+        for (i, ch) in "avg".chars().enumerate() {
+            let cc = Y_AXIS_W.saturating_sub(3) + i;
+            if cc < Y_AXIS_W {
+                grid[row][cc] = (ch, Some(palette::HIGHLIGHT));
+            }
+        }
+    }
+
+    // x-axis: a baseline + time labels spanning the *actual* window
+    // (0 … N−1 s, where N = series.len()), skipping overlaps.
+    let span = (series.len() - 1).max(1);
+    for cell in &mut grid[h - 1][Y_AXIS_W..] {
+        *cell = ('─', Some(palette::MUTED));
+    }
+    grid[h - 1][Y_AXIS_W] = ('├', Some(palette::MUTED));
     let mut label_end: i64 = -1;
-    for (label, frac) in x_labels {
+    for frac in [0.0, 0.25, 0.5, 0.75, 1.0] {
+        let text = format!("{}s", (frac * span as f64).round() as i64);
         let center = Y_AXIS_W as i64 + (frac * (plot_w as f64 - 1.0)).round() as i64;
-        let mut start = (center - (label.len() as i64) / 2).max(Y_AXIS_W as i64);
-        // Keep the label inside the chart width (right-align at the edge so
-        // the final `60s` is never clipped).
-        start = start.min((w as i64) - (label.len() as i64));
+        let mut start = (center - text.len() as i64 / 2).max(Y_AXIS_W as i64);
+        start = start.min((w as i64) - (text.len() as i64));
         if start > label_end {
-            for (i, ch) in label.chars().enumerate() {
+            for (i, ch) in text.chars().enumerate() {
                 let col = (start + i as i64) as usize;
                 if col < w {
                     grid[h - 1][col] = (ch, Some(palette::MUTED));
                 }
             }
-            label_end = start + label.len() as i64;
+            label_end = start + text.len() as i64;
         }
     }
 
@@ -300,74 +361,62 @@ fn build_throughput_chart(series: &[f64], w: u16, h: u16) -> Vec<Line<'static>> 
         .collect()
 }
 
-/// The key-metrics readout: the numbers a remote user scans first, each
-/// with a short dimmed `ℹ` description of what it measures (every number
-/// is human-readable, per the remote-user redesign).
-fn render_key_metrics(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
+/// The **OVERALL** metrics panel (FIX 1): cumulative statistics across
+/// *every* benchmark engine that has run — `max` / `avg` / `p5` per metric,
+/// the total tokens generated (the sum of server-reported
+/// `usage.completion_tokens`, **not** the SSE frame count), the
+/// active-stream average/peak, and the total elapsed time. This contrasts
+/// with the hero chart, which shows the *live* rolling window. Every number
+/// is read lock-free from the snapshot's [`OverallStats`]
+/// (measurement-isolation invariant, blueprint §4).
+fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+    let o = &m.overall;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::border())
-        .title(" KEY METRICS ");
+        .title(" OVERALL METRICS (all engines) ");
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
-    let ttft = mean_ttft(m);
     let lines = vec![
-        kv2(
-            "Gen Throughput",
-            format!("{:.1} t/s", m.aggregate_tps),
-            style::value(),
-            "Output tokens per second (generation speed)",
-        ),
-        kv2(
+        stat_row("Gen Throughput", o.gen.avg, o.gen.max, o.gen.p5, "t/s"),
+        stat_row(
             "Prompt Throughput",
-            if m.prompt_throughput > 0.0 {
-                format!("{:.0} t/s", m.prompt_throughput)
-            } else {
-                "--".to_string()
-            },
-            style::highlight(),
-            "Input tokens processed per second (prefill)",
+            o.prompt.avg,
+            o.prompt.max,
+            o.prompt.p5,
+            "t/s",
         ),
-        kv2(
+        stat_row(
             "TTFT",
-            fmt_ms(ttft),
-            style::value(),
-            "Request → first token (responsiveness)",
+            o.ttft.avg * 1000.0,
+            o.ttft.max * 1000.0,
+            o.ttft.p5 * 1000.0,
+            "ms",
         ),
-        kv2(
-            "ITL p50",
-            ms(m.itl_p50_ns),
-            style::value_ok(),
-            "Median gap between output tokens (smoothness)",
-        ),
-        kv2(
-            "ITL p99",
-            ms(m.itl_p99_ns),
-            style::value_err(),
-            "Worst-case token gap (stutter indicator)",
-        ),
-        kv2(
-            "Total Tokens",
-            grouped(m.completion_tokens),
-            style::value(),
-            "Output tokens generated this run",
-        ),
-        kv2(
-            "Active Streams",
-            format!("{} active", m.active_streams),
-            style::highlight(),
-            "Concurrent requests in flight",
-        ),
-        kv2(
-            "Duration",
-            engine_duration(app)
-                .map(|s| format!("{s:.1} s"))
-                .unwrap_or_else(|| "--".to_string()),
-            style::value(),
-            "Elapsed time for the current engine",
-        ),
+        stat_row("ITL p50", o.itl_p50.avg, o.itl_p50.max, o.itl_p50.p5, "ms"),
+        stat_row("ITL p99", o.itl_p99.avg, o.itl_p99.max, o.itl_p99.p5, "ms"),
+        Line::from(vec![
+            Span::styled("Total Tokens".to_string(), style::label()),
+            Span::styled(format!("{: <14}", grouped(o.total_tokens)), style::value()),
+            Span::styled("generated", style::footer()),
+        ]),
+        Line::from(vec![
+            Span::styled("Streams".to_string(), style::label()),
+            Span::styled(
+                format!("avg {:.1} active │ max {}", o.active_avg, o.active_max),
+                style::value(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Total Duration".to_string(), style::label()),
+            Span::styled(fmt_duration(o.duration_sec), style::value()),
+        ]),
+        Line::from(Span::styled(
+            "ℹ All engines. p5 = 5th percentile (worst 5%).",
+            style::info(),
+        )),
     ];
     f.render_widget(
         Paragraph::new(Text::from(lines))
@@ -377,57 +426,43 @@ fn render_key_metrics(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame)
     );
 }
 
-/// One `label  value  ℹ description` row for the key-metrics panel (the
-/// label column is padded so values line up; the dimmed description wraps
-/// to a second line on narrow terminals).
-fn kv2(label: &str, value: String, value_style: Style, desc: &str) -> Line<'static> {
+/// One `label  avg X │ max Y │ p5 Z  unit` row for the overall panel
+/// (`--` across the board when the metric has no samples yet).
+fn stat_row(label: &str, avg: f64, max: f64, p5: f64, unit: &str) -> Line<'static> {
+    let none = avg <= 0.0 && max <= 0.0;
+    let (a, m, p) = if none {
+        ("--".to_string(), "--".to_string(), "--".to_string())
+    } else {
+        (fmt_stat(avg), fmt_stat(max), fmt_stat(p5))
+    };
     Line::from(vec![
         Span::styled(format!("{label:<18}"), style::label()),
-        Span::styled(value, value_style),
-        Span::styled(format!("  ℹ {desc}"), style::info()),
+        Span::styled(format!("avg {a} │ max {m} │ p5 {p}"), style::value()),
+        Span::styled(format!("  {unit}"), style::footer()),
     ])
 }
 
-/// The current engine's elapsed wall time (seconds), from the sequence
-/// state's start stamp — `None` when no engine has started (the panel
-/// shows `--`). A plain `SystemTime` read on the render path: it never
-/// touches the quanta timing path (measurement-isolation invariant).
-fn engine_duration(app: &App) -> Option<f64> {
-    let seq = app.seq.load()?;
-    let started = seq.engine_started_ms;
-    if started == 0 {
-        return None;
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
-    Some(now.saturating_sub(started) as f64 / 1000.0)
-}
-
-/// Mean time-to-first-token across the streams that report one (`None` when
-/// none do — the panel shows `--`).
-fn mean_ttft(m: &MetricsSnapshot) -> Option<f64> {
-    let vals: Vec<f64> = m.streams.iter().filter_map(|s| s.ttft_s).collect();
-    if vals.is_empty() {
-        None
+/// A stat value: one decimal under 1000, none above (keeps rows compact).
+fn fmt_stat(v: f64) -> String {
+    if v >= 1000.0 {
+        format!("{:.0}", v)
     } else {
-        Some(vals.iter().sum::<f64>() / vals.len() as f64)
+        format!("{v:.1}")
     }
 }
 
-/// `250 ms` for a seconds value, `--` when absent.
-fn fmt_ms(v: Option<f64>) -> String {
-    v.map(|s| format!("{:.0} ms", s * 1000.0))
-        .unwrap_or_else(|| "--".to_string())
-}
-
-/// `33.0 ms` for a nanosecond value, `--` at the `0` sentinel.
-fn ms(ns: u64) -> String {
-    if ns > 0 {
-        format!("{:.1} ms", ns as f64 / 1_000_000.0)
+/// `4m 32s` (or `32s` / `--`) for a duration in seconds.
+fn fmt_duration(sec: f64) -> String {
+    if sec <= 0.0 {
+        return "--".to_string();
+    }
+    let total = sec as u64;
+    let m = total / 60;
+    let s = total % 60;
+    if m > 0 {
+        format!("{m}m {s}s")
     } else {
-        "--".to_string()
+        format!("{s}s")
     }
 }
 
@@ -942,42 +977,49 @@ mod tests {
 
     #[test]
     fn throughput_chart_guard_degenerate_areas() {
-        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2);
+        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0);
         assert_eq!(lines[0].to_string(), "chart too small");
     }
 
     #[test]
     fn throughput_chart_plots_bars_and_axes() {
-        let series = vec![100.0, 200.0, 150.0, 300.0, 50.0, 250.0];
-        let lines = build_throughput_chart(&series, 40, 10);
+        // A 60-sample window → the x-axis spans 0…59s (the *actual* data
+        // window, not a fixed 60s).
+        let series: Vec<f64> = (0..60)
+            .map(|i| 100.0 + 200.0 * ((i as f64) * 0.3).sin())
+            .collect();
+        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0);
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains('█'), "bars rendered: {text}");
-        // x-axis time labels.
+        // x-axis time labels span the real window.
         assert!(text.contains("0s"), "x-axis start: {text}");
-        assert!(text.contains("60s"), "x-axis end: {text}");
-        // y-axis maximum label.
-        assert!(text.contains("300"), "y-axis max: {text}");
+        assert!(text.contains("59s"), "x-axis end: {text}");
+        // y-axis auto-scales to the data with headroom (300 → 330).
+        assert!(text.contains("330"), "y-axis max: {text}");
     }
 
     #[test]
-    fn throughput_chart_empty_series_is_a_flat_zero_line() {
-        // No samples yet → a flat `▁` line at 0, never a blank chart.
-        let lines = build_throughput_chart(&[], 30, 8);
+    fn throughput_chart_empty_series_shows_awaiting() {
+        // No samples yet → "Awaiting first tokens…", never a blank chart.
+        let lines = build_throughput_chart(&[], 30, 8, 0.0, &[], 0.0);
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains('▁'), "flat zero line: {text}");
+        assert!(
+            text.contains("Awaiting first tokens"),
+            "awaiting prompt: {text}"
+        );
     }
 
     #[test]
-    fn key_metrics_panel_labels_every_metric_with_description() {
-        // Rendered tall (120x52) so all eight metric rows fit; on a short
+    fn overall_metrics_panel_labels_every_metric() {
+        // Rendered tall (120x52) so every overall row fits; on a short
         // terminal the least critical rows clip gracefully.
         let app = App::new();
         let text = render_live_text(&app, 120, 52);
@@ -988,28 +1030,22 @@ mod tests {
             "ITL p50",
             "ITL p99",
             "Total Tokens",
-            "Active Streams",
-            "Duration",
+            "Streams",
+            "Total Duration",
         ] {
             assert!(text.contains(label), "missing metric {label}: {text}");
         }
-        // Every number carries a human-readable `ℹ` explanation.
-        for desc in [
-            "generation speed",
-            "prefill",
-            "responsiveness",
-            "smoothness",
-            "stutter",
-        ] {
-            assert!(text.contains(desc), "missing explanation {desc}: {text}");
-        }
+        // The panel is clearly *cumulative*, with the avg/max/p5 legend.
+        assert!(text.contains("OVERALL METRICS"), "overall title: {text}");
+        assert!(text.contains("percentile"), "p5 legend: {text}");
+        assert!(text.contains('ℹ'), "info note: {text}");
     }
 
     #[test]
     fn throughput_chart_right_aligns_newest_sample() {
         // A single sample must plot at the rightmost plot column, not the
         // left.
-        let lines = build_throughput_chart(&[100.0], 20, 5);
+        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0);
         let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // Find a row containing a bar; its rightmost █ should be near the
         // right edge.
@@ -1345,7 +1381,7 @@ mod tests {
         let text = render_live_text(&app, 120, 40);
         assert!(text.contains("BENCHMARK SEQUENCE"), "{text}");
         assert!(text.contains("THROUGHPUT"), "{text}");
-        assert!(text.contains("KEY METRICS"), "{text}");
+        assert!(text.contains("OVERALL METRICS"), "{text}");
         assert!(text.contains("EVENT LOG"), "{text}");
         // The removed hardware panels are gone.
         assert!(!text.contains("Target GPU VRAM"), "{text}");

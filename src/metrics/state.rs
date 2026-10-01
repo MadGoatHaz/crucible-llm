@@ -11,7 +11,7 @@
 //! single `MetricsState` is shared between writer and readers by wrapping it
 //! in an `Arc`; both `update` and `load` take `&self`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,62 @@ pub struct StreamMetric {
     pub progress: f64,
 }
 
+/// A `(max, avg, p5)` summary of a metric's observed distribution.
+///
+/// `p5` is the 5th percentile — the *worst* 5% of samples (for a
+/// throughput, the slowest; for a latency, the slowest). All values are
+/// `0.0` when no sample has been recorded yet (rendered `--` by the views).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StatTriple {
+    pub max: f64,
+    pub avg: f64,
+    pub p5: f64,
+}
+
+/// Cumulative "overall" statistics across **every** benchmark that has run
+/// (FIX 1).
+///
+/// The Live view's **KEY METRICS** panel shows *these* (in contrast to the
+/// hero chart, which shows the *live* rolling window): `max` / `avg` / `p5`
+/// per metric, the total tokens generated, the active-stream average/peak,
+/// and the total elapsed time. It is built by the writer-side
+/// [`OverallAccumulator`] in [`MetricsState::update`] and copied into every
+/// published [`MetricsSnapshot`] so the render loop reads it lock-free.
+#[derive(Debug, Clone, Default)]
+pub struct OverallStats {
+    /// Generation throughput (per-stream decode t/s).
+    pub gen: StatTriple,
+    /// Prompt throughput (prefill t/s).
+    pub prompt: StatTriple,
+    /// Time-to-first-token (seconds).
+    pub ttft: StatTriple,
+    /// Inter-token latency p50 (ms).
+    pub itl_p50: StatTriple,
+    /// Inter-token latency p99 (ms).
+    pub itl_p99: StatTriple,
+    /// Total tokens generated — the sum of the server-reported
+    /// `usage.completion_tokens` across every completed stream (NOT the SSE
+    /// frame count).
+    pub total_tokens: u64,
+    /// Number of streams that reached a terminal state.
+    pub completed_streams: u64,
+    /// Mean active streams (time-weighted).
+    pub active_avg: f64,
+    /// Peak active streams.
+    pub active_max: usize,
+    /// Total elapsed benchmark time (seconds).
+    pub duration_sec: f64,
+}
+
+/// A marker at an engine transition, for the hero chart's vertical lines
+/// (FIX 2): `at_sec` is the elapsed time since the first update when the
+/// running engine changed, `label` is the engine (the snapshot's `mode`).
+#[derive(Debug, Clone)]
+pub struct EngineMarker {
+    pub at_sec: f64,
+    pub label: String,
+}
+
 /// The unified metrics snapshot (blueprint §4.2: the Engine Core "pushes
 /// unified snapshots to an atomic, double-buffered state cache read by the
 /// UI").
@@ -126,6 +182,13 @@ pub struct MetricsSnapshot {
 
     // ---- rolling aggregate-throughput window (one sample/sec, last 60) ----
     pub throughput_series: Vec<f64>,
+
+    // ---- cumulative overall stats (FIX 1: the KEY METRICS panel) ----
+    pub overall: OverallStats,
+    /// Engine-transition markers (FIX 2: the hero chart's vertical lines).
+    pub engine_markers: Vec<EngineMarker>,
+    /// Total elapsed benchmark time (seconds) since the first update.
+    pub elapsed_sec: f64,
 }
 
 impl Default for MetricsSnapshot {
@@ -155,6 +218,9 @@ impl Default for MetricsSnapshot {
             status: StreamStatus::default(),
             streams: Vec::new(),
             throughput_series: Vec::new(),
+            overall: OverallStats::default(),
+            engine_markers: Vec::new(),
+            elapsed_sec: 0.0,
         }
     }
 }
@@ -306,6 +372,180 @@ impl RollingSeries {
     }
 }
 
+/// The `p`-th percentile (0–100) of `samples` via linear interpolation.
+///
+/// `p = 5` yields the 5th percentile — the value at the bottom of the
+/// distribution (the *worst* 5% for a throughput / the slowest 5% for a
+/// latency). `0.0` when `samples` is empty.
+fn percentile(samples: &[f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let idx = (p.clamp(0.0, 100.0) / 100.0) * (sorted.len() - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil().min((sorted.len() - 1) as f64) as usize;
+    let frac = idx - lo as f64;
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+/// A [`StatTriple`] `(max, avg, p5)` over a sample distribution
+/// (`0.0`/default when empty).
+fn triple(samples: &[f64]) -> StatTriple {
+    if samples.is_empty() {
+        return StatTriple::default();
+    }
+    StatTriple {
+        max: samples.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        avg: samples.iter().sum::<f64>() / samples.len() as f64,
+        p5: percentile(samples, 5.0),
+    }
+}
+
+/// Writer-side accumulator for the cumulative [`OverallStats`] (FIX 1).
+///
+/// Lives in [`MetricsState`] *outside* the double buffer (like the
+/// [`RollingSeries`]) so it survives the engines' fresh
+/// `..Default::default()` snapshots. `update()` folds each published
+/// snapshot in and re-stamps the computed [`OverallStats`] into the
+/// snapshot the render loop reads lock-free (measurement-isolation
+/// invariant, blueprint §4).
+///
+/// Two sampling regimes:
+/// * **per-completed-stream** (event-based): generation throughput, TTFT,
+///   and the total-token count are recorded once per stream, on its
+///   non-terminal → terminal transition (a stream is counted exactly once,
+///   and a stream id re-used by a later level/iteration re-counts cleanly);
+/// * **time-weighted** (~1 sample/sec): prompt throughput, the ITL
+///   percentiles, and the active-stream count (mean + peak).
+#[derive(Debug, Default)]
+struct OverallAccumulator {
+    gen: Vec<f64>,
+    prompt: Vec<f64>,
+    ttft: Vec<f64>,
+    itl_p50: Vec<f64>,
+    itl_p99: Vec<f64>,
+    total_tokens: u64,
+    completed_streams: u64,
+    active_max: usize,
+    active_sum: f64,
+    active_count: u64,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    last_agg: Option<Instant>,
+    prev_mode: String,
+    markers: Vec<EngineMarker>,
+    /// Previous status per stream id (completion-transition detection).
+    prev_status: HashMap<u32, StreamStatus>,
+}
+
+impl OverallAccumulator {
+    /// Defensive cap on any per-sample vector (a benchmark produces at most
+    /// a few hundred completed streams / a few thousand time samples).
+    const CAP: usize = 100_000;
+
+    fn elapsed(&self) -> f64 {
+        match (self.first, self.last) {
+            (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
+            _ => 0.0,
+        }
+    }
+
+    fn push(v: &mut Vec<f64>, x: f64) {
+        if v.len() < Self::CAP {
+            v.push(x);
+        }
+    }
+
+    /// Fold one published snapshot into the running totals.
+    fn fold(&mut self, s: &MetricsSnapshot, now: Instant) {
+        if self.first.is_none() {
+            self.first = Some(now);
+        }
+        self.last = Some(now);
+
+        // Engine-transition marker: the snapshot's `mode` identifies the
+        // engine ("short"/"long" = A, "Concurrency" = B, "NIAH" = C1,
+        // "Reasoning" = C2, "Structured" = C3). Record where each new
+        // engine begins so the hero chart can draw a vertical line.
+        if s.mode != self.prev_mode {
+            self.markers.push(EngineMarker {
+                at_sec: self.elapsed(),
+                label: s.mode.clone(),
+            });
+            self.prev_mode = s.mode.clone();
+        }
+
+        // Per-completed-stream metrics (event-based): count a stream once,
+        // on its non-terminal → terminal transition.
+        for st in &s.streams {
+            let terminal = matches!(st.state, StreamStatus::Done | StreamStatus::Error);
+            let was_terminal = self
+                .prev_status
+                .get(&st.id)
+                .is_some_and(|p| matches!(p, StreamStatus::Done | StreamStatus::Error));
+            if terminal && !was_terminal {
+                self.completed_streams += 1;
+                if let Some(g) = st.gen_tps.filter(|g| *g > 0.0) {
+                    Self::push(&mut self.gen, g);
+                }
+                if let Some(t) = st.ttft_s.filter(|t| *t > 0.0) {
+                    Self::push(&mut self.ttft, t);
+                }
+                if let Some(tok) = st.tg_tokens {
+                    self.total_tokens += tok;
+                }
+            }
+            self.prev_status.insert(st.id, st.state);
+        }
+
+        // Time-weighted aggregate metrics (~1 sample/sec, gap-aware): prompt
+        // throughput, the ITL percentiles, and the active-stream count.
+        let due = self
+            .last_agg
+            .is_none_or(|t| now.duration_since(t) >= SAMPLE_PERIOD);
+        if due {
+            self.last_agg = Some(now);
+            if s.prompt_throughput > 0.0 {
+                Self::push(&mut self.prompt, s.prompt_throughput);
+            }
+            if s.itl_p50_ns > 0 {
+                Self::push(&mut self.itl_p50, s.itl_p50_ns as f64 / 1e6);
+            }
+            if s.itl_p99_ns > 0 {
+                Self::push(&mut self.itl_p99, s.itl_p99_ns as f64 / 1e6);
+            }
+            self.active_sum += s.active_streams as f64;
+            self.active_count += 1;
+            self.active_max = self.active_max.max(s.active_streams);
+        }
+    }
+
+    /// The computed [`OverallStats`] for the current snapshot.
+    fn stats(&self) -> OverallStats {
+        OverallStats {
+            gen: triple(&self.gen),
+            prompt: triple(&self.prompt),
+            ttft: triple(&self.ttft),
+            itl_p50: triple(&self.itl_p50),
+            itl_p99: triple(&self.itl_p99),
+            total_tokens: self.total_tokens,
+            completed_streams: self.completed_streams,
+            active_avg: if self.active_count > 0 {
+                self.active_sum / self.active_count as f64
+            } else {
+                0.0
+            },
+            active_max: self.active_max,
+            duration_sec: self.elapsed(),
+        }
+    }
+}
+
 /// Lock-free double-buffered holder for the current [`MetricsSnapshot`].
 ///
 /// Shared between the stream worker (writer) and the TUI (reader) by wrapping
@@ -319,6 +559,10 @@ pub struct MetricsState {
     /// loop reads the copied series from the published snapshot, so the
     /// measurement-isolation invariant (blueprint §4) is intact.
     rolling: Mutex<RollingSeries>,
+    /// Writer-side cumulative overall-stats accumulator (FIX 1, see
+    /// [`OverallAccumulator`]): folded on each `update()` and re-stamped
+    /// into the published snapshot for the lock-free render.
+    overall_acc: Mutex<OverallAccumulator>,
 }
 
 impl MetricsState {
@@ -327,6 +571,7 @@ impl MetricsState {
         Self {
             inner: ArcSwap::from_pointee(MetricsSnapshot::default()),
             rolling: Mutex::new(RollingSeries::default()),
+            overall_acc: Mutex::new(OverallAccumulator::default()),
         }
     }
 
@@ -365,6 +610,16 @@ impl MetricsState {
                 rs.sample(snapshot.aggregate_tps, Instant::now());
             }
             snapshot.throughput_series = rs.as_vec();
+        }
+        {
+            let mut acc = self
+                .overall_acc
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            acc.fold(&snapshot, Instant::now());
+            snapshot.overall = acc.stats();
+            snapshot.engine_markers = acc.markers.clone();
+            snapshot.elapsed_sec = acc.elapsed();
         }
         self.inner.store(Arc::new(snapshot));
     }
@@ -514,5 +769,117 @@ mod tests {
         let loaded = state.load();
         assert!((loaded.prompt_throughput - 200.0).abs() < 1e-9);
         assert_eq!(loaded.throughput_series, vec![0.0]);
+    }
+
+    // ── overall stats (FIX 1) ────────────────────────────────────────────
+
+    fn done_stream(
+        id: u32,
+        gen: Option<f64>,
+        ttft: Option<f64>,
+        tokens: Option<u64>,
+    ) -> StreamMetric {
+        StreamMetric {
+            id,
+            state: StreamStatus::Done,
+            gen_tps: gen,
+            ttft_s: ttft,
+            tg_tokens: tokens,
+            ..Default::default()
+        }
+    }
+
+    fn streaming(id: u32) -> StreamMetric {
+        StreamMetric {
+            id,
+            state: StreamStatus::Streaming,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overall_counts_each_completed_stream_once() {
+        let state = MetricsState::new();
+        // Streaming (not counted) → Done (counted) → Done again (not re-counted).
+        state.update(MetricsSnapshot {
+            streams: vec![streaming(0)],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(100.0), Some(0.5), Some(256))],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(100.0), Some(0.5), Some(256))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.completed_streams, 1, "exactly one completion counted");
+        assert_eq!(o.total_tokens, 256);
+        assert!((o.gen.avg - 100.0).abs() < 1e-9);
+        assert!((o.ttft.avg - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overall_recounts_when_a_stream_id_is_reused() {
+        // A new iteration reuses stream id 0: Streaming → Done counts again.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(100.0), None, Some(100))],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            streams: vec![streaming(0)],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(120.0), None, Some(200))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.completed_streams, 2, "each iteration's completion counts");
+        assert_eq!(o.total_tokens, 300);
+    }
+
+    #[test]
+    fn overall_computes_max_avg_p5_triples() {
+        let state = MetricsState::new();
+        // Three completed streams with distinct gen rates: 100, 200, 300.
+        for g in [100.0, 200.0, 300.0] {
+            state.update(MetricsSnapshot {
+                streams: vec![done_stream(0, Some(g), Some(0.1), Some(50))],
+                ..Default::default()
+            });
+            // A fresh iteration re-arms the (re-used) stream id.
+            state.update(MetricsSnapshot {
+                streams: vec![streaming(0)],
+                ..Default::default()
+            });
+        }
+        let o = state.load().overall.clone();
+        assert_eq!(o.completed_streams, 3);
+        assert!((o.gen.max - 300.0).abs() < 1e-9, "max");
+        assert!((o.gen.avg - 200.0).abs() < 1e-9, "avg");
+        // p5 of [100, 200, 300]: idx = 0.05 × 2 = 0.1 → 100·0.9 + 200·0.1 = 110.
+        assert!((o.gen.p5 - 110.0).abs() < 1e-9, "p5: {}", o.gen.p5);
+    }
+
+    #[test]
+    fn overall_tracks_duration_and_engine_markers() {
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            mode: "short".into(),
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            mode: "Concurrency".into(),
+            ..Default::default()
+        });
+        let loaded = state.load();
+        // Two distinct engines → two transition markers, in order.
+        assert_eq!(loaded.engine_markers.len(), 2, "a marker per engine");
+        assert_eq!(loaded.engine_markers[0].label, "short");
+        assert_eq!(loaded.engine_markers[1].label, "Concurrency");
+        assert!(loaded.elapsed_sec >= 0.0);
     }
 }

@@ -507,18 +507,28 @@ pub(crate) fn curve_notes(
 /// (`KNEE`) and the sweet-spot row green (`SWEET`).
 fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
     let mut rows: Vec<Row> = vec![Row::new(vec![
-        Cell::from("CONC"),
+        Cell::from("USERS"),
         Cell::from("AGG T/S"),
+        Cell::from("PER-STREAM"),
         Cell::from("P90 TPOT"),
-        Cell::from("STATE"),
+        Cell::from("STATUS"),
     ])
     .style(style::muted_title())];
 
     let sweep = app.sweep.load();
     match sweep.as_ref().as_ref() {
         Some(result) if !result.levels.is_empty() => {
+            // The single-user baseline: the min-concurrency level's
+            // per-stream rate (aggregate ÷ users). It is the reference the
+            // per-stream status is measured against (FIX 3).
+            let baseline = result
+                .levels
+                .iter()
+                .min_by_key(|l| l.concurrency)
+                .map(|l| l.aggregate_tps / l.concurrency.max(1) as f64)
+                .unwrap_or(0.0);
             for level in &result.levels {
-                rows.push(sweep_row(level, envelope, app.concurrency_target));
+                rows.push(sweep_row(level, envelope, app.concurrency_target, baseline));
             }
         }
         _ => {
@@ -530,6 +540,7 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
                     } else {
                         style::label()
                     }),
+                    Cell::from("--"),
                     Cell::from("--"),
                     Cell::from("--"),
                     Cell::from(if is_target {
@@ -551,25 +562,33 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
         Table::new(
             rows,
             [
-                Constraint::Percentage(20),
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
-                Constraint::Percentage(30),
+                Constraint::Percentage(12),
+                Constraint::Percentage(18),
+                Constraint::Percentage(18),
+                Constraint::Percentage(14),
+                Constraint::Percentage(38),
             ],
         )
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(style::border())
-                .title("CONCURRENCY SWEEP (Aggregate t/s vs p90 TPOT)"),
+                .title("CONCURRENCY SWEEP — Aggregate vs Per-Stream t/s"),
         ),
         area,
     );
 }
 
 /// One matrix row for a completed sweep level, flagged when it is the
-/// detected knee (red) or the recommended sweet spot (green).
-fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: usize) -> Row<'a> {
+/// detected knee (red) or the recommended sweet spot (green), and carrying
+/// the **Per-Stream t/s** column (FIX 3: aggregate ÷ users) plus a
+/// color-coded per-stream status.
+fn sweep_row<'a>(
+    level: &'a SweepLevel,
+    envelope: &'a Option<Envelope>,
+    target: usize,
+    baseline: f64,
+) -> Row<'a> {
     let is_knee = envelope
         .as_ref()
         .and_then(|e| e.knee)
@@ -595,6 +614,10 @@ fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: 
         state.push_str(" · SWEET");
     }
 
+    // FIX 3: per-stream t/s = aggregate ÷ users — what EACH user gets.
+    let per = level.aggregate_tps / level.concurrency.max(1) as f64;
+    let (ps_label, ps_style) = per_stream_status(per, baseline);
+
     let value_style = if is_knee {
         style::value_err()
     } else if is_sweet {
@@ -604,18 +627,46 @@ fn sweep_row<'a>(level: &'a SweepLevel, envelope: &'a Option<Envelope>, target: 
     } else {
         style::label()
     };
+    let state_style = if is_knee {
+        style::value_err()
+    } else if is_sweet {
+        style::value_ok()
+    } else {
+        style::footer()
+    };
     Row::new(vec![
         Cell::from(level.concurrency.to_string()).style(value_style),
         Cell::from(format!("{:.1} t/s", level.aggregate_tps)).style(value_style),
+        Cell::from(format!("{:.1} t/s", per)).style(value_style),
         Cell::from(format!("{:.1} ms", level.p90_tpot_ms())).style(value_style),
-        Cell::from(state).style(if is_knee {
-            style::value_err()
-        } else if is_sweet {
-            style::value_ok()
-        } else {
-            style::footer()
-        }),
+        Cell::from(Line::from(vec![
+            Span::styled(state, state_style),
+            Span::styled(format!("  {ps_label}"), ps_style),
+        ])),
     ])
+}
+
+/// The per-stream status (FIX 3): green `● optimal` → yellow `● good` →
+/// `▲ knee` → red `✗ saturated`, measured against the single-user
+/// baseline (per-stream = aggregate ÷ users). The "degraded" threshold is
+/// when per-stream falls below 50% of the baseline — the point where adding
+/// more users starts hurting everyone's individual experience.
+fn per_stream_status(per: f64, baseline: f64) -> (String, Style) {
+    let ratio = if baseline > 0.0 { per / baseline } else { 1.0 };
+    if ratio >= 0.85 {
+        ("● optimal".to_string(), style::value_ok())
+    } else if ratio >= 0.50 {
+        ("● good".to_string(), style::value_warn())
+    } else if ratio >= 0.25 {
+        (
+            "▲ knee".to_string(),
+            Style::default()
+                .fg(palette::WARN)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("✗ saturated".to_string(), style::value_err())
+    }
 }
 
 /// The dimmed `ℹ` note explaining what the envelope's numbers mean.
@@ -680,6 +731,19 @@ fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envel
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("ℹ {ENVELOPE_INFO}"),
+        style::info(),
+    )));
+    // FIX 3: what the per-stream column means for the user's workload.
+    lines.push(Line::from(Span::styled(
+        "ℹ Per-Stream t/s = Aggregate ÷ Users — what EACH user experiences.",
+        style::info(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Below ~50% of the single-user baseline, adding users hurts everyone.",
+        style::info(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Multi-agent coding: each agent gets its own per-stream rate.",
         style::info(),
     )));
     f.render_widget(
@@ -844,5 +908,45 @@ mod tests {
             marker_rows[0], marker_rows[1],
             "throughput must change the plotted height"
         );
+    }
+
+    // ── per-stream status (FIX 3) ───────────────────────────────────────
+
+    #[test]
+    fn per_stream_status_tracks_the_baseline() {
+        // Baseline 100 t/s (the single-user rate).
+        assert_eq!(per_stream_status(100.0, 100.0).0, "● optimal");
+        assert_eq!(per_stream_status(90.0, 100.0).0, "● optimal"); // 0.90
+        assert_eq!(per_stream_status(60.0, 100.0).0, "● good"); // 0.60
+        assert_eq!(per_stream_status(40.0, 100.0).0, "▲ knee"); // 0.40
+        assert_eq!(per_stream_status(20.0, 100.0).0, "✗ saturated"); // 0.20
+                                                                     // No baseline → treated as optimal (ratio 1.0).
+        assert_eq!(per_stream_status(50.0, 0.0).0, "● optimal");
+    }
+
+    #[test]
+    fn matrix_shows_the_per_stream_column() {
+        // A two-level sweep: the per-stream column is aggregate ÷ users.
+        let app = crate::ui::app::App::new();
+        app.sweep.store(SweepResult {
+            levels: vec![lvl(1, 100.0, 5.0), lvl(4, 340.0, 20.0)],
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The column header is present.
+        assert!(text.contains("PER-STREAM"), "per-stream column: {text}");
+        // level 1: 100/1 = 100.0; level 4: 340/4 = 85.0.
+        assert!(text.contains("100.0 t/s"), "per-stream at 1 user: {text}");
+        assert!(text.contains("85.0 t/s"), "per-stream at 4 users: {text}");
     }
 }
