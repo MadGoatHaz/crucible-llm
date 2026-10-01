@@ -26,7 +26,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::client::{StreamError, StreamEvent, StreamOutcome, StreamWorker};
+use crate::client::{run_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker};
 use crate::config::{Config, Mode};
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
@@ -254,9 +254,8 @@ impl SpeedEngine {
         }
 
         let start = MonotonicInstant::now();
-        let outcome = tokio::spawn(worker.run(tx))
-            .await
-            .expect("stream worker task panicked");
+        // A worker-task panic becomes a failed outcome, never a crash.
+        let outcome = run_worker(worker, tx).await;
         let mut events = Vec::new();
         let mut batch = 0u32;
         while let Some(event) = rx.recv().await {

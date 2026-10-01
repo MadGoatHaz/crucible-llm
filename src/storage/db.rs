@@ -46,6 +46,7 @@ impl Database {
     /// The default location: `dirs::data_dir()/crucible/benchmarks.db`
     /// (Linux `~/.local/share/crucible/benchmarks.db`, Windows
     /// `%APPDATA%\crucible\benchmarks.db`).
+    #[must_use]
     pub fn default_path() -> PathBuf {
         data_dir().join(DB_FILE_NAME)
     }
@@ -80,12 +81,14 @@ impl Database {
     }
 
     /// The on-disk location of this database.
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// The raw `Connection` (escape hatch for ad-hoc queries, e.g. the
     /// Chunk 13 exporters and the Chunk 14 history diff).
+    #[must_use]
     pub fn conn(&self) -> &Connection {
         &self.conn
     }

@@ -58,6 +58,8 @@ use crate::log::{Context, Level, RunLogger};
 use crate::sse::{Chunk, ParsedFrame, SseParser, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
+use super::truncate_body;
+
 /// Completions path appended to a bare host / base URL.
 const COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
@@ -748,6 +750,26 @@ impl StreamWorker {
     }
 }
 
+/// Spawn a [`StreamWorker`] on its own task and await its
+/// [`StreamOutcome`] — the shared seam every engine uses (A, C1, C2, C3).
+///
+/// A task panic (an internal bug, not an endpoint fault) is converted
+/// into a [`StreamError::Read`] failure outcome instead of unwinding the
+/// benchmark — the N/A-never-fail rule: one bad stream is recorded, the
+/// run continues, and the process never crashes mid-measurement.
+pub async fn run_worker(worker: StreamWorker, tx: mpsc::Sender<StreamEvent>) -> StreamOutcome {
+    match tokio::spawn(worker.run(tx)).await {
+        Ok(outcome) => outcome,
+        Err(join) => StreamOutcome {
+            timestamps: StreamTimestamps::default(),
+            usage: None,
+            premature: false,
+            malformed_frames: 0,
+            error: Some(StreamError::Read(format!("worker task failed: {join}"))),
+        },
+    }
+}
+
 /// The result of one `bytes_stream()` poll with an idle timeout.
 enum ChunkRead<B> {
     Bytes(B),
@@ -789,7 +811,7 @@ async fn emit_frames(
     for frame in frames {
         let mut frame = frame.clone();
         frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(at));
-        if is_token_frame(&frame.chunk) {
+        if frame.chunk.is_token() {
             token_frames += 1;
             if ts.t3.is_none() {
                 ts.t3 = Some(*at);
@@ -807,12 +829,6 @@ async fn emit_frames(
         .map_err(|_| ())?;
     }
     Ok((done_seen, token_frames))
-}
-
-/// A frame carrying generated tokens (reasoning or content) — a
-/// `Usage` / `Control` frame is not a token arrival.
-fn is_token_frame(chunk: &Chunk) -> bool {
-    matches!(chunk, Chunk::Reasoning(_) | Chunk::Content(_))
 }
 
 /// True when `bytes` begin an SSE `data:` frame (BOM tolerated).
@@ -839,18 +855,6 @@ fn parse_plain_completion(body: &[u8]) -> Result<(Option<String>, Option<Usage>)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
     Ok((content, Usage::from_value(&value)))
-}
-
-/// Truncate `s` to at most `max` bytes on a character boundary.
-fn truncate_body(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 /// Resolve a user-supplied endpoint to the full chat-completions URL:
@@ -978,11 +982,11 @@ mod tests {
     }
 
     #[test]
-    fn is_token_frame_covers_reasoning_and_content_only() {
-        assert!(is_token_frame(&Chunk::Reasoning("x".into())));
-        assert!(is_token_frame(&Chunk::Content("x".into())));
-        assert!(!is_token_frame(&Chunk::Control));
-        assert!(!is_token_frame(&Chunk::Usage(Usage::default())));
+    fn chunk_is_token_covers_reasoning_and_content_only() {
+        assert!(Chunk::Reasoning("x".into()).is_token());
+        assert!(Chunk::Content("x".into()).is_token());
+        assert!(!Chunk::Control.is_token());
+        assert!(!Chunk::Usage(Usage::default()).is_token());
     }
 
     #[test]

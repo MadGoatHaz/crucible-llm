@@ -10,37 +10,14 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use crucible_llm::client::{StreamError, StreamEvent, StreamWorker};
 use crucible_llm::sse::{Chunk, Usage};
 
-// ── Mock SSE payloads (vLLM-style) ────────────────────────────────────────
-
-const FRAME_ROLE: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n";
-const FRAME_REASON_1: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Let me think.\"}}]}\n\n";
-const FRAME_REASON_2: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Step by step.\"}}]}\n\n";
-const FRAME_CONTENT_1: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer \"}}]}\n\n";
-const FRAME_CONTENT_2: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is 42.\"}}]}\n\n";
-const FRAME_USAGE: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":128,\"completion_tokens\":34}}\n\n";
-const FRAME_DONE: &str = "data: [DONE]\n\n";
-
-const PLAIN_JSON_BODY: &str = r#"{
-    "id": "cmpl-pj",
-    "object": "chat.completion",
-    "choices": [{
-        "index": 0,
-        "message": { "role": "assistant", "content": "Hello, world!" },
-        "finish_reason": "stop"
-    }],
-    "usage": { "prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49 }
-}"#;
+mod common;
+use common::mock::*;
 
 // ── Mock server ───────────────────────────────────────────────────────────
 
@@ -92,54 +69,13 @@ async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-/// Read the request until the header block is complete (the body is not
-/// needed by the mock).
-async fn drain_request(sock: &mut tokio::net::TcpStream) {
-    let mut buf = [0u8; 8192];
-    let mut acc = Vec::new();
-    use tokio::io::AsyncReadExt;
-    loop {
-        match sock.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") || acc.len() > 65536 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-async fn respond(sock: &mut tokio::net::TcpStream, mock: Mock) {
+async fn respond(sock: &mut TcpStream, mock: Mock) {
     match mock {
         Mock::Sse | Mock::Flaky(_) => {
-            write_all(
-                sock,
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-            for frame in [
-                FRAME_ROLE,
-                FRAME_REASON_1,
-                FRAME_REASON_2,
-                FRAME_CONTENT_1,
-                FRAME_CONTENT_2,
-                FRAME_USAGE,
-                FRAME_DONE,
-            ] {
-                write_chunk(sock, frame.as_bytes()).await;
-            }
-            write_chunk(sock, b"").await; // terminating chunk
-            let _ = sock.shutdown().await;
+            serve_sse(sock, VLLM_STREAM, Duration::ZERO).await;
         }
         Mock::EarlyClose => {
-            write_all(
-                sock,
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-            )
-            .await;
+            write_all(sock, SSE_HEADERS).await;
             write_chunk(sock, FRAME_ROLE.as_bytes()).await;
             write_chunk(sock, FRAME_REASON_1.as_bytes()).await;
             // A third frame with no terminating blank line, then a hard
@@ -152,48 +88,23 @@ async fn respond(sock: &mut tokio::net::TcpStream, mock: Mock) {
             let _ = sock.shutdown().await;
         }
         Mock::PlainJson => {
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                PLAIN_JSON_BODY.len()
-            );
-            write_all(sock, header.as_bytes()).await;
-            write_all(sock, PLAIN_JSON_BODY.as_bytes()).await;
-            let _ = sock.shutdown().await;
+            serve_json(sock, "HTTP/1.1 200 OK", PLAIN_JSON_BODY).await;
         }
         Mock::Http500 => {
-            let body = "{\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}";
-            let header = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            write_all(sock, header.as_bytes()).await;
-            write_all(sock, body.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        }
-        Mock::Stalled => {
-            write_all(
+            serve_json(
                 sock,
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 500 Internal Server Error",
+                "{\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}",
             )
             .await;
+        }
+        Mock::Stalled => {
+            write_all(sock, SSE_HEADERS).await;
             write_chunk(sock, FRAME_ROLE.as_bytes()).await;
             // Then silence: the worker's idle read timeout must fire.
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     }
-}
-
-async fn write_all(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
 }
 
 // ── Test harness ──────────────────────────────────────────────────────────

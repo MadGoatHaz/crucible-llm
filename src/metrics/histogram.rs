@@ -37,50 +37,59 @@ impl LatencyHistogram {
     /// Value at the given percentile `p` in `0.0..=100.0`, in nanoseconds.
     ///
     /// `p` is clamped to `[0, 100]`; an empty histogram returns `0.0`.
+    #[must_use]
     pub fn percentile(&self, p: f64) -> f64 {
         self.inner.value_at_percentile(p.clamp(0.0, 100.0)) as f64
     }
 
     /// p50 in nanoseconds.
     #[inline]
+    #[must_use]
     pub fn p50(&self) -> f64 {
         self.percentile(50.0)
     }
 
     /// p90 in nanoseconds.
     #[inline]
+    #[must_use]
     pub fn p90(&self) -> f64 {
         self.percentile(90.0)
     }
 
     /// p99 in nanoseconds.
     #[inline]
+    #[must_use]
     pub fn p99(&self) -> f64 {
         self.percentile(99.0)
     }
 
     /// p99.9 in nanoseconds.
     #[inline]
+    #[must_use]
     pub fn p999(&self) -> f64 {
         self.percentile(99.9)
     }
 
     /// Mean of the recorded samples, in nanoseconds.
+    #[must_use]
     pub fn mean(&self) -> f64 {
         self.inner.mean()
     }
 
     /// Maximum recorded sample, in nanoseconds.
+    #[must_use]
     pub fn max(&self) -> f64 {
         self.inner.max() as f64
     }
 
     /// Number of recorded samples.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.inner.len() as usize
     }
 
     /// True if no samples have been recorded.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner.len() == 0
     }

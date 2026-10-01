@@ -20,6 +20,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::truncate_body;
+
 /// Chat-completions suffix a user URL may end in (stripped for discovery,
 /// keeping the `/v1` it sits under).
 const CHAT_COMPLETIONS_SUFFIX: &str = "/chat/completions";
@@ -90,7 +92,7 @@ impl ModelError {
 }
 
 /// Resolve a user-supplied URL to the **base** of an OpenAI-compatible
-/// API, so [`list_models] can append `/models`:
+/// API, so [`list_models`] can append `/models`:
 ///
 /// * `http://host:8000` → `http://host:8000/v1`
 /// * `http://host:8000/` → same (trailing slashes ignored)
@@ -172,18 +174,6 @@ pub fn clean_models(mut data: Vec<ModelInfo>) -> Vec<ModelInfo> {
     data.sort_by(|a, b| a.id.cmp(&b.id));
     data.dedup();
     data
-}
-
-/// Truncate `s` to at most `max` bytes on a character boundary.
-fn truncate_body(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

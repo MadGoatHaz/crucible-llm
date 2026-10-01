@@ -21,27 +21,21 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
-use ratatui::Terminal;
 
 use crucible_llm::config::Config;
 use crucible_llm::engines::Engine;
 use crucible_llm::ui::app::{App, View};
-use crucible_llm::ui::views::config::{ConfigKeyResult, ConfigState, Field};
+use crucible_llm::ui::views::config::{self, ConfigKeyResult, ConfigState, Field};
+
+mod common;
+use common::render::render_text;
 
 const W: u16 = 120;
 const H: u16 = 40;
 
 /// Render the Config view at `w`x`h` and return the flattened buffer text.
 fn render_config(app: &App, w: u16, h: u16) -> String {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
-    terminal
-        .draw(|f| crucible_llm::ui::views::config::render(f.area(), app, f))
-        .expect("render frame");
-    let buf: &Buffer = terminal.backend().buffer();
-    buf.content().iter().map(|c| c.symbol()).collect()
+    render_text(config::render, app, w, h)
 }
 
 /// Build a synthetic key event (a press, no modifiers).

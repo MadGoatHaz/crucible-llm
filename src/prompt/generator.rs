@@ -181,8 +181,9 @@ fn long_sentence_rotation(target_tokens: u32) -> String {
     let mut total: usize = 0;
     let mut i = 0;
     while total < target_chars {
-        parts.push(BASE_SENTENCES[i % BASE_SENTENCES.len()]);
-        total += parts[i].len() + 1;
+        let sentence = BASE_SENTENCES[i % BASE_SENTENCES.len()];
+        parts.push(sentence);
+        total += sentence.len() + 1;
         i += 1;
     }
     parts.join(" ")

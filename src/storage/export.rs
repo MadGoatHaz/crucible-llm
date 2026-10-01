@@ -117,6 +117,7 @@ impl ExportPayload {
     // ── the three exporters (blueprint §8 "Export Formats") ────────────
 
     /// **JSON** (CI/CD regression gating): compact, valid, parseable.
+    #[must_use]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|e| {
             // `ExportPayload` is plain serde data — serialization cannot
@@ -130,6 +131,7 @@ impl ExportPayload {
     /// tables (+ a needle table when present), for PRs/issues/READMEs.
     /// Cell values are escaped so a `|` in a model name can't break the
     /// table (GFM rule).
+    #[must_use]
     pub fn to_markdown(&self) -> String {
         let s = &self.session;
         let mut out = String::new();
@@ -203,6 +205,7 @@ impl ExportPayload {
     /// **Raw CSV** (Python/R/Grafana): one row per captured packet with
     /// its arrival time (ns since `T0`) and inter-token interval (ns).
     /// No packets were captured (e.g. a TUI export) → header only.
+    #[must_use]
     pub fn to_csv(&self) -> String {
         let mut out = String::from("stream,arrival_ns,itl_ns,kind\n");
         for p in &self.packets {
@@ -217,6 +220,7 @@ impl ExportPayload {
     }
 
     /// Render in the requested [`ExportFormat`].
+    #[must_use]
     pub fn render(&self, format: ExportFormat) -> String {
         match format {
             ExportFormat::Json => self.to_json(),
@@ -232,6 +236,7 @@ impl ExportPayload {
 /// worker's `t_nanos` stamps (ns since `T0`); the ITL is the delta between
 /// consecutive *token* frames (reasoning or content), so a `usage` frame
 /// between two tokens does not break the interval.
+#[must_use]
 pub fn samples_from_events(events: &[StreamEvent], stream: u64) -> Vec<PacketSample> {
     let mut out = Vec::new();
     let mut last_token_ns: Option<u64> = None;
@@ -239,7 +244,7 @@ pub fn samples_from_events(events: &[StreamEvent], stream: u64) -> Vec<PacketSam
         let StreamEvent::Frame { frame, .. } = event else {
             continue;
         };
-        let is_token = matches!(&frame.chunk, Chunk::Reasoning(_) | Chunk::Content(_));
+        let is_token = frame.chunk.is_token();
         let itl = is_token
             .then(|| last_token_ns.map(|prev| (frame.t_nanos as i128 - prev as i128).max(0) as u64))
             .flatten();
@@ -267,6 +272,7 @@ pub fn samples_from_events(events: &[StreamEvent], stream: u64) -> Vec<PacketSam
 }
 
 /// The file extension for an export format.
+#[must_use]
 pub fn extension(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Json => "json",
@@ -277,6 +283,7 @@ pub fn extension(format: ExportFormat) -> &'static str {
 
 /// Default export destination for a persisted session:
 /// `data_dir()/exports/crucible-<session-id[:8]>.<ext>`.
+#[must_use]
 pub fn default_path(session_id: &str, format: ExportFormat) -> PathBuf {
     data_dir().join("exports").join(format!(
         "crucible-{}.{}",
@@ -287,6 +294,7 @@ pub fn default_path(session_id: &str, format: ExportFormat) -> PathBuf {
 
 /// Default export destination for a live (TUI) export:
 /// `data_dir()/exports/live-<unix-seconds>.<ext>`.
+#[must_use]
 pub fn default_path_live(format: ExportFormat) -> PathBuf {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)

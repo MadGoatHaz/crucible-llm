@@ -77,6 +77,7 @@ impl StreamMetricRow {
     /// `joules_per_token`, and `cache_hit` stay `NULL` until the
     /// capability/hardware engines (Chunks 15/17) and a cold TTFT
     /// baseline produce them.
+    #[must_use]
     pub fn from_speed_result(
         result: &SpeedResult,
         session_id: &str,

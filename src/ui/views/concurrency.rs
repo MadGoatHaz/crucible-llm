@@ -29,10 +29,6 @@ use crate::engines::concurrency::{Envelope, SweepLevel, SweepResult, DEFAULT_LAD
 use crate::ui::app::App;
 use crate::ui::theme::{palette, style};
 
-/// The placeholder ladder shown before a sweep has run (blueprint §5,
-/// Engine B default).
-const LADDER: [usize; 9] = DEFAULT_LADDER;
-
 /// Render the Concurrency view into `area`.
 ///
 /// The envelope (knee + sweet spot) is computed once per frame from the
@@ -378,51 +374,60 @@ pub(crate) fn build_curve_lines(
         }
     }
 
-    // Rebuild the lines: one span per grid cell, then merge each placed
-    // value label's run of single-char spans into one bold span. Per row,
-    // the splices run in *descending* start order so an earlier splice
-    // never shifts the indices a later one uses.
-    let mut lines: Vec<Line> = grid
-        .iter()
-        .map(|row| {
-            Line::from(
-                row.iter()
-                    .map(|(ch, c)| match c {
-                        Some(color) => Span::styled(ch.to_string(), Style::default().fg(*color)),
-                        None => Span::raw(ch.to_string()),
-                    })
-                    .collect::<Vec<Span>>(),
-            )
-        })
-        .collect();
+    // Rebuild the lines: each row's grid is grouped into runs of identical
+    // (char, color) cells — one span per run, not one allocation per cell
+    // (a mostly-blank plot row is a handful of spans on the 60 Hz render
+    // path) — and each placed value label is emitted directly as one
+    // bold span at its column range (the placer already rejected
+    // collisions, so the labels never overlap).
     let mut by_row: std::collections::BTreeMap<usize, Vec<(usize, String, Color)>> =
         Default::default();
     for (row, start, text, color) in placed {
         by_row.entry(row).or_default().push((start, text, color));
     }
-    for (row, mut labels) in by_row {
-        if row >= lines.len() {
-            continue;
-        }
-        labels.sort_by_key(|&(start, _, _)| std::cmp::Reverse(start));
-        for (start, text, color) in labels {
-            let end = start + text.len();
-            if end > lines[row].spans.len() {
-                continue;
-            }
-            let mut spans: Vec<Span> = lines[row].spans.clone();
-            spans.splice(
-                start..end,
-                [Span::styled(
+    let mut lines: Vec<Line> = Vec::with_capacity(grid.len());
+    for (row_idx, row) in grid.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut col = 0usize;
+        if let Some(labels) = by_row.get(&row_idx) {
+            let mut labels: Vec<&(usize, String, Color)> = labels.iter().collect::<Vec<_>>();
+            labels.sort_by_key(|&(start, _, _)| *start);
+            for (start, text, color) in labels {
+                if *start > col {
+                    push_cell_runs(&mut spans, row, col, (*start).min(row.len()));
+                }
+                spans.push(Span::styled(
                     text.clone(),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )],
-            );
-            lines[row] = Line::from(spans);
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                ));
+                col = (*start + text.len()).min(row.len());
+            }
         }
+        if col < row.len() {
+            push_cell_runs(&mut spans, row, col, row.len());
+        }
+        lines.push(Line::from(spans));
     }
 
     lines
+}
+
+/// Append one span per run of identical (char, color) cells in
+/// `row[from..to)` (consecutive blanks / same-color glyphs collapse into
+/// a single span — the render-path allocation saver).
+fn push_cell_runs(spans: &mut Vec<Span>, row: &[(char, Option<Color>)], from: usize, to: usize) {
+    let mut run_start = from;
+    for i in (from + 1)..=to {
+        if i == to || row[i] != row[run_start] {
+            let (ch, color) = row[run_start];
+            let text: String = std::iter::repeat_n(ch, i - run_start).collect();
+            spans.push(match color {
+                Some(c) => Span::styled(text, Style::default().fg(c)),
+                None => Span::raw(text),
+            });
+            run_start = i;
+        }
+    }
 }
 
 /// The y-axis label column width (shared by both chart builders).
@@ -576,7 +581,7 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
             }
         }
         _ => {
-            for &level in &LADDER {
+            for &level in &DEFAULT_LADDER {
                 let is_target = level == app.concurrency_target;
                 rows.push(Row::new(vec![
                     Cell::from(level.to_string()).style(if is_target {

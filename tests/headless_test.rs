@@ -10,38 +10,14 @@
 //! * a dead endpoint yields exit code 1 (all runs failed);
 //! * `--nocache` changes the sent prefix.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 use crucible_llm::config::Config;
 use crucible_llm::engines::speed::{all_failed, json_report, SpeedEngine};
 
-// ── Mock SSE payloads (vLLM-style) ────────────────────────────────────────
-
-const FRAME_ROLE: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n";
-const FRAME_REASON_1: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Let me think.\"}}]}\n\n";
-const FRAME_REASON_2: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Step by step.\"}}]}\n\n";
-const FRAME_CONTENT_1: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer \"}}]}\n\n";
-const FRAME_CONTENT_2: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"is 42.\"}}]}\n\n";
-const FRAME_USAGE: &str =
-    "data: {\"id\":\"cmpl-1\",\"choices\":[],\"usage\":{\"prompt_tokens\":128,\"completion_tokens\":34}}\n\n";
-const FRAME_DONE: &str = "data: [DONE]\n\n";
-
-const PLAIN_JSON_BODY: &str = r#"{
-    "id": "cmpl-pj",
-    "object": "chat.completion",
-    "choices": [{
-        "index": 0,
-        "message": { "role": "assistant", "content": "Hello, world!" },
-        "finish_reason": "stop"
-    }],
-    "usage": { "prompt_tokens": 42, "completion_tokens": 7, "total_tokens": 49 }
-}"#;
+mod common;
+use common::mock::*;
 
 // ── Mock server ───────────────────────────────────────────────────────────
 
@@ -61,21 +37,15 @@ async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
         let (mut sock, _) = listener.accept().await.unwrap();
         match mock {
             Mock::Sse => {
-                drain_headers(&mut sock).await;
+                drain_request(&mut sock).await;
                 sse_response(&mut sock).await;
             }
             Mock::PlainJson => {
-                drain_headers(&mut sock).await;
-                let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    PLAIN_JSON_BODY.len()
-                );
-                write_all(&mut sock, header.as_bytes()).await;
-                write_all(&mut sock, PLAIN_JSON_BODY.as_bytes()).await;
-                let _ = sock.shutdown().await;
+                drain_request(&mut sock).await;
+                serve_json(&mut sock, "HTTP/1.1 200 OK", PLAIN_JSON_BODY).await;
             }
             Mock::Echo => {
-                let body = read_full_request(&mut sock).await;
+                let (_, body) = read_request(&mut sock).await;
                 sse_response(&mut sock).await;
                 // Park the body where the test can read it.
                 ECHO_BODIES.lock().unwrap().push(body);
@@ -88,100 +58,8 @@ async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
 /// Recorded request bodies from `Mock::Echo`.
 static ECHO_BODIES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Read until the header block is complete (the body is not needed).
-async fn drain_headers(sock: &mut tokio::net::TcpStream) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        match sock.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 65536 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Read the full request (headers + `Content-Length` body) as a string.
-async fn read_full_request(sock: &mut tokio::net::TcpStream) -> String {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    let mut header_end: Option<usize> = None;
-    loop {
-        match sock.read(&mut tmp).await {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                    }
-                }
-                if let Some(he) = header_end {
-                    let len = content_length(&buf[..he]);
-                    if buf.len() >= he + len {
-                        break;
-                    }
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let he = header_end.unwrap_or(buf.len());
-    let len = content_length(&buf[..he]);
-    let end = (he + len).min(buf.len());
-    String::from_utf8_lossy(&buf[he..end]).into_owned()
-}
-
-fn content_length(headers: &[u8]) -> usize {
-    let head = String::from_utf8_lossy(headers);
-    head.lines()
-        .find_map(|l| {
-            let l = l.to_ascii_lowercase();
-            l.strip_prefix("content-length:")?
-                .trim()
-                .parse::<usize>()
-                .ok()
-        })
-        .unwrap_or(0)
-}
-
-async fn sse_response(sock: &mut tokio::net::TcpStream) {
-    write_all(
-        sock,
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )
-    .await;
-    for frame in [
-        FRAME_ROLE,
-        FRAME_REASON_1,
-        FRAME_REASON_2,
-        FRAME_CONTENT_1,
-        FRAME_CONTENT_2,
-        FRAME_USAGE,
-        FRAME_DONE,
-    ] {
-        write_chunk(sock, frame.as_bytes()).await;
-    }
-    write_chunk(sock, b"").await; // terminating chunk
-    let _ = sock.shutdown().await;
-}
-
-async fn write_all(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
+async fn sse_response(sock: &mut TcpStream) {
+    serve_sse(sock, VLLM_STREAM, std::time::Duration::ZERO).await;
 }
 
 // ── Test helpers ──────────────────────────────────────────────────────────

@@ -18,5 +18,23 @@ pub mod stream;
 
 pub use models::{list_models, normalize_base_url, ModelError, ModelInfo};
 pub use stream::{
-    normalize_endpoint, StreamError, StreamEvent, StreamOutcome, StreamWorker, DEFAULT_READ_TIMEOUT,
+    normalize_endpoint, run_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker,
+    DEFAULT_READ_TIMEOUT,
 };
+
+/// Truncate `s` to at most `max` bytes on a character boundary, appending
+/// a `…` when a cut was made. Shared by the streaming client
+/// ([`stream::StreamError::Http`] bodies) and the discovery client
+/// ([`models::ModelError::Http`] bodies) — response bodies are untrusted
+/// and must never blow up a log line.
+#[must_use]
+pub(crate) fn truncate_body(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}

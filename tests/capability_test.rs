@@ -15,13 +15,16 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crucible_llm::config::Config;
 use crucible_llm::engines::{
     is_json_compliant, score_responses, ReasoningEngine, StructuredEngine, REASONING_BANK,
 };
+
+mod common;
+use common::mock::{read_request, write_all, write_chunk, SSE_HEADERS};
 
 // ── Mock server ───────────────────────────────────────────────────────────
 
@@ -40,68 +43,10 @@ enum MockMode {
     StructuredBad,
 }
 
-/// Read the full HTTP request (headers + `Content-Length` body) and
-/// return the body as text.
-async fn read_request(sock: &mut TcpStream) -> String {
-    let mut buf = [0u8; 8192];
-    let mut acc: Vec<u8> = Vec::new();
-    loop {
-        match sock.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let header_end = acc
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(acc.len());
-    let content_length = String::from_utf8_lossy(&acc[..header_end])
-        .lines()
-        .find_map(|l| {
-            l.trim()
-                .to_ascii_lowercase()
-                .strip_prefix("content-length:")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-        })
-        .unwrap_or(0);
-    let mut body = acc[header_end..].to_vec();
-    while body.len() < content_length {
-        match sock.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => body.extend_from_slice(&buf[..n]),
-        }
-    }
-    String::from_utf8_lossy(&body).to_string()
-}
-
-async fn write_all(sock: &mut TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
-}
-
 /// An SSE stream whose content is split into ~12-char deltas (like real
 /// token frames), with a usage block and the `[DONE]` terminator.
 async fn respond_sse(sock: &mut TcpStream, content: &str, prompt_tokens: u64) {
-    write_all(
-        sock,
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )
-    .await;
+    write_all(sock, SSE_HEADERS).await;
     // Every frame needs the blank-line separator: without it the parser
     // joins this `data:` line with the next frame's (multi-line data
     // join) and drops the merged blob as malformed JSON.
@@ -139,7 +84,7 @@ async fn start_mock(mode: MockMode) -> String {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let body = read_request(&mut sock).await;
+            let (_, body) = read_request(&mut sock).await;
             match mode {
                 MockMode::ReasoningClever => {
                     let answer = REASONING_BANK
@@ -363,8 +308,7 @@ async fn read_request_captures_full_body() {
     client
         .write_all(b"POST /v1 HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world")
         .unwrap();
-    let body = accept.await.unwrap();
-    eprintln!("PROBE BODY = {:?}", body);
+    let body = accept.await.unwrap().1;
     assert_eq!(body, "hello world");
 }
 

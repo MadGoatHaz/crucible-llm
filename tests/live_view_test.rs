@@ -21,10 +21,8 @@
 //! rendered empty. Rendering runs against `ratatui::backend::TestBackend`, so
 //! the suite is fully offline and deterministic — no terminal attached.
 
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
-use ratatui::Terminal;
 
 use crucible_llm::engines::{
     evaluate_case, Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState,
@@ -34,17 +32,15 @@ use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::live;
 
+mod common;
+use common::render::render_buffer;
+
 const W: u16 = 120;
 const H: u16 = 40;
 
 /// Render the Live view at `w`x`h` and return the resulting buffer.
 fn render_live(app: &App, w: u16, h: u16) -> Buffer {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
-    terminal
-        .draw(|f| live::render(f.area(), app, f))
-        .expect("render frame");
-    terminal.backend().buffer().clone()
+    render_buffer(live::render, app, w, h)
 }
 
 /// Join every cell's symbol into one flat string for substring asserts.

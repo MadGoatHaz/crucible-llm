@@ -39,12 +39,14 @@ impl MonotonicInstant {
 
     /// Elapsed nanoseconds since `self`.
     #[inline]
+    #[must_use]
     pub fn elapsed_nanos(&self) -> u64 {
         u64::try_from(self.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// Elapsed [`Duration`] since `self`.
     #[inline]
+    #[must_use]
     pub fn elapsed(&self) -> Duration {
         self.inner.elapsed()
     }
@@ -55,6 +57,7 @@ impl MonotonicInstant {
     /// is monotonic, so this only reflects an ordering anomaly, never real
     /// backward time).
     #[inline]
+    #[must_use]
     pub fn delta_nanos(&self, other: &Self) -> u64 {
         match other.inner.checked_duration_since(self.inner) {
             Some(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
@@ -124,6 +127,7 @@ impl StreamTimestamps {
     }
 
     /// True once the stream has been fully closed (`Tn` recorded).
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         self.t_end.is_some()
     }

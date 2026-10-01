@@ -250,6 +250,33 @@ fn usage_captured_even_on_content_frame() {
 }
 
 #[test]
+fn empty_feed_and_empty_finish_produce_no_frames() {
+    // Edge: a parser that sees nothing (empty slice, then stream end)
+    // must yield zero frames — not a spurious empty-data frame.
+    let mut parser = SseParser::new();
+    assert!(parser.feed(b"").is_empty());
+    assert!(parser.finish().is_empty());
+    assert_eq!(parser.malformed_frames(), 0);
+    assert_eq!(parser.usage(), None);
+
+    // Edge: only comment / keepalive lines — no `data:` payload at all.
+    let mut parser = SseParser::new();
+    let frames = parser.feed(b": keepalive\n\n: another\n\n").to_vec();
+    assert!(frames.is_empty(), "comments are not frames");
+    assert!(parser.finish().is_empty());
+}
+
+#[test]
+fn chunk_is_token_classifies_the_token_categories() {
+    // The shared worker/engine seam: reasoning + content are tokens;
+    // usage + control are not.
+    assert!(Chunk::Reasoning("x".into()).is_token());
+    assert!(Chunk::Content("x".into()).is_token());
+    assert!(!Chunk::Usage(Usage::default()).is_token());
+    assert!(!Chunk::Control.is_token());
+}
+
+#[test]
 fn classify_priority_reasoning_over_content_over_usage() {
     // Reasoning beats content when both are present.
     let both = json!({

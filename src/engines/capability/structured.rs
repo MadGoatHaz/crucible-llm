@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::client::{StreamEvent, StreamWorker};
+use crate::client::{run_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
@@ -304,9 +304,8 @@ impl StructuredEngine {
         }
 
         let start = MonotonicInstant::now();
-        let outcome = tokio::spawn(worker.run(tx))
-            .await
-            .expect("structured worker task panicked");
+        // A worker-task panic becomes a failed outcome, never a crash.
+        let outcome = run_worker(worker, tx).await;
         let mut body = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
@@ -493,8 +492,7 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
 
     // Only the non-JSON checks run when the body parsed; otherwise the case
     // is `Failed` and there is nothing further to evaluate.
-    if valid {
-        let v = value.as_ref().unwrap();
+    if let Some(v) = &value {
         match name {
             "Simple" => {
                 let schema = v.is_object();

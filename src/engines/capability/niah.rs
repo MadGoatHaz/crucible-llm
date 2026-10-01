@@ -37,7 +37,7 @@ use arc_swap::ArcSwap;
 use rand::Rng;
 use tokio::sync::mpsc;
 
-use crate::client::{StreamEvent, StreamWorker};
+use crate::client::{run_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
@@ -674,9 +674,8 @@ impl NiahEngine {
         }
 
         let start = MonotonicInstant::now();
-        let outcome = tokio::spawn(worker.run(tx))
-            .await
-            .expect("niah worker task panicked");
+        // A worker-task panic becomes a failed outcome, never a crash.
+        let outcome = run_worker(worker, tx).await;
         let mut response = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;

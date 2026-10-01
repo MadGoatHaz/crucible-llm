@@ -1049,7 +1049,7 @@ impl LevelAccumulator {
                     Chunk::Content(_) => t.content_frames += 1,
                     Chunk::Control | Chunk::Usage(_) => {}
                 }
-                if is_token_frame(&frame.chunk) {
+                if frame.chunk.is_token() {
                     if let Some(ns) = sample {
                         self.itl.record(ns);
                     }
@@ -1200,12 +1200,6 @@ impl LevelAccumulator {
             streams: self.stream_rows(),
         }
     }
-}
-
-/// A frame carrying generated tokens (reasoning or content) — a `Usage` /
-/// `Control` frame is not a token arrival (mirrors the Chunk 5 worker).
-fn is_token_frame(chunk: &Chunk) -> bool {
-    matches!(chunk, Chunk::Reasoning(_) | Chunk::Content(_))
 }
 
 /// Relative throughput change `prev → cur` (`(cur − prev) / prev`).

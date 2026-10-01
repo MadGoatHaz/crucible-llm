@@ -129,6 +129,7 @@ impl SseParser {
     }
 
     /// Number of malformed-JSON frames skipped so far.
+    #[must_use]
     pub fn malformed_frames(&self) -> u64 {
         self.malformed
     }

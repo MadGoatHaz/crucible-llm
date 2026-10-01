@@ -51,11 +51,25 @@ pub enum Chunk {
     Usage(Usage),
 }
 
+impl Chunk {
+    /// `true` when this chunk carries generated tokens (a
+    /// [`Reasoning`](Chunk::Reasoning) or
+    /// [`Content`](Chunk::Content) delta). A [`Usage`](Chunk::Usage) /
+    /// [`Control`](Chunk::Control) frame is *not* a token arrival — the
+    /// workers and engines use this to latch the first-token timestamp
+    /// (T3) and to count token frames.
+    #[must_use]
+    pub fn is_token(&self) -> bool {
+        matches!(self, Self::Reasoning(_) | Self::Content(_))
+    }
+}
+
 /// Classify one parsed streaming chunk.
 ///
 /// Reads the first choice's `delta` first: `reasoning`/`reasoning_content`
 /// wins, then `content`; a top-level `usage` object on a chunk with no token
 /// delta yields [`Chunk::Usage`]; anything else is [`Chunk::Control`].
+#[must_use]
 pub fn classify(value: &Value) -> Chunk {
     if let Some(text) = delta_string(value, &["reasoning", "reasoning_content"]) {
         return Chunk::Reasoning(text);

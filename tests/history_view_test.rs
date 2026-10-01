@@ -17,27 +17,23 @@
 
 use std::path::PathBuf;
 
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
-use ratatui::Terminal;
 
 use crucible_llm::storage::db::Database;
 use crucible_llm::storage::models::{BenchmarkSession, StreamMetricRow};
 use crucible_llm::ui::app::App;
-use crucible_llm::ui::views::history::{session_summary, DiffReport, HistoryState};
+use crucible_llm::ui::views::history::{self, session_summary, DiffReport, HistoryState};
+
+mod common;
+use common::render::render_buffer;
 
 const W: u16 = 120;
 const H: u16 = 40;
 
 /// Render the History view at `w`x`h` and return the resulting buffer.
 fn render_history(app: &App, w: u16, h: u16) -> Buffer {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
-    terminal
-        .draw(|f| crucible_llm::ui::views::history::render(f.area(), app, f))
-        .expect("render frame");
-    terminal.backend().buffer().clone()
+    render_buffer(history::render, app, w, h)
 }
 
 /// Join every cell's symbol into one flat string for substring asserts.

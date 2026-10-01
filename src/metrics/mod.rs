@@ -1,7 +1,6 @@
-//! Metrics synthesis: the `EngineCore` aggregator, the `LatencyHistogram`
-//! wrapper, and the `ArcSwap` double-buffered snapshot for the UI.
+//! Metrics synthesis: the `LatencyHistogram` wrapper and the `ArcSwap`
+//! double-buffered snapshot the UI reads lock-free.
 
-pub mod engine;
 pub mod histogram;
 pub mod state;
 

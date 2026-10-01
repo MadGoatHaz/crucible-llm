@@ -21,18 +21,21 @@
 
 use std::time::Duration;
 
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
-use ratatui::Terminal;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 use crucible_llm::client::pool::WorkerPool;
 use crucible_llm::engines::concurrency::{Sweep, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crucible_llm::metrics::state::{StreamMetric, StreamStatus};
 use crucible_llm::ui::app::{App, View};
 use crucible_llm::ui::views::concurrency;
+
+mod common;
+use common::mock::*;
+use common::render::{render_buffer, render_text};
 
 // ── Mock SSE payloads (vLLM-style) ────────────────────────────────────────
 
@@ -82,35 +85,10 @@ async fn start_mock_sse(
     (format!("http://{addr}"), handle)
 }
 
-/// Read the request until the header block is complete.
-async fn drain_request(sock: &mut tokio::net::TcpStream) {
-    let mut buf = [0u8; 8192];
-    let mut acc = Vec::new();
-    use tokio::io::AsyncReadExt;
-    loop {
-        match sock.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") || acc.len() > 65536 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-async fn serve_stream(
-    sock: &mut tokio::net::TcpStream,
-    content_frames: usize,
-    frame_delay: Duration,
-) {
-    write_all(
-        sock,
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )
-    .await;
+/// Serve a ladder-level stream: role opener, `content_frames` token
+/// frames (spaced by `frame_delay`), usage, `[DONE]`.
+async fn serve_stream(sock: &mut TcpStream, content_frames: usize, frame_delay: Duration) {
+    write_all(sock, SSE_HEADERS).await;
     let mut frames = vec![role_frame()];
     for i in 0..content_frames {
         frames.push(content_frame(i));
@@ -127,19 +105,6 @@ async fn serve_stream(
     let _ = sock.shutdown().await;
 }
 
-async fn write_all(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn test_pool(url: &str) -> WorkerPool {
@@ -147,37 +112,66 @@ fn test_pool(url: &str) -> WorkerPool {
         .read_timeout(Duration::from_secs(10))
 }
 
-/// Count open `socket:` file descriptors in this process (Linux `/proc`).
-/// `None` when the platform does not expose `/proc/self/fd`.
-fn socket_fd_count() -> Option<usize> {
+/// Count TCP sockets to remote port `port` that are stuck in a *leak*
+/// state (ESTABLISHED / CLOSING / CLOSE_WAIT), by parsing
+/// `/proc/net/tcp{,6}` (Linux).
+///
+/// This isolates *this* test's mock connections from sibling tests (which
+/// bind their own ports), so the leak check is stable under parallel test
+/// execution. A clean close never leaves these states: the leaked-fd
+/// signature is CLOSE_WAIT (the peer closed, we never did). Transient
+/// TIME_WAIT / FIN_WAIT sockets from a normal shutdown are intentionally
+/// not counted.
+/// `None` when the platform does not expose `/proc/net/tcp`.
+fn stuck_sockets_to_port(port: u16) -> Option<usize> {
+    const LEAK_STATES: &[&str] = &["01", "07", "08"]; // ESTABLISHED, CLOSING, CLOSE_WAIT
     let mut count = 0;
-    let entries = std::fs::read_dir("/proc/self/fd").ok()?;
-    for entry in entries.flatten() {
-        let target = std::fs::read_link(entry.path()).ok()?;
-        if target.to_string_lossy().starts_with("socket:") {
-            count += 1;
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(data) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for line in data.lines().skip(1) {
+            let mut fields = line.split_whitespace();
+            // sl, local_address, rem_address, st, …
+            fields.next()?;
+            fields.next()?;
+            let rem = fields.next()?;
+            let state = fields.next()?;
+            if !LEAK_STATES.contains(&state) {
+                continue;
+            }
+            // `rem` is `HEXIP:HEXPORT`.
+            let rport = rem.rsplit(':').next()?.parse::<u16>().ok()?;
+            if rport == port {
+                count += 1;
+            }
         }
     }
     Some(count)
 }
 
+/// Sample `stuck_sockets_to_port` `samples` times at `interval` spacing and
+/// return the minimum — a socket still tearing down must not masquerade as
+/// a leak.
+async fn min_stuck_sockets(port: u16, samples: usize, interval: Duration) -> Option<usize> {
+    let mut min: Option<usize> = None;
+    for _ in 0..samples {
+        if let Some(c) = stuck_sockets_to_port(port) {
+            min = Some(min.map(|m| m.min(c)).unwrap_or(c));
+        }
+        tokio::time::sleep(interval).await;
+    }
+    min
+}
+
 /// Render the Concurrency view at `w`x`h` and return the resulting buffer.
 fn render_concurrency_at(app: &App, w: u16, h: u16) -> Buffer {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
-    terminal
-        .draw(|f| concurrency::render(f.area(), app, f))
-        .expect("render frame");
-    terminal.backend().buffer().clone()
+    render_buffer(concurrency::render, app, w, h)
 }
 
 /// Render the Concurrency view at 120x40 and return the flat buffer text.
 fn render_concurrency(app: &App) -> String {
-    render_concurrency_at(app, 120, 40)
-        .content()
-        .iter()
-        .map(|c| c.symbol())
-        .collect()
+    render_text(concurrency::render, app, 120, 40)
 }
 
 fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
@@ -287,8 +281,13 @@ async fn aggregate_metrics_span_all_concurrent_streams() {
 #[tokio::test]
 async fn no_fd_leaks_after_sweep_shutdown() {
     let (url, server) = start_mock_sse(2, Duration::from_millis(5)).await;
-    // Baseline *after* the mock's listener exists, *before* any sweep.
-    let baseline = socket_fd_count();
+    // Our mock's port — the leak check is scoped to it, so sibling tests
+    // (each binding their own port) can never contaminate the count.
+    let port: u16 = url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("mock url must carry a port");
 
     let sweep = Sweep::new(test_pool(&url), [2, 4]);
     let result = sweep.run().await;
@@ -298,13 +297,15 @@ async fn no_fd_leaks_after_sweep_shutdown() {
     // mock server.
     drop(sweep);
     server.abort();
-    // Give the pool teardown a moment to close sockets.
+    // Give the pool teardown a moment to close sockets, then sample: a
+    // leaked worker fd would linger in CLOSE_WAIT against our port.
     tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = min_stuck_sockets(port, 10, Duration::from_millis(100)).await;
 
-    if let (Some(before), Some(after)) = (baseline, socket_fd_count()) {
-        assert!(
-            after <= before + 2,
-            "fd leak: {before} sockets before sweep, {after} after shutdown"
+    if let Some(after) = after {
+        assert_eq!(
+            after, 0,
+            "socket leak: {after} connection(s) to the mock still open after shutdown"
         );
     }
 }

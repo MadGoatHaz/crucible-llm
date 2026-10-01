@@ -32,12 +32,11 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::client::{StreamEvent, StreamWorker};
+use crate::client::{run_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
-use crate::prompt::PromptGenerator;
 use crate::sse::Chunk;
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -301,8 +300,6 @@ pub struct ReasoningEngine {
     model: String,
     api_key: Option<String>,
     timeout: u64,
-    #[allow(dead_code)]
-    generator: PromptGenerator,
     /// Optional sequence seam: publish `Challenge {n}/{total}` to the
     /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
     progress: Option<Arc<ProgressBus>>,
@@ -326,17 +323,18 @@ impl ReasoningEngine {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(cfg.timeout.max(1)))
             .build()?;
-        let generator = match &cfg.tokenizer {
-            Some(path) => PromptGenerator::new(Some(crate::prompt::Tokenizer::from_file(path)?)),
-            None => PromptGenerator::new(None),
-        };
+        // Same tokenizer policy as Engine A: an explicit `--tokenizer` that
+        // fails to load is a hard error (validated here, not stored — the
+        // bank's prompts are fixed and need no counting).
+        if let Some(path) = &cfg.tokenizer {
+            crate::prompt::Tokenizer::from_file(path)?;
+        }
         Ok(Self {
             client,
             url: cfg.url.clone(),
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
-            generator,
             progress: None,
             metrics: None,
             pause: None,
@@ -394,9 +392,8 @@ impl ReasoningEngine {
         }
 
         let start = MonotonicInstant::now();
-        let outcome = tokio::spawn(worker.run(tx))
-            .await
-            .expect("reasoning worker task panicked");
+        // A worker-task panic becomes a failed outcome, never a crash.
+        let outcome = run_worker(worker, tx).await;
         let mut response = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;

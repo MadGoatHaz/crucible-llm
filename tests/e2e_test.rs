@@ -23,8 +23,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 use crucible_llm::client::pool::WorkerPool;
 use crucible_llm::config::{Config, ExportFormat};
@@ -32,51 +33,20 @@ use crucible_llm::engines::{NiahEngine, SpeedEngine, Sweep};
 use crucible_llm::storage::export::{self, ExportPayload};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 
+mod common;
+use common::mock::{
+    prompt_from_body, read_request, serve_json, write_all, write_chunk, SSE_HEADERS,
+};
+
 // ── Mock SSE server (multi-connection) ───────────────────────────────────
 
-/// Read the full HTTP request (headers + body) and return the request
-/// target (e.g. `GET /v1/models http/1.1`, lowercased) plus
+/// Read the full HTTP request and return the request
+/// target (e.g. `get /v1/models`, lowercased first line) plus
 /// `messages[0].content` from the JSON body (empty for a GET).
-async fn read_request(sock: &mut tokio::net::TcpStream) -> (String, String) {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-        }
-    }
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(buf.len());
-    let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+async fn read_target_and_prompt(sock: &mut TcpStream) -> (String, String) {
+    let (headers, body) = read_request(sock).await;
     let target = headers.lines().next().unwrap_or_default().to_string();
-    let mut content_length = 0usize;
-    for line in headers.lines() {
-        if let Some(rest) = line.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
-        }
-    }
-    let body = body[..content_length.min(body.len())].to_vec();
-    let prompt = serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v["messages"][0]["content"].as_str().map(String::from))
-        .unwrap_or_default();
-    (target, prompt)
+    (target, prompt_from_body(&body).unwrap_or_default())
 }
 
 /// The needle value as the NIAH engine injects it into the prompt
@@ -101,7 +71,7 @@ async fn start_mock() -> (String, tokio::task::JoinHandle<()>) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let (target, prompt) = read_request(&mut sock).await;
+            let (target, prompt) = read_target_and_prompt(&mut sock).await;
             // Chunk 20: the mock also serves the OpenAI-compatible model
             // discovery endpoint (the TUI's `list_models` target).
             if target.starts_with("get /v1/models") {
@@ -120,12 +90,8 @@ async fn start_mock() -> (String, tokio::task::JoinHandle<()>) {
 ///
 /// Frame order: role opener, content deltas, `usage`, `[DONE]` — the
 /// vLLM shape the SSE parser (Chunk 3) consumes.
-async fn respond(sock: &mut tokio::net::TcpStream, prompt: String) {
-    write_all(
-        sock,
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )
-    .await;
+async fn respond(sock: &mut TcpStream, prompt: String) {
+    write_all(sock, SSE_HEADERS).await;
 
     let (answer, completion_tokens) = match extract_needle_value(&prompt) {
         Some(value) => {
@@ -169,7 +135,7 @@ async fn respond(sock: &mut tokio::net::TcpStream, prompt: String) {
 /// Serve the OpenAI-compatible `GET /v1/models` discovery response
 /// (Chunk 20). Deliberately listed *out of order* (b before a) so the
 /// test also pins the client's id-sorting.
-async fn respond_models(sock: &mut tokio::net::TcpStream) {
+async fn respond_models(sock: &mut TcpStream) {
     let body = serde_json::json!({
         "object": "list",
         "data": [
@@ -178,29 +144,7 @@ async fn respond_models(sock: &mut tokio::net::TcpStream) {
         ]
     })
     .to_string();
-    write_all(
-        sock,
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-        .as_bytes(),
-    )
-    .await;
-    let _ = sock.shutdown().await;
-}
-
-async fn write_all(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
+    serve_json(sock, "HTTP/1.1 200 OK", &body).await;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

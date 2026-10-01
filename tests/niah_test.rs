@@ -14,17 +14,20 @@
 
 use std::time::Duration;
 
-use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
-use ratatui::Terminal;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::net::TcpStream;
 
 use crucible_llm::config::Config;
 use crucible_llm::engines::capability::{NiahCell, NiahCellState, NiahResult, NIAH_DEPTHS};
 use crucible_llm::ui::app::{App, View};
 use crucible_llm::ui::views::needle;
+
+mod common;
+use common::mock::{prompt_from_body, read_request, write_all, write_chunk, SSE_HEADERS};
+use common::render::render_buffer;
 
 // ── Mock server ───────────────────────────────────────────────────────────
 
@@ -50,7 +53,7 @@ async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
                 Ok(c) => c,
                 Err(_) => return,
             };
-            let prompt = read_request(&mut sock).await;
+            let prompt = read_prompt(&mut sock).await;
             respond(&mut sock, mock, prompt).await;
         }
     });
@@ -59,45 +62,9 @@ async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
 
 /// Read the full HTTP request (headers + body) and return
 /// `messages[0].content` from the JSON body.
-async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    // Read until the header block is complete.
-    loop {
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-        }
-    }
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
-        .unwrap_or(buf.len());
-    let headers = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
-    let mut content_length = 0usize;
-    for line in headers.lines() {
-        if let Some(rest) = line.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
-        }
-    }
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        match sock.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => body.extend_from_slice(&tmp[..n]),
-        }
-    }
-    let body = body[..content_length.min(body.len())].to_vec();
-    serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v["messages"][0]["content"].as_str().map(String::from))
-        .unwrap_or_default()
+async fn read_prompt(sock: &mut TcpStream) -> String {
+    let (_, body) = read_request(sock).await;
+    prompt_from_body(&body).unwrap_or_default()
 }
 
 /// The needle value as the engine injected it into the prompt
@@ -110,15 +77,11 @@ fn extract_needle_value(prompt: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-async fn respond(sock: &mut tokio::net::TcpStream, mock: Mock, prompt: String) {
+async fn respond(sock: &mut TcpStream, mock: Mock, prompt: String) {
     // Headers go out immediately; for SlowPrefill the *first body byte*
     // is what arrives late — TTFT is `T3 − T1` (T1 = headers received),
     // so only a post-header delay simulates prefill degradation.
-    write_all(
-        sock,
-        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-    )
-    .await;
+    write_all(sock, SSE_HEADERS).await;
     if mock == Mock::SlowPrefill {
         let approx_tokens = (prompt.chars().count() / 4) as u64;
         let ms = if approx_tokens < 3000 { 40 } else { 600 };
@@ -145,19 +108,6 @@ async fn respond(sock: &mut tokio::net::TcpStream, mock: Mock, prompt: String) {
     }
     write_chunk(sock, b"").await; // terminating chunk
     let _ = sock.shutdown().await;
-}
-
-async fn write_all(sock: &mut tokio::net::TcpStream, bytes: &[u8]) {
-    let _ = sock.write_all(bytes).await;
-    let _ = sock.flush().await;
-}
-
-/// Write one `Transfer-Encoding: chunked` frame.
-async fn write_chunk(sock: &mut tokio::net::TcpStream, payload: &[u8]) {
-    let mut msg = format!("{:x}\r\n", payload.len());
-    msg.push_str(&String::from_utf8_lossy(payload));
-    msg.push_str("\r\n");
-    write_all(sock, msg.as_bytes()).await;
 }
 
 // ── Test harness ──────────────────────────────────────────────────────────
@@ -263,12 +213,7 @@ async fn superlinear_prefill_is_classified_throttled() {
 // ── View 3 (blueprint §6) ────────────────────────────────────────────────
 
 fn render_needle(app: &App, w: u16, h: u16) -> Buffer {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
-    terminal
-        .draw(|f| needle::render(f.area(), app, f))
-        .expect("render frame");
-    terminal.backend().buffer().clone()
+    render_buffer(needle::render, app, w, h)
 }
 
 fn buf_text(buf: &Buffer) -> String {
