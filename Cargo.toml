@@ -3,6 +3,8 @@ name = "crucible-llm"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance terminal LLM benchmark & inference profiler"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/YOURUSERNAME/crucible-llm"
 
 [dependencies]
 # TUI
