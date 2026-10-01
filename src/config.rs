@@ -984,10 +984,15 @@ mod tests {
     }
 
     /// Layer with no env and no file.
+    ///
+    /// Goes through [`layer`] directly (not [`Config::resolve`]) so the
+    /// platform-default config file on a developer's machine can never
+    /// contaminate the assertions (a real `~/.config/crucible/config.json`
+    /// with a `url`/`ladder` entry made these tests machine-dependent).
     fn resolve_bare(cli_args: &[&str]) -> Config {
         let cli = cli_from(cli_args);
         let matches = matches_from(cli_args);
-        Config::resolve(&cli, &matches, &[]).unwrap()
+        layer(&cli, &matches, &[], None).unwrap()
     }
 
     #[test]
