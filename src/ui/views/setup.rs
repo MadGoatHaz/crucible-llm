@@ -691,12 +691,14 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 fn render_top_bar(area: Rect, s: &SetupState, f: &mut Frame) {
     let step = s.phase.step_index();
     let mut spans = vec![
+        Span::styled(" CRUCIBLE", style::title()),
         Span::styled(
-            " CRUCIBLE-LLM — SETUP ",
+            "·LLM",
             Style::default()
-                .fg(palette::ACCENT)
+                .fg(palette::SECONDARY)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(" — SETUP ", style::title()),
         // The explicit phase indicator: "Step 1 of 4: Server URL".
         Span::styled(" │ ", style::tab_separator()),
         Span::styled(

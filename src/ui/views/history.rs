@@ -826,7 +826,7 @@ fn render_delete_confirm(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame
     let block = theme::block(
         theme::panel_title("DELETE RUN?"),
         Style::default()
-            .fg(palette::WARN)
+            .fg(palette::CALLOUT)
             .add_modifier(ratatui::style::Modifier::BOLD),
     );
     let s = h.sessions.get(idx);
@@ -844,7 +844,7 @@ fn render_delete_confirm(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame
     };
     let lines = vec![
         Line::raw(""),
-        Line::from(Span::styled(desc, Style::default().fg(palette::WARN))),
+        Line::from(Span::styled(desc, Style::default().fg(palette::CALLOUT))),
         Line::raw(""),
         Line::from(vec![
             Span::styled("  [y] Delete", style::value_err()),

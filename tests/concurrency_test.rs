@@ -22,7 +22,6 @@
 use std::time::Duration;
 
 use ratatui::buffer::Buffer;
-use ratatui::style::Color;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
@@ -31,6 +30,7 @@ use crucible_llm::client::pool::WorkerPool;
 use crucible_llm::engines::concurrency::{Sweep, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crucible_llm::metrics::state::{StreamMetric, StreamStatus};
 use crucible_llm::ui::app::{App, View};
+use crucible_llm::ui::theme::palette;
 use crucible_llm::ui::views::concurrency;
 
 mod common;
@@ -480,25 +480,25 @@ fn view2_curve_marks_sweet_spot_and_knee() {
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
 
     assert!(text.contains("Parallel Users"), "curve panel title");
-    // Sweet spot (2): a yellow ● marker. Knee (4): a red ▲ marker.
+    // Sweet spot (2): a bright-cyan ◆ marker. Knee (4): a hot-pink ▲ marker.
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "●" && c.fg == Color::Yellow),
-        "sweet spot is a yellow ●"
+            .any(|c| c.symbol() == "◆" && c.fg == palette::ACCENT),
+        "sweet spot is a bright-cyan ◆"
     );
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "▲" && c.fg == Color::Red),
-        "knee is a red ▲"
+            .any(|c| c.symbol() == "▲" && c.fg == palette::CALLOUT),
+        "knee is a hot-pink ▲"
     );
-    // The level below the sweet spot (1): a green ● marker.
+    // The level below the sweet spot (1): a mint ◆ marker.
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
-        "levels below the sweet spot are green ●"
+            .any(|c| c.symbol() == "◆" && c.fg == palette::OK),
+        "levels below the sweet spot are mint ◆"
     );
     // Stems, the knee annotation, and the value labels on every point.
     assert!(text.contains('│'));
@@ -534,18 +534,18 @@ fn view2_curve_renders_the_full_ladder() {
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "●" && c.fg == Color::Yellow),
-        "sweet spot (8) is a yellow ●"
+            .any(|c| c.symbol() == "◆" && c.fg == palette::ACCENT),
+        "sweet spot (8) is a bright-cyan ◆"
     );
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "▲" && c.fg == Color::Red),
-        "knee (16) is a red ▲"
+            .any(|c| c.symbol() == "▲" && c.fg == palette::CALLOUT),
+        "knee (16) is a hot-pink ▲"
     );
     assert!(
-        buf.content().iter().filter(|c| c.symbol() == "●").count() >= 5,
-        "the five non-knee levels get ● markers"
+        buf.content().iter().filter(|c| c.symbol() == "◆").count() >= 5,
+        "the five non-knee levels get ◆ markers"
     );
 }
 

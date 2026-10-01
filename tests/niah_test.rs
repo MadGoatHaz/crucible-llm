@@ -23,6 +23,7 @@ use tokio::net::TcpStream;
 use crucible_llm::config::Config;
 use crucible_llm::engines::capability::{NiahCell, NiahCellState, NiahResult, NIAH_DEPTHS};
 use crucible_llm::ui::app::{App, View};
+use crucible_llm::ui::theme::palette;
 use crucible_llm::ui::views::needle;
 
 mod common;
@@ -256,19 +257,20 @@ fn view3_renders_color_coded_grid_from_published_result() {
     }
     assert!(text.contains("100%"));
 
-    // The three color classes are present in the grid.
+    // The three color classes are present in the grid (cyberpunk:
+    // nominal = mint, throttled = electric purple, failed = hot pink).
     let colors = buf_colors(&buf);
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == Color::Green),
-        "a nominal (green) cell must render"
+        colors.iter().any(|(s, c)| s == "●" && *c == palette::OK),
+        "a nominal (mint) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == Color::Yellow),
-        "a throttled (yellow) cell must render"
+        colors.iter().any(|(s, c)| s == "●" && *c == palette::WARN),
+        "a throttled (purple) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "✗" && *c == Color::Red),
-        "a failed (red) cell must render"
+        colors.iter().any(|(s, c)| s == "✗" && *c == palette::ERR),
+        "a failed (hot-pink) cell must render"
     );
 
     // The legend reports the headline accuracy (cells 0, 1, 2 retrieved;
