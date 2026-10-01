@@ -481,6 +481,10 @@ fn build_throughput_chart(
 /// with the hero chart, which shows the *live* rolling window. Every number
 /// is read lock-free from the snapshot's [`OverallStats`]
 /// (measurement-isolation invariant, blueprint §4).
+///
+/// **Label spacing** (user feedback 6): every row is `Label: value` — the
+/// label (colon included) is padded to a fixed width so all values start in
+/// the same column. No more `Total Tokens33,108` or `Streamavg` collisions.
 fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let o = &m.overall;
     let block = Block::default()
@@ -491,40 +495,41 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
+    // Throughput rows use the compact stat format (one decimal under 1000,
+    // none above); latency rows (TTFT / ITL) format each value with its own
+    // unit (`312ms` / `1.2s`), so they carry no trailing unit column.
+    let gen = stat_triple(o.gen.avg, o.gen.max, o.gen.p5, fmt_stat);
+    let prompt = stat_triple(o.prompt.avg, o.prompt.max, o.prompt.p5, fmt_stat);
+    let ttft = stat_triple(
+        o.ttft.avg * 1000.0,
+        o.ttft.max * 1000.0,
+        o.ttft.p5 * 1000.0,
+        fmt_latency,
+    );
+    let itl50 = stat_triple(o.itl_p50.avg, o.itl_p50.max, o.itl_p50.p5, fmt_latency);
+    let itl99 = stat_triple(o.itl_p99.avg, o.itl_p99.max, o.itl_p99.p5, fmt_latency);
     let lines = vec![
-        stat_row("Gen Throughput", o.gen.avg, o.gen.max, o.gen.p5, "t/s"),
+        stat_row("Gen Throughput", &gen.0, &gen.1, &gen.2, Some("t/s")),
         stat_row(
             "Prompt Throughput",
-            o.prompt.avg,
-            o.prompt.max,
-            o.prompt.p5,
-            "t/s",
+            &prompt.0,
+            &prompt.1,
+            &prompt.2,
+            Some("t/s"),
         ),
-        stat_row(
-            "TTFT",
-            o.ttft.avg * 1000.0,
-            o.ttft.max * 1000.0,
-            o.ttft.p5 * 1000.0,
-            "ms",
-        ),
-        stat_row("ITL p50", o.itl_p50.avg, o.itl_p50.max, o.itl_p50.p5, "ms"),
-        stat_row("ITL p99", o.itl_p99.avg, o.itl_p99.max, o.itl_p99.p5, "ms"),
-        Line::from(vec![
-            Span::styled("Total Tokens".to_string(), style::label()),
-            Span::styled(format!("{: <14}", grouped(o.total_tokens)), style::value()),
-            Span::styled("generated", style::footer()),
-        ]),
-        Line::from(vec![
-            Span::styled("Streams".to_string(), style::label()),
-            Span::styled(
-                format!("avg {:.1} active │ max {}", o.active_avg, o.active_max),
-                style::value(),
+        stat_row("TTFT", &ttft.0, &ttft.1, &ttft.2, None),
+        stat_row("ITL p50", &itl50.0, &itl50.1, &itl50.2, None),
+        stat_row("ITL p99", &itl99.0, &itl99.1, &itl99.2, None),
+        simple_row("Total Tokens", &grouped(o.total_tokens)),
+        simple_row(
+            "Streams",
+            &format!(
+                "avg {a:<5} │ max {b}",
+                a = format!("{:.1}", o.active_avg),
+                b = o.active_max
             ),
-        ]),
-        Line::from(vec![
-            Span::styled("Total Duration".to_string(), style::label()),
-            Span::styled(fmt_duration(o.duration_sec), style::value()),
-        ]),
+        ),
+        simple_row("Total Duration", &fmt_duration(o.duration_sec)),
         Line::from(Span::styled(
             "ℹ All engines. p5 = 5th percentile (worst 5%).",
             style::info(),
@@ -538,20 +543,58 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     );
 }
 
-/// One `label  avg X │ max Y │ p5 Z  unit` row for the overall panel
-/// (`--` across the board when the metric has no samples yet).
-fn stat_row(label: &str, avg: f64, max: f64, p5: f64, unit: &str) -> Line<'static> {
+/// The label cell: `{label}:` padded to 20 columns (the longest label,
+/// `Prompt Throughput:`, is 18) so every value in the panel starts in the
+/// same column — the user-reported `Total Tokens33,108` / `Streamavg`
+/// collisions are gone.
+fn label_cell(label: &str) -> Span<'static> {
+    Span::styled(format!("{:<20}", format!("{label}:")), style::label())
+}
+
+/// One `Label:   avg X │ max Y │ p5 Z [unit]` row for the overall panel
+/// (the pre-formatted value strings come from [`stat_triple`], which
+/// yields `--` across the board when the metric has no samples yet).
+fn stat_row(label: &str, a: &str, m: &str, p: &str, unit: Option<&str>) -> Line<'static> {
+    let mut spans = vec![
+        label_cell(label),
+        Span::styled(format!("avg {a:<5} │ max {m:<5} │ p5 {p}"), style::value()),
+    ];
+    if let Some(u) = unit {
+        spans.push(Span::styled(format!("  {u}"), style::footer()));
+    }
+    Line::from(spans)
+}
+
+/// One `Label:   value` row (total tokens, streams, duration).
+fn simple_row(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        label_cell(label),
+        Span::styled(value.to_string(), style::value()),
+    ])
+}
+
+/// Format `(avg, max, p5)` with `fmt`; all `--` when the metric has no
+/// samples yet.
+fn stat_triple(avg: f64, max: f64, p5: f64, fmt: fn(f64) -> String) -> (String, String, String) {
     let none = avg <= 0.0 && max <= 0.0;
-    let (a, m, p) = if none {
+    if none {
         ("--".to_string(), "--".to_string(), "--".to_string())
     } else {
-        (fmt_stat(avg), fmt_stat(max), fmt_stat(p5))
-    };
-    Line::from(vec![
-        Span::styled(format!("{label:<18}"), style::label()),
-        Span::styled(format!("avg {a} │ max {m} │ p5 {p}"), style::value()),
-        Span::styled(format!("  {unit}"), style::footer()),
-    ])
+        (fmt(avg), fmt(max), fmt(p5))
+    }
+}
+
+/// Adaptive latency format: `12.1ms` under 100 ms, `312ms` under 1 s,
+/// `1.2s` at/above 1 s — each value carries its own unit, so the latency
+/// rows (TTFT / ITL) need no trailing unit column.
+fn fmt_latency(v_ms: f64) -> String {
+    if v_ms >= 1000.0 {
+        format!("{:.1}s", v_ms / 1000.0)
+    } else if v_ms >= 100.0 {
+        format!("{:.0}ms", v_ms)
+    } else {
+        format!("{v_ms:.1}ms")
+    }
 }
 
 /// A stat value: one decimal under 1000, none above (keeps rows compact).
@@ -1283,6 +1326,42 @@ mod tests {
         assert!(text.contains("OVERALL METRICS"), "overall title: {text}");
         assert!(text.contains("percentile"), "p5 legend: {text}");
         assert!(text.contains('ℹ'), "info note: {text}");
+    }
+
+    #[test]
+    fn overall_metric_label_cells_pad_to_20_with_trailing_spaces() {
+        // The user-reported bug: labels ran straight into their values
+        // ("Total Tokens33,108", "Streamavg"). Every label cell must be
+        // exactly 20 columns — the label, a colon directly after it, and
+        // at least two spaces of padding before the value column starts.
+        for label in [
+            "Gen Throughput",
+            "Prompt Throughput",
+            "TTFT",
+            "ITL p50",
+            "ITL p99",
+            "Total Tokens",
+            "Streams",
+            "Total Duration",
+        ] {
+            let text = label_cell(label).content.as_ref().to_string();
+            assert_eq!(text.len(), 20, "{label}: {text:?}");
+            let colon = text.find(':').expect("the label cell carries a colon");
+            assert_eq!(&text[..colon], label, "{label}: {text:?}");
+            assert!(
+                text[colon + 1..].starts_with("  "),
+                "{label}: at least two spaces after the colon: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn latency_format_switches_units_at_one_second() {
+        assert_eq!(fmt_latency(12.1), "12.1ms");
+        assert_eq!(fmt_latency(41.2), "41.2ms");
+        assert_eq!(fmt_latency(145.0), "145ms");
+        assert_eq!(fmt_latency(200.0), "200ms");
+        assert_eq!(fmt_latency(1200.0), "1.2s");
     }
 
     #[test]

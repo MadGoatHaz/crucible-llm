@@ -76,7 +76,8 @@ impl SetupPhase {
 pub enum SetupKeyResult {
     /// The key was consumed by the flow; nothing special to do.
     Inert,
-    /// `Esc` at stage 1 — the user asked to quit.
+    /// `Esc` at stage 1 — the user asked to quit (the app turns this into
+    /// the `[y/N]` confirmation overlay; only a confirmed `y` quits).
     Quit,
     /// Stage 1 `Enter` (non-empty URL) — start model discovery.
     Discover,
@@ -239,7 +240,8 @@ impl SetupState {
 
     fn handle_url_key(&mut self, key: &KeyEvent) -> SetupKeyResult {
         match key.code {
-            // Stage 1 is the outermost stage: `Esc` quits the app.
+            // Stage 1 is the outermost stage: `Esc` asks to quit (the app
+            // opens the `[y/N]` confirmation overlay — the only quit path).
             KeyCode::Esc => SetupKeyResult::Quit,
             KeyCode::Enter => {
                 if self.url.trim().is_empty() {
@@ -995,7 +997,7 @@ fn summary_line(label: &str, value: &str, value_style: Style) -> Line<'static> {
 fn render_footer(area: Rect, s: &SetupState, f: &mut Frame) {
     let hint = match s.phase {
         SetupPhase::Url => {
-            "[type] URL  ·  [←→/Home/End] cursor  ·  [⌫/Del] delete  ·  [Enter] discover models  ·  [Esc] quit"
+            "[type] URL  ·  [←→/Home/End] cursor  ·  [⌫/Del] delete  ·  [Enter] discover models  ·  [Esc] quit (y/n)"
         }
         SetupPhase::Discover => "[d] retry  ·  [Esc] back to URL",
         SetupPhase::Model => {
@@ -1133,7 +1135,9 @@ mod tests {
     }
 
     #[test]
-    fn url_esc_quits() {
+    fn url_esc_requests_quit() {
+        // Esc at the outermost stage asks to quit — the app (not the
+        // setup flow) turns that into the `[y/N]` confirmation overlay.
         let mut s = SetupState::new();
         assert_eq!(
             s.handle_key(&key(KeyCode::Esc), &mut cfg()),

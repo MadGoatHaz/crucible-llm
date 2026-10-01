@@ -1,7 +1,7 @@
 //! `App` state machine: the `View` enum (`Live`, `Concurrency`, `Needle`,
 //! `History`, `Config`) and key handling (blueprint §6 footer: `1`-`5` switch
 //! views, `Space` pause/resume, `+` step concurrency, `n` new needle,
-//! `e` export, `q`/`Esc` quit).
+//! `e` export, `q` quit — with a `[y/N]` confirmation overlay).
 //!
 //! **State-aware key guards** (the TUI interaction audit): a benchmark
 //! is a *server-load* event, so while a `BenchmarkSequence` (or any
@@ -11,7 +11,11 @@
 //! always-available keys are view switching (`1`-`5`), `Space`
 //! (pause/resume: the shared [`RunPause`] gate holds each engine before
 //! its next request, in-flight streams complete, resume continues where
-//! it left off), `e` (local file export), and `q`/`Esc` (quit). The
+//! it left off), `e` (local file export), and `q` (quit — the *only* quit
+//! key: it opens a `[y/N]` confirmation overlay, and only a confirmed `y`
+//! ends the app). `Ctrl-C` is inert (the terminal's copy selection owns
+//! it) and `Esc` never quits outright (in Setup stage 1 it opens the same
+//! confirmation; in the dashboard it leaves the Config view). The
 //! `n` key additionally requires a `[Y/N]` confirmation that shows the
 //! request count (default matrix: 7 sizes × 11 depths = 77), and the
 //! footer + status bar reflect the current state (Idle / BUSY / Paused /
@@ -30,8 +34,8 @@ use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::client::models::ModelInfo;
@@ -139,7 +143,8 @@ pub enum Phase {
 pub enum KeyAction {
     /// Nothing to do — keep running.
     Continue,
-    /// User asked to quit (`q` / `Esc` / Ctrl-C).
+    /// The quit was confirmed (`q` → the `[y/N]` overlay → `y`). Ctrl-C is
+    /// inert and `Esc` never quits outright.
     Quit,
     /// `Space` — pause/resume the benchmark.
     PauseResume,
@@ -257,6 +262,15 @@ pub struct App {
     /// the system is idle (never during a benchmark sequence), so a
     /// single confirmed press can spawn at most one NIAH run.
     pub pending_niah: bool,
+    /// `true` while the quit confirmation overlay ("Quit crucible-llm?
+    /// [y] Yes  [n] No") is on screen — a modal that swallows every key
+    /// but `y`/`Y`/`Enter` (confirm → `running = false`) and anything
+    /// else (cancel). `q` is the *only* quit key (Ctrl-C is inert so the
+    /// terminal's copy selection works, and Esc never quits outright).
+    /// It works in both the dashboard and the Setup takeover (where
+    /// `Esc` at stage 1 opens it, since `q` is a typeable character
+    /// there).
+    pub pending_quit: bool,
     /// The executor's log pipe: the sequence task *sends* real events;
     /// the tick path *drains* them into [`log`](Self::log) (the bounded
     /// line list the Live view renders). `None` until the first run.
@@ -314,6 +328,7 @@ impl App {
             seq_bus: Arc::new(ProgressBus::new()),
             pause: Arc::new(RunPause::new()),
             pending_niah: false,
+            pending_quit: false,
             log_rx: None,
             vram_warned: false,
             // Tests use `App::new()` directly: a disabled logger keeps
@@ -769,12 +784,36 @@ impl App {
 
     /// Handle one terminal key event (blueprint §6 footer key map).
     pub fn handle_key(&mut self, key: &KeyEvent) -> KeyAction {
-        // Ctrl-C quits globally — in the dashboard *and* the Setup
-        // takeover (where `q` and `Esc` are phase keys, not quit keys).
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.logger.info(Context::Tui, "quit (Ctrl-C)");
-            self.running = false;
-            return KeyAction::Quit;
+        // Ctrl-C is **inert**: the terminal's copy selection (mouse-select
+        // + Ctrl-C) owns it, so it must never quit the app — and the same
+        // swallow covers every other Ctrl combo, so none of them can fire
+        // a key action (the old global `Ctrl-C quits` path is gone).
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return KeyAction::Continue;
+        }
+
+        // The quit confirmation is a **modal overlay** (dashboard *and*
+        // Setup takeover): `y`/`Y`/`Enter` confirms — the *only* quit
+        // path — and every other key cancels and is swallowed (a stray
+        // keypress can never both answer the prompt and trigger a second
+        // action).
+        if self.pending_quit {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.pending_quit = false;
+                    self.logger.info(Context::Tui, "quit (q confirmed)");
+                    self.running = false;
+                    KeyAction::Quit
+                }
+                _ => {
+                    self.pending_quit = false;
+                    self.push_log(
+                        "[quit] cancelled — the app keeps running".to_string(),
+                        style::value_warn(),
+                    );
+                    KeyAction::Continue
+                }
+            };
         }
 
         // Setup phase (full-screen takeover): every other key routes to
@@ -783,9 +822,12 @@ impl App {
         if self.phase == Phase::Setup {
             return match self.setup.handle_key(key, &mut self.config) {
                 SetupKeyResult::Inert => KeyAction::Continue,
+                // `Esc` at stage 1 no longer quits outright: it opens the
+                // `[y/N]` confirmation overlay (the only quit path — in
+                // Setup `q` is a typeable character, not a quit key).
                 SetupKeyResult::Quit => {
-                    self.running = false;
-                    KeyAction::Quit
+                    self.pending_quit = true;
+                    KeyAction::Continue
                 }
                 // Stage 1 `Enter` / stage 2 `d`: sync the entered target
                 // into the shared form, then fire the async discovery.
@@ -839,21 +881,18 @@ impl App {
             }
         }
 
-        // `q` quits globally — even inside the Config view (where `q` would
-        // otherwise be typed into a field).
+        // `q` is the **only** quit key — even inside the Config view
+        // (where `q` would otherwise be typed into a field). It opens the
+        // `[y/N]` confirmation overlay; only a confirmed `y` quits.
         if key.code == KeyCode::Char('q') {
-            self.logger.info(Context::Tui, "quit (q)".to_string());
-            self.running = false;
-            return KeyAction::Quit;
+            self.pending_quit = true;
+            self.logger
+                .info(Context::Tui, "quit confirmation opened (q)");
+            return KeyAction::Continue;
         }
-        // `Esc` quits — EXCEPT in the Config view, where it leaves the
-        // config (to the gate / Live) instead of killing the app (FIX 4:
-        // the view must never trap the user; `q` is the quit key there).
-        if key.code == KeyCode::Esc && self.view != View::Config {
-            self.logger.info(Context::Tui, "quit (Esc)".to_string());
-            self.running = false;
-            return KeyAction::Quit;
-        }
+        // `Esc` never quits: in the dashboard views it is a no-op (the
+        // Config view handles it itself — leave to the gate / Live — and
+        // Setup stage 1 routes it to the confirmation above).
 
         // `c` — re-open the interactive Setup takeover. Scoped away from
         // View 5, where `c` is a typeable character in a field. Locked
@@ -1275,23 +1314,64 @@ impl App {
     pub fn render(&self, f: &mut Frame) {
         if self.phase == Phase::Setup {
             views::setup::render(f.area(), self, f);
-            return;
-        }
-        let area = f.area();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // status bar
-                Constraint::Length(1), // tab bar
-                Constraint::Min(3),    // view content
-                Constraint::Length(1), // footer
-            ])
-            .split(area);
+        } else {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1), // status bar
+                    Constraint::Length(1), // tab bar
+                    Constraint::Min(3),    // view content
+                    Constraint::Length(1), // footer
+                ])
+                .split(area);
 
-        self.render_status_bar(chunks[0], f);
-        self.render_tab_bar(chunks[1], f);
-        views::render_current(chunks[2], self, f);
-        self.render_footer(chunks[3], f);
+            self.render_status_bar(chunks[0], f);
+            self.render_tab_bar(chunks[1], f);
+            views::render_current(chunks[2], self, f);
+            self.render_footer(chunks[3], f);
+        }
+        // The quit confirmation is a small centered overlay drawn on top
+        // of whatever phase is behind it (dashboard or Setup).
+        if self.pending_quit {
+            self.render_quit_overlay(f);
+        }
+    }
+
+    /// The `[y/N]` quit-confirmation overlay: a small centered box on top
+    /// of the current frame. `q` (dashboard) / `Esc` (Setup stage 1) opens
+    /// it; `y` confirms (the only quit path), anything else cancels.
+    fn render_quit_overlay(&self, f: &mut Frame) {
+        let area = f.area();
+        const W: u16 = 34;
+        const H: u16 = 5;
+        let w = W.min(area.width);
+        let h = H.min(area.height);
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let overlay = Rect::new(x, y, w, h);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(
+                Style::default()
+                    .fg(palette::WARN)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .title(" QUIT? ");
+        let text = Text::from(vec![
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Quit crucible-llm?",
+                Style::default()
+                    .fg(palette::WARN)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(vec![
+                Span::styled("  [y] Yes", style::value()),
+                Span::styled("   [n] No", style::value()),
+            ]),
+        ]);
+        f.render_widget(Paragraph::new(text).block(block), overlay);
     }
 
     /// Top status bar: version, backend, target model, mode (blueprint §6).
@@ -1400,7 +1480,7 @@ impl App {
                 sep.clone(),
                 live(" [N/Esc] Cancel "),
                 sep.clone(),
-                live("[Q] Quit"),
+                live("[q] Quit"),
             ]);
         }
 
@@ -1419,7 +1499,7 @@ impl App {
                 sep.clone(),
                 live("[E] Export"),
                 sep.clone(),
-                live("[Q] Quit"),
+                live("[q] Quit"),
                 sep.clone(),
                 locked("[N] [C] [+] [R] locked"),
             ]);
@@ -1438,7 +1518,7 @@ impl App {
             sep.clone(),
             live("[E] Export"),
             sep.clone(),
-            live("[Q] Quit"),
+            live("[q] Quit"),
         ])
     }
 }
@@ -1602,25 +1682,40 @@ mod tests {
     }
 
     #[test]
-    fn setup_ctrl_c_still_quits() {
+    fn ctrl_c_is_inert_in_setup() {
+        // A bare `c` still types into the URL; Ctrl-C (the terminal's
+        // copy key) is swallowed — it never quits the app.
         let mut app = App::new().with_setup(&Config::default());
         let r = app.handle_key(&key(KeyCode::Char('c')));
-        // (Ctrl-C check requires the CONTROL modifier; a bare `c` types.)
         assert_eq!(r, KeyAction::Continue);
         assert_eq!(app.setup.url, "c");
         let mut ctrl = key(KeyCode::Char('c'));
         ctrl.modifiers = KeyModifiers::CONTROL;
         let r = app.handle_key(&ctrl);
-        assert_eq!(r, KeyAction::Quit);
-        assert!(!app.running);
+        assert_eq!(r, KeyAction::Continue, "Ctrl-C is inert");
+        assert!(app.running, "Ctrl-C must not quit");
+        assert_eq!(app.setup.url, "c", "the Ctrl combo is swallowed, not typed");
     }
 
     #[test]
-    fn setup_esc_at_url_stage_quits() {
+    fn setup_esc_at_url_stage_opens_the_quit_confirmation() {
+        // Esc at the outermost stage no longer quits outright: it opens
+        // the [y/N] overlay. `n` cancels; a confirmed `y` quits.
         let mut app = App::new().with_setup(&Config::default());
         let r = app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(app.pending_quit, "Esc opens the confirmation overlay");
+        assert!(app.running, "no quit until confirmed");
+
+        app.handle_key(&char_key('n'));
+        assert!(!app.pending_quit, "n cancels");
+        assert!(app.running);
+
+        app.handle_key(&key(KeyCode::Esc));
+        assert!(app.pending_quit);
+        let r = app.handle_key(&char_key('y'));
         assert_eq!(r, KeyAction::Quit);
-        assert!(!app.running);
+        assert!(!app.running, "confirmed y quits");
     }
 
     #[test]
@@ -1857,6 +1952,112 @@ mod tests {
             View::Live,
             "the swallowed key must not double-act (no view switch)"
         );
+    }
+
+    // ── quit: `q` is the only quit key (confirmed) ─────────────────────
+
+    #[test]
+    fn q_opens_the_quit_confirmation_not_a_quit() {
+        let mut app = App::new();
+        let r = app.handle_key(&char_key('q'));
+        assert_eq!(r, KeyAction::Continue, "q alone must not quit");
+        assert!(app.pending_quit, "q opens the [y/N] overlay");
+        assert!(app.running);
+    }
+
+    #[test]
+    fn q_confirm_y_quits_the_app() {
+        let mut app = App::new();
+        app.handle_key(&char_key('q'));
+        assert!(app.pending_quit);
+        let r = app.handle_key(&char_key('y'));
+        assert_eq!(r, KeyAction::Quit);
+        assert!(!app.running);
+        assert!(!app.pending_quit);
+    }
+
+    #[test]
+    fn q_confirm_uppercase_y_also_quits() {
+        let mut app = App::new();
+        app.handle_key(&char_key('q'));
+        let r = app.handle_key(&char_key('Y'));
+        assert_eq!(r, KeyAction::Quit);
+        assert!(!app.running);
+    }
+
+    #[test]
+    fn q_confirm_n_cancels_and_stays_running() {
+        let mut app = App::new();
+        app.handle_key(&char_key('q'));
+        assert!(app.pending_quit);
+        let r = app.handle_key(&char_key('n'));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(!app.pending_quit, "n cancels the overlay");
+        assert!(app.running, "the app keeps running");
+    }
+
+    #[test]
+    fn q_confirm_other_keys_cancel_and_are_swallowed() {
+        let mut app = App::new();
+        app.handle_key(&char_key('q'));
+        assert!(app.pending_quit);
+        app.handle_key(&char_key('1')); // a stray key
+        assert!(!app.pending_quit);
+        assert!(app.running);
+        assert_eq!(
+            app.view,
+            View::Live,
+            "the swallowed key must not double-act (no view switch)"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_is_inert_in_the_dashboard() {
+        let mut app = App::new();
+        let mut ctrl = key(KeyCode::Char('c'));
+        ctrl.modifiers = KeyModifiers::CONTROL;
+        let r = app.handle_key(&ctrl);
+        assert_eq!(r, KeyAction::Continue, "Ctrl-C is inert");
+        assert!(app.running, "the terminal's copy key must not quit");
+    }
+
+    #[test]
+    fn esc_no_longer_quits_in_the_dashboard_views() {
+        for view in [View::Live, View::Concurrency, View::Needle, View::History] {
+            let mut app = App::new();
+            app.view = view;
+            let r = app.handle_key(&key(KeyCode::Esc));
+            assert_eq!(r, KeyAction::Continue, "{view:?}");
+            assert!(app.running, "Esc must not quit {view:?}");
+        }
+    }
+
+    #[test]
+    fn q_opens_the_confirmation_from_the_config_view() {
+        // Even in the Config view (where `q` would otherwise type), `q`
+        // is the quit key: it opens the overlay and never edits a field.
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+        app.config.cursor = 0; // URL
+        let url_before = app.config.url.clone();
+        let r = app.handle_key(&char_key('q'));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(app.pending_quit);
+        assert_eq!(app.config.url, url_before, "q must not type into the field");
+        assert!(app.running);
+    }
+
+    #[test]
+    fn quit_confirmation_works_while_a_benchmark_runs() {
+        // `q` is available mid-run (it was before too); confirming quits.
+        let mut app = App::new();
+        app.seq.set_running(true);
+        app.handle_key(&char_key('q'));
+        assert!(app.pending_quit);
+        let r = app.handle_key(&char_key('y'));
+        assert_eq!(r, KeyAction::Quit);
+        assert!(!app.running);
     }
 
     #[test]
