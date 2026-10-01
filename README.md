@@ -4,7 +4,7 @@
 
 **Terminal-based LLM inference benchmarking suite.**
 
-[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./crucible_llm_architecture_blueprint.md)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
 [![Tests](https://img.shields.io/badge/tests-460%20green-brightgreen)](#)
@@ -14,6 +14,16 @@
 Crucible LLM is a comprehensive benchmarking tool for **OpenAI-compatible inference servers** — vLLM, llama.cpp, SGLang, Ollama, and others. It measures generation speed, concurrency capacity, reasoning ability, long-context retrieval, structured-output compliance, and energy efficiency — all from a single interactive TUI or a headless CLI.
 
 Built in Rust for **zero-dependency deployment**. One static binary. No Python. No JVM. No runtime. SQLite is compiled in; GPU telemetry is feature-gated. Point it at any `/v1` endpoint and start measuring.
+
+### Live Monitor
+
+<div align="center">
+
+![Live Monitor](<docs/img/Live Monitor.png>)
+
+</div>
+
+Real-time throughput graph with auto-scaling y-axis, engine-transition markers, key metrics, and a live event log.
 
 ---
 
@@ -55,6 +65,20 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 5 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
 - **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
+
+More views in action:
+
+<div align="center">
+
+**Concurrency** — per-stream and aggregate throughput across the sweep, with the practical sweet spot.
+
+![Concurrency Matrix](<docs/img/Concurrency Matrix.png>)
+
+**NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
+
+![Needle (NIAH)](<docs/img/Needle (NIAH).png>)
+
+</div>
 
 ### Headless / CLI Mode
 
