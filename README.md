@@ -1,264 +1,298 @@
-# Crucible-LLM
+<div align="center">
 
-A native-Rust, zero-runtime-dependency terminal application that benchmarks
-OpenAI-compatible streaming LLM inference endpoints (vLLM, llama.cpp, SGLang,
-Ollama). It measures not only raw token speed, but how efficiently an engine
-handles compute saturation, speculative decoding, and complex task fidelity.
+# ⚗️ Crucible LLM
 
-```
-crucible-llm --url http://your-inference-host:8080/v1 --model qwen3 --mode long
-```
+**Terminal-based LLM inference benchmarking suite.**
 
-## Engines
+[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./crucible_llm_architecture_blueprint.md)
+[![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
+[![Tests](https://img.shields.io/badge/tests-460%20green-brightgreen)](#)
 
-| Engine | What it measures |
-| :--- | :--- |
-| **A — Speed & Latency** | Microsecond TTFT, isolated prefill (PP) / decode (TG) throughput, MTP / speculative-decoding ratio, ITL jitter, warm/cold KV-cache detection |
-| **B — Concurrency & Saturation** | Multi-stream sweeps (1→2→4→8→16→32→64), aggregate tokens/sec, client-perceived p50/p90/p99 TPOT, saturation **knee-point** detection and the "Optimal Operational Envelope" |
-| **C — Capability & Fidelity** | C1 needle-in-a-haystack context retention (2k–128k × 0–100% depth, with prefill-degradation curves), C2 deterministic reasoning/code verification, C3 structured-output / JSON-grammar compliance and its speed penalty |
-| **D — Hardware & Energy** | VRAM usage, GPU clock/temperature, instantaneous wattage, and the Silicon Efficiency Metric `Joules/Token = ∫P(t)dt / Total_Generated_Tokens`; VRAM fragmentation warnings |
+</div>
 
-Results are presented through a 60 FPS ratatui+crossterm dashboard and
-persisted to embedded SQLite (`~/.local/share/crucible/benchmarks.db`) with
-JSON / Markdown / CSV export for CI/CD regression gating.
+Crucible LLM is a comprehensive benchmarking tool for **OpenAI-compatible inference servers** — vLLM, llama.cpp, SGLang, Ollama, and others. It measures generation speed, concurrency capacity, reasoning ability, long-context retrieval, structured-output compliance, and energy efficiency — all from a single interactive TUI or a headless CLI.
 
-Measurement isolation is the design's top invariant: worker-pool timing
-(`quanta` cycle clock) lives in dedicated rings and is never touched by UI
-repaints, allocation churn, or the SQLite flusher — the dashboard reads a
-lock-free, double-buffered (`ArcSwap`) snapshot.
+Built in Rust for **zero-dependency deployment**. One static binary. No Python. No JVM. No runtime. SQLite is compiled in; GPU telemetry is feature-gated. Point it at any `/v1` endpoint and start measuring.
 
-## Build
+---
 
-The toolchain is pinned to `stable` via `rust-toolchain.toml` (the machine's
-*default* toolchain is too old for the latest ratatui/reqwest/quanta).
+## Why Crucible?
 
-```sh
-cargo build --release          # optimized static binary → target/release/crucible-llm
-cargo test                     # unit + integration + end-to-end suites (offline mock server)
-cargo clippy --all-targets     # static analysis
-cargo fmt --check              # formatting
-```
+- **TUI-first** — an interactive terminal dashboard with real-time throughput graphs, live model discovery, and per-engine metrics.
+- **Headless-ready** — a full CLI mode for CI/CD, scripting, and automated regression testing, with pure-JSON output and meaningful exit codes.
+- **Comprehensive** — six benchmark engines covering speed, scale, intelligence, structured-output fidelity, and silicon efficiency.
+- **Portable** — a single static binary. Run it from any terminal on any Linux box. No install, no venv, no system libraries.
+- **Honest metrics** — measures what actually matters for a *user*: per-stream experience and practical capacity, not just aggregate throughput. A server that serves 64 users at 2.6 t/s each is not "fast" — it is slow for everyone. Crucible reports the difference.
+- **Rigorous timing** — all latency is captured on a hardware cycle clock (`quanta`) in isolated worker rings and is never perturbed by UI repaints, allocation churn, or database writes (the *measurement-isolation* invariant).
 
-The release binary is fully self-contained: SQLite is compiled in
-(`rusqlite` bundled) and there are no system library dependencies at runtime.
+---
 
-**Optional NVIDIA GPU telemetry** (VRAM, wattage, clocks):
+## Features
 
-```sh
+### Benchmark Engines
+
+| Engine | Measures | Use Case |
+| :--- | :--- | :--- |
+| **A · Speed** | tokens/sec (decode), prefill throughput, TTFT, ITL p50/p99, MTP/speculative ratio | How fast does the model respond to **one** user? |
+| **B · Concurrency** | sweep 1→32 parallel streams, per-stream t/s, saturation knee, practical sweet spot | How many users can your server **actually** serve? |
+| **C1 · NIAH** | needle-in-a-haystack retrieval across 2k→128k contexts × 11 depths | Can the model **find a fact** buried in a long document? |
+| **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
+| **C3 · Structured** | JSON compliance across 3 schema-complexity levels + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
+| **D · Energy** | GPU watts, joules/token (NVIDIA NVML built-in; AMD/Intel pending) | What's the **power cost**? |
+
+By default a run executes **A, B, C1, C2, C3** (Engine D is opt-in, since it must run on the machine with the GPU). Select any subset with `--engine`.
+
+### TUI Interface
+
+The default mode. A keyboard-first, 60 Hz dashboard (vim-style navigation):
+
+- **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker.
+- **Real-time throughput graph** with auto-scaling y-axis and engine-transition markers.
+- **Concurrency sweep visualization** with a practical sweet-spot recommendation.
+- **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
+- **Live event log** and a per-engine **benchmark queue** panel.
+- **Pause/resume**, view switching (`1`–`5`), and one-key export (`e`).
+
+### Headless / CLI Mode
+
+For CI/CD, scripting, and regression gating:
+
+- **Pure JSON** output on stdout for programmatic consumption.
+- **Export** to JSON, Markdown (GitHub-Flavored tables), or raw CSV (per-packet timestamps).
+- **SQLite persistence** of every run for historical comparison and diffing.
+- **Exit codes** for pipeline integration: `0` = pass, `1` = benchmark failed, `2` = configuration error.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- A Rust **stable** toolchain (to build from source) — **or** a pre-compiled binary from [Releases].
+- A running **OpenAI-compatible inference server** (vLLM, llama.cpp, SGLang, Ollama, …).
+
+### Build
+
+```bash
+git clone https://github.com/YOURUSERNAME/crucible-llm.git
+cd crucible-llm
+cargo build --release          # → target/release/crucible-llm  (static binary)
+
+# Optional: enable built-in NVIDIA GPU telemetry (Engine D)
 cargo build --release --features nvml
 ```
 
-`nvml` links against the NVIDIA driver (`libnvidia-ml`). On machines without
-the driver (or without an NVIDIA GPU) every hardware field degrades to
-`N/A` — the app never panics (CPU/RAM telemetry via `sysinfo` still works).
+The release binary is fully self-contained: SQLite is bundled (no system `libsqlite3`), and there are **no** runtime library dependencies.
 
-## Quick start
+### Run (TUI)
 
-**Headless single-stream benchmark** (Engine A) — the direct port of
-`llmspeedtest.py`:
-
-```sh
-crucible-llm --url http://host:8000/v1 --model my-model --mode long --tokens 4096
-crucible-llm --url http://host:8000/v1 --model my-model --iterations 5 --json
-crucible-llm --url http://host:8000/v1 --model my-model --nocache   # bust the server KV cache
+```bash
+./target/release/crucible-llm
 ```
 
-**Interactive dashboard** (all engines, 60 FPS):
+1. Enter your server URL (e.g. `http://localhost:8000/v1`).
+2. Pick a model from the auto-discovered list (or type it).
+3. Configure the benchmark (or accept the defaults).
+4. Press **Enter** to launch — watch the live dashboard run A → B → C1 → C2 → C3.
 
-```sh
-crucible-llm --url http://host:8000/v1 --model my-model --tui
-```
+> Pass `--url … --model …` on the command line to skip straight to the dashboard. A bare invocation always opens the interactive Setup flow.
 
-**Export for CI/CD** (after any headless run):
+### Run (Headless)
 
-```sh
-crucible-llm --url http://host:8000/v1 --model my-model --json \
+```bash
+# Quick single-stream speed test (Engine A), JSON on stdout
+./target/release/crucible-llm --headless --url http://localhost:8000/v1 \
+  --model my-model --json
+
+# A full multi-engine run with export
+./target/release/crucible-llm --headless --url http://localhost:8000/v1 --model my-model \
+  --engine speed --engine concurrency --engine niah \
   --export json --export-path ./results.json
+
+# CI/CD integration (non-zero exit on failure)
+./target/release/crucible-llm --headless --url "$SERVER_URL" --model "$MODEL" --json --timeout 60
+echo "exit code: $?"   # 0 = success, 1 = benchmark failed, 2 = config error
 ```
 
-A bare invocation (`crucible-llm` with no target) prints the banner and exits
-0.
+> `--json` implies headless. When stdout is **not** a TTY (a pipe or CI runner), the TUI automatically falls back to a headless run — use `--tui` to force the dashboard.
 
-## CLI reference
+---
 
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `--url <URL>` | `http://192.168.51.163:8080/v1/chat/completions` | Endpoint: bare host, base URL, or full completions path |
-| `--model <NAME>` | `default` | Model name sent in the request |
-| `--mode <short\|long>` | `short` | `short` = fixed ~50-token prompt; `long` = padded to `--tokens` (`base` is an alias for `short`) |
-| `--tokens <N>` | `2000` | Target prompt tokens for `long` mode |
-| `--iterations <N>` | `1` | Number of headless runs |
-| `--api-key <KEY>` | — | Sent as `Authorization: Bearer <KEY>` |
-| `--timeout <SECS>` | `120` | Connect / idle-read timeout |
-| `--nocache` | off | Prepend a unique random prefix to bypass the server KV cache (cold-cache runs) |
-| `--json` | off | Emit the result as JSON on stdout (the prototype's `output_json` field set) |
-| `--verbose` | off | Per-run chunk detail on stderr |
-| `--no-color` | off | Force-disable ANSI colors (default: on only when stdout is a TTY) |
-| `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact prompt token counts; without it, counts are `chars/4` estimates (flagged `estimated`) |
-| `--tui` | off | Open the interactive ratatui dashboard instead of the headless run |
-| `--export <json\|md\|csv>` | — | Export the completed run (headless: after persisting; TUI: `e` key) |
-| `--export-path <PATH>` | `data_dir()/exports/…` | Destination file for `--export` |
-| `--config <PATH>` | `~/.config/crucible/config.json` | JSON config file |
-| `--help` / `--version` | | Standard clap help |
+## Configuration
 
-### Configuration layering
+### Priority Order
 
-One `Config` (a superset of both Python prototype CLIs) feeds the headless,
-TUI, and export paths identically. Resolution order per field — first match
-wins:
+Every field is resolved from the **first** source that provides it:
 
-1. **CLI flag**
-2. **environment variable**
-3. **config file** (JSON, all fields optional)
-4. **built-in default** (mirrors `llmspeedtest.py`)
+```
+CLI flag  >  environment variable  >  config file  >  built-in default
+```
 
-Environment variables:
+### Config File
 
-| Variable | Flag equivalent |
-| :--- | :--- |
-| `CRUCIBLE_URL` | `--url` |
-| `CRUCIBLE_MODEL` | `--model` |
-| `CRUCIBLE_MODE` | `--mode` |
-| `CRUCIBLE_TOKENS` | `--tokens` |
-| `CRUCIBLE_ITERATIONS` | `--iterations` |
-| `CRUCIBLE_API_KEY` | `--api-key` |
-| `CRUCIBLE_TIMEOUT` | `--timeout` |
-| `CRUCIBLE_NOCACHE` | `--nocache` |
-| `CRUCIBLE_TOKENIZER` | `--tokenizer` |
-| `CRUCIBLE_JSON` | `--json` |
-| `CRUCIBLE_VERBOSE` | `--verbose` |
-| `CRUCIBLE_NO_COLOR` | `--no-color` |
-| `CRUCIBLE_TUI` | `--tui` |
-| `CRUCIBLE_EXPORT` | `--export` |
-| `CRUCIBLE_EXPORT_PATH` | `--export-path` |
-| `CRUCIBLE_CONFIG` | `--config` |
-
-Example config file (`~/.config/crucible/config.json`):
+`~/.config/crucible/config.json` (override the path with `--config` / `CRUCIBLE_CONFIG`). All fields are optional; only what you specify overrides the defaults.
 
 ```json
 {
-  "url": "http://192.168.51.163:8080/v1/chat/completions",
-  "model": "qwen3",
+  "url": "http://192.168.51.163:8000/v1",
+  "model": "qwen3.8-27b",
   "mode": "long",
-  "tokens": 8192,
-  "timeout": 60
+  "tokens": 2000,
+  "iterations": 3,
+  "timeout": 120,
+  "ladder": [1, 2, 3, 4, 8, 12, 16, 24, 32],
+  "hardware": true,
+  "engines": {
+    "speed": true, "concurrency": true, "niah": true,
+    "reasoning": true, "structured": true, "hardware": false
+  }
 }
 ```
 
-## The TUI dashboard
+### Environment Variables
 
-Five views (blueprint §6), rendered at 60 Hz from the lock-free metrics
-snapshot:
+Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`.
 
-| Key | Action |
-| :---: | :--- |
-| `1` | **Live Monitor** — telemetry gauges (aggregate t/s, VRAM, GPU clock, J/token), ITL distribution (p50/p90/p99 + histogram), active-stream matrix (PP/TG split, TTFT, gen speed, MTP rate, progress), rolling throughput chart, log/event stream |
-| `2` | **Concurrency Matrix** — the sweep curve (concurrency × aggregate t/s × p90 TPOT) with the detected knee (red) and optimal operational envelope / sweet spot (green) highlighted |
-| `3` | **Needle (NIAH)** — the context-size × depth grid, color-coded: green = accurate + nominal prefill, yellow = accurate + throttled prefill, red = retrieval failed |
-| `4` | **History Diff** — side-by-side comparison of two stored runs with signed delta metrics (TTFT, tokens/s, MTP rate, J/token), gains green / regressions red; `j`/`k` navigate, `a`/`b` select run A / run B |
-| `5` | **Config** — the resolved run configuration (target, model, mode, tokens, ladder, tokenizer, feature toggles) |
-| `Space` | Pause / resume the active run |
-| `+` | Step concurrency up (live sweep) |
-| `n` | Queue a new NIAH matrix run |
-| `e` | Export the current session (JSON / MD / CSV, per `--export`) to the data dir |
-| `q` | Quit (terminal state is restored on all exit paths) |
+### CLI Reference
 
-A dropped frame, a resize, or any UI activity never touches the timing path.
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--url <URL>` | *(built-in)* | Endpoint: bare host, base URL, or full completions path. |
+| `--model <NAME>` | `default` | Model name sent in the request. |
+| `--mode <short\|long>` | `short` | `short` = fixed ~50-token prompt; `long` = padded to `--tokens`. (`base` is an alias for `short`.) |
+| `--tokens <N>` | `2000` | Target prompt tokens for `long` mode. |
+| `--iterations <N>` | `1` | Number of headless single-stream runs (Engine A). |
+| `--api-key <KEY>` | — | Sent as `Authorization: Bearer <KEY>`. |
+| `--timeout <SECS>` | `120` | Connection / idle-read timeout. |
+| `--nocache` | off | Prepend a unique random prefix to bypass the server KV cache (cold-cache runs). |
+| `--json` | off | Emit the result as JSON on stdout (implies headless). |
+| `--verbose` | off | Per-run chunk detail. |
+| `--no-color` | off | Force-disable ANSI colors (default: on only when stdout is a TTY). |
+| `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact token counts; without it, counts are `chars/4` estimates (flagged `estimated`). |
+| `--tui` | off | Force the interactive dashboard (default mode on a TTY). |
+| `--headless` | off | Run the classic headless benchmark instead of the TUI. |
+| `--engine <NAME>` | A,B,C1,C2,C3 | Select which engines a run orchestrates (repeatable): `speed`/`a`, `concurrency`/`b`, `niah`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`d`. |
+| `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
+| `--no-hardware` | off | Disable the hardware/energy telemetry poller. |
+| `--export <fmt>` | — | Export the run: `json`, `md`, or `csv`. |
+| `--export-path <PATH>` | `data_dir()/exports/…` | Destination file for `--export`. |
+| `--config <PATH>` | `~/.config/crucible/config.json` | Config file path. |
+| `--log-dir <PATH>` | `~/.local/share/crucible/logs` | Run-log directory. |
+| `--help` / `--version` | | Standard clap help. |
 
-## Metric definitions (blueprint §7)
+---
 
-- **TTFT** = `T_first_token − T_request_dispatched` (quanta cycle clock)
-- **PP throughput** = `prompt_tokens / TTFT`
-- **TG speed** = `(completion_tokens − 1) / (T_stream_end − T_first_token)`
-- **ITL jitter** = std-dev of the inter-token deltas
-- **MTP multiplier** = `total_output_tokens / SSE_packets` (1.0 = standard
-  auto-regressive; >1 quantifies speculative-draft acceptance)
-- **Cache status** = `HIT` if `TTFT ≤ 0.15 × TTFT_cold_baseline`, else `MISS`
-- **Joules/Token** = `∫P(t)dt / Total_Generated_Tokens` over the 100 ms
-  hardware power trace
+## Understanding the Results
 
-## Persistence & data locations
+### Speed (Engine A)
+
+- **Tokens/sec (decode / TG)** — how fast the model produces output tokens.
+- **Prompt throughput (prefill / PP)** — `prompt_tokens / TTFT`; how fast the server ingests your input.
+- **TTFT** — time from sending the request to the first token arriving.
+- **ITL p50 / p99** — median and worst-case gap between consecutive output tokens.
+- **MTP ratio** — `output_tokens / SSE_packets`; `1.0` = standard auto-regressive, `> 1` quantifies speculative-decoding acceptance.
+
+### Concurrency (Engine B)
+
+- **Practical sweet spot** — the most users where **each** still gets ≥ **40 t/s** (comfortable for chat / agents / RAG).
+- **Maximum usable** — the most users where each gets ≥ **15 t/s** (workable, noticeably slower).
+- **Throughput knee** — where *aggregate* t/s stops increasing (a reference point, not the recommendation).
+- **Per-stream t/s** — `aggregate ÷ users`; what each individual user actually experiences.
+
+### NIAH (Engine C1)
+
+Hides a unique random fact in a synthetic document and asks the model to retrieve it, across **7 context sizes (2k → 128k) × 11 depths (0 → 100%)** = 77 cells.
+
+- 🟢 **Green ≥ 80 %** · 🟡 **Yellow 50–79 %** · 🔴 **Red < 50 %** (per context size).
+- Tells you the **maximum reliable context window** for RAG / long-document QA, plus how prefill speed degrades as context grows.
+
+### Reasoning (Engine C2)
+
+- **13 deterministic challenges** (5 math, 5 logic, 3 code), each validated by a **strict checker** — no LLM-as-judge, no fuzzy scoring.
+- **% solved** is a reproducible, cross-model indicator of raw problem-solving ability, reported alongside average decode speed.
+
+### Structured (Engine C3)
+
+A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-length array) → **Complex** (nested schema) — each run under the `response_format: json_object` constraint and scored field-by-field, plus a free-form baseline to quantify the **grammar speed penalty**.
+
+- **Verdict:** `3/3` fully suitable for API/agent use · `2/3` simple-only · `1/3` trivial key-value only · `0/3` not suitable (needs parsing/fallback).
+
+### Energy (Engine D)
+
+- GPU **power draw** (watts) sampled at 100 ms during inference.
+- **Joules/token** = `∫P(t)dt / total_tokens` — the silicon-efficiency metric for comparing quantizations and hardware.
+- **Requires a local GPU with driver support** — NVIDIA NVML is built-in (`--features nvml`); AMD/Intel are on the roadmap. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
+
+---
+
+## Data & Storage
 
 | What | Where |
 | :--- | :--- |
-| SQLite database | `~/.local/share/crucible/benchmarks.db` (Linux) · `%APPDATA%\crucible\benchmarks.db` (Windows) |
-| Exports (default) | `~/.local/share/crucible/exports/crucible-<session-id>.<ext>` |
+| Benchmark history (SQLite) | `~/.local/share/crucible/benchmarks.db` |
+| Exports (default) | `~/.local/share/crucible/exports/` |
+| Run logs | `~/.local/share/crucible/logs/latest.log` (+ timestamped archives) |
 | Config file | `~/.config/crucible/config.json` |
 
-Schema (three tables): `benchmark_sessions` (one row per run: target, model,
-backend, GPU, duration), `stream_metrics` (per stream/iteration: token
-counts, TTFT, TPOT, MTP, J/token, cache-hit), `needle_evaluations` (per NIAH
-cell: context length, depth, retrieved, latency).
+Every completed run (headless or TUI) persists automatically across three tables — `benchmark_sessions`, `stream_metrics`, and `needle_evaluations`. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
 
-Every completed run (headless or TUI) persists automatically; a storage
-failure degrades gracefully and never changes the exit code of a benchmark.
+---
 
-## Export formats
+## Architecture
 
-| Format | Use |
-| :--- | :--- |
-| `json` | Zero-alloc, parseable — CI/CD regression gating (e.g., deploy gates on TTFT/throughput thresholds) |
-| `md` | GitHub-Flavored Markdown tables (metadata + stream metrics + needle table) for PRs/issues/READMEs |
-| `csv` | Raw per-packet arrival times + inter-token intervals for Python / R / Grafana |
+Crucible is a single static binary organized around one core invariant: **measurement isolation**.
 
-```sh
-crucible-llm --url http://host:8000/v1 --model my-model \
-  --export csv --export-path ./packets.csv
-```
+- **Four decoupled execution rings** — a stream-worker pool (network I/O), the engine core (metric synthesis), a 100 ms hardware profiler, and the 60 Hz TUI render loop — connected by lock-free channels.
+- **Timing never touches the UI.** All latency is stamped by `quanta` (CPU cycle counters, no syscalls) inside the worker rings. The dashboard reads a lock-free, double-buffered (`ArcSwap`) snapshot; a dropped frame, a resize, or a SQLite flush can never perturb a measurement.
+- **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; `eventsource-stream` + `reqwest` (HTTP/2) drive low-allocation SSE parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
+- **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); NVIDIA telemetry is feature-gated and absent by default; GPU/CPU telemetry degrades to N/A where a driver is missing.
 
-In the TUI, press `e` to export the current session (format follows
-`--export`, default `json`).
+See [`crucible_llm_architecture_blueprint.md`](./crucible_llm_architecture_blueprint.md) for the full system specification, metric formulations, and database schema.
 
-## Graceful degradation
-
-- **No NVIDIA GPU / driver:** all hardware fields report `N/A` (never a
-  panic, never a spurious 0.0); CPU/RAM telemetry still works.
-- **No `tokenizer.json`:** prompt token counts fall back to `chars/4` and
-  are flagged `estimated` in every report.
-- **Server omits `usage`:** token counts fall back to counted frames.
-- **Dead endpoint / all runs failed:** exit code `1` (the prototype's rule).
-
-## Development
-
-```sh
-cargo test                        # 12+ suites: unit + integration + e2e (all offline)
-cargo test --release              # same suite, release profile
-cargo clippy --all-targets        # must be clean
-cargo fmt --check                 # must be clean
-```
-
-The test strategy is fully offline: a small in-process `tokio` mock SSE
-server (vLLM-style frames, `[DONE]`, `usage`, early-close, HTTP 500, stalls,
-flaky endpoints) stands in for a real inference server. The end-to-end smoke
-test (`tests/e2e_test.rs`) runs the full pipeline — single stream + sweep +
-NIAH + persistence + all three exports — and also exercises the real binary
-as a subprocess (headless `--json` + `--export`, isolated data dir).
-
-### Project layout
-
-```
-src/
-├── main.rs          CLI dispatch (banner / headless / TUI)
-├── lib.rs           crate root
-├── config.rs        the single-source-of-truth Config (CLI > env > file > defaults)
-├── timing.rs        quanta clock wrapper; T0..Tn milestone stamps
-├── sse/             incremental low-alloc SSE parser + chunk model
-├── client/          StreamWorker (one SSE stream) + WorkerPool (N streams)
-├── metrics/         EngineCore aggregation, HdrHistogram, ArcSwap snapshot
-├── prompt/          prompt generator (short/long/nocache) + optional tokenizer
-├── engines/
-│   ├── speed.rs              Engine A
-│   ├── concurrency.rs        Engine B (sweep + knee + envelope)
-│   ├── capability/           Engine C (niah / reasoning / structured)
-│   └── hardware.rs           Engine D (Joules/Token, fragmentation warning)
-├── hw/                100 ms hardware poller (NVML feature-gated + sysinfo)
-├── storage/           SQLite (bundled) + JSON/MD/CSV exporters
-└── ui/                ratatui dashboard: app state machine, 60 Hz event loop, 5 views
-tests/
-├── e2e_test.rs        full-pipeline smoke test + binary subprocess tests
-├── …                  per-module integration suites (mock SSE server, offline)
-```
+---
 
 ## License
 
-Internal tooling. See repository history.
+[GPL-3.0](./crucible_llm_architecture_blueprint.md). This is a copyleft-licensed tool: you may use, study, modify, and share it, provided any derivative works carry the same license.
+
+---
+
+## Contributing
+
+Contributions are welcome. The bar for a merge is high — the measurement path must stay clean.
+
+1. **Fork** the repository and create a feature branch from `master`.
+2. **Build and test** — the suite is fully offline (an in-process mock SSE server stands in for a real inference server):
+
+   ```bash
+   cargo build --release
+   cargo test                     # unit + integration + e2e
+   cargo clippy --all-targets     # must be clean
+   cargo fmt --check              # must be clean
+   ```
+
+3. **Respect the invariants:**
+   - **Measurement isolation** — nothing on the render / storage / hardware path may touch the `quanta` timing path.
+   - **Graceful degradation** — a missing GPU, driver, tokenizer, or server `usage` block must yield N/A or a flagged estimate, **never** a panic.
+   - **Deterministic checkers** — capability scoring (NIAH / reasoning / structured) must stay strict and reproducible.
+4. **Open a pull request** with a concise description of the change and the test coverage it adds.
+
+---
+
+## Roadmap
+
+- [ ] **AMD GPU telemetry** — watts / VRAM / clocks via in-tree `amdgpu` sysfs + hwmon (no ROCm stack required).
+- [ ] **Intel GPU telemetry** — Level Zero Sysman, with a sysfs/hwmon fallback for minimal hosts.
+- [ ] **WebSocket / streaming metrics** — a remote, real-time frontend for the dashboard.
+- [ ] **Model comparison mode** — A/B two models (or two quantizations) side-by-side with signed deltas.
+- [ ] **Docker image** — one-command deployment of the static binary.
+- [ ] **Web dashboard** — an optional browser frontend over the same lock-free metrics pipeline.
+
+---
+
+<div align="center">
+
+**Crucible LLM** — forge your inference stack in fire, and measure what survives.
+
+</div>
