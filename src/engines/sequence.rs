@@ -748,6 +748,13 @@ impl BenchmarkSequence {
             *self.engines.last().unwrap(),
             &final_summary,
         );
+        // The run is over: freeze the metrics pipeline. This stops the
+        // forever-running 100 ms hardware poller (and any other writer)
+        // from re-stamping `0.0` throughput samples / growing `elapsed` /
+        // dragging the overall averages after the last engine finishes —
+        // so the OVERALL METRICS panel and the throughput graph hold their
+        // final values and stop animating.
+        self.metrics.freeze();
         self.log_line(format!("[seq] ✓ all benchmarks complete — {final_summary}"));
         self.logger.info(
             Context::Sequence,

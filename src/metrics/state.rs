@@ -12,6 +12,7 @@
 //! in an `Arc`; both `update` and `load` take `&self`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,7 +92,7 @@ pub struct StatTriple {
 /// and the total elapsed time. It is built by the writer-side
 /// [`OverallAccumulator`] in [`MetricsState::update`] and copied into every
 /// published [`MetricsSnapshot`] so the render loop reads it lock-free.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverallStats {
     /// Generation throughput (per-stream decode t/s).
     pub gen: StatTriple,
@@ -563,6 +564,15 @@ pub struct MetricsState {
     /// [`OverallAccumulator`]): folded on each `update()` and re-stamped
     /// into the published snapshot for the lock-free render.
     overall_acc: Mutex<OverallAccumulator>,
+    /// One-way latch set when the benchmark sequence reaches
+    /// `AllComplete`. While set, [`update`](Self::update) is a no-op: the
+    /// rolling window, the overall accumulator, and the published snapshot
+    /// all freeze at their final values, so the UI never shows numbers
+    /// shifting after the run is done. This is what stops the
+    /// forever-running 100 ms hardware poller (and any other writer) from
+    /// re-stamping `0.0` throughput samples / growing `elapsed_sec` /
+    /// dragging `active_avg` toward zero after the last engine finishes.
+    frozen: AtomicBool,
 }
 
 impl MetricsState {
@@ -572,7 +582,23 @@ impl MetricsState {
             inner: ArcSwap::from_pointee(MetricsSnapshot::default()),
             rolling: Mutex::new(RollingSeries::default()),
             overall_acc: Mutex::new(OverallAccumulator::default()),
+            frozen: AtomicBool::new(false),
         }
+    }
+
+    /// One-way latch: freeze all metric updates. Called by the sequence
+    /// executor when it reaches `AllComplete`. After this,
+    /// [`update`](Self::update) is a no-op — the rolling window, the
+    /// overall-stats accumulator, and the published snapshot all hold their
+    /// final values, so the UI shows static numbers and the throughput
+    /// graph stops animating. Idempotent (setting it twice is a no-op).
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::Relaxed);
+    }
+
+    /// `true` once [`freeze`](Self::freeze) has been called (one-way).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
     }
 
     /// Atomically publish a new snapshot.
@@ -589,6 +615,15 @@ impl MetricsState {
     /// * [`MetricsSnapshot::throughput_series`] — the rolling 60 s window
     ///   maintained by this state (the Live view's hero chart reads it).
     pub fn update(&self, mut snapshot: MetricsSnapshot) {
+        // One-way freeze (sequence `AllComplete`): no further updates. The
+        // rolling window, the overall accumulator, and the published
+        // snapshot all stay at their final values — the UI shows static
+        // numbers and the graph stops animating. This short-circuits the
+        // forever-running hardware poller, which would otherwise keep
+        // re-stamping `0.0` samples and growing `elapsed_sec`.
+        if self.frozen.load(Ordering::Relaxed) {
+            return;
+        }
         snapshot = snapshot.with_derived_prompt_throughput();
         {
             let mut rs = self
@@ -881,5 +916,39 @@ mod tests {
         assert_eq!(loaded.engine_markers[0].label, "short");
         assert_eq!(loaded.engine_markers[1].label, "Concurrency");
         assert!(loaded.elapsed_sec >= 0.0);
+    }
+
+    // ── one-way freeze (AllComplete) ────────────────────────────────────
+
+    #[test]
+    fn frozen_state_ignores_all_further_updates() {
+        let state = MetricsState::new();
+        state.update(snap(100.0));
+        assert!(!state.is_frozen(), "fresh state is not frozen");
+
+        // The sequence completes: everything freezes in place.
+        state.freeze();
+        assert!(state.is_frozen());
+        let before = state.load();
+        let series_before = before.throughput_series.clone();
+        let elapsed_before = before.elapsed_sec;
+        let overall_before = before.overall.clone();
+        let agg_before = before.aggregate_tps;
+
+        // A later update (e.g. from the forever-running 100 ms hardware
+        // poller, now with `0.0` throughput and no active streams) must be
+        // a no-op: no new rolling sample, no elapsed growth, no overall
+        // drift, and the published snapshot is untouched.
+        std::thread::sleep(Duration::from_millis(1100));
+        state.update(snap(0.0));
+        let after = state.load();
+        assert_eq!(after.throughput_series, series_before, "series frozen");
+        assert_eq!(after.elapsed_sec, elapsed_before, "elapsed frozen");
+        assert_eq!(after.overall, overall_before, "overall frozen");
+        assert_eq!(after.aggregate_tps, agg_before, "snapshot frozen");
+
+        // The freeze is one-way: it cannot be cleared.
+        state.freeze();
+        assert!(state.is_frozen());
     }
 }

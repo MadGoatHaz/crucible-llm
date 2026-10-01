@@ -54,6 +54,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let snap = app.metrics.load();
     let m = snap.as_ref();
     let seq = app.seq.load();
+    // Once the sequence completes the metrics pipeline freezes: the hero
+    // shows its final, static state ("final" + a ✓ COMPLETE badge) and the
+    // throughput graph stops animating (no more per-tick samples/averages).
+    let frozen = app.metrics.is_frozen();
 
     let show_concurrency = should_show_concurrency(&seq, app);
     let show_capabilities = should_show_capabilities(&seq, app);
@@ -81,7 +85,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     for (i, (id, _)) in plan.iter().enumerate() {
         match *id {
             0 => render_sequence_header(rects[i], app, f),
-            1 => render_throughput_row(rects[i], m, f),
+            1 => render_throughput_row(rects[i], m, frozen, f),
             2 => render_concurrency_curve(rects[i], app, f),
             3 => render_capability_scores(rects[i], app, m, f),
             4 => render_log(rects[i], app, f),
@@ -131,14 +135,14 @@ fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
 /// The top row: the throughput hero chart (left, the *live* rolling
 /// window) + the overall-metrics readout (right, *cumulative* across all
 /// engines — FIX 1).
-fn render_throughput_row(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+fn render_throughput_row(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         // 50/50 so the overall panel's `avg │ max │ p5` rows (the widest
         // content) fit without wrapping and clipping the footer (FIX 1).
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    render_throughput_hero(cols[0], m, f);
+    render_throughput_hero(cols[0], m, frozen, f);
     render_overall_metrics(cols[1], m, f);
 }
 
@@ -151,11 +155,23 @@ fn render_throughput_row(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
 /// y-axis auto-scales to the data (never a fixed axis); the x-axis spans
 /// the *actual* data window. An empty series shows
 /// "Awaiting first tokens…" (never a blank panel).
-fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut Frame) {
+    // While the run is live the hero is a real-time chart ("now"); once the
+    // sequence completes the metrics pipeline freezes and the hero shows its
+    // final, static state ("final" + a ✓ COMPLETE badge, green border).
+    let title = if frozen {
+        " LIVE THROUGHPUT — ✓ COMPLETE (final, frozen) "
+    } else {
+        " LIVE THROUGHPUT — real-time generation speed (tokens/sec) "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(style::active_border())
-        .title(" LIVE THROUGHPUT — real-time generation speed (tokens/sec) ");
+        .border_style(if frozen {
+            style::value_ok()
+        } else {
+            style::active_border()
+        })
+        .title(title);
     if area.width < 8 || area.height < 5 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -175,15 +191,26 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         series.iter().sum::<f64>() / series.len() as f64
     };
 
-    // The header line: the *live* now / peak / avg for the window.
-    let value_line = Line::from(vec![
-        Span::styled("now ", style::label()),
-        Span::styled(format!("{current:.1} t/s"), style::value()),
-        Span::styled("  │  peak ", style::footer()),
-        Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
-        Span::styled("  │  avg ", style::footer()),
-        Span::styled(format!("{avg:.1} t/s"), style::value()),
-    ]);
+    // The header line: the *live* now / peak / avg for the window — or, once
+    // frozen, the *final* window average + peak (the run is over, so there is
+    // no live "now" and the instantaneous rate would read 0.0).
+    let value_line = if frozen {
+        Line::from(vec![
+            Span::styled("final ", style::label()),
+            Span::styled(format!("{avg:.1} t/s"), style::value_ok()),
+            Span::styled("  │  peak ", style::footer()),
+            Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("now ", style::label()),
+            Span::styled(format!("{current:.1} t/s"), style::value()),
+            Span::styled("  │  peak ", style::footer()),
+            Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+            Span::styled("  │  avg ", style::footer()),
+            Span::styled(format!("{avg:.1} t/s"), style::value()),
+        ])
+    };
 
     // Engine-transition markers positioned in the current window: the
     // window starts `elapsed − (len−1)` seconds ago (one sample/sec).
@@ -1391,5 +1418,45 @@ mod tests {
         // No engine running → the adaptive panels stay hidden.
         assert!(!text.contains("CONCURRENCY CURVE"), "{text}");
         assert!(!text.contains("CAPABILITY SCORES"), "{text}");
+    }
+
+    // ── frozen (AllComplete) hero ────────────────────────────────────────
+
+    #[test]
+    fn live_view_hero_shows_final_frozen_state_when_complete() {
+        // A frozen metrics state (the sequence reached AllComplete) → the
+        // hero reads "final" + the ✓ COMPLETE badge, the live "now" is gone,
+        // and the (frozen) rolling series stops animating.
+        let app = App::new();
+        app.metrics.update(MetricsSnapshot {
+            aggregate_tps: 150.0,
+            throughput_series: vec![120.0, 150.0, 180.0],
+            ..Default::default()
+        });
+        app.metrics.freeze();
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("final"), "final label: {text}");
+        assert!(text.contains("COMPLETE"), "✓ COMPLETE badge: {text}");
+        assert!(text.contains("peak"), "peak still shown: {text}");
+        assert!(
+            !text.contains("now "),
+            "live 'now' gone when frozen: {text}"
+        );
+    }
+
+    #[test]
+    fn live_view_hero_is_live_when_not_frozen() {
+        // Not frozen → the hero keeps the live "now / peak / avg" line and
+        // the real-time title (no COMPLETE badge) — behavior unchanged.
+        let app = App::new();
+        app.metrics.update(MetricsSnapshot {
+            aggregate_tps: 150.0,
+            throughput_series: vec![120.0, 150.0, 180.0],
+            ..Default::default()
+        });
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("now "), "live 'now' present: {text}");
+        assert!(text.contains("avg"), "live 'avg' present: {text}");
+        assert!(!text.contains("COMPLETE"), "no badge while live: {text}");
     }
 }
