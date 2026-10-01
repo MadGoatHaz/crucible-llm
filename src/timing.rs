@@ -72,6 +72,29 @@ impl Default for MonotonicInstant {
     }
 }
 
+/// The number of timestamp calls averaged by
+/// [`measure_timestamp_overhead`].
+const OVERHEAD_SAMPLE_COUNT: u64 = 10_000;
+
+/// Measure the overhead of a single [`MonotonicInstant::now`] call in
+/// nanoseconds (v0.1.1 "nanosecond timing publication"): time
+/// [`OVERHEAD_SAMPLE_COUNT`] consecutive calls on the quanta source clock
+/// and divide by the count.
+///
+/// `std::hint::black_box` keeps the loop from being optimized away. The
+/// result is the per-call cost of the *measurement itself* — the number we
+/// publish in every JSON export's `timing.overhead_ns` /
+/// `methodology.timing.overhead_ns` blocks and stamp into
+/// [`crate::metrics::MetricsSnapshot::timing_resolution_ns`].
+#[must_use]
+pub fn measure_timestamp_overhead() -> u64 {
+    let start = MonotonicInstant::now();
+    for _ in 0..OVERHEAD_SAMPLE_COUNT {
+        std::hint::black_box(MonotonicInstant::now());
+    }
+    start.elapsed_nanos() / OVERHEAD_SAMPLE_COUNT
+}
+
 /// Per-stream lifecycle timestamps (blueprint §4.1 / §7).
 ///
 /// `T0` socket start · `T1` request write complete · `T2` first byte ·

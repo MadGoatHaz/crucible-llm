@@ -119,20 +119,30 @@ async fn json_report_matches_prototype_key_set() {
     let v = json_report(&c, &results);
     let top = v.as_object().unwrap();
 
-    // Top-level keys: exactly the prototype `output_json` set (no summary
-    // for a single valid run).
+    // Top-level keys: the prototype `output_json` set plus the v0.1.1
+    // `timing` / `methodology` blocks (no summary for a single valid run,
+    // no `loop_guard` — the mock stream does not loop).
     let top_keys: Vec<&str> = top.keys().map(|s| s.as_str()).collect();
     assert_eq!(
         top_keys,
-        vec!["url", "model", "mode", "iterations", "results"]
+        vec![
+            "url",
+            "model",
+            "mode",
+            "iterations",
+            "results",
+            "timing",
+            "methodology"
+        ]
     );
     assert!(top.get("summary").is_none());
+    assert!(top.get("loop_guard").is_none());
     assert_eq!(top["url"], url);
     assert_eq!(top["iterations"], 1);
 
-    // Per-run keys: exactly the prototype `to_dict` set.
+    // Per-run keys: the prototype `to_dict` set + v0.1.1 `looping`.
     let rj = top["results"][0].as_object().unwrap();
-    assert_eq!(rj.len(), 14);
+    assert_eq!(rj.len(), 15);
     for key in [
         "ttft_s",
         "prompt_tokens",
@@ -148,6 +158,7 @@ async fn json_report_matches_prototype_key_set() {
         "model",
         "mode",
         "error",
+        "looping",
     ] {
         assert!(rj.contains_key(key), "missing {key}");
     }
@@ -159,6 +170,11 @@ async fn json_report_matches_prototype_key_set() {
     assert_eq!(rj["completion_tokens"], 34);
     assert_eq!(rj["estimated"], false);
     assert_eq!(rj["error"], serde_json::Value::Null);
+
+    // The v0.1.1 blocks publish the measurement methodology.
+    assert_eq!(top["timing"]["resolution"], "nanosecond");
+    assert!(top["timing"]["overhead_ns"].is_u64());
+    assert_eq!(top["methodology"]["version"], env!("CARGO_PKG_VERSION"));
 
     // Two valid runs → summary with the prototype's four keys.
     let v2 = json_report(

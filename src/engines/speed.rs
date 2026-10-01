@@ -72,6 +72,9 @@ pub struct SpeedResult {
     /// `Some` on a hard failure, or as a warning note (e.g. skipped
     /// malformed frames) on an otherwise successful run.
     pub error: Option<String>,
+    /// The decode-loop guard (v0.1.1) flagged this run: its throughput
+    /// numbers are zeroed (excluded) and it is kept out of summaries.
+    pub looping: bool,
 }
 
 impl SpeedResult {
@@ -100,6 +103,7 @@ impl SpeedResult {
             "model": self.model,
             "mode": self.mode,
             "error": self.error,
+            "looping": self.looping,
         })
     }
 }
@@ -318,8 +322,12 @@ impl SpeedEngine {
         let mut ttft_ns: Option<u64> = None;
         let mut usage: Option<Usage> = None;
         let mut state = StreamStatus::Waiting;
+        let mut t0: Option<MonotonicInstant> = None;
         let mut t3: Option<MonotonicInstant> = None;
         let mut t_end: Option<MonotonicInstant> = None;
+        // v0.1.1 decode-loop guard verdict (carried by the terminal event).
+        let mut looping = false;
+        let mut loop_excluded_tokens = 0u64;
 
         for event in events {
             match event {
@@ -346,6 +354,9 @@ impl SpeedEngine {
                             state = StreamStatus::Streaming;
                         }
                     }
+                    if t0.is_none() {
+                        t0 = timestamps.t0;
+                    }
                     if ttft_ns.is_none() {
                         ttft_ns = timestamps.ttft_nanos();
                     }
@@ -353,18 +364,29 @@ impl SpeedEngine {
                 StreamEvent::Complete {
                     timestamps,
                     usage: u,
+                    looping: l,
+                    loop_excluded_tokens: e,
                     ..
                 } => {
                     usage = *u;
                     t_end = timestamps.t_end;
                     state = StreamStatus::Done;
+                    looping = *l;
+                    loop_excluded_tokens = *e;
                     if ttft_ns.is_none() {
                         ttft_ns = timestamps.ttft_nanos();
                     }
                 }
-                StreamEvent::Failed { timestamps, .. } => {
+                StreamEvent::Failed {
+                    timestamps,
+                    looping: l,
+                    loop_excluded_tokens: e,
+                    ..
+                } => {
                     t_end = timestamps.t_end;
                     state = StreamStatus::Error;
+                    looping = *l;
+                    loop_excluded_tokens = *e;
                     if ttft_ns.is_none() {
                         ttft_ns = timestamps.ttft_nanos();
                     }
@@ -385,6 +407,43 @@ impl SpeedEngine {
                 }
             }
             _ => None,
+        };
+        // v0.1.1 labeled metric layers — three separate numbers, never
+        // blended (blueprint §v0.1.1-B):
+        //   prefill = prompt_tokens / TTFT
+        //   decode  = completion_tokens / (T_last − T_first)
+        //   e2e     = total_tokens / total wall time (T0 → Tn)
+        // A looping stream is excluded from all three.
+        let (prefill_tps, decode_tps, e2e_tps) = if looping {
+            (0.0, 0.0, 0.0)
+        } else {
+            let prefill = match (prompt_tokens, ttft_ns) {
+                (p, Some(ns)) if p > 0 && ns > 0 => p as f64 / (ns as f64 / 1e9),
+                _ => 0.0,
+            };
+            let decode = match (t3, t_end) {
+                (Some(t3), Some(end)) => {
+                    let span_s = t3.delta_nanos(&end) as f64 / 1e9;
+                    if span_s > 0.0 && tokens > 0 {
+                        tokens as f64 / span_s
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            let e2e = match (t0, t_end) {
+                (Some(t0), Some(end)) => {
+                    let span_s = t0.delta_nanos(&end) as f64 / 1e9;
+                    if span_s > 0.0 && tokens > 0 {
+                        tokens as f64 / span_s
+                    } else {
+                        0.0
+                    }
+                }
+                _ => 0.0,
+            };
+            (prefill, decode, e2e)
         };
         let mtp = if content_frames > 0 {
             Some(tokens as f64 / content_frames as f64)
@@ -410,7 +469,10 @@ impl SpeedEngine {
             model: model.to_string(),
             mode: mode.to_string(),
             aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),
-            active_streams: if state == StreamStatus::Streaming {
+            prefill_throughput: prefill_tps,
+            decode_throughput: decode_tps,
+            e2e_throughput: e2e_tps,
+            active_streams: if state == StreamStatus::Streaming && !looping {
                 1
             } else {
                 0
@@ -423,6 +485,8 @@ impl SpeedEngine {
             prompt_tokens,
             completion_tokens: tokens,
             status: state,
+            loop_excluded_streams: looping as usize,
+            loop_excluded_tokens,
             streams: vec![StreamMetric {
                 id: 0,
                 kind: kind.to_string(),
@@ -433,6 +497,7 @@ impl SpeedEngine {
                 gen_tps,
                 mtp,
                 progress,
+                looping,
             }],
             ..Default::default()
         }
@@ -584,14 +649,24 @@ pub fn aggregate(
         }
     }
 
-    let pp_speed = if ttft > 0.0 {
+    // The v0.1.1 decode-loop guard: a looping stream's repeating output is
+    // excluded from the throughput numbers (the layers are zeroed, the
+    // run is flagged, and summaries skip it).
+    let looping = outcome.looping;
+    let pp_speed = if looping {
+        0.0
+    } else if ttft > 0.0 {
         prompt_tokens as f64 / ttft
     } else {
         0.0
     };
     // §7.2: isolate the decode window from the prefill.
     let generation_time = (stream_time - ttft).max(0.001);
-    let tg_speed = completion_tokens as f64 / generation_time;
+    let tg_speed = if looping {
+        0.0
+    } else {
+        completion_tokens as f64 / generation_time
+    };
     // §7.4: MTP η = tokens / content packets.
     let mtp_efficiency = if content_chunks > 0 {
         completion_tokens as f64 / content_chunks as f64
@@ -635,12 +710,18 @@ pub fn aggregate(
         model: cfg.model.clone(),
         mode: cfg.mode.label().to_string(),
         error,
+        looping,
     }
 }
 
 /// The `--json` document (parity with the prototype's `output_json`):
 /// top-level `url` / `model` / `mode` / `iterations` / `results`, plus a
 /// `summary` when more than one run is valid.
+///
+/// v0.1.1 additions (measurement credibility): a `timing` block (ns
+/// resolution + measured overhead), a `methodology` block (the formula
+/// behind every number), and a `loop_guard` block when any run was
+/// excluded by the decode-loop guard.
 pub fn json_report(cfg: &Config, results: &[SpeedResult]) -> serde_json::Value {
     let mut output = json!({
         "url": cfg.url,
@@ -657,6 +738,21 @@ pub fn json_report(cfg: &Config, results: &[SpeedResult]) -> serde_json::Value {
             "avg_pp_speed": round(valid.iter().map(|r| r.pp_speed).sum::<f64>() / n, 2),
             "avg_tg_speed": round(valid.iter().map(|r| r.tg_speed).sum::<f64>() / n, 2),
             "avg_mtp": round(valid.iter().map(|r| r.mtp_efficiency).sum::<f64>() / n, 4),
+        });
+    }
+    let overhead = crate::timing::measure_timestamp_overhead();
+    output["timing"] = crate::metrics::methodology::timing_block(overhead);
+    output["methodology"] = crate::metrics::methodology::methodology_block(overhead);
+    let detected = results.iter().filter(|r| r.looping).count();
+    if detected > 0 {
+        let excluded: u64 = results
+            .iter()
+            .filter(|r| r.looping)
+            .map(|r| r.completion_tokens)
+            .sum();
+        output["loop_guard"] = json!({
+            "detected_streams": detected,
+            "excluded_tokens": excluded,
         });
     }
     output
@@ -747,6 +843,9 @@ pub fn format_result_box(
             &result.reasoning_chunks.to_string(),
         );
     }
+    if result.looping {
+        row(&mut lines, "  loop guard:", "EXCLUDED (repeating pattern)");
+    }
     lines.push(format!("╚{}╝", "═".repeat(50)));
 
     let mut out = String::new();
@@ -772,7 +871,12 @@ fn row(lines: &mut Vec<String>, label: &str, value: &str) {
 /// The multi-iteration summary (parity with the prototype's
 /// `print_summary`): `None` when fewer than two runs are valid.
 pub fn format_summary(results: &[SpeedResult], color: bool) -> Option<String> {
-    let valid: Vec<&SpeedResult> = results.iter().filter(|r| !r.is_failed()).collect();
+    // Looping runs (v0.1.1) are excluded from the averaged summary — their
+    // throughput is not a measurement of the server.
+    let valid: Vec<&SpeedResult> = results
+        .iter()
+        .filter(|r| !r.is_failed() && !r.looping)
+        .collect();
     if valid.len() < 2 {
         return None;
     }
@@ -921,6 +1025,8 @@ mod tests {
                 usage: Some(usage),
                 premature: false,
                 malformed_frames: 0,
+                looping: false,
+                loop_excluded_tokens: 0,
             }))
             .collect();
         let outcome = StreamOutcome {
@@ -935,6 +1041,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: None,
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         (outcome, events)
     }
@@ -1007,6 +1116,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: None,
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(r.error.as_deref(), Some("No data received from server"));
@@ -1031,6 +1143,9 @@ mod tests {
                 status: 500,
                 body: "boom".into(),
             }),
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(r.error.as_deref(), Some("HTTP 500: boom"));
@@ -1050,6 +1165,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(
@@ -1076,16 +1194,29 @@ mod tests {
         let r = aggregate(&cfg(), &prompt(), &outcome, &events);
 
         // One valid run: no summary (the prototype emits one only for
-        // >1 valid runs).
+        // >1 valid runs). v0.1.1: the `timing` + `methodology` blocks are
+        // always present; `loop_guard` only when a run was excluded.
         let v = json_report(&cfg(), std::slice::from_ref(&r));
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
-        assert_eq!(keys, vec!["url", "model", "mode", "iterations", "results"]);
+        assert_eq!(
+            keys,
+            vec![
+                "url",
+                "model",
+                "mode",
+                "iterations",
+                "results",
+                "timing",
+                "methodology"
+            ]
+        );
         assert!(v.get("summary").is_none());
+        assert!(v.get("loop_guard").is_none(), "no looping runs → no block");
 
-        // Result keys: exactly the prototype `to_dict` set (no
-        // `other_chunks`).
+        // Result keys: the prototype `to_dict` set + v0.1.1 `looping`
+        // (no `other_chunks`).
         let rj = v["results"][0].as_object().unwrap();
-        assert_eq!(rj.len(), 14);
+        assert_eq!(rj.len(), 15);
         for key in [
             "ttft_s",
             "prompt_tokens",
@@ -1101,10 +1232,18 @@ mod tests {
             "model",
             "mode",
             "error",
+            "looping",
         ] {
             assert!(rj.contains_key(key), "missing {key}");
         }
         assert!(!rj.contains_key("other_chunks"));
+        assert_eq!(rj["looping"], false);
+
+        // The v0.1.1 blocks carry the published methodology.
+        assert_eq!(v["timing"]["resolution"], "nanosecond");
+        assert!(v["timing"]["overhead_ns"].is_u64());
+        assert_eq!(v["methodology"]["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["methodology"]["prefill_throughput"].is_string());
 
         // Two valid runs: summary with the prototype's four keys.
         let v2 = json_report(&cfg(), &[r.clone(), r]);
@@ -1115,6 +1254,150 @@ mod tests {
             vec!["avg_ttft", "avg_pp_speed", "avg_tg_speed", "avg_mtp"]
         );
         assert_eq!(v2["iterations"], 2);
+    }
+
+    // ── v0.1.1: labeled layers, loop guard, timing publication ─────────
+
+    #[test]
+    fn aggregate_zeroes_throughput_for_a_looping_run() {
+        let (mut outcome, events) = completed_run();
+        outcome.looping = true;
+        outcome.loop_excluded_tokens = outcome.usage.map(|u| u.completion_tokens).unwrap_or(0);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        assert!(r.looping, "the flag survives into the result");
+        assert_eq!(r.pp_speed, 0.0, "prefill excluded");
+        assert_eq!(r.tg_speed, 0.0, "decode excluded");
+        // The observed token count is preserved (it is the exclusion
+        // numerator), only the rates are zeroed.
+        assert_eq!(r.completion_tokens, 34);
+    }
+
+    #[test]
+    fn single_stream_snapshot_computes_the_three_labeled_layers() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(10_000_000);
+            let t1 = MonotonicInstant::now(); // 10 ms
+            mock.increment(20_000_000);
+            let t3 = MonotonicInstant::now(); // 30 ms
+            mock.increment(100_000_000);
+            let t_end = MonotonicInstant::now(); // 130 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 60,
+                completion_tokens: 10,
+            };
+            let events = vec![
+                StreamEvent::Frame {
+                    frame: crate::sse::ParsedFrame {
+                        chunk: Chunk::Content("a".into()),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t3,
+                    timestamps: ts,
+                },
+                StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+            ];
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, &t0, 256);
+            // prefill = 60 prompt tokens / 20 ms TTFT = 3000 t/s.
+            assert!(
+                (snap.prefill_throughput - 3000.0).abs() < 1e-6,
+                "{}",
+                snap.prefill_throughput
+            );
+            // decode = 10 tokens / (130−30) ms = 100 t/s.
+            assert!(
+                (snap.decode_throughput - 100.0).abs() < 1e-6,
+                "{}",
+                snap.decode_throughput
+            );
+            // e2e = 10 tokens / 130 ms ≈ 76.9 t/s.
+            assert!(
+                (snap.e2e_throughput - 10.0 / 0.13).abs() < 1e-6,
+                "{}",
+                snap.e2e_throughput
+            );
+            // The three layers are distinct (never blended).
+            assert_ne!(snap.prefill_throughput, snap.decode_throughput);
+            assert_ne!(snap.decode_throughput, snap.e2e_throughput);
+            assert_eq!(snap.loop_excluded_streams, 0);
+        });
+    }
+
+    #[test]
+    fn single_stream_snapshot_excludes_a_looping_stream() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(10_000_000);
+            let t3 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t0),
+                t2: Some(t3),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 60,
+                completion_tokens: 10,
+            };
+            let events = vec![
+                StreamEvent::Frame {
+                    frame: crate::sse::ParsedFrame {
+                        chunk: Chunk::Content("a".into()),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t3,
+                    timestamps: ts,
+                },
+                StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: true,
+                    loop_excluded_tokens: 10,
+                },
+            ];
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, &t0, 256);
+            assert_eq!(snap.prefill_throughput, 0.0);
+            assert_eq!(snap.decode_throughput, 0.0);
+            assert_eq!(snap.e2e_throughput, 0.0);
+            assert_eq!(snap.loop_excluded_streams, 1);
+            assert_eq!(snap.loop_excluded_tokens, 10);
+            assert!(snap.streams[0].looping);
+        });
+    }
+
+    #[test]
+    fn measured_timestamp_overhead_is_positive_and_small() {
+        let ns = crate::timing::measure_timestamp_overhead();
+        // A real clock measures a positive overhead; quanta's TSC path is
+        // well under a microsecond per call (the "< 100 ns" marketing
+        // claim is for the TSC case; allow generous headroom here).
+        assert!(ns > 0, "overhead must be positive");
+        assert!(ns < 10_000, "a single timestamp call is not 10 µs: {ns}");
     }
 
     #[test]
@@ -1131,6 +1414,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
         assert!(!all_failed(&[ok.clone(), failed.clone()]));
@@ -1179,6 +1465,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let fr = aggregate(&cfg(), &prompt(), &failed, &[]);
         assert!(format_result_box(&fr, 1, 1, false).is_none());
@@ -1206,6 +1495,9 @@ mod tests {
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("x".into())),
+
+            looping: false,
+            loop_excluded_tokens: 0,
         };
         let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
         assert!(format_summary(&[a.clone(), failed], false).is_none());

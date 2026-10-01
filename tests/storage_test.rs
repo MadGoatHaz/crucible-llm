@@ -260,6 +260,7 @@ fn speed_result(tg_speed: f64) -> SpeedResult {
         model: "test-model".into(),
         mode: "short".into(),
         error: None,
+        looping: false,
     }
 }
 

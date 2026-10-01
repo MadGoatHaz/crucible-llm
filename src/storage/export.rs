@@ -64,6 +64,20 @@ pub struct ExportPayload {
     pub packets: Vec<PacketSample>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub needles: Vec<NeedleEvaluation>,
+    /// The v0.1.1 decode-loop guard verdict for this run
+    /// (`"loop_guard"` block in the JSON export).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_guard: Option<crate::metrics::LoopGuardSummary>,
+    /// The v0.1.1 2D concurrency × context matrix (`"matrix"` block in
+    /// the JSON export) when Engine B ran with a multi-context axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<crate::engines::ConcurrencyMatrix>,
+    /// The measured timestamp overhead (ns) captured when this payload
+    /// was built — kept out of the serialized shape (`skip`) so that
+    /// `to_json()` is deterministic: the `timing.overhead_ns` it publishes
+    /// is the one from *this* measurement, not a fresh one per call.
+    #[serde(default, skip)]
+    pub timing_overhead_ns: u64,
 }
 
 /// Export failures.
@@ -95,6 +109,9 @@ impl ExportPayload {
             metrics,
             packets: Vec::new(),
             needles,
+            loop_guard: None,
+            matrix: None,
+            timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
         })
     }
 
@@ -111,20 +128,128 @@ impl ExportPayload {
             metrics,
             packets,
             needles,
+            loop_guard: None,
+            matrix: None,
+            timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
         }
+    }
+
+    /// Attach the v0.1.1 decode-loop guard summary (the JSON export's
+    /// `loop_guard` block).
+    pub fn with_loop_guard(mut self, summary: crate::metrics::LoopGuardSummary) -> Self {
+        self.loop_guard = Some(summary);
+        self
+    }
+
+    /// Attach the v0.1.1 2D concurrency × context matrix (the JSON
+    /// export's `matrix` block).
+    pub fn with_matrix(mut self, matrix: crate::engines::ConcurrencyMatrix) -> Self {
+        self.matrix = Some(matrix);
+        self
     }
 
     // ── the three exporters (blueprint §8 "Export Formats") ────────────
 
     /// **JSON** (CI/CD regression gating): compact, valid, parseable.
+    ///
+    /// v0.1.1 (measurement credibility): every JSON export carries the
+    /// `timing` block (ns resolution + the measured per-timestamp
+    /// overhead) and the `methodology` block (the formula behind every
+    /// published number), plus the three **labeled** throughput layers
+    /// derived from the metric rows — `prefill_throughput`,
+    /// `decode_throughput`, and `e2e_throughput` — kept as separate
+    /// fields, never blended. The `loop_guard` / `matrix` blocks are
+    /// present when the payload carries them.
     #[must_use]
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|e| {
-            // `ExportPayload` is plain serde data — serialization cannot
-            // realistically fail; if it ever does, emit an explicit error
-            // object rather than panicking the run.
-            format!("{{\"error\": \"serialization failed: {e}\"}}")
-        })
+        let base = match serde_json::to_value(self) {
+            Ok(v) => v,
+            Err(e) => {
+                // `ExportPayload` is plain serde data — serialization
+                // cannot realistically fail; if it ever does, emit an
+                // explicit error object rather than panicking the run.
+                return format!("{{\"error\": \"serialization failed: {e}\"}}");
+            }
+        };
+        let overhead = self.timing_overhead_ns;
+        let mut v = base;
+        v["timing"] = crate::metrics::methodology::timing_block(overhead);
+        v["methodology"] = crate::metrics::methodology::methodology_block(overhead);
+        if let Some(t) = self.prefill_throughput() {
+            v["prefill_throughput"] = serde_json::json!(round2(t));
+        }
+        if let Some(t) = self.decode_throughput() {
+            v["decode_throughput"] = serde_json::json!(round2(t));
+        }
+        if let Some(t) = self.e2e_throughput() {
+            v["e2e_throughput"] = serde_json::json!(round2(t));
+        }
+        serde_json::to_string(&v)
+            .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"))
+    }
+
+    /// The v0.1.1 **prefill** layer derived from the metric rows:
+    /// `sum(prompt_tokens) / mean(TTFT)` — how fast the server ingests
+    /// the input. `None` when no row carries both a prompt count and a
+    /// TTFT.
+    #[must_use]
+    pub fn prefill_throughput(&self) -> Option<f64> {
+        let prompt: i64 = self
+            .metrics
+            .iter()
+            .filter_map(|m| m.prompt_tokens)
+            .filter(|&p| p > 0)
+            .sum();
+        let ttfts: Vec<f64> = self
+            .metrics
+            .iter()
+            .filter_map(|m| m.ttft_ms)
+            .filter(|&t| t > 0.0)
+            .collect();
+        if prompt > 0 && !ttfts.is_empty() {
+            let mean_ttft_s = ttfts.iter().sum::<f64>() / ttfts.len() as f64 / 1000.0;
+            (mean_ttft_s > 0.0).then(|| prompt as f64 / mean_ttft_s)
+        } else {
+            None
+        }
+    }
+
+    /// The v0.1.1 **decode** layer derived from the metric rows:
+    /// `sum(completion_tokens) / sum((completion_tokens − 1) × TPOT)` —
+    /// sustained generation over each stream's first→last token window.
+    /// `None` when no row carries both.
+    #[must_use]
+    pub fn decode_throughput(&self) -> Option<f64> {
+        let mut tokens = 0i64;
+        let mut window_s = 0.0;
+        for m in &self.metrics {
+            let c = m.completion_tokens.unwrap_or(0);
+            if c < 2 {
+                continue;
+            }
+            let Some(tpot_ms) = m.tpot_ms.filter(|t| *t > 0.0) else {
+                continue;
+            };
+            tokens += c;
+            window_s += (c - 1) as f64 * tpot_ms / 1000.0;
+        }
+        (tokens > 0 && window_s > 0.0).then(|| tokens as f64 / window_s)
+    }
+
+    /// The v0.1.1 **e2e** layer derived from the session:
+    /// `sum(completion_tokens) / total wall time` — everything included
+    /// (connection, TTFT, generation). `None` when the session has no
+    /// recorded duration or no tokens.
+    #[must_use]
+    pub fn e2e_throughput(&self) -> Option<f64> {
+        let tokens: i64 = self
+            .metrics
+            .iter()
+            .filter_map(|m| m.completion_tokens)
+            .filter(|&c| c > 0)
+            .sum();
+        let d = self.session.total_duration_sec.filter(|d| *d > 0.0)?;
+        (tokens > 0).then(|| tokens as f64 / d)
     }
 
     /// **GitHub-Flavored Markdown**: session metadata + per-stream metric
@@ -348,6 +473,11 @@ fn opt_bool(v: Option<bool>) -> String {
     v.map(|v| v.to_string()).unwrap_or_else(|| "--".to_string())
 }
 
+/// Round to 2 decimal places (the JSON export's labeled-layer display).
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
 /// Append a CSV field to `out`, quoting it (RFC 4180) when it contains a
 /// comma, quote, or newline.
 fn push_csv_field(out: &mut String, field: &str) {
@@ -450,6 +580,98 @@ mod tests {
         assert_eq!(back.packets[1].itl_ns, Some(12_000));
         // Compact (no pretty-print newlines outside the string values).
         assert!(!json.contains("\n"));
+    }
+
+    // ── v0.1.1: methodology transparency in every JSON export ─────────
+
+    #[test]
+    fn json_export_includes_timing_and_methodology_blocks() {
+        let payload = sample_payload();
+        let v: serde_json::Value =
+            serde_json::from_str(&payload.to_json()).expect("must be valid JSON");
+        // The timing block publishes ns resolution + measured overhead.
+        assert_eq!(v["timing"]["resolution"], "nanosecond");
+        assert!(v["timing"]["overhead_ns"].is_u64());
+        assert!(v["timing"]["method"].as_str().unwrap().contains("quanta"));
+        assert!(v["timing"]["isolation"]
+            .as_str()
+            .unwrap()
+            .contains("wait-free"));
+        // The methodology block documents every formula.
+        assert_eq!(v["methodology"]["version"], env!("CARGO_PKG_VERSION"));
+        for key in [
+            "prefill_throughput",
+            "decode_throughput",
+            "e2e_throughput",
+            "itl",
+            "aggregate_throughput",
+            "per_stream_throughput",
+            "token_counting",
+            "loop_guard",
+            "warmup",
+        ] {
+            assert!(v["methodology"].get(key).is_some(), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn json_export_includes_the_three_labeled_layers() {
+        let payload = sample_payload();
+        let v: serde_json::Value =
+            serde_json::from_str(&payload.to_json()).expect("must be valid JSON");
+        // Two sample rows: prompt 128 each, TTFT 182.5 ms, completion 34
+        // each, TPOT 13.8 ms; session duration 12.34 s.
+        let prefill = payload.prefill_throughput().expect("prefill derivable");
+        assert!((prefill - 256.0 / 0.1825).abs() < 1e-6, "{prefill}");
+        assert_eq!(v["prefill_throughput"], serde_json::json!(round2(prefill)));
+        let decode = payload.decode_throughput().expect("decode derivable");
+        let window = 2.0 * 33.0 * 13.8 / 1000.0;
+        assert!((decode - 68.0 / window).abs() < 1e-6, "{decode}");
+        assert_eq!(v["decode_throughput"], serde_json::json!(round2(decode)));
+        let e2e = payload.e2e_throughput().expect("e2e derivable");
+        assert!((e2e - 68.0 / 12.34).abs() < 1e-6, "{e2e}");
+        assert_eq!(v["e2e_throughput"], serde_json::json!(round2(e2e)));
+        // The three layers are separate fields (never blended).
+        assert_ne!(v["prefill_throughput"], v["decode_throughput"]);
+        assert_ne!(v["decode_throughput"], v["e2e_throughput"]);
+    }
+
+    #[test]
+    fn labeled_layers_are_absent_without_data() {
+        let payload = ExportPayload::from_live(sample_session(), vec![], Vec::new(), Vec::new());
+        assert!(payload.prefill_throughput().is_none());
+        assert!(payload.decode_throughput().is_none());
+        // No duration on the session → no e2e.
+        let mut no_duration = payload.clone();
+        no_duration.session.total_duration_sec = None;
+        assert!(no_duration.e2e_throughput().is_none());
+        let v: serde_json::Value = serde_json::from_str(&payload.to_json()).unwrap();
+        assert!(v.get("prefill_throughput").is_none());
+        assert!(v.get("decode_throughput").is_none());
+        assert!(v.get("e2e_throughput").is_none());
+    }
+
+    #[test]
+    fn loop_guard_and_matrix_blocks_serialize_when_present() {
+        let mut payload = sample_payload();
+        payload = payload.with_loop_guard(crate::metrics::LoopGuardSummary {
+            detected_streams: 2,
+            excluded_tokens: 1847,
+        });
+        payload = payload.with_matrix(crate::engines::ConcurrencyMatrix {
+            contexts: vec![0, 8000],
+            concurrency: vec![1, 4],
+            cells: vec![vec![], vec![]],
+        });
+        let v: serde_json::Value = serde_json::from_str(&payload.to_json()).unwrap();
+        assert_eq!(v["loop_guard"]["detected_streams"], 2);
+        assert_eq!(v["loop_guard"]["excluded_tokens"], 1847);
+        assert_eq!(v["matrix"]["contexts"], serde_json::json!([0, 8000]));
+        assert_eq!(v["matrix"]["concurrency"], serde_json::json!([1, 4]));
+        // A payload without them omits the blocks.
+        let plain: serde_json::Value = serde_json::from_str(&sample_payload().to_json()).unwrap();
+        assert!(plain.get("loop_guard").is_none());
+        assert!(plain.get("matrix").is_none());
     }
 
     #[test]
@@ -586,6 +808,9 @@ mod tests {
             usage: None,
             premature: false,
             malformed_frames: 0,
+
+            looping: false,
+            loop_excluded_tokens: 0,
         });
         assert_eq!(samples_from_events(&events, 1).len(), 5);
     }

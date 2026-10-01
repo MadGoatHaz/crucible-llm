@@ -46,9 +46,9 @@ pub use capability::{
     REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
 };
 pub use concurrency::{
-    normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, UsabilityProfile,
-    DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD, PRACTICAL_PER_STREAM_TPS,
-    USABLE_PER_STREAM_TPS,
+    normalize_ladder, ConcurrencyMatrix, Envelope, KneePoint, MatrixCell, Sweep, SweepLevel,
+    SweepResult, UsabilityProfile, DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,
+    PRACTICAL_PER_STREAM_TPS, USABLE_PER_STREAM_TPS,
 };
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
@@ -275,6 +275,18 @@ pub fn build_sweep(
         None => pool,
     };
     let mut sweep = Sweep::new(pool, cfg.ladder.clone());
+    // v0.1.1 2D concurrency × context matrix: with more than one context
+    // size the sweep runs one ladder per context and collects the grid.
+    // A single context (including `[0]`) keeps the classic 1D sweep.
+    if cfg.matrix_contexts.len() > 1 {
+        sweep = sweep.with_matrix(
+            Some(generator),
+            cfg.matrix_contexts.clone(),
+            prompt.token_count,
+        );
+    } else {
+        sweep = sweep.with_matrix(None, Vec::new(), prompt.token_count);
+    }
     if let Some(state) = metrics {
         sweep = sweep.metrics(state);
     }
@@ -351,6 +363,8 @@ mod tests {
                 model: "m".into(),
                 mode: "short".into(),
                 error: None,
+
+                looping: false,
             }],
             ..Default::default()
         };

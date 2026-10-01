@@ -58,6 +58,7 @@ use crate::log::{Context, Level, RunLogger};
 use crate::sse::{Chunk, ParsedFrame, SseParser, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
+use super::loop_guard::LoopGuard;
 use super::truncate_body;
 
 /// Completions path appended to a bare host / base URL.
@@ -92,17 +93,27 @@ pub enum StreamEvent {
     },
     /// The stream ended: cleanly on `[DONE]` (`premature: false`), or
     /// early without a terminator (`premature: true`).
+    ///
+    /// `looping` / `loop_excluded_tokens` (v0.1.1 decode-loop guard):
+    /// `looping` is `true` when the guard flagged a repeating 32-token
+    /// pattern ×3; `loop_excluded_tokens` is the stream's total token
+    /// count when looping (its output is excluded from throughput
+    /// calculations), else `0`.
     Complete {
         timestamps: StreamTimestamps,
         usage: Option<Usage>,
         premature: bool,
         malformed_frames: u64,
+        looping: bool,
+        loop_excluded_tokens: u64,
     },
     /// The stream failed (HTTP error, connection refused, timeout,
     /// read error, unparseable plain-JSON fallback).
     Failed {
         timestamps: StreamTimestamps,
         error: StreamError,
+        looping: bool,
+        loop_excluded_tokens: u64,
     },
 }
 
@@ -162,6 +173,12 @@ pub struct StreamOutcome {
     pub malformed_frames: u64,
     /// `Some` when the run failed.
     pub error: Option<StreamError>,
+    /// The decode-loop guard flagged this stream (v0.1.1): its repeating
+    /// output is excluded from throughput calculations.
+    pub looping: bool,
+    /// The stream's total token count when `looping` (excluded from
+    /// throughput), else `0`.
+    pub loop_excluded_tokens: u64,
 }
 
 impl StreamOutcome {
@@ -327,7 +344,7 @@ impl StreamWorker {
             Err(e) => {
                 ts.t_end = Some(MonotonicInstant::now());
                 return self
-                    .finish_failed(tx, ts, StreamError::Connection(e.to_string()))
+                    .finish_failed(tx, ts, StreamError::Connection(e.to_string()), false, 0)
                     .await;
             }
         };
@@ -344,7 +361,7 @@ impl StreamWorker {
             );
             ts.t_end = Some(MonotonicInstant::now());
             return self
-                .finish_failed(tx, ts, StreamError::Http { status, body })
+                .finish_failed(tx, ts, StreamError::Http { status, body }, false, 0)
                 .await;
         }
 
@@ -360,18 +377,20 @@ impl StreamWorker {
                 // Empty 200 body: nothing to measure.
                 ts.t_end = Some(MonotonicInstant::now());
                 return self
-                    .finish_complete(tx, &ts, None, false, parser.malformed_frames())
+                    .finish_complete(tx, &ts, None, false, parser.malformed_frames(), (false, 0))
                     .await;
             }
             ChunkRead::Timeout => {
                 ts.t_end = Some(MonotonicInstant::now());
                 return self
-                    .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout))
+                    .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout), false, 0)
                     .await;
             }
             ChunkRead::Error(msg) => {
                 ts.t_end = Some(MonotonicInstant::now());
-                return self.finish_failed(tx, ts, StreamError::Read(msg)).await;
+                return self
+                    .finish_failed(tx, ts, StreamError::Read(msg), false, 0)
+                    .await;
             }
         };
         while head.len() < SSE_PREFIX_LEN {
@@ -381,12 +400,14 @@ impl StreamWorker {
                 ChunkRead::Timeout => {
                     ts.t_end = Some(MonotonicInstant::now());
                     return self
-                        .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout))
+                        .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout), false, 0)
                         .await;
                 }
                 ChunkRead::Error(msg) => {
                     ts.t_end = Some(MonotonicInstant::now());
-                    return self.finish_failed(tx, ts, StreamError::Read(msg)).await;
+                    return self
+                        .finish_failed(tx, ts, StreamError::Read(msg), false, 0)
+                        .await;
                 }
             }
         }
@@ -417,6 +438,10 @@ impl StreamWorker {
 
     /// The SSE path: feed bytes into the parser, stamp and forward frames,
     /// until `[DONE]`, clean EOF, premature close, timeout, or read error.
+    ///
+    /// The per-stream [`LoopGuard`] (v0.1.1 decode-loop guard) sees every
+    /// decoded token here; a flagged stream's terminal event carries
+    /// `looping: true` so the engines exclude its tokens from throughput.
     async fn run_sse(
         &self,
         head: impl AsRef<[u8]>,
@@ -426,8 +451,23 @@ impl StreamWorker {
         stream: &mut (impl StreamExt<Item = reqwest::Result<impl AsRef<[u8]>>> + Unpin),
         tx: &mut mpsc::Sender<StreamEvent>,
     ) -> StreamOutcome {
+        let mut guard = LoopGuard::new();
+        let loop_state = |guard: &LoopGuard, usage: Option<Usage>, frames: u64| {
+            let looping = guard.is_detected();
+            (
+                looping,
+                if looping {
+                    usage.map(|u| u.completion_tokens).unwrap_or(frames)
+                } else {
+                    0
+                },
+            )
+        };
         let mut tokens = 0u64;
-        let mut done = match emit_frames(parser.feed(head.as_ref()), &head_at, ts, tx).await {
+        let mut done = match self
+            .emit_frames(parser.feed(head.as_ref()), &head_at, ts, tx, &mut guard)
+            .await
+        {
             Ok((d, tc)) => {
                 tokens += tc;
                 self.log_token_milestones(ts, tokens);
@@ -436,8 +476,16 @@ impl StreamWorker {
             Err(_) => {
                 // Receiver gone: stop measuring.
                 ts.t_end = Some(MonotonicInstant::now());
+                let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                 return self
-                    .finish_complete(tx, ts, parser.usage(), true, parser.malformed_frames())
+                    .finish_complete(
+                        tx,
+                        ts,
+                        parser.usage(),
+                        true,
+                        parser.malformed_frames(),
+                        (looping, excluded),
+                    )
                     .await;
             }
         };
@@ -449,18 +497,29 @@ impl StreamWorker {
                 ChunkRead::Timeout => {
                     ts.t_end = Some(at);
                     return self
-                        .finish_failed(tx, *ts, StreamError::Timeout(self.read_timeout))
+                        .finish_failed(tx, *ts, StreamError::Timeout(self.read_timeout), false, 0)
                         .await;
                 }
                 ChunkRead::Eof => {
                     // Clean EOF without `[DONE]`: premature close.
-                    if let Ok((_, tc)) = emit_frames(parser.finish(), &at, ts, tx).await {
+                    if let Ok((_, tc)) = self
+                        .emit_frames(parser.finish(), &at, ts, tx, &mut guard)
+                        .await
+                    {
                         tokens += tc;
                     }
                     ts.t_end = Some(at);
                     self.log_stream_end(ts, tokens, parser.usage(), true);
+                    let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                     return self
-                        .finish_complete(tx, ts, parser.usage(), true, parser.malformed_frames())
+                        .finish_complete(
+                            tx,
+                            ts,
+                            parser.usage(),
+                            true,
+                            parser.malformed_frames(),
+                            (looping, excluded),
+                        )
                         .await;
                 }
                 ChunkRead::Error(msg) => {
@@ -468,11 +527,15 @@ impl StreamWorker {
                         // Premature close mid-stream: a broken `chunked`
                         // close or connection reset. Flush the pending
                         // frame, keep every captured timestamp.
-                        if let Ok((_, tc)) = emit_frames(parser.finish(), &at, ts, tx).await {
+                        if let Ok((_, tc)) = self
+                            .emit_frames(parser.finish(), &at, ts, tx, &mut guard)
+                            .await
+                        {
                             tokens += tc;
                         }
                         ts.t_end = Some(at);
                         self.log_stream_end(ts, tokens, parser.usage(), true);
+                        let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                         return self
                             .finish_complete(
                                 tx,
@@ -480,17 +543,23 @@ impl StreamWorker {
                                 parser.usage(),
                                 true,
                                 parser.malformed_frames(),
+                                (looping, excluded),
                             )
                             .await;
                     }
                     ts.t_end = Some(at);
-                    return self.finish_failed(tx, *ts, StreamError::Read(msg)).await;
+                    return self
+                        .finish_failed(tx, *ts, StreamError::Read(msg), false, 0)
+                        .await;
                 }
                 ChunkRead::Bytes(b) => {
                     if ts.t2.is_none() {
                         ts.t2 = Some(at);
                     }
-                    match emit_frames(parser.feed(b.as_ref()), &at, ts, tx).await {
+                    match self
+                        .emit_frames(parser.feed(b.as_ref()), &at, ts, tx, &mut guard)
+                        .await
+                    {
                         Ok((d, tc)) => {
                             done = d;
                             tokens += tc;
@@ -498,6 +567,7 @@ impl StreamWorker {
                         }
                         Err(_) => {
                             ts.t_end = Some(at);
+                            let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                             return self
                                 .finish_complete(
                                     tx,
@@ -505,6 +575,7 @@ impl StreamWorker {
                                     parser.usage(),
                                     !done,
                                     parser.malformed_frames(),
+                                    (looping, excluded),
                                 )
                                 .await;
                         }
@@ -516,8 +587,16 @@ impl StreamWorker {
         // `[DONE]` received: Tn — stream close.
         ts.t_end = Some(MonotonicInstant::now());
         self.log_stream_end(ts, tokens, parser.usage(), false);
-        self.finish_complete(tx, ts, parser.usage(), false, parser.malformed_frames())
-            .await
+        let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
+        self.finish_complete(
+            tx,
+            ts,
+            parser.usage(),
+            false,
+            parser.malformed_frames(),
+            (looping, excluded),
+        )
+        .await
     }
 
     /// Log the first token and every 50th token of the stream (the
@@ -619,16 +698,21 @@ impl StreamWorker {
                 ChunkRead::Timeout => {
                     ts.t_end = Some(MonotonicInstant::now());
                     return self
-                        .finish_failed(tx, *ts, StreamError::Timeout(self.read_timeout))
+                        .finish_failed(tx, *ts, StreamError::Timeout(self.read_timeout), false, 0)
                         .await;
                 }
                 ChunkRead::Error(msg) => {
                     ts.t_end = Some(MonotonicInstant::now());
-                    return self.finish_failed(tx, *ts, StreamError::Read(msg)).await;
+                    return self
+                        .finish_failed(tx, *ts, StreamError::Read(msg), false, 0)
+                        .await;
                 }
             }
         }
 
+        // A single non-streaming completion cannot loop (at most one token
+        // frame), but the guard is fed for a uniform `emit_frames` contract.
+        let mut guard = LoopGuard::new();
         let parsed_at = MonotonicInstant::now();
         match parse_plain_completion(&body) {
             Ok((content, usage)) => {
@@ -649,22 +733,28 @@ impl StreamWorker {
                 }
                 // `emit_frames` stamps `t_nanos` and sets T3 on the first
                 // token (content) frame.
-                let tokens = match emit_frames(&frames, &parsed_at, ts, tx).await {
+                let tokens = match self
+                    .emit_frames(&frames, &parsed_at, ts, tx, &mut guard)
+                    .await
+                {
                     Ok((_, tc)) => tc,
                     Err(_) => {
                         ts.t_end = Some(parsed_at);
-                        return self.finish_complete(tx, ts, usage, true, 0).await;
+                        return self
+                            .finish_complete(tx, ts, usage, true, 0, (false, 0))
+                            .await;
                     }
                 };
                 ts.t_end = Some(MonotonicInstant::now());
                 self.log_stream_end(ts, tokens, usage, false);
                 // A complete plain-JSON response is a normal completion, not
                 // a premature one (there is no `[DONE]` to expect).
-                self.finish_complete(tx, ts, usage, false, 0).await
+                self.finish_complete(tx, ts, usage, false, 0, (false, 0))
+                    .await
             }
             Err(msg) => {
                 ts.t_end = Some(parsed_at);
-                self.finish_failed(tx, *ts, StreamError::InvalidJson(msg))
+                self.finish_failed(tx, *ts, StreamError::InvalidJson(msg), false, 0)
                     .await
             }
         }
@@ -699,6 +789,10 @@ impl StreamWorker {
     }
 
     /// Emit the terminal `Complete` event and build the outcome.
+    ///
+    /// `looping` / `loop_excluded_tokens` (v0.1.1) carry the decode-loop
+    /// guard's verdict so the engines can exclude a looping stream's
+    /// tokens from throughput.
     async fn finish_complete(
         &self,
         tx: &mut mpsc::Sender<StreamEvent>,
@@ -706,12 +800,16 @@ impl StreamWorker {
         usage: Option<Usage>,
         premature: bool,
         malformed_frames: u64,
+        loop_state: (bool, u64),
     ) -> StreamOutcome {
+        let (looping, loop_excluded_tokens) = loop_state;
         let event = StreamEvent::Complete {
             timestamps: *ts,
             usage,
             premature,
             malformed_frames,
+            looping,
+            loop_excluded_tokens,
         };
         let _ = tx.send(event).await;
         StreamOutcome {
@@ -720,6 +818,8 @@ impl StreamWorker {
             premature,
             malformed_frames,
             error: None,
+            looping,
+            loop_excluded_tokens,
         }
     }
 
@@ -729,6 +829,8 @@ impl StreamWorker {
         tx: &mut mpsc::Sender<StreamEvent>,
         ts: StreamTimestamps,
         error: StreamError,
+        looping: bool,
+        loop_excluded_tokens: u64,
     ) -> StreamOutcome {
         self.logl(
             Level::Error,
@@ -738,6 +840,8 @@ impl StreamWorker {
         let event = StreamEvent::Failed {
             timestamps: ts,
             error: error.clone(),
+            looping,
+            loop_excluded_tokens,
         };
         let _ = tx.send(event).await;
         StreamOutcome {
@@ -746,6 +850,8 @@ impl StreamWorker {
             premature: false,
             malformed_frames: 0,
             error: Some(error),
+            looping,
+            loop_excluded_tokens,
         }
     }
 }
@@ -766,6 +872,8 @@ pub async fn run_worker(worker: StreamWorker, tx: mpsc::Sender<StreamEvent>) -> 
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Read(format!("worker task failed: {join}"))),
+            looping: false,
+            loop_excluded_tokens: 0,
         },
     }
 }
@@ -793,42 +901,62 @@ where
     }
 }
 
-/// Stamp and forward the frames produced by one parser `feed` / `finish`.
-///
-/// `frame.t_nanos` is set to the arrival time in nanoseconds since `T0`
-/// (the parser leaves it `0` by contract); `T3` is latched on the first
-/// token frame. Returns `(done, token_frames)`: `true` when a terminal
-/// `[DONE]` frame was among them, plus the number of token frames emitted
-/// in this call (the worker's log-milestone counter).
-async fn emit_frames(
-    frames: &[ParsedFrame],
-    at: &MonotonicInstant,
-    ts: &mut StreamTimestamps,
-    tx: &mut mpsc::Sender<StreamEvent>,
-) -> Result<(bool, u64), ()> {
-    let mut done_seen = false;
-    let mut token_frames = 0u64;
-    for frame in frames {
-        let mut frame = frame.clone();
-        frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(at));
-        if frame.chunk.is_token() {
-            token_frames += 1;
-            if ts.t3.is_none() {
-                ts.t3 = Some(*at);
+impl StreamWorker {
+    /// Stamp and forward the frames produced by one parser `feed` /
+    /// `finish`.
+    ///
+    /// `frame.t_nanos` is set to the arrival time in nanoseconds since
+    /// `T0` (the parser leaves it `0` by contract); `T3` is latched on the
+    /// first token frame. Each decoded token string is also fed to the
+    /// per-stream [`LoopGuard`] (v0.1.1) — the first detection logs a
+    /// `[LOOP_GUARD]` warning line. Returns `(done, token_frames)`: `true`
+    /// when a terminal `[DONE]` frame was among them, plus the number of
+    /// token frames emitted in this call (the worker's log-milestone
+    /// counter).
+    async fn emit_frames(
+        &self,
+        frames: &[ParsedFrame],
+        at: &MonotonicInstant,
+        ts: &mut StreamTimestamps,
+        tx: &mut mpsc::Sender<StreamEvent>,
+        guard: &mut LoopGuard,
+    ) -> Result<(bool, u64), ()> {
+        let mut done_seen = false;
+        let mut token_frames = 0u64;
+        for frame in frames {
+            let mut frame = frame.clone();
+            frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(at));
+            if frame.chunk.is_token() {
+                token_frames += 1;
+                if let Some(text) = frame.chunk.token_text() {
+                    if guard.push(text) {
+                        self.logl(
+                            Level::Warn,
+                            Context::Sse,
+                            &format!(
+                                "[LOOP_GUARD] Stream #{}: repeating pattern detected (32 tokens × 3) — excluded",
+                                self.tag
+                            ),
+                        );
+                    }
+                }
+                if ts.t3.is_none() {
+                    ts.t3 = Some(*at);
+                }
             }
+            if frame.done {
+                done_seen = true;
+            }
+            tx.send(StreamEvent::Frame {
+                frame,
+                at: *at,
+                timestamps: *ts,
+            })
+            .await
+            .map_err(|_| ())?;
         }
-        if frame.done {
-            done_seen = true;
-        }
-        tx.send(StreamEvent::Frame {
-            frame,
-            at: *at,
-            timestamps: *ts,
-        })
-        .await
-        .map_err(|_| ())?;
+        Ok((done_seen, token_frames))
     }
-    Ok((done_seen, token_frames))
 }
 
 /// True when `bytes` begin an SSE `data:` frame (BOM tolerated).

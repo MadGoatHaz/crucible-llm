@@ -177,7 +177,9 @@ fn render_concurrency(app: &App) -> String {
 fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
     SweepLevel {
         concurrency,
+        context: 0,
         aggregate_tps: tps,
+        per_stream_tps: tps / concurrency.max(1) as f64,
         p50_tpot_ns: (p90_ms * 0.8e6) as u64,
         p90_tpot_ns: (p90_ms * 1e6) as u64,
         p99_tpot_ns: (p90_ms * 2e6) as u64,
@@ -189,6 +191,8 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         timed_out_streams: 0,
         aborted: false,
         wall_ns: 1_000_000_000,
+        loop_excluded_streams: 0,
+        loop_excluded_tokens: 0,
         streams: (0..concurrency as u32)
             .map(|id| StreamMetric {
                 id,
@@ -200,6 +204,7 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
                 gen_tps: Some(25.0),
                 mtp: Some(1.0),
                 progress: 1.0,
+                looping: false,
             })
             .collect(),
     }
@@ -352,6 +357,7 @@ fn view2_renders_sweep_curve_knee_and_envelope() {
             level(2, 350.0, 8.0),
             level(4, 80.0, 20.0),
         ],
+        matrix: None,
     });
     let text = render_concurrency(&app);
 
@@ -395,6 +401,7 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
             level(32, 342.0, 60.0),
             level(64, 338.0, 90.0),
         ],
+        matrix: None,
     });
     let text = render_concurrency(&app);
 
@@ -446,7 +453,10 @@ fn view2_survives_a_partial_failure_level() {
             m
         })
         .collect();
-    app.sweep.store(SweepResult { levels: vec![lvl] });
+    app.sweep.store(SweepResult {
+        levels: vec![lvl],
+        matrix: None,
+    });
     let text = render_concurrency(&app);
     assert!(text.contains("6/8 ok"));
     assert!(text.contains("300.0 t/s"));
@@ -475,6 +485,7 @@ fn view2_curve_marks_sweet_spot_and_knee() {
             level(2, 350.0, 8.0),
             level(4, 340.0, 20.0),
         ],
+        matrix: None,
     });
     let buf = render_concurrency_at(&app, 120, 40);
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -529,6 +540,7 @@ fn view2_curve_renders_the_full_ladder() {
             level(32, 342.0, 60.0),
             level(64, 338.0, 90.0),
         ],
+        matrix: None,
     });
     let buf = render_concurrency_at(&app, 120, 40);
     assert!(
@@ -555,6 +567,7 @@ fn view2_curve_survives_small_terminals() {
     app.view = View::Concurrency;
     app.sweep.store(SweepResult {
         levels: vec![level(1, 100.0, 5.0), level(2, 350.0, 8.0)],
+        matrix: None,
     });
     for (w, h) in [(40, 10), (20, 6), (80, 24)] {
         let _ = render_concurrency_at(&app, w, h);

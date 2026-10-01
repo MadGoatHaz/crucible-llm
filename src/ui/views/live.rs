@@ -1431,7 +1431,13 @@ mod tests {
                 aborted: false,
                 wall_ns: 0,
                 streams: Vec::new(),
+
+                context: 0,
+                per_stream_tps: 0.0,
+                loop_excluded_streams: 0,
+                loop_excluded_tokens: 0,
             }],
+            matrix: None,
         });
         app.seq.store(SeqState {
             phase: SeqPhase::AllComplete,

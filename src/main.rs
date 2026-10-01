@@ -339,6 +339,20 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                 // `--export` (Chunk 13): consume the run back from the
                 // SQLite storage layer and write the requested format.
                 if let Some(fmt) = cfg.export {
+                    // v0.1.1: the JSON export's `loop_guard` block comes
+                    // from the runs the decode-loop guard excluded.
+                    let loop_guard = {
+                        let detected = results.iter().filter(|r| r.looping).count();
+                        let excluded: u64 = results
+                            .iter()
+                            .filter(|r| r.looping)
+                            .map(|r| r.completion_tokens)
+                            .sum();
+                        (detected > 0).then_some(crucible_llm::metrics::LoopGuardSummary {
+                            detected_streams: detected,
+                            excluded_tokens: excluded,
+                        })
+                    };
                     run_export(
                         &db,
                         &session,
@@ -346,6 +360,7 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                         fmt,
                         cfg.export_path.as_deref(),
                         &term,
+                        loop_guard,
                     );
                 }
             }
@@ -486,6 +501,7 @@ fn run_export(
     format: ExportFormat,
     path: Option<&std::path::Path>,
     term: &Term,
+    loop_guard: Option<crucible_llm::metrics::LoopGuardSummary>,
 ) {
     let mut payload = match ExportPayload::from_stored(db, &session.session_id) {
         Ok(p) => p,
@@ -495,6 +511,9 @@ fn run_export(
         }
     };
     payload.packets = packets.to_vec();
+    if let Some(lg) = loop_guard {
+        payload = payload.with_loop_guard(lg);
+    }
     let dest = path
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| export::default_path(&session.session_id, format));

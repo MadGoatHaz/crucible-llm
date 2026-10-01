@@ -399,6 +399,8 @@ impl ConfigState {
                 structured: self.engine_structured,
                 hardware: self.hardware,
             }),
+            // The matrix axis is a CLI/env concern — never persisted from the form.
+            matrix_contexts: None,
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {

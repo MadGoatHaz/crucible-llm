@@ -67,18 +67,26 @@ pub enum PoolEvent {
     },
     /// The stream ended: cleanly on `[DONE]` (`premature: false`), or early
     /// without a terminator (`premature: true`).
+    ///
+    /// `looping` / `loop_excluded_tokens` (v0.1.1 decode-loop guard): the
+    /// stream's guard verdict, so the sweep can exclude its tokens from
+    /// throughput.
     Complete {
         stream: u32,
         timestamps: StreamTimestamps,
         usage: Option<Usage>,
         premature: bool,
         malformed_frames: u64,
+        looping: bool,
+        loop_excluded_tokens: u64,
     },
     /// The stream failed (HTTP error, connection refused, timeout, …).
     Failed {
         stream: u32,
         timestamps: StreamTimestamps,
         error: StreamError,
+        looping: bool,
+        loop_excluded_tokens: u64,
     },
 }
 
@@ -101,17 +109,28 @@ impl PoolEvent {
                 usage,
                 premature,
                 malformed_frames,
+                looping,
+                loop_excluded_tokens,
             } => PoolEvent::Complete {
                 stream,
                 timestamps,
                 usage,
                 premature,
                 malformed_frames,
+                looping,
+                loop_excluded_tokens,
             },
-            StreamEvent::Failed { timestamps, error } => PoolEvent::Failed {
+            StreamEvent::Failed {
+                timestamps,
+                error,
+                looping,
+                loop_excluded_tokens,
+            } => PoolEvent::Failed {
                 stream,
                 timestamps,
                 error,
+                looping,
+                loop_excluded_tokens,
             },
         }
     }
@@ -267,6 +286,14 @@ impl WorkerPool {
         self.max_tokens
     }
 
+    /// A copy of this pool with a different prompt text (v0.1.1 2D
+    /// concurrency × context matrix: the same pool settings, a
+    /// context-sized prompt).
+    pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
     /// Build one [`StreamWorker`] for this pool's target (tag `stream`).
     pub fn worker(&self) -> StreamWorker {
         self.worker_tagged("stream")
@@ -364,6 +391,8 @@ impl WorkerPool {
                                         .send(StreamEvent::Failed {
                                             timestamps: StreamTimestamps::default(),
                                             error: StreamError::WorkerTimeout(d),
+                                            looping: false,
+                                            loop_excluded_tokens: 0,
                                         })
                                         .await;
                                     StreamOutcome {
@@ -372,6 +401,8 @@ impl WorkerPool {
                                         premature: false,
                                         malformed_frames: 0,
                                         error: Some(StreamError::WorkerTimeout(d)),
+                                        looping: false,
+                                        loop_excluded_tokens: 0,
                                     }
                                 }
                             }
@@ -404,6 +435,8 @@ impl WorkerPool {
                         premature: false,
                         malformed_frames: 0,
                         error: Some(StreamError::Read("worker task panicked".to_string())),
+                        looping: false,
+                        loop_excluded_tokens: 0,
                     },
                 })
                 .collect()
@@ -468,6 +501,8 @@ mod tests {
                     usage: Some(usage),
                     premature: false,
                     malformed_frames: 1,
+                    looping: false,
+                    loop_excluded_tokens: 0,
                 },
                 3,
             );
@@ -495,6 +530,8 @@ mod tests {
                 StreamEvent::Failed {
                     timestamps: StreamTimestamps::default(),
                     error: err.clone(),
+                    looping: false,
+                    loop_excluded_tokens: 0,
                 },
                 11,
             );

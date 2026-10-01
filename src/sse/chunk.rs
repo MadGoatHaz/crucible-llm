@@ -62,6 +62,17 @@ impl Chunk {
     pub fn is_token(&self) -> bool {
         matches!(self, Self::Reasoning(_) | Self::Content(_))
     }
+
+    /// The decoded token text of a token-carrying chunk (`Reasoning` /
+    /// `Content`), for the decode-loop guard's rolling token buffer.
+    /// `None` for `Usage` / `Control` frames.
+    #[must_use]
+    pub fn token_text(&self) -> Option<&str> {
+        match self {
+            Self::Reasoning(s) | Self::Content(s) => Some(s.as_str()),
+            Self::Usage(_) | Self::Control => None,
+        }
+    }
 }
 
 /// Classify one parsed streaming chunk.

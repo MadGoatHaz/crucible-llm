@@ -1250,7 +1250,22 @@ impl App {
                 cache_hit: None,
             })
             .collect();
-        let payload = ExportPayload::from_live(session, metrics, Vec::new(), Vec::new());
+        let mut payload = ExportPayload::from_live(session, metrics, Vec::new(), Vec::new());
+        // v0.1.1: carry the decode-loop guard verdict and the 2D
+        // concurrency × context matrix (when Engine B ran one) into the
+        // JSON export's `loop_guard` / `matrix` blocks.
+        if snap.loop_excluded_streams > 0 || snap.loop_excluded_tokens > 0 {
+            payload = payload.with_loop_guard(crate::metrics::LoopGuardSummary {
+                detected_streams: snap.loop_excluded_streams,
+                excluded_tokens: snap.loop_excluded_tokens,
+            });
+        }
+        if let Some(matrix) = (*self.sweep.load())
+            .as_ref()
+            .and_then(|r| r.matrix.as_ref())
+        {
+            payload = payload.with_matrix(matrix.clone());
+        }
         let dest = export::default_path_live(self.export_format);
         let path = export::write(&dest, self.export_format, &payload).map_err(|e| e.to_string())?;
         self.push_log(

@@ -1415,6 +1415,7 @@ mod tests {
             model: "m".into(),
             mode: "short".into(),
             error: failed.then(|| "boom".to_string()),
+            looping: false,
         }
     }
 
@@ -1455,11 +1456,17 @@ mod tests {
             aborted: false,
             wall_ns: 1_000_000_000,
             streams: Vec::new(),
+
+            context: 0,
+            per_stream_tps: 0.0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
         };
         // Per-stream: 100 @ 1 user, 175 @ 2 → the practical sweet spot
         // (≥40 t/s each) is 2. No knee on a 2-level climb.
         let result = SweepResult {
             levels: vec![level(1, 100.0, 5_000_000), level(2, 350.0, 6_000_000)],
+            matrix: None,
         };
         let line = summarize_sweep(&result);
         assert!(line.contains("practical sweet spot 2 users"), "{line}");

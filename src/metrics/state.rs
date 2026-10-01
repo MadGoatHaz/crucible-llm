@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 
 use super::histogram::LatencyHistogram;
 
@@ -69,6 +70,20 @@ pub struct StreamMetric {
     pub mtp: Option<f64>,
     /// 0.0..=1.0.
     pub progress: f64,
+    /// The decode-loop guard (v0.1.1) flagged this stream: its repeating
+    /// output is excluded from throughput tallies.
+    pub looping: bool,
+}
+
+/// The JSON export's `loop_guard` block (v0.1.1): how many streams the
+/// decode-loop guard excluded, and how many of their tokens were kept out
+/// of the throughput numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopGuardSummary {
+    /// Streams flagged `looping` (excluded from throughput).
+    pub detected_streams: usize,
+    /// Tokens excluded with them.
+    pub excluded_tokens: u64,
 }
 
 /// A `(max, avg, p5)` summary of a metric's observed distribution.
@@ -151,6 +166,20 @@ pub struct MetricsSnapshot {
     /// distinct from generation speed. `0.0` is the N/A sentinel (no prompt
     /// data / no TTFT yet), rendered `--` by the views.
     pub prompt_throughput: f64,
+    /// Labeled metric layers (v0.1.1, blueprint §v0.1.1-B) — the three
+    /// throughput numbers a benchmark must keep *separate* (never blended):
+    ///
+    /// * **prefill** — `prompt_tokens / TTFT`: how fast the server ingests
+    ///   the input;
+    /// * **decode** — `completion_tokens / (T_last − T_first)`: sustained
+    ///   generation speed;
+    /// * **e2e** — `total_tokens / total wall time`: everything included
+    ///   (connection, TTFT, generation).
+    ///
+    /// `0.0` is the N/A sentinel for each.
+    pub prefill_throughput: f64,
+    pub decode_throughput: f64,
+    pub e2e_throughput: f64,
     pub active_streams: usize,
     pub total_streams: usize,
 
@@ -170,10 +199,25 @@ pub struct MetricsSnapshot {
     /// Normalized ITL histogram bins (0.0..=1.0), low → high latency.
     pub itl_bins: Vec<f64>,
 
+    // ---- nanosecond timing publication (v0.1.1) ----
+    /// The measured overhead of a single [`crate::timing::MonotonicInstant::now`]
+    /// call, in nanoseconds (10 000 calls averaged at state construction).
+    /// This is the precision the timestamps are claimed at; the JSON export
+    /// publishes it as `timing.overhead_ns`. `0` until
+    /// [`MetricsState::update`] stamps it.
+    pub timing_resolution_ns: u64,
+
     // ---- token counts ----
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub reasoning_tokens: u64,
+
+    // ---- decode-loop guard (v0.1.1) ----
+    /// Streams excluded from throughput because the loop guard flagged a
+    /// repeating 32-token pattern × 3.
+    pub loop_excluded_streams: usize,
+    /// Tokens excluded with those streams.
+    pub loop_excluded_tokens: u64,
 
     // ---- overall run status ----
     pub status: StreamStatus,
@@ -201,6 +245,9 @@ impl Default for MetricsSnapshot {
             mode: String::new(),
             aggregate_tps: 0.0,
             prompt_throughput: 0.0,
+            prefill_throughput: 0.0,
+            decode_throughput: 0.0,
+            e2e_throughput: 0.0,
             active_streams: 0,
             total_streams: 0,
             vram_used_gb: 0.0,
@@ -213,9 +260,12 @@ impl Default for MetricsSnapshot {
             itl_p99_ns: 0,
             itl_p999_ns: 0,
             itl_bins: Vec::new(),
+            timing_resolution_ns: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
             reasoning_tokens: 0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
             status: StreamStatus::default(),
             streams: Vec::new(),
             throughput_series: Vec::new(),
@@ -299,6 +349,48 @@ impl MetricsSnapshot {
             if mean_ttft > 0.0 {
                 self.prompt_throughput = prompt as f64 / mean_ttft;
             }
+        }
+        self
+    }
+
+    /// Fill the v0.1.1 **labeled metric layers**
+    /// ([`prefill_throughput`](Self::prefill_throughput),
+    /// [`decode_throughput`](Self::decode_throughput),
+    /// [`e2e_throughput`](Self::e2e_throughput)) from the snapshot's own
+    /// data when an engine did not set them. The three numbers are kept
+    /// separate — never blended into one:
+    ///
+    /// * **prefill** — the derived prompt throughput (input tokens / mean
+    ///   TTFT);
+    /// * **decode** — the token-weighted mean of the non-looping
+    ///   streams' `gen_tps` (each is `tokens / (T_last − T_first)`);
+    /// * **e2e** — the live aggregate (total tokens / total wall time).
+    ///
+    /// Looping streams (the v0.1.1 decode-loop guard) are excluded from
+    /// the decode layer. `0.0` stays the N/A sentinel when no data exists.
+    pub fn with_derived_labeled_throughputs(mut self) -> Self {
+        if self.prefill_throughput <= 0.0 {
+            self.prefill_throughput = self.prompt_throughput;
+        }
+        if self.decode_throughput <= 0.0 {
+            let mut tokens = 0u64;
+            let mut weighted = 0.0;
+            for s in &self.streams {
+                if s.looping {
+                    continue;
+                }
+                let t = s.tg_tokens.unwrap_or(0);
+                tokens += t;
+                if let Some(g) = s.gen_tps.filter(|g| *g > 0.0) {
+                    weighted += g * t as f64;
+                }
+            }
+            if tokens > 0 && weighted > 0.0 {
+                self.decode_throughput = weighted / tokens as f64;
+            }
+        }
+        if self.e2e_throughput <= 0.0 {
+            self.e2e_throughput = self.aggregate_tps;
         }
         self
     }
@@ -491,14 +583,20 @@ impl OverallAccumulator {
                 .is_some_and(|p| matches!(p, StreamStatus::Done | StreamStatus::Error));
             if terminal && !was_terminal {
                 self.completed_streams += 1;
-                if let Some(g) = st.gen_tps.filter(|g| *g > 0.0) {
-                    Self::push(&mut self.gen, g);
+                // Looping streams (v0.1.1 decode-loop guard) are excluded
+                // from the throughput tallies — their repeating output is
+                // not a measurement of the server's real generation speed.
+                // The TTFT sample is kept (a latency, not a throughput).
+                if !st.looping {
+                    if let Some(g) = st.gen_tps.filter(|g| *g > 0.0) {
+                        Self::push(&mut self.gen, g);
+                    }
+                    if let Some(tok) = st.tg_tokens {
+                        self.total_tokens += tok;
+                    }
                 }
                 if let Some(t) = st.ttft_s.filter(|t| *t > 0.0) {
                     Self::push(&mut self.ttft, t);
-                }
-                if let Some(tok) = st.tg_tokens {
-                    self.total_tokens += tok;
                 }
             }
             self.prev_status.insert(st.id, st.state);
@@ -574,6 +672,12 @@ pub struct MetricsState {
     /// toward zero after the last engine finishes. One-way *within a run*:
     /// [`unfreeze`](Self::unfreeze) re-arms it when a new run starts.
     frozen: AtomicBool,
+    /// The measured overhead of a single
+    /// [`crate::timing::MonotonicInstant::now`] call (ns) — timed once at
+    /// construction (10 000 calls averaged) and stamped into every
+    /// published snapshot as `timing_resolution_ns` (v0.1.1 nanosecond
+    /// timing publication).
+    timing_overhead_ns: u64,
 }
 
 impl MetricsState {
@@ -584,6 +688,7 @@ impl MetricsState {
             rolling: Mutex::new(RollingSeries::default()),
             overall_acc: Mutex::new(OverallAccumulator::default()),
             frozen: AtomicBool::new(false),
+            timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
         }
     }
 
@@ -636,7 +741,14 @@ impl MetricsState {
         if self.frozen.load(Ordering::Relaxed) {
             return;
         }
-        snapshot = snapshot.with_derived_prompt_throughput();
+        // v0.1.1: stamp the measured timestamp overhead when the engine
+        // left the field empty, then complete the labeled metric layers.
+        if snapshot.timing_resolution_ns == 0 {
+            snapshot.timing_resolution_ns = self.timing_overhead_ns;
+        }
+        snapshot = snapshot
+            .with_derived_prompt_throughput()
+            .with_derived_labeled_throughputs();
         {
             let mut rs = self
                 .rolling
@@ -962,6 +1074,110 @@ mod tests {
         // The freeze is idempotent (setting it twice is a no-op).
         state.freeze();
         assert!(state.is_frozen());
+    }
+
+    // ── v0.1.1: labeled layers, timing publication, loop guard ─────────
+
+    #[test]
+    fn update_stamps_the_measured_timing_resolution() {
+        let state = MetricsState::new();
+        state.update(snap(100.0));
+        // The measured overhead is stamped onto every published snapshot
+        // (a real clock measures a small positive number of ns).
+        assert!(
+            state.load().timing_resolution_ns > 0,
+            "timing_resolution_ns must be the measured overhead"
+        );
+    }
+
+    #[test]
+    fn labeled_layers_derive_from_stream_data() {
+        let s = MetricsSnapshot {
+            prompt_tokens: 4096,
+            streams: vec![
+                StreamMetric {
+                    id: 1,
+                    ttft_s: Some(0.2),
+                    tg_tokens: Some(100),
+                    gen_tps: Some(50.0),
+                    ..Default::default()
+                },
+                StreamMetric {
+                    id: 2,
+                    ttft_s: Some(0.4),
+                    tg_tokens: Some(300),
+                    gen_tps: Some(100.0),
+                    ..Default::default()
+                },
+            ],
+            aggregate_tps: 42.0,
+            ..Default::default()
+        };
+        let s = s
+            .with_derived_prompt_throughput()
+            .with_derived_labeled_throughputs();
+        // prefill = the derived prompt throughput (4096 / mean TTFT 0.3).
+        assert!((s.prefill_throughput - 4096.0 / 0.3).abs() < 1e-9);
+        // decode = token-weighted mean gen: (50·100 + 100·300) / 400.
+        assert!((s.decode_throughput - 87.5).abs() < 1e-9);
+        // e2e = the live aggregate.
+        assert!((s.e2e_throughput - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn labeled_layers_exclude_looping_streams_from_decode() {
+        let s = MetricsSnapshot {
+            streams: vec![
+                StreamMetric {
+                    id: 1,
+                    tg_tokens: Some(100),
+                    gen_tps: Some(50.0),
+                    looping: true,
+                    ..Default::default()
+                },
+                StreamMetric {
+                    id: 2,
+                    tg_tokens: Some(300),
+                    gen_tps: Some(100.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let s = s.with_derived_labeled_throughputs();
+        // The looping stream's 100 tokens at 50 t/s are out: decode is
+        // exactly stream 2's rate.
+        assert!((s.decode_throughput - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overall_excludes_looping_streams_from_tokens_and_gen() {
+        let state = MetricsState::new();
+        // Stream 0 loops (excluded), stream 1 is clean (counted).
+        state.update(MetricsSnapshot {
+            streams: vec![
+                StreamMetric {
+                    id: 0,
+                    state: StreamStatus::Done,
+                    gen_tps: Some(999.0),
+                    tg_tokens: Some(1000),
+                    looping: true,
+                    ..Default::default()
+                },
+                StreamMetric {
+                    id: 1,
+                    state: StreamStatus::Done,
+                    gen_tps: Some(50.0),
+                    tg_tokens: Some(200),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.completed_streams, 2, "both streams completed");
+        assert_eq!(o.total_tokens, 200, "looping stream's tokens excluded");
+        assert!((o.gen.avg - 50.0).abs() < 1e-9, "looping rate excluded");
     }
 
     #[test]

@@ -548,6 +548,7 @@ fn recommendation_lines(result: &SweepResult) -> Vec<Line<'static>> {
 pub(crate) fn curve_notes(levels: &[SweepLevel]) -> Vec<Line<'static>> {
     let result = SweepResult {
         levels: levels.to_vec(),
+        matrix: None,
     };
     let mut ls: Vec<Line> = vec![Line::from(Span::styled(
         "ℹ Sweet spot = most users where EACH still gets ≥40 t/s (comfortable).",
@@ -803,7 +804,9 @@ mod tests {
     fn lvl(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         SweepLevel {
             concurrency,
+            context: 0,
             aggregate_tps: tps,
+            per_stream_tps: tps / concurrency.max(1) as f64,
             p50_tpot_ns: 0,
             p90_tpot_ns: (p90_ms * 1e6) as u64,
             p99_tpot_ns: 0,
@@ -815,6 +818,8 @@ mod tests {
             timed_out_streams: 0,
             aborted: false,
             wall_ns: 0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
             streams: Vec::new(),
         }
     }
@@ -832,6 +837,7 @@ mod tests {
         let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)];
         let env = SweepResult {
             levels: levels.clone(),
+            matrix: None,
         }
         .envelope();
         let lines = build_curve_lines(&levels, 80, 12, &env);
@@ -977,6 +983,7 @@ mod tests {
                 lvl(32, 342.0, 60.0),
                 lvl(64, 338.0, 90.0),
             ],
+            matrix: None,
         });
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
@@ -1049,6 +1056,7 @@ mod tests {
         let app = crate::ui::app::App::new();
         app.sweep.store(SweepResult {
             levels: vec![lvl(1, 100.0, 5.0), lvl(4, 340.0, 20.0)],
+            matrix: None,
         });
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");

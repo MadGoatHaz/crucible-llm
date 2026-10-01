@@ -39,6 +39,9 @@ pub const DEFAULT_MODEL: &str = "default";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default target prompt tokens for `long` mode (parity with the prototype).
 pub const DEFAULT_TOKENS: u32 = 10000;
+/// Default v0.1.1 2D matrix context axis (target prompt tokens):
+/// `0` = the configured prompt as-is, plus the 8k and 32k context sizes.
+pub const DEFAULT_MATRIX_CONTEXTS: [u32; 3] = [0, 8000, 32000];
 
 /// The default config file name inside the config dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -73,6 +76,9 @@ pub mod env_vars {
     /// Directory for the run log (`latest.log` + `run-<timestamp>.log`
     /// archives). Default: `data_dir()/crucible/logs`.
     pub const LOG_DIR: &str = "CRUCIBLE_LOG_DIR";
+    /// Comma-separated context sizes for the v0.1.1 2D matrix
+    /// (e.g. `0,8k,32k`).
+    pub const MATRIX_CONTEXT: &str = "CRUCIBLE_MATRIX_CONTEXT";
 }
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
@@ -359,6 +365,12 @@ pub struct Cli {
     /// archives). Default: `~/.local/share/crucible/logs`.
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
+    /// Context sizes for the v0.1.1 2D concurrency × context matrix, as a
+    /// comma-separated list with optional `k`/`m` suffixes
+    /// (e.g. `--matrix-context 0,8k,32k`). `0` means "the configured
+    /// prompt as-is"; more than one value enables the matrix sweep.
+    #[arg(long, value_name = "CSV")]
+    pub matrix_context: Option<String>,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -407,6 +419,11 @@ pub struct Config {
     /// The run-log directory (`latest.log` + `run-<timestamp>.log`
     /// archives). `None` → the default `data_dir()/crucible/logs`.
     pub log_dir: Option<PathBuf>,
+    /// The v0.1.1 2D matrix context axis (target prompt tokens per
+    /// sweep leg). Default `[0, 8000, 32000]`; `0` = the configured
+    /// prompt as-is. More than one value makes Engine B run the full
+    /// concurrency × context matrix.
+    pub matrix_contexts: Vec<u32>,
 }
 
 impl Default for Config {
@@ -434,6 +451,7 @@ impl Default for Config {
             engines: EngineSelection::default(),
             target_explicit: false,
             log_dir: None,
+            matrix_contexts: DEFAULT_MATRIX_CONTEXTS.to_vec(),
         }
     }
 }
@@ -507,6 +525,8 @@ pub struct ConfigFile {
     pub engines: Option<EngineSelection>,
     /// The run-log directory (default `data_dir()/crucible/logs`).
     pub log_dir: Option<PathBuf>,
+    /// The v0.1.1 2D matrix context axis (target prompt tokens).
+    pub matrix_contexts: Option<Vec<u32>>,
 }
 
 impl ConfigFile {
@@ -573,6 +593,9 @@ impl ConfigFile {
         }
         if let Some(v) = &self.log_dir {
             c.log_dir = Some(v.clone());
+        }
+        if let Some(v) = &self.matrix_contexts {
+            c.matrix_contexts = v.clone();
         }
         c.target_explicit = self.url.is_some();
         c
@@ -799,6 +822,20 @@ pub fn layer(
             .or_else(|| file.and_then(|f| f.log_dir.clone()))
     };
 
+    // ── v0.1.1 2D matrix context axis ──
+    let matrix_contexts = if explicit("matrix_context") {
+        cli.matrix_context
+            .as_deref()
+            .and_then(parse_context_list)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_MATRIX_CONTEXTS.to_vec())
+    } else {
+        env_get(env_vars::MATRIX_CONTEXT)
+            .and_then(|s| parse_context_list(&s))
+            .or_else(|| file.and_then(|f| f.matrix_contexts.clone()))
+            .unwrap_or_else(|| DEFAULT_MATRIX_CONTEXTS.to_vec())
+    };
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -872,6 +909,7 @@ pub fn layer(
         engines,
         target_explicit,
         log_dir,
+        matrix_contexts,
     })
 }
 
@@ -881,6 +919,34 @@ pub fn parse_ladder(s: &str) -> Option<Vec<usize>> {
     let v: Vec<usize> = s
         .split(',')
         .map(|p| p.trim().parse::<usize>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some(v)
+}
+
+/// Parse a comma-separated context-size list (v0.1.1 2D matrix) such as
+/// `"0,8k,32k"` into target prompt token counts.
+///
+/// Each entry is a plain number (`0` = the configured prompt as-is) or a
+/// number with a `k` (×1000) / `m` (×1,000,000) suffix (case-insensitive).
+/// `None` when any entry is unparseable.
+pub fn parse_context_list(s: &str) -> Option<Vec<u32>> {
+    let v: Vec<u32> = s
+        .split(',')
+        .map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            let (digits, mult) =
+                if let Some(k) = p.strip_suffix(['k', 'K']).map(|d| d.parse::<u32>().ok()) {
+                    (k?, 1_000u32)
+                } else if let Some(m) = p.strip_suffix(['m', 'M']).map(|d| d.parse::<u32>().ok()) {
+                    (m?, 1_000_000u32)
+                } else {
+                    (p.parse::<u32>().ok()?, 1u32)
+                };
+            digits.checked_mul(mult)
+        })
         .collect::<Option<Vec<_>>>()?;
     Some(v)
 }
@@ -1298,6 +1364,7 @@ mod tests {
             "--ladder",
             "--engine",
             "--no-hardware",
+            "--matrix-context",
         ] {
             assert!(help.contains(flag), "help missing {flag}");
         }
@@ -1353,6 +1420,48 @@ mod tests {
         // An empty string is not a valid ladder entry (the caller falls
         // back to the default ladder).
         assert_eq!(parse_ladder(""), None);
+    }
+
+    // ── v0.1.1: 2D matrix context axis ─────────────────────────────────
+
+    #[test]
+    fn parse_context_list_handles_k_and_m_suffixes() {
+        assert_eq!(parse_context_list("0,8k,32k"), Some(vec![0, 8000, 32000]));
+        assert_eq!(parse_context_list(" 4k , 128K "), Some(vec![4000, 128_000]));
+        assert_eq!(parse_context_list("1m"), Some(vec![1_000_000]));
+        assert_eq!(parse_context_list("512"), Some(vec![512]));
+        assert_eq!(parse_context_list("0"), Some(vec![0]));
+        // Invalid entries are rejected (the caller falls back to the
+        // default axis).
+        assert_eq!(parse_context_list("8x"), None);
+        assert_eq!(parse_context_list("1,2,x"), None);
+        assert_eq!(parse_context_list(""), None);
+    }
+
+    #[test]
+    fn default_matrix_contexts_match_the_blueprint() {
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert_eq!(cfg.matrix_contexts, vec![0, 8000, 32000]);
+    }
+
+    #[test]
+    fn cli_matrix_context_overrides_default() {
+        let cfg = resolve_bare(&["crucible-llm", "--matrix-context", "0,4k,32k"]);
+        assert_eq!(cfg.matrix_contexts, vec![0, 4000, 32000]);
+    }
+
+    #[test]
+    fn env_and_file_layer_the_matrix_contexts() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        // env wins over file.
+        let env = vec![(env_vars::MATRIX_CONTEXT.to_string(), "0,2k".to_string())];
+        let f = file(r#"{"matrix_contexts": [0, 999]}"#);
+        let cfg = layer(&cli, &matches, &env, Some(&f)).unwrap();
+        assert_eq!(cfg.matrix_contexts, vec![0, 2000]);
+        // file only.
+        let cfg = layer(&cli, &matches, &[], Some(&f)).unwrap();
+        assert_eq!(cfg.matrix_contexts, vec![0, 999]);
     }
 
     #[test]

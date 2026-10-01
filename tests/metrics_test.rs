@@ -179,6 +179,7 @@ fn snapshot_update_load_roundtrip() {
             gen_tps: Some(60.0),
             mtp: Some(1.5),
             progress: 0.5,
+            looping: false,
         }],
         throughput_series: vec![1.0, 2.0, 3.0],
         ..Default::default()

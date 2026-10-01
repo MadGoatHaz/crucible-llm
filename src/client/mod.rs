@@ -12,10 +12,12 @@
 //!   OpenAI-compatible endpoint: [`list_models`] returns the served
 //!   [`ModelInfo`] list (deduped, id-sorted) for the TUI's model picker.
 
+pub mod loop_guard;
 pub mod models;
 pub mod pool;
 pub mod stream;
 
+pub use loop_guard::{LoopGuard, LOOP_BUFFER, LOOP_REPETITIONS, LOOP_WINDOW};
 pub use models::{list_models, normalize_base_url, ModelError, ModelInfo};
 pub use stream::{
     normalize_endpoint, run_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker,

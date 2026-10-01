@@ -97,6 +97,7 @@ fn stream(id: u32, ttft: Option<f64>) -> crucible_llm::metrics::StreamMetric {
         gen_tps: Some(72.4),
         mtp: Some(1.0),
         progress: 0.5,
+        looping: false,
     }
 }
 
@@ -104,7 +105,9 @@ fn stream(id: u32, ttft: Option<f64>) -> crucible_llm::metrics::StreamMetric {
 fn lvl(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
     SweepLevel {
         concurrency,
+        context: 0,
         aggregate_tps: tps,
+        per_stream_tps: tps / concurrency.max(1) as f64,
         p50_tpot_ns: 0,
         p90_tpot_ns: (p90_ms * 1e6) as u64,
         p99_tpot_ns: 0,
@@ -116,6 +119,8 @@ fn lvl(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         timed_out_streams: 0,
         aborted: false,
         wall_ns: 0,
+        loop_excluded_streams: 0,
+        loop_excluded_tokens: 0,
         streams: Vec::new(),
     }
 }
@@ -275,6 +280,7 @@ fn concurrency_curve_shows_while_engine_b_runs() {
     // A completed sweep on screen + Engine B running.
     app.sweep.store(SweepResult {
         levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)],
+        matrix: None,
     });
     app.seq.store(seq_state(
         SeqPhase::Running,
@@ -303,6 +309,7 @@ fn concurrency_curve_hidden_during_engine_a() {
     // (never shown empty for the wrong engine).
     app.sweep.store(SweepResult {
         levels: vec![lvl(1, 100.0, 5.0)],
+        matrix: None,
     });
     app.seq.store(seq_state(
         SeqPhase::Running,
@@ -431,6 +438,7 @@ fn all_complete_shows_the_full_summary() {
     let app = app_with(test_snapshot());
     app.sweep.store(SweepResult {
         levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0)],
+        matrix: None,
     });
     app.reasoning_slot.store(ReasoningResult {
         responses: vec![],
