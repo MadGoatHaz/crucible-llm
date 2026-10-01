@@ -138,6 +138,7 @@ fn seq_state(
         progress,
         summary: String::new(),
         completed,
+        engine_started_ms: 0,
     }
 }
 
@@ -193,8 +194,13 @@ fn key_metrics_panel_shows_real_data() {
     assert!(text.contains("1,332"));
     assert!(text.contains("Streams"));
     assert!(text.contains("16 active"));
-    // The one-line dimmed note explains the aggregate figure.
+    // Prompt throughput is derived: 4096 prompt tokens / 0.2 s mean TTFT.
+    assert!(text.contains("Prompt Throughput"));
+    assert!(text.contains("20480 t/s"), "prompt throughput: {text}");
+    // Every metric carries a dimmed `ℹ` explanation.
     assert!(text.contains('ℹ'), "key-metrics info note");
+    assert!(text.contains("generation speed"), "gen explanation");
+    assert!(text.contains("prefill"), "prefill explanation");
 }
 
 #[test]
@@ -214,16 +220,17 @@ fn key_metrics_show_placeholders_without_telemetry() {
 fn throughput_hero_renders_block_chart_with_axes() {
     let mut s = test_snapshot();
     // A high/medium/low mix across the window so all three gradient colors
-    // appear and the y-axis shows the max.
+    // appear and the y-axis shows the max. `now` is the latest published
+    // aggregate (420.0 here); `PEAK` is the window max (950.0).
     s.throughput_series = vec![900.0, 100.0, 480.0, 950.0, 60.0, 420.0];
+    s.aggregate_tps = 420.0;
     let app = app_with(s);
     let buf = render_live(&app, W, H);
     let text = buf_text(&buf);
 
     assert!(text.contains("THROUGHPUT"));
-    // The `now | peak` value line (last sample = 420.0, max = 950.0).
     assert!(text.contains("now 420.0 t/s"), "{text}");
-    assert!(text.contains("peak 950.0 t/s"), "{text}");
+    assert!(text.contains("PEAK: 950.0 t/s"), "{text}");
     // The block chart body + the x-axis time labels.
     assert!(text.contains('█'), "bars rendered");
     assert!(text.contains("0s"), "x-axis start");
@@ -363,14 +370,21 @@ fn capability_scores_show_for_c_engines() {
         Vec::new(),
     ));
     let text = buf_text(&render_live(&app, W, H));
-    assert!(text.contains("CAPABILITY SCORES"), "panel visible");
-    // All four capability bars are present.
-    for label in ["Reasoning", "NIAH", "Structured", "Energy"] {
-        assert!(text.contains(label), "missing bar: {label}");
-    }
+    assert!(text.contains("CAPABILITY ASSESSMENT"), "panel visible");
+    // Only the engines that *ran* show a bar.
+    assert!(text.contains("Reasoning"), "run: reasoning bar");
+    assert!(text.contains("Structured"), "run: structured bar");
+    assert!(
+        !text.contains("Long Context"),
+        "unrun: no long-context bar: {text}"
+    );
     // The stored results render their values.
     assert!(text.contains("12/13"), "reasoning score");
-    assert!(text.contains("NON-COMPLIANT"), "structured verdict");
+    assert!(text.contains("FAIL"), "structured verdict");
+    // The ⚠ warning marks the poor scores.
+    assert!(text.contains('⚠'), "warning on poor scores");
+    // The practical OVERALL summary.
+    assert!(text.contains("OVERALL"), "overall summary");
 }
 
 #[test]
@@ -431,7 +445,7 @@ fn all_complete_shows_the_full_summary() {
         "concurrency in the summary"
     );
     assert!(
-        text.contains("CAPABILITY SCORES"),
+        text.contains("CAPABILITY ASSESSMENT"),
         "capabilities in the summary"
     );
     assert!(text.contains("EVENT LOG"), "log");

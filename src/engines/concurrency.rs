@@ -788,6 +788,10 @@ impl Sweep {
             model: self.pool.model().to_string(),
             mode: "Concurrency".to_string(),
             aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),
+            // Server-reported prompt totals (usage frames): the metrics
+            // seam derives `prompt_throughput` = prompt / mean TTFT from
+            // this plus the per-stream TTFTs.
+            prompt_tokens: acc.prompt_tokens_so_far(),
             active_streams: acc.active(),
             total_streams: n,
             status,
@@ -1024,6 +1028,16 @@ impl LevelAccumulator {
     /// Token frames received so far (live-snapshot throughput numerator).
     fn tokens_so_far(&self) -> u64 {
         self.trackers.iter().map(|t| t.token_frames()).sum()
+    }
+
+    /// Prompt tokens reported by server `usage` so far (live-snapshot
+    /// prompt-throughput numerator; the per-stream `pp_tokens` rows carry
+    /// the same data for the UI's stream detail).
+    fn prompt_tokens_so_far(&self) -> u64 {
+        self.trackers
+            .iter()
+            .filter_map(|t| t.usage.map(|u| u.prompt_tokens))
+            .sum()
     }
 
     /// Streams actively receiving tokens.

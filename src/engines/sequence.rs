@@ -346,6 +346,11 @@ pub struct SeqState {
     /// The completed engines so far, in run order, with their summary
     /// lines (the queue panel's `✓` rows).
     pub completed: Vec<(Engine, String)>,
+    /// Unix milliseconds when the *current* engine started (`0` when no
+    /// engine is running): the Live view's key-metrics `Duration` row
+    /// renders `now − engine_started_ms` (a plain wall-clock read on the
+    /// render path — never the quanta timing path).
+    pub engine_started_ms: u64,
 }
 
 impl SeqState {
@@ -549,6 +554,32 @@ impl BenchmarkSequence {
         }
     }
 
+    /// The current unix-millisecond wall clock (for the
+    /// [`SeqState::engine_started_ms`] stamp — a display concern, never
+    /// the quanta timing path).
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// The `engine_started_ms` to carry into a fresh `Running` state: the
+    /// previous engine's start stamp survives (the ticker re-publishes the
+    /// same engine many times), a new engine gets a fresh stamp, and
+    /// non-running phases clear it.
+    fn started_ms_for(&self, phase: SeqPhase, engine: Engine) -> u64 {
+        if phase != SeqPhase::Running {
+            return 0;
+        }
+        match self.slot.load() {
+            Some(prev) if prev.engine == engine && prev.engine_started_ms > 0 => {
+                prev.engine_started_ms
+            }
+            _ => Self::now_ms(),
+        }
+    }
+
     /// Store a `SeqState` built from the current shared pieces.
     fn publish_state(&self, phase: SeqPhase, engine: Engine, summary: &str) {
         let progress = if phase == SeqPhase::Running {
@@ -564,6 +595,7 @@ impl BenchmarkSequence {
             progress,
             summary: summary.to_string(),
             completed,
+            engine_started_ms: self.started_ms_for(phase, engine),
         });
     }
 
@@ -623,6 +655,15 @@ impl BenchmarkSequence {
                     };
                     let completed = g.clone();
                     drop(g);
+                    // The ticker re-publishes the *same* engine at 10 Hz:
+                    // keep its start stamp (a new engine gets one from
+                    // `publish_state` before the ticker catches up).
+                    let started_ms = slot
+                        .load()
+                        .as_ref()
+                        .filter(|p| p.engine == *engine && p.engine_started_ms > 0)
+                        .map(|p| p.engine_started_ms)
+                        .unwrap_or_else(Self::now_ms);
                     slot.store(SeqState {
                         phase: SeqPhase::Running,
                         queue: engines.clone(),
@@ -630,6 +671,7 @@ impl BenchmarkSequence {
                         progress,
                         summary: String::new(),
                         completed,
+                        engine_started_ms: started_ms,
                     });
                 }
             });
@@ -1203,6 +1245,7 @@ mod tests {
             }),
             summary: String::new(),
             completed: Vec::new(),
+            engine_started_ms: 0,
         });
         let s = slot.load().unwrap();
         assert_eq!(s.phase, SeqPhase::Running);

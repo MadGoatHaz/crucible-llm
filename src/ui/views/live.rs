@@ -39,7 +39,7 @@ use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::MetricsSnapshot;
 use crate::ui::app::App;
 use crate::ui::theme::{palette, style};
-use crate::ui::views::concurrency::build_curve_lines;
+use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
 
 /// Render the Live view into `area`.
 ///
@@ -58,17 +58,19 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let show_concurrency = should_show_concurrency(&seq, app);
     let show_capabilities = should_show_capabilities(&seq, app);
 
-    // (panel id, constraint). The hero row is the largest slice.
+    // (panel id, constraint). The hero row is the largest slice; the
+    // key-metrics panel carries a two-line-per-metric description, so it
+    // gets the wider share of the row.
     let mut plan: Vec<(u8, Constraint)> = Vec::new();
     plan.push((0, Constraint::Length(3))); // sequence header + progress bar
-    plan.push((1, Constraint::Percentage(40))); // throughput hero | key metrics
+    plan.push((1, Constraint::Percentage(38))); // throughput hero | key metrics
     if show_concurrency {
-        plan.push((2, Constraint::Percentage(28))); // concurrency curve
+        plan.push((2, Constraint::Percentage(23))); // concurrency curve
     }
     if show_capabilities {
-        plan.push((3, Constraint::Percentage(22))); // capability scores
+        plan.push((3, Constraint::Percentage(23))); // capability scores
     }
-    plan.push((4, Constraint::Length(5))); // compact event log
+    plan.push((4, Constraint::Length(4))); // compact event log
 
     let constraints: Vec<Constraint> = plan.iter().map(|(_, c)| *c).collect();
     let rects = Layout::default()
@@ -79,7 +81,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     for (i, (id, _)) in plan.iter().enumerate() {
         match *id {
             0 => render_sequence_header(rects[i], app, f),
-            1 => render_throughput_row(rects[i], m, f),
+            1 => render_throughput_row(rects[i], m, app, f),
             2 => render_concurrency_curve(rects[i], app, f),
             3 => render_capability_scores(rects[i], app, m, f),
             4 => render_log(rects[i], app, f),
@@ -126,28 +128,29 @@ fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
 
 // ── Throughput hero + key metrics (the top row) ────────────────────────────
 
-/// The top row: the throughput hero chart (left, the largest panel) + the
-/// key-metrics readout (right).
-fn render_throughput_row(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+/// The top row: the throughput hero chart (left) + the key-metrics
+/// readout (right, with a dimmed `ℹ` description under every number).
+fn render_throughput_row(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
     render_throughput_hero(cols[0], m, f);
-    render_key_metrics(cols[1], m, f);
+    render_key_metrics(cols[1], m, app, f);
 }
 
 /// The hero: a large real-time aggregate tokens/sec block chart. One column
 /// per sample (right-aligned, newest at the right edge), each a vertical run
 /// of `█` graded green (high) → yellow (medium) → red (low) against the
-/// window maximum, with a `now | peak` value line on top and y/x axis labels
-/// so it reads at a glance.
+/// window maximum, with a `now | PEAK` value line, a prefill
+/// (prompt-throughput) line, and y/x axis labels so it reads at a glance.
+/// An empty rolling series renders a flat line at 0 (never a blank panel).
 fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::active_border())
         .title(" THROUGHPUT — tokens/sec (last 60s)  ● live ");
-    if area.width < 8 || area.height < 4 {
+    if area.width < 8 || area.height < 5 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
@@ -157,22 +160,41 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         vertical: 1,
     });
 
-    // The `now | peak` value line.
+    // The `now · PEAK` value line: `now` is the latest published
+    // aggregate (always fresh), `PEAK` the window maximum.
     let series = &m.throughput_series;
-    let current = series.last().copied().unwrap_or(m.aggregate_tps);
+    let current = m.aggregate_tps;
     let peak = series.iter().cloned().fold(0.0_f64, f64::max);
     let value_line = Line::from(vec![
         Span::styled("now ", style::label()),
         Span::styled(format!("{current:.1} t/s"), style::value()),
-        Span::styled("  |  peak ", style::footer()),
+        Span::styled("  ·  PEAK: ", style::footer()),
         Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
     ]);
 
-    // The block chart fills the inner area below the value line; both are
-    // rendered together inside the hero's bordered block (title + accent
-    // border) so the panel reads as the view's centerpiece.
-    let chart = build_throughput_chart(series, inner.width, inner.height.saturating_sub(1));
-    let mut lines = vec![value_line];
+    // The prefill line: prompt throughput (prompt_tokens / TTFT) — how
+    // fast the server digests the input, the rig-builder's key number.
+    let prefill_line = if m.prompt_throughput > 0.0 {
+        Line::from(vec![
+            Span::styled("prefill ", style::label()),
+            Span::styled(
+                format!("{:.0} t/s", m.prompt_throughput),
+                style::highlight(),
+            ),
+            Span::styled("  (prompt tokens / TTFT)", style::info()),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "prefill --  (no prompt data yet)",
+            style::info(),
+        ))
+    };
+
+    // The block chart fills the inner area below the two value lines;
+    // all of it is rendered together inside the hero's bordered block
+    // (title + accent border) so the panel reads as the view's centerpiece.
+    let chart = build_throughput_chart(series, inner.width, inner.height.saturating_sub(2));
+    let mut lines = vec![value_line, prefill_line];
     lines.extend(chart);
 
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -194,6 +216,14 @@ fn build_throughput_chart(series: &[f64], w: u16, h: u16) -> Vec<Line<'static>> 
     let max = series.iter().cloned().fold(0.0_f64, f64::max).max(1.0);
 
     let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+
+    // No samples yet: a flat line at 0 across the plot (the panel must
+    // never be blank — "0 t/s so far" is information).
+    if series.is_empty() {
+        for cell in &mut grid[plot_h.saturating_sub(1)][Y_AXIS_W..] {
+            *cell = ('▁', Some(palette::MUTED));
+        }
+    }
 
     // y-axis labels: top = max, middle = max/2, bottom = 0.
     let mut place_y = |row: usize, val: f64| {
@@ -270,8 +300,10 @@ fn build_throughput_chart(series: &[f64], w: u16, h: u16) -> Vec<Line<'static>> 
         .collect()
 }
 
-/// The key-metrics readout: the numbers a remote user scans first.
-fn render_key_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+/// The key-metrics readout: the numbers a remote user scans first, each
+/// with a short dimmed `ℹ` description of what it measures (every number
+/// is human-readable, per the remote-user redesign).
+fn render_key_metrics(area: Rect, m: &MetricsSnapshot, app: &App, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::border())
@@ -281,19 +313,61 @@ fn render_key_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         return;
     }
     let ttft = mean_ttft(m);
-    let lines =
-        vec![
-        kv("Throughput", format!("{:.1} t/s", m.aggregate_tps), style::value()),
-        kv("TTFT", fmt_ms(ttft), style::value()),
-        kv("ITL p50", ms(m.itl_p50_ns), style::value_ok()),
-        kv("ITL p99", ms(m.itl_p99_ns), style::value_err()),
-        kv("Tokens", grouped(m.completion_tokens), style::value()),
-        kv("Streams", format!("{} active", m.active_streams), style::highlight()),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "ℹ Aggregate tokens/sec across all active streams. Higher = more parallel capacity.",
-            style::info(),
-        )),
+    let lines = vec![
+        kv2(
+            "Gen Throughput",
+            format!("{:.1} t/s", m.aggregate_tps),
+            style::value(),
+            "Output tokens per second (generation speed)",
+        ),
+        kv2(
+            "Prompt Throughput",
+            if m.prompt_throughput > 0.0 {
+                format!("{:.0} t/s", m.prompt_throughput)
+            } else {
+                "--".to_string()
+            },
+            style::highlight(),
+            "Input tokens processed per second (prefill)",
+        ),
+        kv2(
+            "TTFT",
+            fmt_ms(ttft),
+            style::value(),
+            "Request → first token (responsiveness)",
+        ),
+        kv2(
+            "ITL p50",
+            ms(m.itl_p50_ns),
+            style::value_ok(),
+            "Median gap between output tokens (smoothness)",
+        ),
+        kv2(
+            "ITL p99",
+            ms(m.itl_p99_ns),
+            style::value_err(),
+            "Worst-case token gap (stutter indicator)",
+        ),
+        kv2(
+            "Total Tokens",
+            grouped(m.completion_tokens),
+            style::value(),
+            "Output tokens generated this run",
+        ),
+        kv2(
+            "Active Streams",
+            format!("{} active", m.active_streams),
+            style::highlight(),
+            "Concurrent requests in flight",
+        ),
+        kv2(
+            "Duration",
+            engine_duration(app)
+                .map(|s| format!("{s:.1} s"))
+                .unwrap_or_else(|| "--".to_string()),
+            style::value(),
+            "Elapsed time for the current engine",
+        ),
     ];
     f.render_widget(
         Paragraph::new(Text::from(lines))
@@ -303,13 +377,32 @@ fn render_key_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     );
 }
 
-/// One `label  value` row for the key-metrics panel (the label column is
-/// padded so values line up).
-fn kv(label: &str, value: String, value_style: Style) -> Line<'static> {
+/// One `label  value  ℹ description` row for the key-metrics panel (the
+/// label column is padded so values line up; the dimmed description wraps
+/// to a second line on narrow terminals).
+fn kv2(label: &str, value: String, value_style: Style, desc: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{label:<11}"), style::label()),
+        Span::styled(format!("{label:<18}"), style::label()),
         Span::styled(value, value_style),
+        Span::styled(format!("  ℹ {desc}"), style::info()),
     ])
+}
+
+/// The current engine's elapsed wall time (seconds), from the sequence
+/// state's start stamp — `None` when no engine has started (the panel
+/// shows `--`). A plain `SystemTime` read on the render path: it never
+/// touches the quanta timing path (measurement-isolation invariant).
+fn engine_duration(app: &App) -> Option<f64> {
+    let seq = app.seq.load()?;
+    let started = seq.engine_started_ms;
+    if started == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(now.saturating_sub(started) as f64 / 1000.0)
 }
 
 /// Mean time-to-first-token across the streams that report one (`None` when
@@ -340,15 +433,17 @@ fn ms(ns: u64) -> String {
 
 // ── Concurrency curve (Engine B) ───────────────────────────────────────────
 
-/// The prominent concurrency panel: aggregate t/s vs parallel users, reusing
-/// View 2's block-based curve (the sweet spot `●` and the knee `▲`). While
-/// Engine B is mid-sweep (no result published yet) it shows an in-progress
-/// note; with no sweep at all it shows the run-a-sweep hint.
+/// The prominent concurrency panel: aggregate t/s vs parallel users —
+/// View 2's labelled curve (green below the sweet spot, yellow at it,
+/// red past the knee, `▲ KNEE @ n` annotated) plus the plain-language
+/// "what to do with this" note. While Engine B is mid-sweep (no result
+/// published yet) it shows an in-progress note; with no sweep at all it
+/// shows the run-a-sweep hint.
 fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::border())
-        .title(" CONCURRENCY CURVE — t/s vs parallel users  ● sweet spot  ▲ knee ");
+        .title(" CONCURRENCY CURVE — t/s vs parallel users ");
     if area.width < 8 || area.height < 4 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -365,7 +460,13 @@ fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
         .filter(|r| !r.levels.is_empty())
         .map(|r| {
             let env = r.envelope();
-            build_curve_lines(&r.levels, inner.width, inner.height, &env)
+            let notes = curve_notes(&r.levels, &env);
+            // The plot gets whatever height the notes leave (it
+            // self-degrades to a compact form in the small Live panel).
+            let plot_h = (inner.height as i64 - notes.len() as i64).max(4) as u16;
+            let mut ls = build_curve_lines(&r.levels, inner.width, plot_h, &env);
+            ls.extend(notes);
+            ls
         })
         .unwrap_or_else(|| {
             let running_b =
@@ -387,33 +488,66 @@ fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
 
 // ── Capability scores (C1 / C2 / C3 / D) ───────────────────────────────────
 
-/// One capability bar: a label, a horizontal `[████░░]` bar (0–100%), a value
-/// detail, and a one-line dimmed `ℹ` note.
+/// One capability score: a label, a horizontal `[████░░]` bar (0–100%), a
+/// value detail, a one-line dimmed `ℹ` explanation, and (for poor scores)
+/// a `⚠` warning. Only engines that have *actually run* appear.
 struct CapScore {
     label: &'static str,
-    /// `0.0..=100.0` bar fill, or `None` for a non-percentage metric (the bar
-    /// stays empty and the detail carries the value).
+    /// `0.0..=100.0` bar fill, or `None` for a non-percentage metric (the
+    /// bar stays empty and the detail carries the value).
     pct: Option<f64>,
     detail: String,
     detail_style: Style,
     color: Color,
     info: &'static str,
+    /// A `⚠` warning for a score that means something is wrong.
+    warn: Option<&'static str>,
 }
 
-/// The capability scores panel: horizontal bars for Reasoning (C2), NIAH
-/// (C1), Structured (C3), and Energy (D). Each reads its lock-free result
-/// slot; a metric that hasn't run shows an empty bar with a `—` detail.
+/// Score → color: green (>80%), yellow (50–80%), red (<50%), gray (N/A /
+/// non-percentage).
+fn score_color(pct: Option<f64>) -> Color {
+    match pct {
+        Some(p) if p > 80.0 => palette::OK,
+        Some(p) if p >= 50.0 => palette::WARN,
+        Some(_) => palette::ERR,
+        None => palette::MUTED,
+    }
+}
+
+/// The capability scores panel: color-coded horizontal bars for every
+/// capability engine that has run (Reasoning C2, Long Context C1,
+/// Structured C3, Energy D), each with a `ℹ` explanation, a `⚠` warning
+/// when the score is poor, and an **OVERALL** practical summary line at
+/// the bottom. Engines that haven't run are omitted (never shown empty).
 fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut Frame) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(style::border())
-        .title(" CAPABILITY SCORES ");
+        .title(" CAPABILITY ASSESSMENT ");
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
     let scores = build_capability_scores(app, m);
-    let lines: Vec<Line> = scores.iter().map(|s| build_cap_bar(s)).collect();
+    let overall = Line::from(Span::styled(capability_overall(&scores), style::value()));
+    let mut lines: Vec<Line> = Vec::new();
+    // The OVERALL summary sits at the bottom (the verdict after the
+    // evidence) — except in a squeezed panel, where it moves up front so
+    // it is never clipped away.
+    let tall = area.height >= 12;
+    if !tall {
+        lines.push(overall.clone());
+        lines.push(Line::raw(""));
+    }
+    for s in &scores {
+        lines.extend(build_cap_lines(s));
+    }
+    if tall {
+        let divider = "─".repeat(area.width.saturating_sub(4) as usize);
+        lines.push(Line::from(Span::styled(divider, style::border())));
+        lines.push(overall);
+    }
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -422,125 +556,94 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
     );
 }
 
-/// Gather the four capability scores from their lock-free result slots (pure
-/// over `&App` — unit-testable without a terminal).
+/// Gather the capability scores from their lock-free result slots — only
+/// the engines that have actually run (pure over `&App`, unit-testable).
 fn build_capability_scores(app: &App, m: &MetricsSnapshot) -> Vec<CapScore> {
     let mut v: Vec<CapScore> = Vec::with_capacity(4);
 
     // Reasoning (C2) — N/M solved as a percentage.
-    match app.reasoning_slot.load().as_ref() {
-        Some(r) if r.score.total > 0 => {
-            let pct = r.score.solved as f64 / r.score.total as f64 * 100.0;
-            v.push(CapScore {
-                label: "Reasoning",
-                pct: Some(pct),
-                detail: format!(
-                    "{}%  ({}/{})",
-                    pct.round() as i64,
-                    r.score.solved,
-                    r.score.total
-                ),
-                detail_style: style::value(),
-                color: palette::OK,
-                info: "Logic, math, code problem-solving",
-            });
-        }
-        _ => v.push(CapScore {
+    if let Some(r) = app
+        .reasoning_slot
+        .load()
+        .as_ref()
+        .as_ref()
+        .filter(|r| r.score.total > 0)
+    {
+        let pct = r.score.solved as f64 / r.score.total as f64 * 100.0;
+        v.push(CapScore {
             label: "Reasoning",
-            pct: None,
-            detail: "—".to_string(),
-            detail_style: style::footer(),
-            color: palette::MUTED,
-            info: "Logic, math, code problem-solving",
-        }),
+            pct: Some(pct),
+            detail: format!("{pct:.1}%  ({}/{})", r.score.solved, r.score.total),
+            detail_style: style::value(),
+            color: score_color(Some(pct)),
+            info: "Math, logic, code problems. Measures analytical ability.",
+            warn: (pct < 50.0).then_some("LOW: weak analytical problem-solving."),
+        });
     }
 
-    // NIAH (C1) — retrieved/total cells as a percentage.
-    match app.niah.load().as_ref() {
-        Some(r) => {
-            let (retrieved, total) = r.accuracy();
-            let pct = if total > 0 {
-                retrieved as f64 / total as f64 * 100.0
+    // Long Context (C1, NIAH) — retrieved/total cells as a percentage.
+    if let Some(r) = app.niah.load().as_ref() {
+        let (retrieved, total) = r.accuracy();
+        let pct = if total > 0 {
+            retrieved as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        v.push(CapScore {
+            label: "Long Context",
+            pct: Some(pct),
+            detail: format!("{pct:.1}%  ({retrieved}/{total})",),
+            detail_style: style::value(),
+            color: score_color(Some(pct)),
+            info: "Retrieval from large documents. Critical for RAG / chat history.",
+            warn: (pct < 50.0).then_some("LOW: the model loses information in long contexts."),
+        });
+    }
+
+    // Structured Out (C3) — compliant (100%) or not (0%).
+    if let Some(r) = app.structured_slot.load().as_ref() {
+        let ok = r.compliant;
+        v.push(CapScore {
+            label: "Structured Out",
+            pct: Some(if ok { 100.0 } else { 0.0 }),
+            detail: if ok {
+                "PASS".to_string()
             } else {
-                0.0
-            };
-            v.push(CapScore {
-                label: "NIAH",
-                pct: Some(pct),
-                detail: format!("{}%  ({}/{})", pct.round() as i64, retrieved, total),
-                detail_style: style::value(),
-                color: palette::OK,
-                info: "Long-context retrieval (RAG readiness)",
-            });
-        }
-        None => v.push(CapScore {
-            label: "NIAH",
-            pct: None,
-            detail: "—".to_string(),
-            detail_style: style::footer(),
-            color: palette::MUTED,
-            info: "Long-context retrieval (RAG readiness)",
-        }),
+                "FAIL (non-compliant)".to_string()
+            },
+            detail_style: if ok {
+                style::value_ok()
+            } else {
+                style::value_err()
+            },
+            color: score_color(Some(if ok { 100.0 } else { 0.0 })),
+            info: "JSON format adherence. Required for API / agent tool-calling.",
+            warn: (!ok).then_some("The model does not follow response_format instructions."),
+        });
     }
 
-    // Structured (C3) — compliant (100%) or not (0%).
-    match app.structured_slot.load().as_ref() {
-        Some(r) => {
-            let ok = r.compliant;
-            v.push(CapScore {
-                label: "Structured",
-                pct: Some(if ok { 100.0 } else { 0.0 }),
-                detail: if ok {
-                    "COMPLIANT".to_string()
-                } else {
-                    "NON-COMPLIANT".to_string()
-                },
-                detail_style: if ok {
-                    style::value_ok()
-                } else {
-                    style::value_err()
-                },
-                color: if ok { palette::OK } else { palette::ERR },
-                info: "JSON/API instruction following",
-            });
-        }
-        None => v.push(CapScore {
-            label: "Structured",
-            pct: None,
-            detail: "—".to_string(),
-            detail_style: style::footer(),
-            color: palette::MUTED,
-            info: "JSON/API instruction following",
-        }),
-    }
-
-    // Energy (D) — J/token (not a percentage); `N/A` without GPU telemetry.
-    match energy_line(m, app) {
-        Some(line) => v.push(CapScore {
-            label: "Energy",
+    // Energy Efficiency (D) — J/token; N/A without local GPU telemetry.
+    if let Some(line) = energy_line(m, app) {
+        let na = line.starts_with("N/A");
+        v.push(CapScore {
+            label: "Energy Efficiency",
             pct: None,
             detail: line,
-            detail_style: style::value(),
-            color: palette::WARN,
-            info: "Requires local GPU access",
-        }),
-        None => v.push(CapScore {
-            label: "Energy",
-            pct: None,
-            detail: "N/A".to_string(),
-            detail_style: style::footer(),
+            detail_style: if na { style::footer() } else { style::value() },
             color: palette::MUTED,
-            info: "Requires local GPU access",
-        }),
+            info: "Joules per token. Requires a local GPU with driver support.",
+            warn: None,
+        });
     }
 
     v
 }
 
-/// Render one capability score as a single line:
-/// `Label   [████████████░░]  detail  ℹ info`.
-fn build_cap_bar(s: &CapScore) -> Line<'static> {
-    const BAR_W: usize = 14;
+/// Render one capability score as two lines:
+/// `Label   [████████████████████]  detail  ⚠ warning`
+/// `        ℹ what it measures`
+fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
+    const BAR_W: usize = 20;
     let filled = s
         .pct
         .map(|p| (p.clamp(0.0, 100.0) / 100.0 * BAR_W as f64).round() as usize)
@@ -549,12 +652,83 @@ fn build_cap_bar(s: &CapScore) -> Line<'static> {
     for i in 0..BAR_W {
         bar.push(if i < filled { '█' } else { '░' });
     }
-    Line::from(vec![
-        Span::styled(format!("{:<11}", s.label), style::label()),
+    let mut line1: Vec<Span> = vec![
+        Span::styled(format!("{:<16}", s.label), style::label()),
         Span::styled(format!("[{bar}] "), Style::default().fg(s.color)),
         Span::styled(s.detail.clone(), s.detail_style),
-        Span::styled(format!("  ℹ {}", s.info), style::info()),
-    ])
+    ];
+    if let Some(w) = s.warn {
+        line1.push(Span::styled(format!("  ⚠ {w}"), style::value_warn()));
+    }
+    vec![
+        Line::from(line1),
+        Line::from(Span::styled(
+            format!("                ℹ {}", s.info),
+            style::info(),
+        )),
+    ]
+}
+
+/// The **OVERALL** practical summary under the capability bars: what the
+/// scores mean for actually using the model (pure — unit-testable).
+fn capability_overall(scores: &[CapScore]) -> String {
+    if scores.is_empty() {
+        return "No capability engines have run — select C1–C3/D in Config (View 5) and press R."
+            .to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut caveats: Vec<String> = Vec::new();
+    for s in scores {
+        match s.label {
+            "Reasoning" => {
+                if let Some(p) = s.pct {
+                    parts.push(if p >= 80.0 {
+                        "strong reasoning".to_string()
+                    } else if p >= 50.0 {
+                        "solid reasoning".to_string()
+                    } else {
+                        "weak reasoning".to_string()
+                    });
+                }
+            }
+            "Long Context" => {
+                if let Some(p) = s.pct {
+                    if p >= 80.0 {
+                        parts.push("good long-context retention".to_string());
+                    } else if p >= 50.0 {
+                        parts.push("moderate long-context retention".to_string());
+                    } else {
+                        parts.push("weak long-context".to_string());
+                        caveats.push("Not suitable for RAG / long chat history".to_string());
+                    }
+                }
+            }
+            "Structured Out" => {
+                if let Some(p) = s.pct {
+                    if p >= 100.0 {
+                        parts.push("reliable JSON output".to_string());
+                    } else {
+                        parts.push("unreliable JSON output".to_string());
+                        caveats.push(
+                            "Not safe for API / agent tool-calling without prompt workarounds"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = if parts.is_empty() {
+        "OVERALL: no scored capabilities yet.".to_string()
+    } else {
+        format!("OVERALL: {}. ", parts.join(", "))
+    };
+    if !caveats.is_empty() {
+        out.push_str(&caveats.join("; "));
+        out.push('.');
+    }
+    out
 }
 
 // ── Engine D energy line (shared by capability scores) ─────────────────────
@@ -790,6 +964,48 @@ mod tests {
     }
 
     #[test]
+    fn throughput_chart_empty_series_is_a_flat_zero_line() {
+        // No samples yet → a flat `▁` line at 0, never a blank chart.
+        let lines = build_throughput_chart(&[], 30, 8);
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains('▁'), "flat zero line: {text}");
+    }
+
+    #[test]
+    fn key_metrics_panel_labels_every_metric_with_description() {
+        // Rendered tall (120x52) so all eight metric rows fit; on a short
+        // terminal the least critical rows clip gracefully.
+        let app = App::new();
+        let text = render_live_text(&app, 120, 52);
+        for label in [
+            "Gen Throughput",
+            "Prompt Throughput",
+            "TTFT",
+            "ITL p50",
+            "ITL p99",
+            "Total Tokens",
+            "Active Streams",
+            "Duration",
+        ] {
+            assert!(text.contains(label), "missing metric {label}: {text}");
+        }
+        // Every number carries a human-readable `ℹ` explanation.
+        for desc in [
+            "generation speed",
+            "prefill",
+            "responsiveness",
+            "smoothness",
+            "stutter",
+        ] {
+            assert!(text.contains(desc), "missing explanation {desc}: {text}");
+        }
+    }
+
+    #[test]
     fn throughput_chart_right_aligns_newest_sample() {
         // A single sample must plot at the rightmost plot column, not the
         // left.
@@ -816,6 +1032,7 @@ mod tests {
             progress: None,
             summary: String::new(),
             completed: Vec::new(),
+            engine_started_ms: 0,
         });
         app
     }
@@ -860,6 +1077,7 @@ mod tests {
             progress: None,
             summary: "6 of 6 engines complete".to_string(),
             completed: Vec::new(),
+            engine_started_ms: 0,
         });
         let seq = app.seq.load();
         assert!(should_show_concurrency(&seq, &app));
@@ -895,19 +1113,29 @@ mod tests {
             });
         let m = crate::metrics::state::MetricsSnapshot::default();
         let scores = build_capability_scores(&app, &m);
-        assert_eq!(scores.len(), 4, "one bar per capability");
+        // Only the two engines that ran appear (no empty/zero bars).
+        assert_eq!(scores.len(), 2, "one bar per *run* capability");
         let details: String = scores
             .iter()
             .map(|s| s.detail.clone())
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(details.contains("12/13"), "reasoning detail: {details}");
-        assert!(
-            details.contains("NON-COMPLIANT"),
-            "structured detail: {details}"
-        );
-        // NIAH + Energy not run → `—` / `N/A`.
-        assert!(details.contains('—'), "unrun metric placeholder: {details}");
+        assert!(details.contains("FAIL"), "structured detail: {details}");
+        // The failing structured score carries a ⚠ warning.
+        let structured = scores
+            .iter()
+            .find(|s| s.label == "Structured Out")
+            .expect("structured score");
+        assert!(structured.warn.is_some(), "poor score warns");
+    }
+
+    #[test]
+    fn capability_scores_hide_unrun_engines() {
+        let app = App::new();
+        let m = crate::metrics::state::MetricsSnapshot::default();
+        // Nothing ran, no hw poller → no bars at all.
+        assert!(build_capability_scores(&app, &m).is_empty());
     }
 
     #[test]
@@ -919,11 +1147,68 @@ mod tests {
             detail_style: style::value(),
             color: palette::OK,
             info: "note",
+            warn: None,
         };
-        let line = build_cap_bar(&s);
-        let text: String = line.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        // 14-wide bar at 50% → 7 filled, 7 empty.
-        assert!(text.contains("[███████░░░░░░░]"), "{text}");
+        let lines = build_cap_lines(&s);
+        assert_eq!(lines.len(), 2, "value line + ℹ line");
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref().to_string())
+            .collect();
+        // 20-wide bar at 50% → 10 filled, 10 empty.
+        assert!(text.contains("[██████████░░░░░░░░░░]"), "{text}");
+        // The second line is the dimmed explanation.
+        let info: String = lines[1]
+            .spans
+            .iter()
+            .map(|sp| sp.content.as_ref().to_string())
+            .collect();
+        assert!(info.contains('ℹ'), "{info}");
+        assert!(info.contains("note"), "{info}");
+    }
+
+    #[test]
+    fn capability_overall_composes_the_practical_summary() {
+        // Strong reasoning, weak long-context, non-compliant JSON.
+        let scores = vec![
+            CapScore {
+                label: "Reasoning",
+                pct: Some(92.0),
+                detail: "92% (12/13)".into(),
+                detail_style: style::value(),
+                color: palette::OK,
+                info: "",
+                warn: None,
+            },
+            CapScore {
+                label: "Long Context",
+                pct: Some(29.9),
+                detail: "29.9% (23/77)".into(),
+                detail_style: style::value(),
+                color: palette::ERR,
+                info: "",
+                warn: Some("LOW"),
+            },
+            CapScore {
+                label: "Structured Out",
+                pct: Some(0.0),
+                detail: "FAIL".into(),
+                detail_style: style::value_err(),
+                color: palette::ERR,
+                info: "",
+                warn: Some("non-compliant"),
+            },
+        ];
+        let overall = capability_overall(&scores);
+        assert!(overall.starts_with("OVERALL:"), "{overall}");
+        assert!(overall.contains("strong reasoning"), "{overall}");
+        assert!(overall.contains("weak long-context"), "{overall}");
+        assert!(overall.contains("RAG"), "{overall}");
+        assert!(overall.contains("tool-calling"), "{overall}");
+
+        // No scores at all → the run-them hint.
+        assert!(capability_overall(&[]).contains("No capability engines"));
     }
 
     // ── energy line (Engine D) ───────────────────────────────────────────
@@ -946,6 +1231,7 @@ mod tests {
             progress: None,
             summary: String::new(),
             completed: vec![(Engine::Hardware, "0.338 J/token · peak 285 W".to_string())],
+            engine_started_ms: 0,
         });
         assert_eq!(
             energy_line(&MetricsSnapshot::default(), &app).as_deref(),
@@ -985,6 +1271,7 @@ mod tests {
             }),
             summary: String::new(),
             completed: Vec::new(),
+            engine_started_ms: 0,
         };
         let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
         assert!(text.contains("ENGINE A: SPEED"), "{text}");
@@ -1002,6 +1289,7 @@ mod tests {
             progress: None,
             summary: "100.0 t/s decode".to_string(),
             completed: vec![(Engine::Speed, "100.0 t/s decode".to_string())],
+            engine_started_ms: 0,
         };
         let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
         assert!(text.contains("ENGINE A: SPEED"), "{text}");
@@ -1019,6 +1307,7 @@ mod tests {
             progress: None,
             summary: String::new(),
             completed: Vec::new(),
+            engine_started_ms: 0,
         };
         let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
         assert!(text.contains("ALL BENCHMARKS COMPLETE"), "{text}");

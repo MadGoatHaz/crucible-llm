@@ -447,7 +447,7 @@ fn view2_curve_shows_placeholder_before_a_sweep() {
     let mut app = App::new();
     app.view = View::Concurrency;
     let text = render_concurrency(&app);
-    assert!(text.contains("THROUGHPUT VS CONCURRENCY"));
+    assert!(text.contains("Parallel Users"), "curve panel title");
     assert!(text.contains("Run a sweep"));
 }
 
@@ -465,13 +465,13 @@ fn view2_curve_marks_sweet_spot_and_knee() {
     let buf = render_concurrency_at(&app, 120, 40);
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
 
-    assert!(text.contains("THROUGHPUT VS CONCURRENCY"));
-    // Sweet spot (2): a green ● cap. Knee (4): a red ▲ cap.
+    assert!(text.contains("Parallel Users"), "curve panel title");
+    // Sweet spot (2): a yellow ● marker. Knee (4): a red ▲ marker.
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
-        "sweet spot is a green ●"
+            .any(|c| c.symbol() == "●" && c.fg == Color::Yellow),
+        "sweet spot is a yellow ●"
     );
     assert!(
         buf.content()
@@ -479,14 +479,21 @@ fn view2_curve_marks_sweet_spot_and_knee() {
             .any(|c| c.symbol() == "▲" && c.fg == Color::Red),
         "knee is a red ▲"
     );
-    // The other level: a cyan • cap; the bars are vertical strokes.
+    // The level below the sweet spot (1): a green ● marker.
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "•" && c.fg == Color::Cyan),
-        "other levels are cyan •"
+            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
+        "levels below the sweet spot are green ●"
     );
+    // Stems, the knee annotation, and the value labels on every point.
     assert!(text.contains('│'));
+    assert!(text.contains("KNEE @ 4"));
+    assert!(text.contains("350.0 t/s"), "value label: {text}");
+    assert!(text.contains("concurrent users"), "axis title: {text}");
+    // The actionable note under the plot.
+    assert!(text.contains("SWEET SPOT"), "note: {text}");
+    assert!(text.contains("SATURATION"), "note: {text}");
     // x labels: every ladder step appears on the plot.
     for c in ["1", "2", "4"] {
         assert!(text.contains(c));
@@ -512,8 +519,8 @@ fn view2_curve_renders_the_full_ladder() {
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "●" && c.fg == Color::Green),
-        "sweet spot (8) is a green ●"
+            .any(|c| c.symbol() == "●" && c.fg == Color::Yellow),
+        "sweet spot (8) is a yellow ●"
     );
     assert!(
         buf.content()
@@ -522,8 +529,8 @@ fn view2_curve_renders_the_full_ladder() {
         "knee (16) is a red ▲"
     );
     assert!(
-        buf.content().iter().filter(|c| c.symbol() == "•").count() >= 5,
-        "the five non-special levels get cyan • caps"
+        buf.content().iter().filter(|c| c.symbol() == "●").count() >= 5,
+        "the five non-knee levels get ● markers"
     );
 }
 

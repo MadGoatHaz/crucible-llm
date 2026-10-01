@@ -49,7 +49,7 @@ use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{palette, style};
 use crate::ui::views;
-use crate::ui::views::config::{ConfigKeyResult, ConfigState};
+use crate::ui::views::config::{ConfigKeyResult, ConfigState, Field as ConfigField};
 use crate::ui::views::history::HistoryState;
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
@@ -706,6 +706,10 @@ impl App {
             progress: None,
             summary: String::new(),
             completed: Vec::new(),
+            engine_started_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         });
         self.push_log(
             format!(
@@ -846,9 +850,14 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // Config view (Chunk 18): `PageDown`/`PageUp` switch views (so the
-        // user can leave); everything else is delegated to the editor
-        // (`F2` saves, `F5` runs, arrows/typing edit the focused field).
+        // Config view (Chunk 18): `PageDown`/`PageUp` and the `1`-`5`
+        // digits switch views (so the user can always leave); everything
+        // else is delegated to the editor (`F2` saves, `F5` runs,
+        // arrows/typing edit the focused field). Digits keep *typing*
+        // into the focused field when it is a text field (URL, model,
+        // API key, tokenizer path, ladder — all of which need digits),
+        // and switch views from the step/toggle fields (Mode, Tokens,
+        // Iterations, Timeout, Nocache, Hardware, engines).
         if self.view == View::Config {
             match key.code {
                 KeyCode::PageDown => {
@@ -863,6 +872,46 @@ impl App {
                         View::ALL[(self.view.index() + View::ALL.len() - 1) % View::ALL.len()];
                     if self.view == View::History {
                         self.ensure_history();
+                    }
+                    return KeyAction::Continue;
+                }
+                KeyCode::Char(c @ '1'..='5') => {
+                    let field = self.config.current();
+                    let text_field = matches!(
+                        field,
+                        ConfigField::Url
+                            | ConfigField::Model
+                            | ConfigField::ApiKey
+                            | ConfigField::Tokenizer
+                            | ConfigField::Ladder
+                    );
+                    if text_field {
+                        // The focused field needs the digit: type it.
+                        return match self.config.handle_key(key) {
+                            ConfigKeyResult::Saved => {
+                                self.push_log(
+                                    format!(
+                                        "[config] saved → {}",
+                                        self.config.config_path.display()
+                                    ),
+                                    style::value_ok(),
+                                );
+                                KeyAction::Continue
+                            }
+                            ConfigKeyResult::Run => {
+                                self.start_run();
+                                KeyAction::Run
+                            }
+                            ConfigKeyResult::Inert => KeyAction::Continue,
+                        };
+                    }
+                    // `c as u8` is the code point (49 for '1'); use the
+                    // digit's value for the view lookup.
+                    if let Some(view) = View::from_digit(c.to_digit(10).unwrap() as u8) {
+                        self.view = view;
+                        if view == View::History {
+                            self.ensure_history();
+                        }
                     }
                     return KeyAction::Continue;
                 }
@@ -890,7 +939,9 @@ impl App {
 
         match key.code {
             KeyCode::Char(c @ '1'..='5') => {
-                if let Some(view) = View::from_digit(c as u8) {
+                // `c as u8` is the Unicode code point (49 for '1') — use
+                // the digit's *value* (1) for the view lookup.
+                if let Some(view) = View::from_digit(c.to_digit(10).unwrap() as u8) {
                     self.view = view;
                     // Chunk 14: entering the History view loads the stored
                     // session list once (key path, not the render path).
@@ -1261,10 +1312,19 @@ impl App {
                     .add_modifier(Modifier::DIM),
             )
         };
+        // The current view, highlighted, so a user who switched with
+        // `1`-`5` always knows which dashboard panel is on screen.
+        let view_tag = Span::styled(
+            format!(" ▸ {} ", self.view.label()),
+            Style::default()
+                .fg(palette::HIGHLIGHT)
+                .add_modifier(Modifier::BOLD),
+        );
 
         if self.pending_niah {
             let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
             return Line::from(vec![
+                view_tag,
                 live(&format!(
                     " [Y] Run NIAH test? {requests} requests ({s} sizes × {d} depths) ",
                     s = NIAH_SIZES.len(),
@@ -1285,6 +1345,7 @@ impl App {
                 live("[Space] Pause")
             };
             return Line::from(vec![
+                view_tag,
                 live("[1-5] Views"),
                 sep.clone(),
                 space_key,
@@ -1299,6 +1360,7 @@ impl App {
 
         let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
         Line::from(vec![
+            view_tag,
             live("[1-5] Views"),
             sep.clone(),
             live("[R] Run Benchmark"),
@@ -1766,6 +1828,104 @@ mod tests {
         app.handle_key(&char_key(' '));
         assert!(!app.paused);
         assert!(!app.pause.is_paused(), "resume clears the gate");
+    }
+
+    // ── view switching (1-5) — the #1 priority ───────────────────────────
+
+    #[test]
+    fn digits_switch_views_from_every_dashboard_view() {
+        for view in View::ALL {
+            let mut app = App::new();
+            app.view = view;
+            // In the Config view the cursor starts on the URL (a text
+            // field where digits type); park it on a step field so the
+            // digits switch views.
+            if view == View::Config {
+                app.config.cursor = 2; // Field::Mode
+            }
+            for (digit, expected) in [
+                ('1', View::Live),
+                ('2', View::Concurrency),
+                ('3', View::Needle),
+                ('4', View::History),
+                ('5', View::Config),
+            ] {
+                app.handle_key(&char_key(digit));
+                assert_eq!(app.view, expected, "from {view:?}, {digit} → {expected:?}");
+                // After leaving and re-entering the Config view mid-loop,
+                // the cursor keeps its (non-text) position.
+                if app.view == View::Config {
+                    app.config.cursor = 2;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn digits_switch_views_while_a_sequence_runs() {
+        // Views must be switchable at ALL times — even mid-benchmark.
+        let mut app = App::new();
+        app.seq.set_running(true);
+        app.view = View::Live;
+        app.handle_key(&char_key('2'));
+        assert_eq!(app.view, View::Concurrency, "mid-run view switch works");
+        app.handle_key(&char_key('4'));
+        assert_eq!(app.view, View::History);
+        app.handle_key(&char_key('1'));
+        assert_eq!(app.view, View::Live);
+    }
+
+    #[test]
+    fn config_view_digits_switch_views_from_step_fields() {
+        // From a non-text field (Tokens = index 3) the digits switch views
+        // instead of typing.
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 3; // Field::Tokens
+        app.handle_key(&char_key('2'));
+        assert_eq!(app.view, View::Concurrency);
+        assert_eq!(
+            app.config.tokens,
+            crate::config::DEFAULT_TOKENS,
+            "the digit must not edit the field"
+        );
+    }
+
+    #[test]
+    fn config_view_digits_type_into_text_fields() {
+        // URL / model / API key / tokenizer / ladder need digits: typing
+        // is preserved on those fields (they never switch views).
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 9; // Field::Ladder
+        app.config.ladder.clear();
+        app.handle_key(&char_key('1'));
+        app.handle_key(&char_key('6'));
+        assert_eq!(
+            app.view,
+            View::Config,
+            "digits type, they do not switch views"
+        );
+        assert_eq!(app.config.ladder, "16");
+
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.cursor = 0; // Field::Url
+        app.config.url.clear();
+        app.handle_key(&char_key('8'));
+        assert_eq!(app.view, View::Config);
+        assert_eq!(app.config.url, "8");
+    }
+
+    #[test]
+    fn footer_highlights_the_current_view() {
+        let mut app = App::new();
+        app.view = View::Concurrency;
+        let t = line_text(&app.footer_line());
+        assert!(
+            t.contains("Concurrency Matrix"),
+            "footer names the view: {t}"
+        );
     }
 
     // ── state-aware footer ───────────────────────────────────────────────

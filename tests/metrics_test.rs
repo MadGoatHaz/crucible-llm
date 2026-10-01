@@ -130,6 +130,7 @@ fn stream_timestamps_missing_milestones_yield_none() {
 fn snapshot_default_is_zeroed() {
     let s = MetricsSnapshot::default();
     assert_eq!(s.aggregate_tps, 0.0);
+    assert_eq!(s.prompt_throughput, 0.0);
     assert_eq!(s.active_streams, 0);
     assert_eq!(s.total_streams, 0);
     assert_eq!(s.prompt_tokens, 0);
@@ -204,7 +205,36 @@ fn snapshot_update_load_roundtrip() {
     assert_eq!(loaded.streams.len(), 1);
     assert_eq!(loaded.streams[0].id, 7);
     assert_eq!(loaded.streams[0].kind, "Reasoning");
+    // A writer-seeded window is adopted on the first publish.
     assert_eq!(loaded.throughput_series, vec![1.0, 2.0, 3.0]);
+    // Prompt throughput is derived: 512 prompt tokens / 0.12 s TTFT.
+    assert!((loaded.prompt_throughput - 512.0 / 0.12).abs() < 1e-9);
+}
+
+/// The rolling window persists across `update()` calls (the engines
+/// publish fresh `..Default::default()` snapshots, which would otherwise
+/// wipe the series on every batch) and samples at most once per second.
+#[test]
+fn update_maintains_the_rolling_throughput_series() {
+    let state = MetricsState::new();
+    state.update(MetricsSnapshot {
+        aggregate_tps: 100.0,
+        ..Default::default()
+    });
+    assert_eq!(state.load().throughput_series, vec![100.0]);
+
+    // A fresh default snapshot (as every engine batch publishes) does
+    // not wipe the window.
+    state.update(MetricsSnapshot::default());
+    assert_eq!(state.load().throughput_series, vec![100.0]);
+
+    // After the 1 s sample period, the latest value is appended.
+    std::thread::sleep(Duration::from_millis(1100));
+    state.update(MetricsSnapshot {
+        aggregate_tps: 200.0,
+        ..Default::default()
+    });
+    assert_eq!(state.load().throughput_series, vec![100.0, 200.0]);
 }
 
 /// A later `update` atomically replaces the pointee; `load` sees the latest.
