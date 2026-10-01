@@ -46,16 +46,17 @@ pub use capability::{
     REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
 };
 pub use concurrency::{
-    normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, DEFAULT_LADDER,
-    KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,
+    normalize_ladder, Envelope, KneePoint, Sweep, SweepLevel, SweepResult, UsabilityProfile,
+    DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD, PRACTICAL_PER_STREAM_TPS,
+    USABLE_PER_STREAM_TPS,
 };
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
 };
 pub use sequence::{
-    queue_for, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunPause, RunSlots,
-    SeqPhase, SeqState, SeqStateSlot,
+    queue_for, summarize_sweep, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunPause,
+    RunSlots, SeqPhase, SeqState, SeqStateSlot,
 };
 pub use speed::{
     aggregate, all_failed, format_result_box, format_summary, json_report, EngineError,

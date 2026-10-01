@@ -2,7 +2,8 @@
 //! blueprint §5 Engine B).
 //!
 //! A [`Sweep`] steps a configurable concurrency ladder (default
-//! `1→2→4→8→16→32→64` simultaneous sessions), running a fixed workload
+//! `1→2→3→4→8→12→16→24→32` simultaneous sessions — granular at the low
+//! end where home users actually operate), running a fixed workload
 //! (one prompt, `max_tokens`) at `n` concurrent [`WorkerPool`] streams per
 //! level, and collects per level:
 //!
@@ -40,9 +41,13 @@ use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamS
 use crate::sse::{Chunk, Usage};
 use crate::timing::MonotonicInstant;
 
-/// The default concurrency ladder (blueprint §5 Engine B:
-/// `1→2→4→8→16→32→64` simultaneous sessions).
-pub const DEFAULT_LADDER: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
+/// The default concurrency ladder (blueprint §5 Engine B):
+/// `1→2→3→4→8→12→16→24→32` simultaneous sessions.
+///
+/// Granular at the low end — that is where home setups actually
+/// operate (a few concurrent users, not dozens) — and capped at 32
+/// (64 concurrent streams is unrealistic for a home rig).
+pub const DEFAULT_LADDER: [usize; 9] = [1, 2, 3, 4, 8, 12, 16, 24, 32];
 
 /// The stall-detection window for the *inter-token* phase: a worker that
 /// has received at least one token and then goes silent for this long is
@@ -221,6 +226,81 @@ impl SweepResult {
             knee,
         })
     }
+
+    /// The **per-stream usability profile** (the practical recommendation
+    /// that replaces the pure-throughput knee for real-world use).
+    ///
+    /// Aggregate throughput is misleading: 64 users at 2.6 t/s each is not
+    /// "fast", it is "slow for everyone". What matters for chat, coding
+    /// agents, and RAG pipelines is what **each** stream gets
+    /// (aggregate ÷ users). This profile computes:
+    ///
+    /// * [`UsabilityProfile::practical_sweet_spot`] — the highest
+    ///   concurrency where every stream still gets at least
+    ///   [`PRACTICAL_PER_STREAM_TPS`] (40 t/s: comfortable);
+    /// * [`UsabilityProfile::max_usable`] — the highest concurrency
+    ///   where every stream still gets at least
+    ///   [`USABLE_PER_STREAM_TPS`] (15 t/s: usable, noticeably slower);
+    /// * [`UsabilityProfile::unusable_from`] — the first concurrency
+    ///   where every stream drops below 15 t/s (impractical for
+    ///   interactive use).
+    ///
+    /// The old throughput knee ([`Self::detect_knee`]) is still computed
+    /// for reference; the *recommendation* is the practical sweet spot.
+    ///
+    /// Pure function over the curve: no timing, no locks (measurement
+    /// isolation, blueprint §4).
+    pub fn usability(&self) -> UsabilityProfile {
+        let mut sorted: Vec<&SweepLevel> = self.levels.iter().collect();
+        sorted.sort_by_key(|l| l.concurrency);
+        let mut p = UsabilityProfile::default();
+        for l in &sorted {
+            let per = l.aggregate_tps / l.concurrency.max(1) as f64;
+            if per >= PRACTICAL_PER_STREAM_TPS {
+                p.practical_sweet_spot = Some(l.concurrency);
+                p.practical_per_stream = per;
+            }
+            if per >= USABLE_PER_STREAM_TPS {
+                p.max_usable = Some(l.concurrency);
+                p.max_usable_per_stream = per;
+            }
+            if p.unusable_from.is_none() && per < USABLE_PER_STREAM_TPS {
+                p.unusable_from = Some(l.concurrency);
+            }
+        }
+        p
+    }
+}
+
+/// Per-stream throughput (aggregate ÷ users) at or above which each user
+/// gets a **comfortable** experience — chat, coding agents, RAG pipelines.
+/// The practical sweet spot is the highest level that clears this bar.
+pub const PRACTICAL_PER_STREAM_TPS: f64 = 40.0;
+
+/// Per-stream throughput (aggregate ÷ users) at or above which the
+/// experience is **usable** (noticeably slower, but workable). Below it,
+/// interactive use becomes impractical.
+pub const USABLE_PER_STREAM_TPS: f64 = 15.0;
+
+/// The per-stream usability profile for a sweep curve (see
+/// [`SweepResult::usability`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UsabilityProfile {
+    /// The highest concurrency where every stream still gets ≥
+    /// [`PRACTICAL_PER_STREAM_TPS`] (40 t/s) — the **practical sweet
+    /// spot**: the most users you can serve while each still gets an
+    /// acceptable speed. `None` when no level clears the bar.
+    pub practical_sweet_spot: Option<usize>,
+    /// The per-stream t/s at the practical sweet spot (for display).
+    pub practical_per_stream: f64,
+    /// The highest concurrency where every stream still gets ≥
+    /// [`USABLE_PER_STREAM_TPS`] (15 t/s) — **maximum usable**.
+    pub max_usable: Option<usize>,
+    /// The per-stream t/s at the maximum usable level (for display).
+    pub max_usable_per_stream: f64,
+    /// The first concurrency where every stream drops below
+    /// [`USABLE_PER_STREAM_TPS`] — **unusable beyond** this level.
+    pub unusable_from: Option<usize>,
 }
 
 /// Relative aggregate-throughput gain at or below which a level is
@@ -1236,7 +1316,9 @@ mod tests {
 
     #[test]
     fn default_ladder_matches_blueprint() {
-        assert_eq!(DEFAULT_LADDER, [1, 2, 4, 8, 16, 32, 64]);
+        // Granular at the low end (home users operate at 1–16), capped at
+        // 32 (64 concurrent streams is unrealistic for a home setup).
+        assert_eq!(DEFAULT_LADDER, [1, 2, 3, 4, 8, 12, 16, 24, 32]);
     }
 
     #[test]
@@ -1575,6 +1657,72 @@ mod tests {
         assert_eq!(relative_spike(0, 10), f64::INFINITY);
         assert_eq!(relative_spike(0, 0), 0.0);
         assert!((relative_spike(10, 30) - 3.0).abs() < 1e-9);
+    }
+
+    // ── per-stream usability (the practical recommendation) ─────────────
+
+    #[test]
+    fn usability_finds_the_per_stream_thresholds() {
+        // The user's real run (qwen3.8-27b): aggregate 55 / 92.7 / 94.5 /
+        // 117.3 / 118.2 / 120.5 → per-stream 55.0 / 46.4 / 23.6 / 14.7 /
+        // 7.4 / 3.8. Practical (≥40 each): up to 2. Usable (≥15 each): up
+        // to 4. Unusable (<15 each): from 8. (The old throughput knee
+        // called 32 the "sweet spot" — 32 users at 3.8 t/s each.)
+        let result = SweepResult {
+            levels: vec![
+                level(1, 55.0, 5.0),
+                level(2, 92.7, 8.0),
+                level(4, 94.5, 20.0),
+                level(8, 117.3, 40.0),
+                level(16, 118.2, 80.0),
+                level(32, 120.5, 120.0),
+            ],
+        };
+        let p = result.usability();
+        assert_eq!(p.practical_sweet_spot, Some(2), "practical: ~46 t/s each");
+        assert!((p.practical_per_stream - 92.7 / 2.0).abs() < 0.01);
+        assert_eq!(p.max_usable, Some(4), "usable: ~24 t/s each");
+        assert!((p.max_usable_per_stream - 94.5 / 4.0).abs() < 0.01);
+        assert_eq!(p.unusable_from, Some(8), "unusable: ~14.7 t/s each");
+    }
+
+    #[test]
+    fn usability_reports_partial_usability() {
+        // Level 1: 30 t/s/user — usable (≥15) but not comfortable (<40);
+        // level 2: 10 t/s/user — unusable.
+        let result = SweepResult {
+            levels: vec![level(1, 30.0, 5.0), level(2, 20.0, 8.0)],
+        };
+        let p = result.usability();
+        assert_eq!(p.practical_sweet_spot, None, "no level clears 40 t/s each");
+        assert_eq!(p.max_usable, Some(1), "one user is still usable");
+        assert_eq!(p.unusable_from, Some(2), "two users drop below 15 t/s each");
+    }
+
+    #[test]
+    fn usability_all_levels_comfortable() {
+        // Per-stream stays ≥ 40 across the whole curve (and never drops
+        // below 15): the practical sweet spot is the top level, and there
+        // is no unusable boundary within the sweep.
+        let result = SweepResult {
+            levels: vec![
+                level(1, 100.0, 5.0),
+                level(2, 220.0, 6.0),
+                level(4, 480.0, 8.0),
+            ],
+        };
+        let p = result.usability();
+        assert_eq!(p.practical_sweet_spot, Some(4));
+        assert_eq!(p.max_usable, Some(4));
+        assert_eq!(p.unusable_from, None);
+    }
+
+    #[test]
+    fn usability_is_empty_for_an_empty_curve() {
+        let p = SweepResult::default().usability();
+        assert_eq!(p.practical_sweet_spot, None);
+        assert_eq!(p.max_usable, None);
+        assert_eq!(p.unusable_from, None);
     }
 
     #[tokio::test]

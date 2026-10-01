@@ -7,14 +7,17 @@
 //! pooled across every concurrent stream of the level — and highlights the
 //! **saturation knee** (plan Chunk 11, [`SweepResult::detect_knee`]): the
 //! level where aggregate throughput plateaus while p90 TPOT spikes (the
-//! memory-bandwidth-bound → compute-bound transition), plus the
-//! **Optimal Operational Envelope** ([`SweepResult::envelope`]) — the
-//! recommended sweet spot just before the knee.
+//! memory-bandwidth-bound → compute-bound transition).
+//!
+//! The bottom panel is the **Concurrency Recommendation** (the practical
+//! sweet spot, FIX 3): the knee is *reference only* — the recommendation
+//! is per-stream usability, i.e. how many users you can serve while each
+//! still gets an acceptable speed (≥40 t/s comfortable, ≥15 t/s usable).
 //!
 //! The top panel renders the sweep as a block-based throughput-vs-
 //! concurrency curve: one vertical bar per ladder level (x on a
-//! `log2(concurrency)` scale, y ∝ aggregate t/s), with the sweet spot
-//! capped by a green `●` and the saturation knee by a red `▲`.
+//! `log2(concurrency)` scale, y ∝ aggregate t/s), with the knee capped
+//! by a red `▲` and the rest marked `●`.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,13 +25,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::engines::concurrency::{Envelope, SweepLevel, DEFAULT_LADDER};
+use crate::engines::concurrency::{Envelope, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crate::ui::app::App;
 use crate::ui::theme::{palette, style};
 
 /// The placeholder ladder shown before a sweep has run (blueprint §5,
 /// Engine B default).
-const LADDER: [usize; 7] = DEFAULT_LADDER;
+const LADDER: [usize; 9] = DEFAULT_LADDER;
 
 /// Render the Concurrency view into `area`.
 ///
@@ -55,7 +58,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .and_then(|r| r.envelope());
     render_curve(chunks[0], app, f, &envelope);
     render_matrix(chunks[1], app, f, &envelope);
-    render_envelope(chunks[2], app, f, &envelope);
+    render_recommendation(chunks[2], app, f);
 }
 
 /// Top panel: aggregate throughput vs concurrent users — one point per
@@ -85,7 +88,7 @@ fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let notes = curve_notes(&result.levels, envelope);
+    let notes = curve_notes(&result.levels);
     // Give the plot the space left over for the notes (it self-degrades
     // to a compact form when squeezed by a small terminal).
     let plot_h = (inner_h as i64 - notes.len() as i64).max(4) as u16;
@@ -443,62 +446,103 @@ fn write_text(
     }
 }
 
-/// The plain-language "what to do with this curve" note under the plot:
-/// a dimmed `ℹ` explanation of the knee, plus the actionable sweet spot
-/// (or the no-knee fallback: the curve is still climbing).
-pub(crate) fn curve_notes(
-    levels: &[SweepLevel],
-    envelope: &Option<Envelope>,
-) -> Vec<Line<'static>> {
-    let mut ls: Vec<Line> = vec![Line::from(Span::styled(
-        "ℹ Below the knee: more users = more total throughput. Above it, it hurts everyone.",
-        style::info(),
-    ))];
-    match envelope {
-        Some(env) => {
+/// The recommendation data lines (FIX 3): the **practical sweet spot**
+/// (the highest concurrency where every user still gets ≥40 t/s — the
+/// recommendation), the **maximum usable** level (≥15 t/s each), the
+/// **unusable beyond** boundary (<15 t/s each), and the **pure
+/// throughput knee** as reference only. Pure over the sweep result
+/// (unit-testable, no terminal).
+fn recommendation_lines(result: &SweepResult) -> Vec<Line<'static>> {
+    let us = result.usability();
+    // The reference knee: the detected saturation knee, else the peak-
+    // throughput level (where total t/s tops out).
+    let knee = result
+        .envelope()
+        .and_then(|e| e.knee)
+        .map(|k| k.concurrency)
+        .or_else(|| result.peak_throughput().map(|l| l.concurrency));
+    let mut ls: Vec<Line> = Vec::new();
+    // Practical sweet spot — the recommendation, prominent.
+    match us.practical_sweet_spot {
+        Some(n) => {
             ls.push(Line::from(vec![
-                Span::styled("  SWEET SPOT: ", style::value_ok()),
                 Span::styled(
-                    format!(
-                        "{} users — {:.1} t/s. Run at or below it.",
-                        env.sweet_spot, env.aggregate_tps
-                    ),
+                    "  Practical Sweet Spot: ",
+                    Style::default()
+                        .fg(palette::OK)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{n} concurrent users"),
+                    Style::default()
+                        .fg(palette::OK)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" — each gets ~{:.0} t/s", us.practical_per_stream),
                     style::value_ok(),
                 ),
             ]));
-            match env.knee {
-                Some(k) => ls.push(Line::from(vec![
-                    Span::styled("  SATURATION:  ", style::value_err()),
-                    Span::styled(
-                        format!(
-                            "{} users — plateau, p90 spikes to {:.1} ms.",
-                            k.concurrency,
-                            k.p90_tpot_ns as f64 / 1e6
-                        ),
-                        style::value_err(),
-                    ),
-                ])),
-                None => ls.push(Line::from(Span::styled(
-                    "  No knee detected — throughput still climbing.",
-                    style::footer(),
-                ))),
-            }
         }
-        None => {
-            if let Some(peak) = levels
-                .iter()
-                .max_by(|a, b| a.aggregate_tps.total_cmp(&b.aggregate_tps))
-            {
-                ls.push(Line::from(Span::styled(
-                    format!(
-                        "  No knee detected — still climbing at {} users ({:.1} t/s).",
-                        peak.concurrency, peak.aggregate_tps
-                    ),
-                    style::footer(),
-                )));
-            }
-        }
+        None => ls.push(Line::from(Span::styled(
+            "  Practical Sweet Spot: — (even 1 user is below 40 t/s)",
+            style::value_warn(),
+        ))),
     }
+    // Maximum usable.
+    match us.max_usable {
+        Some(n) => ls.push(Line::from(vec![
+            Span::styled("  Maximum Usable:      ", style::label()),
+            Span::styled(format!("{n} concurrent users"), style::value()),
+            Span::styled(
+                format!(" — each gets ~{:.0} t/s (slower)", us.max_usable_per_stream),
+                style::footer(),
+            ),
+        ])),
+        None => ls.push(Line::from(Span::styled(
+            "  Maximum Usable:      — (below 15 t/s per user throughout)",
+            style::value_err(),
+        ))),
+    }
+    // Unusable beyond.
+    match us.unusable_from {
+        Some(n) => ls.push(Line::from(vec![
+            Span::styled("  Unusable Beyond:     ", style::label()),
+            Span::styled(format!("{n}+ concurrent users"), style::value_err()),
+            Span::styled(" — each drops below 15 t/s", style::footer()),
+        ])),
+        None => ls.push(Line::from(Span::styled(
+            "  Unusable Beyond:     not reached in this sweep",
+            style::footer(),
+        ))),
+    }
+    // Pure throughput knee — reference only.
+    if let Some(k) = knee {
+        ls.push(Line::from(vec![
+            Span::styled("  Pure Throughput Knee: ", style::label()),
+            Span::styled(format!("{k}"), style::footer()),
+            Span::styled(" (reference only — total t/s peaks here)", style::footer()),
+        ]));
+    }
+    ls
+}
+
+/// The plain-language note under the plot (shared with the Live view's
+/// concurrency panel, FIX 3): what the recommendation means, the
+/// practical-sweet-spot lines, and the aggregate-throughput caveat.
+pub(crate) fn curve_notes(levels: &[SweepLevel]) -> Vec<Line<'static>> {
+    let result = SweepResult {
+        levels: levels.to_vec(),
+    };
+    let mut ls: Vec<Line> = vec![Line::from(Span::styled(
+        "ℹ Sweet spot = most users where EACH still gets ≥40 t/s (comfortable).",
+        style::info(),
+    ))];
+    ls.extend(recommendation_lines(&result));
+    ls.push(Line::from(Span::styled(
+        "ℹ Aggregate t/s alone misleads: many slow users is not fast service.",
+        style::info(),
+    )));
     ls
 }
 
@@ -669,90 +713,71 @@ fn per_stream_status(per: f64, baseline: f64) -> (String, Style) {
     }
 }
 
-/// The dimmed `ℹ` note explaining what the envelope's numbers mean.
-const ENVELOPE_INFO: &str = "Finds your server's capacity limit. The sweet spot is where you get \
-     the best throughput before latency spikes; the knee is where adding \
-     more users starts hurting everyone's response time.";
+/// The dimmed `ℹ` notes explaining what the recommendation means (FIX 3).
+const RECOMMENDATION_INFO: [&str; 4] = [
+    "\"Practical sweet spot\" = most users where each still gets ≥40 t/s.",
+    "This is what matters for real use: coding agents, chat, RAG pipelines.",
+    "Pure aggregate throughput is misleading — 32 users at 3.8 t/s each",
+    "is not \"fast\", it's \"slow for everyone\".",
+];
 
-/// Optimal Operational Envelope (blueprint §6 View 2): the recommended
-/// sweet spot, with the detected saturation knee (and the rationale —
-/// throughput plateau + p90 spike) when the curve showed a transition,
-/// plus a dimmed `ℹ` note explaining the numbers.
-fn render_envelope(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
-    let mut lines: Vec<Line> = match envelope {
-        Some(env) => {
-            let mut ls = vec![Line::from(vec![
-                Span::styled("Recommended sweet spot: ", style::label()),
-                Span::styled(
-                    format!(
-                        "{} streams ({} t/s @ p90 {} ms)",
-                        env.sweet_spot,
-                        env.aggregate_tps,
-                        env.p90_tpot_ns as f64 / 1_000_000.0
-                    ),
-                    style::value_ok(),
-                ),
-            ])];
-            match env.knee {
-                Some(k) => ls.push(Line::from(vec![
-                    Span::styled("Saturation knee: ", style::label()),
-                    Span::styled(
-                        format!(
-                            "{} streams — throughput plateaus ({} t/s) while p90 TPOT spikes to {} ms",
-                            k.concurrency,
-                            k.aggregate_tps,
-                            k.p90_tpot_ns as f64 / 1_000_000.0
-                        ),
-                        style::value_err(),
-                    ),
-                ])),
-                None => ls.push(Line::from(Span::styled(
-                    "No saturation knee detected — running at the peak-throughput point.",
-                    style::footer(),
-                ))),
+/// The **Concurrency Recommendation** panel (blueprint §6 View 2,
+/// reworked in FIX 3): the practical sweet spot (per-stream usability —
+/// the recommendation), the maximum usable level, the unusable boundary,
+/// and the pure-throughput knee as reference only — plus the dimmed `ℹ`
+/// notes explaining why per-stream beats aggregate.
+fn render_recommendation(area: Rect, app: &App, f: &mut Frame) {
+    let sweep = app.sweep.load();
+    let lines: Vec<Line> = sweep
+        .as_ref()
+        .as_ref()
+        .filter(|r| !r.levels.is_empty())
+        .map(|r| {
+            let mut ls = recommendation_lines(r);
+            ls.push(Line::raw(""));
+            for (i, note) in RECOMMENDATION_INFO.iter().enumerate() {
+                // The last line continues the previous sentence (no `ℹ`).
+                let prefixed = if i == RECOMMENDATION_INFO.len() - 1 {
+                    format!("  {note}")
+                } else {
+                    format!("ℹ {note}")
+                };
+                ls.push(Line::from(Span::styled(prefixed, style::info())));
             }
             ls
-        }
-        None => vec![
-            Line::from(vec![
-                Span::styled("Recommended sweet spot: ", style::label()),
-                Span::styled(
-                    format!("{} streams", app.concurrency_target),
-                    style::highlight(),
-                ),
-                Span::styled("  (step with [+])", style::footer()),
-            ]),
-            Line::from(Span::styled(
-                "Run a sweep to detect the saturation knee — the transition from memory-bandwidth-bound to compute-bound.",
-                style::footer(),
-            )),
-        ],
-    };
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        format!("ℹ {ENVELOPE_INFO}"),
-        style::info(),
-    )));
-    // FIX 3: what the per-stream column means for the user's workload.
-    lines.push(Line::from(Span::styled(
-        "ℹ Per-Stream t/s = Aggregate ÷ Users — what EACH user experiences.",
-        style::info(),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Below ~50% of the single-user baseline, adding users hurts everyone.",
-        style::info(),
-    )));
-    lines.push(Line::from(Span::styled(
-        "  Multi-agent coding: each agent gets its own per-stream rate.",
-        style::info(),
-    )));
+        })
+        .unwrap_or_else(|| {
+            vec![
+                Line::from(vec![
+                    Span::styled("Practical Sweet Spot: ", style::label()),
+                    Span::styled(
+                        format!("{} streams", app.concurrency_target),
+                        style::highlight(),
+                    ),
+                    Span::styled("  (current target — step with [+])", style::footer()),
+                ]),
+                Line::from(Span::styled(
+                    "Run a sweep (Engine B) to find how many users you can serve while each stays fast.",
+                    style::footer(),
+                )),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    "ℹ \"Practical sweet spot\" = most users where each still gets ≥40 t/s.",
+                    style::info(),
+                )),
+                Line::from(Span::styled(
+                    "ℹ This is what matters for real use: coding agents, chat, RAG pipelines.",
+                    style::info(),
+                )),
+            ]
+        });
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(style::active_border())
-                    .title("OPTIMAL OPERATIONAL ENVELOPE"),
+                    .title("CONCURRENCY RECOMMENDATION"),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -827,47 +852,84 @@ mod tests {
     }
 
     #[test]
-    fn curve_notes_explain_the_sweet_spot_and_knee() {
-        let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)];
-        let env = SweepResult {
-            levels: levels.clone(),
-        }
-        .envelope();
-        let notes = curve_notes(&levels, &env);
+    fn curve_notes_carry_the_practical_recommendation() {
+        // Per-stream: 100, 175, 20 → practical 2, max usable 4, no
+        // unusable boundary; the knee (reference) is at 4.
+        let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 80.0, 20.0)];
+        let notes = curve_notes(&levels);
         let text: String = notes
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains('ℹ'), "explanation present");
-        assert!(text.contains("SWEET SPOT"), "actionable sweet spot: {text}");
-        assert!(text.contains("2 users"), "sweet spot value: {text}");
-        assert!(text.contains("SATURATION"), "knee line: {text}");
-        assert!(text.contains("4 users"), "knee value: {text}");
+        assert!(
+            text.contains("Practical Sweet Spot"),
+            "recommendation: {text}"
+        );
+        assert!(
+            text.contains("2 concurrent users"),
+            "sweet spot value: {text}"
+        );
+        assert!(text.contains("Maximum Usable"), "max usable: {text}");
+        assert!(
+            text.contains("4 concurrent users"),
+            "max usable value: {text}"
+        );
+        assert!(
+            text.contains("Pure Throughput Knee"),
+            "knee as reference: {text}"
+        );
     }
 
     #[test]
-    fn curve_notes_fallback_when_no_knee() {
-        // A strictly climbing curve has no knee.
-        let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 200.0, 6.0), lvl(4, 300.0, 7.0)];
-        let env = SweepResult {
-            levels: levels.clone(),
-        }
-        .envelope();
-        let notes = curve_notes(&levels, &env);
+    fn curve_notes_mark_the_unusable_boundary() {
+        // Per-stream: 100, 100, 75, 14.7 → unusable from 8 (below 15).
+        let levels = vec![
+            lvl(1, 100.0, 5.0),
+            lvl(2, 200.0, 6.0),
+            lvl(4, 300.0, 8.0),
+            lvl(8, 117.6, 20.0),
+        ];
+        let notes = curve_notes(&levels);
         let text: String = notes
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("still climbing") || text.contains("No knee"),
-            "no-knee fallback: {text}"
+            text.contains("Unusable Beyond") && text.contains("8+ concurrent users"),
+            "unusable boundary: {text}"
         );
     }
 
     #[test]
-    fn envelope_panel_shows_the_capacity_info_note() {
+    fn curve_notes_handle_a_slow_curve() {
+        // Per-stream: 30, 10 → no practical spot (nothing ≥40), one usable
+        // level (30 ≥ 15), unusable from 2.
+        let levels = vec![lvl(1, 30.0, 5.0), lvl(2, 20.0, 8.0)];
+        let notes = curve_notes(&levels);
+        let text: String = notes
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("even 1 user is below 40 t/s"),
+            "no-practical-spot wording: {text}"
+        );
+        assert!(
+            text.contains("1 concurrent users"),
+            "partial usable wording: {text}"
+        );
+        assert!(
+            text.contains("2+ concurrent users"),
+            "unusable boundary: {text}"
+        );
+    }
+
+    #[test]
+    fn recommendation_panel_shows_the_info_notes() {
         let app = crate::ui::app::App::new();
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
@@ -881,9 +943,55 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("OPTIMAL OPERATIONAL ENVELOPE"), "{text}");
-        assert!(text.contains('ℹ'), "capacity info note: {text}");
-        assert!(text.contains("capacity limit"), "{text}");
+        assert!(text.contains("CONCURRENCY RECOMMENDATION"), "{text}");
+        assert!(text.contains('ℹ'), "info notes: {text}");
+        assert!(
+            text.contains("coding agents, chat, RAG"),
+            "real-use note: {text}"
+        );
+    }
+
+    #[test]
+    fn recommendation_panel_shows_the_sweep_recommendation() {
+        let app = crate::ui::app::App::new();
+        // Per-stream: 100, 95, 70, 42.5, 21.6, 10.7, 5.3 → practical 8,
+        // max usable 16, unusable from 32, knee at 16.
+        app.sweep.store(SweepResult {
+            levels: vec![
+                lvl(1, 100.0, 5.0),
+                lvl(2, 190.0, 6.0),
+                lvl(4, 280.0, 7.0),
+                lvl(8, 340.0, 10.0),
+                lvl(16, 345.0, 30.0),
+                lvl(32, 342.0, 60.0),
+                lvl(64, 338.0, 90.0),
+            ],
+        });
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("Practical Sweet Spot"),
+            "recommendation: {text}"
+        );
+        assert!(text.contains("8 concurrent users"), "{text}");
+        assert!(text.contains("Maximum Usable"), "{text}");
+        assert!(text.contains("16 concurrent users"), "{text}");
+        assert!(text.contains("Unusable Beyond"), "{text}");
+        assert!(text.contains("32+ concurrent users"), "{text}");
+        assert!(
+            text.contains("Pure Throughput Knee"),
+            "knee reference: {text}"
+        );
     }
 
     #[test]

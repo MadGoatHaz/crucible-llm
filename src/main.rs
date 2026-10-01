@@ -28,7 +28,9 @@ use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine, MAX_GEN_TOKENS,
 };
-use crucible_llm::engines::{build_sweep, NiahEngine, ReasoningEngine, StructuredEngine};
+use crucible_llm::engines::{
+    build_sweep, summarize_sweep, NiahEngine, ReasoningEngine, StructuredEngine,
+};
 use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
@@ -376,17 +378,13 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                         ));
                     }
                     let r = sweep.run().await;
-                    match r.envelope() {
-                        Some(env) => term.info(&format!(
-                            "  [B] sweet spot: {} streams ({} t/s @ p90 {:.1} ms){}",
-                            env.sweet_spot,
-                            env.aggregate_tps,
-                            env.p90_tpot_ns as f64 / 1e6,
-                            env.knee
-                                .map(|k| format!(" · knee at {}", k.concurrency))
-                                .unwrap_or_default()
-                        )),
-                        None => term.warning("  [B] sweep produced no usable levels"),
+                    // FIX 3: the headless summary leads with the
+                    // practical (per-stream usability) sweet spot, with
+                    // the pure-throughput knee as reference.
+                    if r.is_empty() {
+                        term.warning("  [B] sweep produced no usable levels");
+                    } else {
+                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
                     }
                 }
             }
@@ -533,7 +531,6 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
             let mut app = App::new()
                 .with_export_format(export_format)
                 .with_config(cfg)
-                .with_hw(hw.clone())
                 .with_logger(logger.clone());
             // The interactive Setup phase (full-screen takeover) opens
             // only when the target (URL + model) was *not* fully given
@@ -549,8 +546,12 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
             // views read lock-free. It never touches the stream
             // workers' quanta timing path (measurement isolation,
             // blueprint §4); a lock failure is a no-op. Chunk 18: only
-            // spawned when the hardware/energy engine is enabled.
+            // spawned (and only attached to the App) when the
+            // hardware/energy telemetry is enabled — `app.hw.is_some()`
+            // then means "the poller is live", which the views use to
+            // decide whether an Energy line belongs on screen.
             if cfg.hardware {
+                app = app.with_hw(hw.clone());
                 let state = app.metrics.clone();
                 let poller = hw;
                 tokio::spawn(async move {
@@ -558,6 +559,14 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
                         tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
                     loop {
                         interval.tick().await;
+                        // FIX 2: the run is over (the metrics pipeline
+                        // is frozen) → the poller stops: no hardware
+                        // reads, no snapshot updates. The task goes
+                        // idle (one atomic load per tick) until a new
+                        // run re-arms the pipeline (`unfreeze()`).
+                        if state.is_frozen() {
+                            continue;
+                        }
                         if let Ok(mut p) = poller.lock() {
                             p.tick(&state);
                         }

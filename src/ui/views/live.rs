@@ -35,6 +35,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use crate::config::EngineSelection;
 use crate::engines::capability::CaseVerdict;
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
@@ -102,38 +103,95 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     }
 }
 
-// ── Engine-adaptive panel visibility ───────────────────────────────────────
+// ── Engine selection (FIX 1: unselected engines never appear) ─────────────
 
-/// The concurrency curve shows while Engine B runs, after the whole sequence
-/// completes, or whenever a sweep result is already on screen (no sequence
-/// in flight).
-fn should_show_concurrency(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
-    match seq.as_deref() {
-        Some(s) if s.phase == SeqPhase::AllComplete => true,
-        Some(s) => s.engine == Engine::Concurrency,
-        None => app
-            .sweep
-            .load()
-            .as_ref()
-            .as_ref()
-            .is_some_and(|r| !r.levels.is_empty()),
+/// The engines the user selected, as the Live view should treat them:
+///
+/// * **during / after a run** — the run's own queue is authoritative
+///   (it contains exactly the engines selected when the run started);
+/// * **before any run** — the current Configuration form.
+///
+/// Every display panel on this view filters through this: an engine that
+/// was not selected does not appear — not in the capability assessment,
+/// not in the benchmark queue, not in any results panel (e.g. no
+/// `N/A (no GPU telemetry)` line when Energy (D) is off).
+fn selected(app: &App) -> EngineSelection {
+    if let Some(seq) = app.seq.load().as_ref() {
+        return EngineSelection {
+            speed: seq.queue.contains(&Engine::Speed),
+            concurrency: seq.queue.contains(&Engine::Concurrency),
+            niah: seq.queue.contains(&Engine::Niah),
+            reasoning: seq.queue.contains(&Engine::Reasoning),
+            structured: seq.queue.contains(&Engine::Structured),
+            hardware: seq.queue.contains(&Engine::Hardware),
+        };
+    }
+    let c = &app.config;
+    EngineSelection {
+        speed: c.engine_speed,
+        concurrency: c.engine_concurrency,
+        niah: c.engine_niah,
+        reasoning: c.engine_reasoning,
+        structured: c.engine_structured,
+        hardware: c.hardware,
     }
 }
 
-/// The capability scores show while any of the C/D engines runs, after the
-/// whole sequence completes, or whenever a capability result is already on
-/// screen (no sequence in flight).
-fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
+// ── Engine-adaptive panel visibility ───────────────────────────────────────
+
+/// The concurrency curve shows while Engine B runs, after the whole
+/// sequence completes (when B ran in it, or a sweep result is on
+/// screen), or whenever a sweep result is already on screen (no sequence
+/// in flight) — **and only when Engine B was selected** (FIX 1).
+fn should_show_concurrency(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
+    if !selected(app).concurrency {
+        return false;
+    }
+    let has_sweep = app
+        .sweep
+        .load()
+        .as_ref()
+        .as_ref()
+        .is_some_and(|r| !r.levels.is_empty());
     match seq.as_deref() {
-        Some(s) if s.phase == SeqPhase::AllComplete => true,
+        Some(s) if s.phase == SeqPhase::AllComplete => {
+            s.completed.iter().any(|(e, _)| *e == Engine::Concurrency) || has_sweep
+        }
+        Some(s) => s.engine == Engine::Concurrency,
+        None => has_sweep,
+    }
+}
+
+/// The capability scores show while any of the *selected* C/D engines
+/// runs, after the whole sequence completes (when a selected capability
+/// engine ran in it), or whenever a selected capability's result is
+/// already on screen (no sequence in flight) — never for engines the
+/// user did not select (FIX 1).
+fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
+    let sel = selected(app);
+    if !sel.niah && !sel.reasoning && !sel.structured && !sel.hardware {
+        return false;
+    }
+    match seq.as_deref() {
+        Some(s) if s.phase == SeqPhase::AllComplete => {
+            s.completed.iter().any(|(e, _)| {
+                matches!(
+                    e,
+                    Engine::Niah | Engine::Reasoning | Engine::Structured | Engine::Hardware
+                )
+            }) || (sel.niah && app.niah.load().as_ref().is_some())
+                || (sel.reasoning && app.reasoning_slot.load().as_ref().is_some())
+                || (sel.structured && app.structured_slot.load().as_ref().is_some())
+        }
         Some(s) => matches!(
             s.engine,
             Engine::Niah | Engine::Reasoning | Engine::Structured | Engine::Hardware
         ),
         None => {
-            app.niah.load().as_ref().is_some()
-                || app.reasoning_slot.load().as_ref().is_some()
-                || app.structured_slot.load().as_ref().is_some()
+            (sel.niah && app.niah.load().as_ref().is_some())
+                || (sel.reasoning && app.reasoning_slot.load().as_ref().is_some())
+                || (sel.structured && app.structured_slot.load().as_ref().is_some())
+                || (sel.hardware && app.hw.is_some())
         }
     }
 }
@@ -230,7 +288,9 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
         .collect();
 
     // The chart fills the inner area below the header line; it carries its
-    // own axes, the average line, and the transition markers.
+    // own axes, the average line, and the transition markers. Once frozen
+    // it renders the *final* state: no new samples ever arrive, and a
+    // `✓ COMPLETE` overlay marks it as the finished run's chart.
     let chart = build_throughput_chart(
         series,
         inner.width,
@@ -238,6 +298,7 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
         avg,
         &markers,
         window_start,
+        frozen,
     );
     let mut lines = vec![value_line];
     lines.extend(chart);
@@ -252,6 +313,8 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
 /// dashed horizontal line at the **window average**, **vertical markers at
 /// engine transitions**, and an x-axis spanning the *actual* data window
 /// (`0 … N−1 s`). An empty series renders "Awaiting first tokens…".
+/// When `frozen` (the run is complete), a **`✓ COMPLETE` overlay** is
+/// drawn at the top of the plot — the final line is the final line.
 /// Pure over its inputs (unit-testable, no terminal).
 fn build_throughput_chart(
     series: &[f64],
@@ -260,6 +323,7 @@ fn build_throughput_chart(
     avg: f64,
     markers: &[(f64, String)],
     window_start_sec: f64,
+    frozen: bool,
 ) -> Vec<Line<'static>> {
     const Y_AXIS_W: usize = 5;
     let w = w as usize;
@@ -379,6 +443,19 @@ fn build_throughput_chart(
                 }
             }
             label_end = start + text.len() as i64;
+        }
+    }
+
+    // The frozen overlay (FIX 2): `✓ COMPLETE` at the top of the plot —
+    // the chart is the run's final state and will not change again.
+    if frozen {
+        let text = "✓ COMPLETE";
+        let start = (w as i64 - text.len() as i64).max(Y_AXIS_W as i64) as usize;
+        for (i, ch) in text.chars().enumerate() {
+            let col = start + i;
+            if col < w {
+                grid[0][col] = (ch, Some(palette::OK));
+            }
         }
     }
 
@@ -530,7 +607,7 @@ fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
         .filter(|r| !r.levels.is_empty())
         .map(|r| {
             let env = r.envelope();
-            let notes = curve_notes(&r.levels, &env);
+            let notes = curve_notes(&r.levels);
             // The plot gets whatever height the notes leave (it
             // self-degrades to a compact form in the small Live panel).
             let plot_h = (inner.height as i64 - notes.len() as i64).max(4) as u16;
@@ -599,7 +676,8 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
-    let scores = build_capability_scores(app, m);
+    let sel = selected(app);
+    let scores = build_capability_scores(app, m, &sel);
     let overall = Line::from(Span::styled(capability_overall(&scores), style::value()));
     let mut lines: Vec<Line> = Vec::new();
     // The OVERALL summary sits at the bottom (the verdict after the
@@ -615,8 +693,9 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
     }
     // The structured-output detail sub-section (per-case checks, the
     // truncated actual output for failures, speed impact, and the
-    // practical verdict) — appended only when C3 has run.
-    let detail = build_structured_detail_lines(app);
+    // practical verdict) — appended only when C3 has run *and was
+    // selected* (FIX 1).
+    let detail = build_structured_detail_lines(app, &sel);
     if !detail.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(detail);
@@ -635,79 +714,88 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
 }
 
 /// Gather the capability scores from their lock-free result slots — only
-/// the engines that have actually run (pure over `&App`, unit-testable).
-fn build_capability_scores(app: &App, m: &MetricsSnapshot) -> Vec<CapScore> {
+/// the engines that were **selected and have actually run** (FIX 1: an
+/// unselected engine never appears, even if a stale result is in its
+/// slot). Pure over its inputs, unit-testable.
+fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection) -> Vec<CapScore> {
     let mut v: Vec<CapScore> = Vec::with_capacity(4);
 
     // Reasoning (C2) — N/M solved as a percentage.
-    if let Some(r) = app
-        .reasoning_slot
-        .load()
-        .as_ref()
-        .as_ref()
-        .filter(|r| r.score.total > 0)
-    {
-        let pct = r.score.solved as f64 / r.score.total as f64 * 100.0;
-        v.push(CapScore {
-            label: "Reasoning",
-            pct: Some(pct),
-            detail: format!("{pct:.1}%  ({}/{})", r.score.solved, r.score.total),
-            detail_style: style::value(),
-            color: score_color(Some(pct)),
-            info: "Math, logic, code problems. Measures analytical ability.",
-            warn: (pct < 50.0).then_some("LOW: weak analytical problem-solving."),
-        });
+    if sel.reasoning {
+        if let Some(r) = app
+            .reasoning_slot
+            .load()
+            .as_ref()
+            .as_ref()
+            .filter(|r| r.score.total > 0)
+        {
+            let pct = r.score.solved as f64 / r.score.total as f64 * 100.0;
+            v.push(CapScore {
+                label: "Reasoning",
+                pct: Some(pct),
+                detail: format!("{pct:.1}%  ({}/{})", r.score.solved, r.score.total),
+                detail_style: style::value(),
+                color: score_color(Some(pct)),
+                info: "Math, logic, code problems. Measures analytical ability.",
+                warn: (pct < 50.0).then_some("LOW: weak analytical problem-solving."),
+            });
+        }
     }
 
     // Long Context (C1, NIAH) — retrieved/total cells as a percentage.
-    if let Some(r) = app.niah.load().as_ref() {
-        let (retrieved, total) = r.accuracy();
-        let pct = if total > 0 {
-            retrieved as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
-        v.push(CapScore {
-            label: "Long Context",
-            pct: Some(pct),
-            detail: format!("{pct:.1}%  ({retrieved}/{total})",),
-            detail_style: style::value(),
-            color: score_color(Some(pct)),
-            info: "Retrieval from large documents. Critical for RAG / chat history.",
-            warn: (pct < 50.0).then_some("LOW: the model loses information in long contexts."),
-        });
+    if sel.niah {
+        if let Some(r) = app.niah.load().as_ref() {
+            let (retrieved, total) = r.accuracy();
+            let pct = if total > 0 {
+                retrieved as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            v.push(CapScore {
+                label: "Long Context",
+                pct: Some(pct),
+                detail: format!("{pct:.1}%  ({retrieved}/{total})",),
+                detail_style: style::value(),
+                color: score_color(Some(pct)),
+                info: "Retrieval from large documents. Critical for RAG / chat history.",
+                warn: (pct < 50.0).then_some("LOW: the model loses information in long contexts."),
+            });
+        }
     }
 
     // Structured Out (C3) — the score across the three schema cases
     // (compliant / partial / failed), with the practical verdict carried by
     // the detail sub-section below.
-    if let Some(r) = app.structured_slot.load().as_ref() {
-        let (c, _p, _f) = r.score();
-        let total = r.cases.len();
-        let pct = if total > 0 {
-            c as f64 / total as f64 * 100.0
-        } else {
-            0.0
-        };
-        v.push(CapScore {
-            label: "Structured Out",
-            pct: Some(pct),
-            detail: r.score_label(),
-            detail_style: if c == total {
-                style::value_ok()
-            } else if c == 0 {
-                style::value_err()
+    if sel.structured {
+        if let Some(r) = app.structured_slot.load().as_ref() {
+            let (c, _p, _f) = r.score();
+            let total = r.cases.len();
+            let pct = if total > 0 {
+                c as f64 / total as f64 * 100.0
             } else {
-                style::value_warn()
-            },
-            color: score_color(Some(pct)),
-            info: "JSON schema adherence (3 cases). Required for API / agent tool-calling.",
-            warn: (c < total).then_some("See the detail below for which cases fail."),
-        });
+                0.0
+            };
+            v.push(CapScore {
+                label: "Structured Out",
+                pct: Some(pct),
+                detail: r.score_label(),
+                detail_style: if c == total {
+                    style::value_ok()
+                } else if c == 0 {
+                    style::value_err()
+                } else {
+                    style::value_warn()
+                },
+                color: score_color(Some(pct)),
+                info: "JSON schema adherence (3 cases). Required for API / agent tool-calling.",
+                warn: (c < total).then_some("See the detail below for which cases fail."),
+            });
+        }
     }
 
     // Energy Efficiency (D) — J/token; N/A without local GPU telemetry.
-    if let Some(line) = energy_line(m, app) {
+    // `energy_line` returns `None` when D was not selected (FIX 1).
+    if let Some(line) = energy_line(m, app, sel) {
         let na = line.starts_with("N/A");
         v.push(CapScore {
             label: "Energy Efficiency",
@@ -769,8 +857,12 @@ fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult) -> 
 /// a header, one line per case (its checks + verdict glyph), the
 /// (truncated) actual output for any non-compliant case, the speed-impact
 /// line, and the auto-generated practical verdict. `empty` when C3 has not
-/// run (the render path never shows an empty box).
-fn build_structured_detail_lines(app: &App) -> Vec<Line<'static>> {
+/// run **or was not selected** (FIX 1: the render path never shows an
+/// empty box, and never shows an unselected engine's detail).
+fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'static>> {
+    if !sel.structured {
+        return Vec::new();
+    }
     let binding = app.structured_slot.load();
     let Some(r) = binding.as_ref() else {
         return Vec::new();
@@ -915,9 +1007,13 @@ fn capability_overall(scores: &[CapScore]) -> String {
 
 /// The Engine D data line, when one should be shown: the sequence's
 /// sampling summary wins; otherwise the live hardware-poller telemetry
-/// (`N/A` without GPU telemetry). `None` when Engine D was never
-/// requested (no poller, no summary).
-fn energy_line(m: &MetricsSnapshot, app: &App) -> Option<String> {
+/// (`N/A` without GPU telemetry). `None` when Engine D was **not
+/// selected** (FIX 1) — an unselected engine never appears, so no
+/// `N/A (no GPU telemetry)` line on a run without D.
+fn energy_line(m: &MetricsSnapshot, app: &App, sel: &EngineSelection) -> Option<String> {
+    if !sel.hardware {
+        return None;
+    }
     if let Some(st) = app.seq.load().as_ref() {
         if let Some((_, summary)) = st.completed.iter().find(|(e, _)| *e == Engine::Hardware) {
             return Some(summary.clone());
@@ -930,7 +1026,10 @@ fn energy_line(m: &MetricsSnapshot, app: &App) -> Option<String> {
             "N/A (no GPU telemetry)".to_string()
         });
     }
-    None
+    // D was selected but no telemetry source is live (e.g. the poller was
+    // not started on this host, or D is still running): show the N/A line
+    // so the user knows D was requested.
+    Some("N/A (no GPU telemetry)".to_string())
 }
 
 // ── Benchmark Sequence: header + progress bar ──────────────────────────────
@@ -1122,7 +1221,7 @@ mod tests {
 
     #[test]
     fn throughput_chart_guard_degenerate_areas() {
-        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0);
+        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0, false);
         assert_eq!(lines[0].to_string(), "chart too small");
     }
 
@@ -1133,7 +1232,7 @@ mod tests {
         let series: Vec<f64> = (0..60)
             .map(|i| 100.0 + 200.0 * ((i as f64) * 0.3).sin())
             .collect();
-        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0);
+        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0, false);
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1150,7 +1249,7 @@ mod tests {
     #[test]
     fn throughput_chart_empty_series_shows_awaiting() {
         // No samples yet → "Awaiting first tokens…", never a blank chart.
-        let lines = build_throughput_chart(&[], 30, 8, 0.0, &[], 0.0);
+        let lines = build_throughput_chart(&[], 30, 8, 0.0, &[], 0.0, false);
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1190,7 +1289,7 @@ mod tests {
     fn throughput_chart_right_aligns_newest_sample() {
         // A single sample must plot at the rightmost plot column, not the
         // left.
-        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0);
+        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0, false);
         let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // Find a row containing a bar; its rightmost █ should be near the
         // right edge.
@@ -1200,6 +1299,21 @@ mod tests {
             last_block > 10,
             "newest sample sits at the right edge: {bar_row}"
         );
+    }
+
+    #[test]
+    fn throughput_chart_frozen_shows_the_complete_overlay() {
+        // FIX 2: once the run completes (frozen), the chart carries a
+        // `✓ COMPLETE` overlay and stays the final state.
+        let lines = build_throughput_chart(&[100.0, 120.0, 90.0], 40, 8, 100.0, &[], 0.0, true);
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("✓ COMPLETE"), "frozen overlay: {text}");
+        // The bars are still the final data (frozen, not cleared).
+        assert!(text.contains('█'), "final bars rendered: {text}");
     }
 
     // ── engine-adaptive visibility ───────────────────────────────────────
@@ -1251,18 +1365,96 @@ mod tests {
     #[test]
     fn all_complete_shows_every_panel() {
         let app = App::new();
+        // A full run: everything selected, everything completed, and the
+        // results are on screen (the sweep slot + a capability slot).
+        app.sweep.store(crate::engines::SweepResult {
+            levels: vec![crate::engines::SweepLevel {
+                concurrency: 1,
+                aggregate_tps: 100.0,
+                p50_tpot_ns: 0,
+                p90_tpot_ns: 0,
+                p99_tpot_ns: 0,
+                ttft_p50_ns: 0,
+                ttft_p90_ns: 0,
+                total_tokens: 0,
+                completed_streams: 1,
+                failed_streams: 0,
+                timed_out_streams: 0,
+                aborted: false,
+                wall_ns: 0,
+                streams: Vec::new(),
+            }],
+        });
         app.seq.store(SeqState {
             phase: SeqPhase::AllComplete,
             queue: Engine::ALL.to_vec(),
             engine: Engine::Hardware,
             progress: None,
             summary: "6 of 6 engines complete".to_string(),
-            completed: Vec::new(),
+            completed: vec![
+                (
+                    Engine::Concurrency,
+                    "practical sweet spot 1 users".to_string(),
+                ),
+                (Engine::Hardware, "0.33 J/token".to_string()),
+            ],
             engine_started_ms: 0,
         });
         let seq = app.seq.load();
         assert!(should_show_concurrency(&seq, &app));
         assert!(should_show_capabilities(&seq, &app));
+    }
+
+    #[test]
+    fn all_complete_hides_panels_for_unselected_engines() {
+        // FIX 1: a run of only A + B — after AllComplete the capability
+        // panel must stay hidden (no C/D engines were selected), and the
+        // concurrency panel shows only because B ran in the run.
+        let app = App::new();
+        app.seq.store(SeqState {
+            phase: SeqPhase::AllComplete,
+            queue: vec![Engine::Speed, Engine::Concurrency],
+            engine: Engine::Concurrency,
+            progress: None,
+            summary: "2 of 2 engines complete".to_string(),
+            completed: vec![(Engine::Concurrency, "sweep".to_string())],
+            engine_started_ms: 0,
+        });
+        let seq = app.seq.load();
+        assert!(should_show_concurrency(&seq, &app));
+        assert!(!should_show_capabilities(&seq, &app));
+    }
+
+    #[test]
+    fn selected_comes_from_the_run_queue_during_a_run() {
+        // The run's queue is the authoritative selection while/after a run.
+        let app = App::new();
+        app.seq.store(SeqState {
+            phase: SeqPhase::Running,
+            queue: vec![Engine::Speed, Engine::Niah],
+            engine: Engine::Speed,
+            progress: None,
+            summary: String::new(),
+            completed: Vec::new(),
+            engine_started_ms: 0,
+        });
+        let sel = selected(&app);
+        assert!(sel.speed && sel.niah);
+        assert!(!sel.concurrency && !sel.hardware);
+        // Before any run, the config form is the source.
+        let app = App::new();
+        let sel = selected(&app);
+        assert_eq!(
+            sel,
+            EngineSelection {
+                speed: true,
+                concurrency: true,
+                niah: true,
+                reasoning: true,
+                structured: true,
+                hardware: false, // FIX 4: D is off by default
+            }
+        );
     }
 
     // ── capability scores ────────────────────────────────────────────────
@@ -1300,7 +1492,7 @@ mod tests {
                 free_body: "hi".into(),
             });
         let m = crate::metrics::state::MetricsSnapshot::default();
-        let scores = build_capability_scores(&app, &m);
+        let scores = build_capability_scores(&app, &m, &selected(&app));
         // Only the two engines that ran appear (no empty/zero bars).
         assert_eq!(scores.len(), 2, "one bar per *run* capability");
         let details: String = scores
@@ -1326,7 +1518,35 @@ mod tests {
         let app = App::new();
         let m = crate::metrics::state::MetricsSnapshot::default();
         // Nothing ran, no hw poller → no bars at all.
-        assert!(build_capability_scores(&app, &m).is_empty());
+        assert!(build_capability_scores(&app, &m, &selected(&app)).is_empty());
+    }
+
+    #[test]
+    fn capability_scores_hide_unselected_engines() {
+        // FIX 1: a result in a slot is not enough — the engine must also
+        // have been *selected*. (No seq → the config form is the source:
+        // D is off by default, so its stale/absent data never shows.)
+        let mut app = App::new();
+        app.config.hardware = true; // D selected…
+        app.hw = Some(Arc::new(std::sync::Mutex::new(crate::hw::HwPoller::new())));
+        let m = crate::metrics::state::MetricsSnapshot::default();
+        let sel = selected(&app);
+        assert!(sel.hardware);
+        let scores = build_capability_scores(&app, &m, &sel);
+        assert!(
+            scores.iter().any(|s| s.label == "Energy Efficiency"),
+            "selected + poller live → the Energy line shows"
+        );
+
+        // … and when D is NOT selected, the same data yields no line.
+        app.config.hardware = false;
+        let sel = selected(&app);
+        assert!(!sel.hardware);
+        let scores = build_capability_scores(&app, &m, &sel);
+        assert!(
+            scores.iter().all(|s| s.label != "Energy Efficiency"),
+            "unselected D never appears"
+        );
     }
 
     #[test]
@@ -1407,13 +1627,15 @@ mod tests {
     #[test]
     fn energy_line_tracks_summary_poller_and_telemetry() {
         use crate::metrics::state::MetricsSnapshot;
-        // Nothing (no poller, no sequence summary) → omitted.
+        // Nothing (no poller, no sequence summary) and D not selected →
+        // omitted.
         let app = App::new();
         assert!(
-            energy_line(&MetricsSnapshot::default(), &app).is_none(),
+            energy_line(&MetricsSnapshot::default(), &app, &selected(&app)).is_none(),
             "no Engine D request → no line"
         );
-        // A completed D run in the sequence: its summary wins.
+        // A completed D run in the sequence: its summary wins (the run's
+        // queue selects D).
         let app = App::new();
         app.seq.store(SeqState {
             phase: SeqPhase::AllComplete,
@@ -1425,14 +1647,33 @@ mod tests {
             engine_started_ms: 0,
         });
         assert_eq!(
-            energy_line(&MetricsSnapshot::default(), &app).as_deref(),
+            energy_line(&MetricsSnapshot::default(), &app, &selected(&app)).as_deref(),
             Some("0.338 J/token · peak 285 W")
         );
-        // A live poller without GPU telemetry: N/A.
+        // FIX 1: D *not* selected in the run → no line at all, even with
+        // a live poller (the user's reported bug: "N/A (no GPU telemetry)"
+        // showing for an unselected engine).
         let mut app = App::new();
+        app.seq.store(SeqState {
+            phase: SeqPhase::AllComplete,
+            queue: vec![Engine::Speed],
+            engine: Engine::Speed,
+            progress: None,
+            summary: String::new(),
+            completed: vec![(Engine::Speed, "65 t/s".to_string())],
+            engine_started_ms: 0,
+        });
+        app.hw = Some(Arc::new(std::sync::Mutex::new(crate::hw::HwPoller::new())));
+        assert!(
+            energy_line(&MetricsSnapshot::default(), &app, &selected(&app)).is_none(),
+            "unselected D never shows the N/A line"
+        );
+        // A live poller without GPU telemetry (D selected): N/A.
+        let mut app = App::new();
+        app.config.hardware = true;
         app.hw = Some(Arc::new(std::sync::Mutex::new(crate::hw::HwPoller::new())));
         assert_eq!(
-            energy_line(&MetricsSnapshot::default(), &app).as_deref(),
+            energy_line(&MetricsSnapshot::default(), &app, &selected(&app)).as_deref(),
             Some("N/A (no GPU telemetry)")
         );
         // … and with telemetry: the live J/token value.
@@ -1442,7 +1683,7 @@ mod tests {
             ..MetricsSnapshot::default()
         };
         assert_eq!(
-            energy_line(&m, &app).as_deref(),
+            energy_line(&m, &app, &selected(&app)).as_deref(),
             Some("0.338 J/token · 285 W")
         );
     }

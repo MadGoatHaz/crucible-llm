@@ -168,7 +168,7 @@ impl SetupField {
                 "How many times to repeat the benchmark. More iterations = more reliable\naverages (reduces variance from scheduling, caching, thermal throttling).\n1 = quick check, 5 = reliable, 10+ = publication-grade.",
             ),
             SetupField::Ladder => Some(
-                "Concurrency levels to test, in order. Each level spawns that many\nsimultaneous requests. The sweep finds where your server saturates.\nDefault: 1,2,4,8,16,32,64 (doubles); custom: 1,4,16,64 (wider gaps).",
+                "Concurrency levels to test, in order. Each level spawns that many\nsimultaneous requests. The sweep finds where per-user speed degrades.\nDefault: 1,2,3,4,8,12,16,24,32 (fine at the low end); custom: 1,4,16,64.",
             ),
             _ => None,
         }
@@ -1319,14 +1319,14 @@ mod tests {
         let mut s = SetupState::new();
         s.phase = SetupPhase::Config;
         let mut c = cfg();
-        // Focus Engine B (index 5) — off by default, so the toggle is
-        // observable (Engine A defaults on).
-        s.form_field = 5;
-        assert!(!c.engine_concurrency);
+        // Focus Engine D (index 9) — off by default (FIX 4: everything
+        // except Energy is selected), so the toggle is observable.
+        s.form_field = 9;
+        assert!(!c.hardware);
         s.handle_key(&char_key(' '), &mut c);
-        assert!(c.engine_concurrency);
+        assert!(c.hardware);
         s.handle_key(&char_key(' '), &mut c);
-        assert!(!c.engine_concurrency);
+        assert!(!c.hardware);
         // Focus Mode (index 0): short → long.
         s.form_field = 0;
         assert_eq!(c.mode, Mode::Short);
@@ -1511,7 +1511,7 @@ mod tests {
         let app = setup_app_at_config(3);
         let text = render_setup_text(&app, 120, 30);
         assert!(text.contains('ℹ'), "{text}");
-        assert!(text.contains("1,2,4,8,16,32,64"), "{text}");
+        assert!(text.contains("1,2,3,4,8,12,16,24,32"), "{text}");
         assert!(text.contains("1,4,16,64"), "{text}");
     }
 

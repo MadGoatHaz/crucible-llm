@@ -167,7 +167,7 @@ pub struct ConfigState {
     pub api_key: Option<String>,
     pub nocache: bool,
     pub tokenizer: Option<String>,
-    /// Comma-separated ladder (`"1,2,4,8,16,32,64"`).
+    /// Comma-separated ladder (`"1,2,3,4,8,12,16,24,32"`).
     pub ladder: String,
     /// Engine D — the hardware/energy telemetry poller.
     pub hardware: bool,
@@ -215,7 +215,12 @@ impl ConfigState {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            hardware: cfg.hardware,
+            // FIX 4: the form's Hardware/Energy toggle mirrors the
+            // *engine selection* (D is off by default — it must run on
+            // the GPU box). `to_config` keeps the two in lockstep, so
+            // seeding from `engines.hardware` is what the user sees and
+            // what a run will use.
+            hardware: cfg.engines.hardware,
             engine_speed: cfg.engines.speed,
             engine_concurrency: cfg.engines.concurrency,
             engine_niah: cfg.engines.niah,

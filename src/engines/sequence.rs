@@ -166,7 +166,7 @@ impl Engine {
                 "Single-stream throughput. Measures tokens/sec and\nTTFT (time to first token) for one user — how fast\nthe model generates text in isolation."
             }
             Engine::Concurrency => {
-                "Multi-stream sweep. Gradually raises parallel requests\n(1→2→4→8→16→32→64) to find the server's saturation\npoint — max users before latency degrades."
+                "Multi-stream sweep. Gradually raises parallel requests\n(1→2→3→4→8→12→16→24→32) to find where per-user\nspeed degrades — how many users you can actually serve."
             }
             Engine::Niah => {
                 "Long-context retrieval. Hides a fact in a 2k–128k\ndocument and asks the model to find it — measures\ncontext retention for RAG / document QA."
@@ -729,6 +729,17 @@ impl BenchmarkSequence {
             );
             self.publish_state(SeqPhase::Complete, *engine, &summary);
 
+            // FIX 2: the last engine is done — freeze the metrics
+            // pipeline *now*, before the summary hold. The 100 ms
+            // hardware poller would otherwise keep stamping samples and
+            // growing `elapsed_sec` for the whole 2 s hold (and the
+            // graph would keep animating), so the frozen state is the
+            // true final state from this point on. (The freeze at
+            // `AllComplete` below is the idempotent safety net.)
+            if i + 1 == self.engines.len() {
+                self.metrics.freeze();
+            }
+
             // Brief summary hold so the user sees the result before the
             // queue advances (the header shows `✓ … — {summary}`).
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -748,12 +759,14 @@ impl BenchmarkSequence {
             *self.engines.last().unwrap(),
             &final_summary,
         );
-        // The run is over: freeze the metrics pipeline. This stops the
-        // forever-running 100 ms hardware poller (and any other writer)
-        // from re-stamping `0.0` throughput samples / growing `elapsed` /
-        // dragging the overall averages after the last engine finishes —
-        // so the OVERALL METRICS panel and the throughput graph hold their
-        // final values and stop animating.
+        // The run is over: freeze the metrics pipeline (idempotent — the
+        // last engine's `Complete` already froze it before the summary
+        // hold). This stops the forever-running 100 ms hardware poller
+        // (and any other writer) from re-stamping `0.0` throughput
+        // samples / growing `elapsed` / dragging the overall averages
+        // after the last engine finishes — so the OVERALL METRICS panel
+        // and the throughput graph hold their final values and stop
+        // animating.
         self.metrics.freeze();
         self.log_line(format!("[seq] ✓ all benchmarks complete — {final_summary}"));
         self.logger.info(
@@ -943,20 +956,37 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
     }
 }
 
-/// Engine B's one-line summary: the optimal-operational envelope (the
-/// sweet spot), or a note when the curve was empty.
+/// Engine B's one-line summary: the **practical sweet spot** (the
+/// highest concurrency where every user still gets ≥ 40 t/s — what
+/// matters for real use), with the pure-throughput knee as reference,
+/// or a note when the curve was empty / nothing cleared the usability
+/// bar.
 pub fn summarize_sweep(result: &SweepResult) -> String {
-    match result.envelope() {
-        Some(env) => format!(
-            "sweet spot {} streams ({:.1} t/s @ p90 {:.1} ms){}",
-            env.sweet_spot,
-            env.aggregate_tps,
-            env.p90_tpot_ns as f64 / 1e6,
-            env.knee
-                .map(|k| format!(" · knee at {}", k.concurrency))
-                .unwrap_or_default()
+    if result.is_empty() {
+        return "no usable levels".to_string();
+    }
+    let us = result.usability();
+    let knee = result
+        .envelope()
+        .and_then(|e| e.knee)
+        .map(|k| format!(" · throughput knee at {}", k.concurrency))
+        .unwrap_or_default();
+    match us.practical_sweet_spot {
+        Some(n) => format!(
+            "practical sweet spot {} users (~{:.0} t/s each){}",
+            n, us.practical_per_stream, knee
         ),
-        None => "no usable levels".to_string(),
+        None => {
+            // Even the lightest load is below the 40 t/s/user comfort
+            // bar: report the usability edge instead.
+            match us.max_usable {
+                Some(n) => format!(
+                    "no level reaches 40 t/s/user — usable up to {} users (~{:.0} t/s each){}",
+                    n, us.max_usable_per_stream, knee
+                ),
+                None => format!("unusable for interactive use (below 15 t/s/user even at 1){knee}"),
+            }
+        }
     }
 }
 
@@ -1318,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn sweep_summary_reports_the_envelope() {
+    fn sweep_summary_reports_the_practical_sweet_spot() {
         use crate::engines::concurrency::SweepLevel;
         let level = |c: usize, tps: f64, p90: u64| SweepLevel {
             concurrency: c,
@@ -1336,13 +1366,14 @@ mod tests {
             wall_ns: 1_000_000_000,
             streams: Vec::new(),
         };
+        // Per-stream: 100 @ 1 user, 175 @ 2 → the practical sweet spot
+        // (≥40 t/s each) is 2. No knee on a 2-level climb.
         let result = SweepResult {
             levels: vec![level(1, 100.0, 5_000_000), level(2, 350.0, 6_000_000)],
         };
         let line = summarize_sweep(&result);
-        // No knee on a 2-level climb → the envelope is the peak level.
-        assert!(line.contains("sweet spot 2 streams"), "{line}");
-        assert!(line.contains("350.0 t/s"), "{line}");
+        assert!(line.contains("practical sweet spot 2 users"), "{line}");
+        assert!(line.contains("~175 t/s each"), "{line}");
         assert_eq!(summarize_sweep(&SweepResult::default()), "no usable levels");
     }
 

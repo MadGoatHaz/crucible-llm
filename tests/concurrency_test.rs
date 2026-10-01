@@ -313,9 +313,11 @@ async fn no_fd_leaks_after_sweep_shutdown() {
 
 #[tokio::test]
 async fn default_ladder_is_the_blueprint_sweep() {
-    assert_eq!(DEFAULT_LADDER, [1, 2, 4, 8, 16, 32, 64]);
+    // FIX 3: the new default ladder — granular at the low end where home
+    // users operate, capped at 32.
+    assert_eq!(DEFAULT_LADDER, [1, 2, 3, 4, 8, 12, 16, 24, 32]);
     let sweep = Sweep::new(test_pool("http://127.0.0.1:1"), DEFAULT_LADDER);
-    assert_eq!(sweep.ladder(), &[1, 2, 4, 8, 16, 32, 64]);
+    assert_eq!(sweep.ladder(), &[1, 2, 3, 4, 8, 12, 16, 24, 32]);
 }
 
 // ── View 2: Concurrency Matrix rendering ──────────────────────────────────
@@ -326,24 +328,28 @@ fn view2_shows_placeholder_matrix_before_a_sweep() {
     app.view = View::Concurrency;
     let text = render_concurrency(&app);
     // The full default ladder is listed, unrun.
-    for lvl in [1usize, 2, 4, 8, 16, 32, 64] {
+    for lvl in [1usize, 2, 3, 4, 8, 12, 16, 24, 32] {
         assert!(text.contains(&lvl.to_string()), "missing ladder row {lvl}");
     }
     assert!(text.contains("not run"));
     assert!(text.contains("CONCURRENCY SWEEP"));
-    assert!(text.contains("OPTIMAL OPERATIONAL ENVELOPE"));
-    assert!(text.contains("Run a sweep to detect the saturation knee"));
+    // FIX 3: the bottom panel is the practical recommendation.
+    assert!(text.contains("CONCURRENCY RECOMMENDATION"));
+    assert!(text.contains("Run a sweep (Engine B)"));
 }
 
 #[test]
 fn view2_renders_sweep_curve_knee_and_envelope() {
     let mut app = App::new();
     app.view = View::Concurrency;
+    // Per-stream: 100 / 175 / 20 — the knee (c=4: throughput collapses
+    // 350→80, p90 spikes 8→20 ms) is past the point where each user
+    // still gets a comfortable rate.
     app.sweep.store(SweepResult {
         levels: vec![
             level(1, 100.0, 5.0),
             level(2, 350.0, 8.0),
-            level(4, 340.0, 20.0),
+            level(4, 80.0, 20.0),
         ],
     });
     let text = render_concurrency(&app);
@@ -351,21 +357,23 @@ fn view2_renders_sweep_curve_knee_and_envelope() {
     // Real curve rows: aggregate t/s + p90 TPOT per level.
     assert!(text.contains("100.0 t/s"));
     assert!(text.contains("350.0 t/s"));
-    assert!(text.contains("340.0 t/s"));
+    assert!(text.contains("80.0 t/s"));
     assert!(text.contains("5.0 ms"));
     assert!(text.contains("8.0 ms"));
     assert!(text.contains("20.0 ms"));
-    // The knee row (c=4: throughput plateaus 350→340, p90 spikes 8→20 ms)
-    // is flagged in the matrix.
+    // The knee row (c=4) is flagged in the matrix.
     assert!(text.contains("KNEE"));
     // The sweet-spot row (c=2, the last healthy level) is flagged.
     assert!(text.contains("SWEET"));
-    // The envelope panel reports the recommended sweet spot and the
-    // detected knee.
-    assert!(text.contains("Recommended sweet spot"));
-    assert!(text.contains("2 streams"));
-    assert!(text.contains("Saturation knee"));
-    assert!(text.contains("4 streams"));
+    // The recommendation panel (FIX 3): per-stream = 100 / 175 / 20 →
+    // practical sweet spot 2, max usable 4, no unusable boundary, knee
+    // 4 as reference.
+    assert!(text.contains("CONCURRENCY RECOMMENDATION"));
+    assert!(text.contains("Practical Sweet Spot"));
+    assert!(text.contains("2 concurrent users"));
+    assert!(text.contains("Maximum Usable"));
+    assert!(text.contains("4 concurrent users"));
+    assert!(text.contains("Pure Throughput Knee"));
     // The placeholder copy is gone.
     assert!(!text.contains("not run"));
 }
@@ -405,11 +413,16 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
     // The matrix flags the knee and sweet-spot rows.
     assert!(text.contains("KNEE"));
     assert!(text.contains("SWEET"));
-    // The envelope panel reports the sweet spot (8) and the knee (16).
-    assert!(text.contains("Recommended sweet spot"));
-    assert!(text.contains("8 streams"));
-    assert!(text.contains("Saturation knee"));
-    assert!(text.contains("16 streams"));
+    // The recommendation panel (FIX 3): per-stream = 100 / 95 / 70 /
+    // 42.5 / 21.6 / 10.7 / 5.3 → practical 8, max usable 16, unusable
+    // from 32, knee (reference) 16.
+    assert!(text.contains("Practical Sweet Spot"));
+    assert!(text.contains("8 concurrent users"));
+    assert!(text.contains("Maximum Usable"));
+    assert!(text.contains("16 concurrent users"));
+    assert!(text.contains("Unusable Beyond"));
+    assert!(text.contains("32+ concurrent users"));
+    assert!(text.contains("Pure Throughput Knee"));
 }
 
 #[test]
@@ -491,9 +504,10 @@ fn view2_curve_marks_sweet_spot_and_knee() {
     assert!(text.contains("KNEE @ 4"));
     assert!(text.contains("350.0 t/s"), "value label: {text}");
     assert!(text.contains("concurrent users"), "axis title: {text}");
-    // The actionable note under the plot.
-    assert!(text.contains("SWEET SPOT"), "note: {text}");
-    assert!(text.contains("SATURATION"), "note: {text}");
+    // The actionable note under the plot (FIX 3: the recommendation is
+    // per-stream usability, with the knee as reference).
+    assert!(text.contains("Practical Sweet Spot"), "note: {text}");
+    assert!(text.contains("Pure Throughput Knee"), "note: {text}");
     // x labels: every ladder step appears on the plot.
     for c in ["1", "2", "4"] {
         assert!(text.contains(c));

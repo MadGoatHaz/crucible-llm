@@ -564,14 +564,15 @@ pub struct MetricsState {
     /// [`OverallAccumulator`]): folded on each `update()` and re-stamped
     /// into the published snapshot for the lock-free render.
     overall_acc: Mutex<OverallAccumulator>,
-    /// One-way latch set when the benchmark sequence reaches
-    /// `AllComplete`. While set, [`update`](Self::update) is a no-op: the
-    /// rolling window, the overall accumulator, and the published snapshot
-    /// all freeze at their final values, so the UI never shows numbers
-    /// shifting after the run is done. This is what stops the
-    /// forever-running 100 ms hardware poller (and any other writer) from
-    /// re-stamping `0.0` throughput samples / growing `elapsed_sec` /
-    /// dragging `active_avg` toward zero after the last engine finishes.
+    /// Latch set when the benchmark sequence completes. While set,
+    /// [`update`](Self::update) is a no-op: the rolling window, the
+    /// overall accumulator, and the published snapshot all freeze at
+    /// their final values, so the UI never shows numbers shifting after
+    /// the run is done. This is what stops the forever-running 100 ms
+    /// hardware poller (and any other writer) from re-stamping `0.0`
+    /// throughput samples / growing `elapsed_sec` / dragging `active_avg`
+    /// toward zero after the last engine finishes. One-way *within a run*:
+    /// [`unfreeze`](Self::unfreeze) re-arms it when a new run starts.
     frozen: AtomicBool,
 }
 
@@ -586,17 +587,28 @@ impl MetricsState {
         }
     }
 
-    /// One-way latch: freeze all metric updates. Called by the sequence
-    /// executor when it reaches `AllComplete`. After this,
-    /// [`update`](Self::update) is a no-op — the rolling window, the
-    /// overall-stats accumulator, and the published snapshot all hold their
-    /// final values, so the UI shows static numbers and the throughput
-    /// graph stops animating. Idempotent (setting it twice is a no-op).
+    /// Freeze all metric updates. Called by the sequence executor when
+    /// the last engine completes (and again at `AllComplete`, idempotently).
+    /// After this, [`update`](Self::update) is a no-op — the rolling
+    /// window, the overall-stats accumulator, and the published snapshot
+    /// all hold their final values, so the UI shows static numbers, the
+    /// throughput graph stops animating, and the 100 ms hardware poller
+    /// (which checks [`is_frozen`](Self::is_frozen)) goes idle.
     pub fn freeze(&self) {
         self.frozen.store(true, Ordering::Relaxed);
     }
 
-    /// `true` once [`freeze`](Self::freeze) has been called (one-way).
+    /// Re-arm the pipeline for a **new** run. The freeze is one-way
+    /// within a run (so the final numbers can never drift), but a fresh
+    /// benchmark sequence must be able to update metrics again — the App
+    /// calls this when the user starts the next run (`r` / `F5` /
+    /// launch). Also wakes the idle hardware poller.
+    pub fn unfreeze(&self) {
+        self.frozen.store(false, Ordering::Relaxed);
+    }
+
+    /// `true` while the pipeline is frozen (a run completed and no new
+    /// run has started).
     pub fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::Relaxed)
     }
@@ -947,7 +959,31 @@ mod tests {
         assert_eq!(after.overall, overall_before, "overall frozen");
         assert_eq!(after.aggregate_tps, agg_before, "snapshot frozen");
 
-        // The freeze is one-way: it cannot be cleared.
+        // The freeze is idempotent (setting it twice is a no-op).
+        state.freeze();
+        assert!(state.is_frozen());
+    }
+
+    #[test]
+    fn unfreeze_re_arms_the_pipeline_for_a_new_run() {
+        let state = MetricsState::new();
+        state.update(snap(100.0));
+        state.freeze();
+        assert!(state.is_frozen());
+
+        // A new run starts: the latch clears and updates flow again.
+        state.unfreeze();
+        assert!(!state.is_frozen());
+        std::thread::sleep(Duration::from_millis(1100));
+        state.update(snap(120.0));
+        let loaded = state.load();
+        assert!(
+            loaded.throughput_series.len() >= 2,
+            "series fills again after unfreeze: {:?}",
+            loaded.throughput_series
+        );
+        // … and a later completion freezes it once more (one-way within
+        // the new run).
         state.freeze();
         assert!(state.is_frozen());
     }

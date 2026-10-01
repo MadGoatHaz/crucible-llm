@@ -157,9 +157,11 @@ impl std::str::FromStr for ExportFormat {
 /// * `niah` / `reasoning` / `structured` — Engine C1/C2/C3;
 /// * `hardware` — Engine D (the 100 ms power/VRAM poller).
 ///
-/// The default run is Engine A + Engine D: `speed` and `hardware` are on
-/// (the hardware poller degrades gracefully to N/A on a driverless host),
-/// the rest are off.
+/// The default run is **everything except Engine D**: `speed`,
+/// `concurrency`, `niah`, `reasoning`, and `structured` are on;
+/// `hardware` is off (it must run on the machine with the GPU — remote
+/// users get N/A — so it is opt-in; the user can enable it in Setup /
+/// View 5 when they are on the GPU box).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSelection {
@@ -181,11 +183,13 @@ impl Default for EngineSelection {
     fn default() -> Self {
         Self {
             speed: true,
-            concurrency: false,
-            niah: false,
-            reasoning: false,
-            structured: false,
-            hardware: true,
+            concurrency: true,
+            niah: true,
+            reasoning: true,
+            structured: true,
+            // Engine D (energy) is off by default: it must run on the
+            // machine with the GPU, and is opt-in for GPU-box users.
+            hardware: false,
         }
     }
 }
@@ -194,11 +198,21 @@ impl EngineSelection {
     /// Build a selection from a list of engine names (case-insensitive).
     ///
     /// Accepted names: `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`,
-    /// `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`. Returns
-    /// the selection (starting from the default) plus any unknown names, so
-    /// the caller can surface a precise error.
+    /// `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`. The
+    /// list is the **complete** selection: only the named engines are on
+    /// (so `--engine niah` runs exactly NIAH, not the default five).
+    /// Returns the selection plus any unknown names, so the caller can
+    /// surface a precise error. (The built-in default — everything except
+    /// D — applies only when no engines are named at all.)
     pub fn from_names(names: impl IntoIterator<Item = impl AsRef<str>>) -> (Self, Vec<String>) {
-        let mut sel = Self::default();
+        let mut sel = Self {
+            speed: false,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: false,
+        };
         let mut unknown = Vec::new();
         for name in names {
             match name.as_ref().to_ascii_lowercase().as_str() {
@@ -329,7 +343,7 @@ pub struct Cli {
     #[arg(long)]
     pub config: Option<PathBuf>,
     /// Concurrency ladder as a comma-separated list of stream counts
-    /// (e.g. `--ladder 1,2,4,8,16,32,64`); Engine B (Chunk 18).
+    /// (e.g. `--ladder 1,2,3,4,8,12,16,24,32`); Engine B (Chunk 18).
     #[arg(long, value_name = "CSV")]
     pub ladder: Option<String>,
     /// Select which engines a run orchestrates (repeatable; Chunk 18):
@@ -376,7 +390,8 @@ pub struct Config {
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
     /// The concurrency ladder Engine B sweeps (Chunk 18; default
-    /// `1→2→4→8→16→32→64`).
+    /// `1→2→3→4→8→12→16→24→32` — granular at the low end where home
+    /// users operate).
     pub ladder: Vec<usize>,
     /// Enable the hardware/energy telemetry poller (Engine D, Chunk 17/18).
     /// On by default; a driverless host degrades to N/A, never a failure.
@@ -1286,15 +1301,20 @@ mod tests {
     // ── Chunk 18: engine selection, ladder, hardware ─────────────────────
 
     #[test]
-    fn engine_selection_default_is_speed_and_hardware() {
+    fn engine_selection_default_is_everything_except_hardware() {
+        // FIX 4: the default run selects A, B, C1, C2, C3 — Energy (D)
+        // is off (it must run on the GPU box and is opt-in).
         let e = EngineSelection::default();
         assert!(e.speed, "Engine A on by default");
-        assert!(e.hardware, "Engine D on by default (degrades to N/A)");
-        assert!(!e.concurrency);
-        assert!(!e.niah);
-        assert!(!e.reasoning);
-        assert!(!e.structured);
-        assert_eq!(e.count(), 2);
+        assert!(e.concurrency, "Engine B on by default");
+        assert!(e.niah, "Engine C1 on by default");
+        assert!(e.reasoning, "Engine C2 on by default");
+        assert!(e.structured, "Engine C3 on by default");
+        assert!(
+            !e.hardware,
+            "Engine D off by default (opt-in on the GPU box)"
+        );
+        assert_eq!(e.count(), 5);
         assert!(!e.is_empty());
     }
 
@@ -1339,7 +1359,8 @@ mod tests {
     #[test]
     fn default_ladder_matches_the_blueprint() {
         let cfg = resolve_bare(&["crucible-llm"]);
-        assert_eq!(cfg.ladder, vec![1, 2, 4, 8, 16, 32, 64]);
+        // FIX 3: the new default ladder — granular at the low end.
+        assert_eq!(cfg.ladder, vec![1, 2, 3, 4, 8, 12, 16, 24, 32]);
         assert!(cfg.hardware, "hardware on by default");
     }
 
@@ -1390,7 +1411,11 @@ mod tests {
         let cfg = layer(&cli, &matches, &env, None).unwrap();
         assert!(cfg.engines.reasoning);
         assert!(cfg.engines.structured);
-        assert!(cfg.engines.speed, "default speed stays on");
+        // A named engine list is the *complete* selection: un-named
+        // engines stay off (so the user can run exactly what they asked
+        // for).
+        assert!(!cfg.engines.speed, "un-named engines stay off");
+        assert!(!cfg.engines.hardware, "un-named engines stay off");
     }
 
     #[test]

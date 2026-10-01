@@ -416,6 +416,9 @@ impl App {
         self.phase = Phase::Dashboard;
         self.view = View::Live;
         self.paused = false;
+        // FIX 2: a new run re-arms the metrics pipeline (the previous
+        // run's freeze must not leak into this one).
+        self.metrics.unfreeze();
         // Refresh the snapshot identity from the current config so the
         // status bar and panels show the real target (not stale/zeroed
         // values from before the setup flow filled in the form).
@@ -519,7 +522,7 @@ impl App {
         if self.seq.is_running() {
             self.push_log(
                 "[niah] locked while a benchmark sequence is running — \
-                 it runs as Engine C1 in the queue"
+                  it runs as Engine C1 in the queue"
                     .to_string(),
                 style::value_warn(),
             );
@@ -532,6 +535,10 @@ impl App {
             );
             return;
         }
+        // FIX 2: a standalone run is a run — re-arm the metrics pipeline
+        // (a previous completed run froze it), and freeze it again when
+        // this one finishes (below) so the numbers stop drifting.
+        self.metrics.unfreeze();
         // Chunk 18: the `n` key runs against the *current* Configuration
         // form, so edits made in View 5 apply immediately.
         let config = NiahEngineConfig::from_config(&self.config.to_config());
@@ -563,6 +570,7 @@ impl App {
         // running flag and publishes the scored grid.
         let logger = self.logger.clone();
         let engine = engine.pause(self.pause.clone()).logger(logger.clone());
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             logger.info(
                 Context::EngineC1,
@@ -574,6 +582,9 @@ impl App {
             let result = engine.run().await;
             slot.set_running(false);
             slot.store(result);
+            // FIX 2: the run is over — freeze the metrics pipeline (the
+            // hardware poller goes idle; the UI shows final numbers).
+            metrics.freeze();
         });
     }
 
@@ -686,6 +697,11 @@ impl App {
             );
             return;
         }
+        // FIX 2: re-arm the metrics pipeline for the new run — a
+        // completed run freezes it (final numbers stop drifting), and
+        // the freeze must not leak into the next one. This also wakes
+        // the idle hardware poller.
+        self.metrics.unfreeze();
         let cfg = self.config.to_config();
         if cfg.engines.is_empty() {
             self.push_log(
@@ -1220,6 +1236,15 @@ impl App {
         {
             self.setup
                 .complete_discovery(self.model_list(), self.discovery_error());
+        }
+
+        // FIX 2: the run is over (the metrics pipeline is frozen) → no
+        // metric-driven tick work at all. The snapshot is static, so the
+        // VRAM-fragmentation check (the only metric read here) has
+        // nothing new to warn about; skipping it keeps the tick path
+        // from touching a finished run.
+        if self.metrics.is_frozen() {
+            return;
         }
 
         let m = self.metrics.load();

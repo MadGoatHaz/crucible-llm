@@ -203,18 +203,20 @@ fn digits_type_into_a_number_field() {
 #[test]
 fn engine_switches_toggle_independently() {
     let mut s = ConfigState::default();
-    // Default: speed + hardware on, the rest off.
+    // FIX 4 default: everything except Energy (D) is on.
     assert!(s.engine_speed);
-    assert!(!s.engine_concurrency);
-    s.cursor = Field::EngineConcurrency as usize;
-    s.handle_key(&key(KeyCode::Char(' ')));
     assert!(s.engine_concurrency);
-    s.cursor = Field::EngineNiah as usize;
-    s.handle_key(&key(KeyCode::Char(' ')));
     assert!(s.engine_niah);
+    assert!(s.engine_reasoning);
+    assert!(s.engine_structured);
+    assert!(!s.hardware);
+    // Toggle D on.
+    s.cursor = Field::Hardware as usize;
+    s.handle_key(&key(KeyCode::Char(' ')));
+    assert!(s.hardware);
     // Toggling one leaves the others untouched.
     assert!(s.engine_speed);
-    assert!(!s.engine_reasoning);
+    assert!(s.engine_concurrency);
 }
 
 // ── cursor navigation ─────────────────────────────────────────────────────
@@ -337,7 +339,7 @@ fn to_config_falls_back_to_the_default_ladder_when_blank() {
         ..Default::default()
     };
     let cfg = s.to_config();
-    assert_eq!(cfg.ladder, vec![1, 2, 4, 8, 16, 32, 64]);
+    assert_eq!(cfg.ladder, vec![1, 2, 3, 4, 8, 12, 16, 24, 32]);
 }
 
 // ── a single run orchestrates the selected subset (r / F5) ────────────────
@@ -381,7 +383,12 @@ async fn run_key_triggers_only_the_selected_engines() {
 async fn f5_in_the_config_view_also_runs() {
     let mut app = App::new();
     app.view = View::Config;
+    // Select exactly Engine A + Engine D (the new default has A–C3 on).
     app.config.engine_speed = true;
+    app.config.engine_concurrency = false;
+    app.config.engine_niah = false;
+    app.config.engine_reasoning = false;
+    app.config.engine_structured = false;
     app.config.hardware = true;
     app.config.url = "http://127.0.0.1:9".to_string();
     app.config.timeout = 1;
