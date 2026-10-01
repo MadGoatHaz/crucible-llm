@@ -978,6 +978,9 @@ impl App {
                     }
                     KeyCode::F(5) => {
                         self.start_run();
+                        // After launching a run, switch to Live.
+                        self.view = View::Live;
+                        self.config.edit_mode = ConfigMode::Viewing;
                         return KeyAction::Run;
                     }
                     // Everything else is ignored at the gate.
@@ -985,29 +988,14 @@ impl App {
                 },
                 // ── Editing (the fields are live). ──
                 ConfigMode::Editing => {
-                    // `1`–`4` ALWAYS exit the config and switch views
-                    // (saving first) — they are never typed into a field.
-                    if let KeyCode::Char(c @ '1'..='4') = key.code {
-                        let _ = self.config.save();
-                        if let Some(d) = c.to_digit(10) {
-                            if let Some(view) = View::from_digit(d as u8) {
-                                self.view = view;
-                                self.config.edit_mode = ConfigMode::Viewing;
-                                if view == View::History {
-                                    self.ensure_history();
-                                }
-                            }
-                        }
-                        return KeyAction::Continue;
-                    }
-                    // `5` / `Esc`: save and return to the gate.
-                    if key.code == KeyCode::Char('5') || key.code == KeyCode::Esc {
+                    // `Esc`: save and return to the gate (stay on tab 5).
+                    if key.code == KeyCode::Esc {
                         let _ = self.config.save();
                         self.config.edit_mode = ConfigMode::Viewing;
                         return KeyAction::Continue;
                     }
-                    // Everything else delegates to the field editor
-                    // (Tab / arrows / F2 / F5 / typing / backspace).
+                    // Everything else (including `1`–`9`, `0`, letters, Tab,
+                    // arrows, F2, F5) delegates to the field editor.
                     match self.config.handle_key(key) {
                         ConfigKeyResult::Saved => {
                             self.push_log(
@@ -1022,6 +1010,9 @@ impl App {
                         }
                         ConfigKeyResult::Run => {
                             self.start_run();
+                            // After launching a run, switch to Live.
+                            self.view = View::Live;
+                            self.config.edit_mode = ConfigMode::Viewing;
                             return KeyAction::Run;
                         }
                         ConfigKeyResult::Inert => return KeyAction::Continue,
@@ -2283,23 +2274,21 @@ mod tests {
     }
 
     #[test]
-    fn config_view_digits_always_switch_views() {
-        // FIX 4: number keys 1-4 are NEVER captured by the config editor —
-        // they always switch views, from the gate *and* from edit mode.
-        // From the gate, `1` leaves straight to Live.
+    fn config_view_digits_type_in_edit_mode() {
+        // From the gate (Viewing), `1` leaves straight to Live.
         let mut app = App::new();
         app.view = View::Config; // gate (Viewing)
         app.handle_key(&char_key('1'));
         assert_eq!(app.view, View::Live, "digit 1 exits the gate to Live");
 
-        // In Editing mode, a non-navigation digit (8) still types into the
-        // focused field, but a 1-4 digit exits and switches views.
+        // In Editing mode, digits type into the focused field (not switch
+        // views). Only Esc exits edit mode.
         let mut app = App::new();
         app.view = View::Config;
         app.config.edit_mode = ConfigMode::Editing;
         app.config.cursor = 9; // Field::Ladder
         app.config.ladder.clear();
-        // Point the save (digit-exit saves) at a temp path so the test
+        // Point the save (Esc saves) at a temp path so the test
         // never touches the real config file.
         app.config.config_path =
             std::env::temp_dir().join(format!("crucible-digit-{}.json", std::process::id()));
@@ -2307,7 +2296,68 @@ mod tests {
         assert_eq!(app.view, View::Config, "8 types into the field");
         assert_eq!(app.config.ladder, "8");
         app.handle_key(&char_key('1'));
-        assert_eq!(app.view, View::Live, "1 exits the config and switches");
+        assert_eq!(
+            app.view,
+            View::Config,
+            "1 types into the field (not switch)"
+        );
+        assert_eq!(app.config.ladder, "81");
+        // Esc saves and returns to the gate (stay on tab 5).
+        app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(app.view, View::Config, "Esc stays on tab 5");
+        assert_eq!(
+            app.config.edit_mode,
+            ConfigMode::Viewing,
+            "Esc returns to gate"
+        );
+        let _ = std::fs::remove_file(&app.config.config_path);
+    }
+
+    #[tokio::test]
+    async fn config_f5_from_viewing_switches_to_live() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Viewing;
+        app.handle_key(&key(KeyCode::F(5)));
+        assert_eq!(app.view, View::Live, "F5 from the gate switches to Live");
+        assert_eq!(
+            app.config.edit_mode,
+            ConfigMode::Viewing,
+            "edit mode stays at the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_f5_from_editing_switches_to_live() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+        app.handle_key(&key(KeyCode::F(5)));
+        assert_eq!(app.view, View::Live, "F5 from editing switches to Live");
+        assert_eq!(
+            app.config.edit_mode,
+            ConfigMode::Viewing,
+            "edit mode resets to the gate"
+        );
+    }
+
+    #[test]
+    fn config_esc_in_editing_saves_and_stays_on_tab5() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+        // Point the save at a temp path so the test never touches the
+        // real config file.
+        app.config.config_path =
+            std::env::temp_dir().join(format!("crucible-esc-{}.json", std::process::id()));
+        app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(app.view, View::Config, "Esc stays on tab 5");
+        assert_eq!(
+            app.config.edit_mode,
+            ConfigMode::Viewing,
+            "Esc returns to the gate"
+        );
+        assert!(app.config.saved, "Esc saves the form");
         let _ = std::fs::remove_file(&app.config.config_path);
     }
 

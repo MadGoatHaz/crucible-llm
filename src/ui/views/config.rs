@@ -127,12 +127,12 @@ impl Field {
 /// * [`Viewing`] — the default on entry. The form is shown **read-only**
 ///   behind a gate ("press [Enter] to edit"). Only `Enter` (→ edit),
 ///   `Esc` (→ back to Live), `1`–`4` (→ switch view), `5` (stay), `F2`
-///   (save) and `F5` (run) are live; every other key is ignored, so the
-///   view can never capture the number keys and trap the user.
-/// * [`Editing`] — the form is editable. `Esc` / `1`–`4` save and exit
-///   (to the gate / to that view); `5` saves and returns to the gate;
-///   `q` always quits; character / Tab / arrow / `F2` / `F5` keys edit the
-///   focused field.
+///   (save) and `F5` (run → Live) are live; every other key is ignored, so
+///   the view can never capture the number keys and trap the user.
+/// * [`Editing`] — the form is editable. `Esc` saves and returns to the
+///   gate (stay on tab 5); `q` always quits; all other keys (characters
+///   including `1`–`9`/`0`, Tab, arrows, `F2`, `F5`) edit the focused
+///   field. `F5` launches the run and switches to Live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConfigMode {
     #[default]
@@ -568,7 +568,7 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "[Enter] Edit  ·  [Esc] Back to Live  ·  [1-4] Switch view  ·  [F2] Save  ·  [F5] Run",
+        "[Enter] Edit  ·  [Esc] Back to Live  ·  [1-4] Switch view  ·  [F2] Save  ·  [F5] Run → Live",
         style::footer(),
     )));
     f.render_widget(
@@ -581,7 +581,8 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
 
 /// The **editable form** (FIX 4, [`ConfigMode::Editing`]): the field list
 /// with a cursor, the focused engine's description, and the edit-mode key
-/// hints (`Esc` / `1`–`4` save and exit; `5` returns to the gate).
+/// hints (`Esc` saves and returns to the gate; all other keys type into
+/// the focused field).
 fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
     let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 4);
     for &field in &Field::ALL {
@@ -605,7 +606,7 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "[Esc] Save & exit  ·  [1-4] Switch view  ·  [5] Gate  ·  [F2] Save  ·  [F5] Run",
+        "[Esc] Save & exit  ·  [F2] Save  ·  [F5] Run → Live",
         style::footer(),
     )));
     lines.push(Line::from(Span::styled(
