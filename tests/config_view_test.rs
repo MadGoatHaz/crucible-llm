@@ -53,7 +53,7 @@ fn state_with(path: PathBuf) -> ConfigState {
     let cfg = Config {
         url: "http://127.0.0.1:8000/v1".to_string(),
         model: "test-model".to_string(),
-        tokens: 2000,
+        tokens: 10000,
         iterations: 2,
         timeout: 60,
         nocache: false,

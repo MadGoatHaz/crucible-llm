@@ -44,6 +44,8 @@ use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::HwPoller;
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
+use crate::storage::db::Database;
+use crate::storage::models::{BenchmarkSession, NeedleEvaluation, StreamMetricRow};
 
 /// The cooperative pause gate (the `Space` key, TUI): shared between the
 /// App's key path and every engine run loop.
@@ -773,6 +775,94 @@ impl BenchmarkSequence {
             Context::Sequence,
             format!("sequence complete — {final_summary}"),
         );
+        // Persist the completed run to SQLite (the History view reads
+        // these rows). A storage failure degrades gracefully — it never
+        // changes the run's outcome.
+        self.persist_results();
+    }
+
+    /// Persist the completed run to the default SQLite database: one
+    /// `benchmark_sessions` row plus `stream_metrics` rows (from Engine A
+    /// speed results) and `needle_evaluations` rows (from Engine C1 NIAH
+    /// results). A failure is logged but never propagated — the run is
+    /// already complete and the TUI is showing its final state.
+    fn persist_results(&self) {
+        let session = BenchmarkSession {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            timestamp: None, // SQLite `DEFAULT CURRENT_TIMESTAMP` fills it
+            target_url: self.cfg.url.clone(),
+            model_name: self.cfg.model.clone(),
+            backend_type: None,
+            quantization: None,
+            system_gpu: None,
+            total_duration_sec: None,
+        };
+
+        // Engine A: speed results → stream_metrics rows.
+        let mut metrics: Vec<StreamMetricRow> = Vec::new();
+        if let Some(results) = (*self.slots.speed.load()).clone() {
+            for r in &results {
+                metrics.push(StreamMetricRow::from_speed_result(
+                    r,
+                    &session.session_id,
+                    1,
+                ));
+            }
+        }
+
+        // Engine C1: NIAH results → needle_evaluations rows.
+        let mut needles: Vec<NeedleEvaluation> = Vec::new();
+        if let Some(niah) = (*self.slots.niah.load()).as_ref() {
+            for cell in &niah.cells {
+                needles.push(NeedleEvaluation {
+                    eval_id: None,
+                    session_id: session.session_id.clone(),
+                    context_length: Some(cell.target_tokens as i64),
+                    depth_percent: Some(cell.depth_percent as f64),
+                    retrieved_successfully: Some(cell.retrieved),
+                    latency_ms: Some(cell.ttft_s * 1000.0),
+                });
+            }
+        }
+
+        match Database::open_default() {
+            Ok(mut db) => {
+                // Insert the session + stream metrics in one transaction.
+                if let Err(e) = db.persist_run(&session, &metrics) {
+                    self.logger
+                        .warn(Context::Sequence, format!("persist session failed: {e}"));
+                } else {
+                    // Insert the needle evaluations (separate inserts).
+                    for n in &needles {
+                        if let Err(e) = db.insert_needle_evaluation(n) {
+                            self.logger
+                                .warn(Context::Sequence, format!("persist needle failed: {e}"));
+                            break;
+                        }
+                    }
+                    let id = &session.session_id;
+                    self.log_line(format!(
+                        "[seq] saved → {} (session {})",
+                        db.path().display(),
+                        &id[..8]
+                    ));
+                    self.logger.info(
+                        Context::Sequence,
+                        format!(
+                            "run persisted → {} (session {}, {} metric rows, {} needle rows)",
+                            db.path().display(),
+                            &id[..8],
+                            metrics.len(),
+                            needles.len()
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                self.logger
+                    .warn(Context::Sequence, format!("open DB failed: {e}"));
+            }
+        }
     }
 
     // ── Per-engine runners (one at a time) ─────────────────────────────

@@ -38,7 +38,7 @@ pub const DEFAULT_MODEL: &str = "default";
 /// Default connection/read timeout in seconds (parity with the prototype).
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Default target prompt tokens for `long` mode (parity with the prototype).
-pub const DEFAULT_TOKENS: u32 = 2000;
+pub const DEFAULT_TOKENS: u32 = 10000;
 
 /// The default config file name inside the config dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -1001,7 +1001,7 @@ mod tests {
         assert_eq!(cfg.url, DEFAULT_URL);
         assert_eq!(cfg.model, "default");
         assert_eq!(cfg.mode, Mode::Short);
-        assert_eq!(cfg.tokens, 2000);
+        assert_eq!(cfg.tokens, 10000);
         assert_eq!(cfg.iterations, 1);
         assert_eq!(cfg.timeout, 120);
         assert!(!cfg.nocache);

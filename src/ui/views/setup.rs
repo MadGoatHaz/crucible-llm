@@ -173,7 +173,7 @@ impl SetupField {
                 "\"short\" = brief prompt (~100 tokens) for quick TTFT measurement.\n\"long\" = extended prompt (your token target) for sustained throughput.\nUse \"short\" to test responsiveness, \"long\" to test sustained generation speed.",
             ),
             SetupField::Tokens => Some(
-                "Target number of tokens to generate per request. Higher = longer test,\nmore stable averages. 256 = quick test, 2000 = standard, 8192+ = stress.\nThis is the MAX_tokens sent to the server — actual output may vary.",
+                "Target number of tokens to generate per request. Higher = longer test,\nmore stable averages. 256 = quick test, 10000 = standard, 32000+ = stress.\nThis is the MAX_tokens sent to the server — actual output may vary.",
             ),
             SetupField::Iterations => Some(
                 "How many times to repeat the benchmark. More iterations = more reliable\naverages (reduces variance from scheduling, caching, thermal throttling).\n1 = quick check, 5 = reliable, 10+ = publication-grade.",

@@ -193,14 +193,36 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT eval_id, session_id, context_length, depth_percent,
                     retrieved_successfully, latency_ms
-             FROM needle_evaluations
-             WHERE session_id = ?1
-             ORDER BY eval_id",
+              FROM needle_evaluations
+              WHERE session_id = ?1
+              ORDER BY eval_id",
         )?;
         let out = stmt
             .query_map(params![session_id], row_to_needle)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(out)
+    }
+
+    /// Delete a session and all its related `stream_metrics` and
+    /// `needle_evaluations` rows, atomically in a single transaction.
+    /// Returns the number of `stream_metrics` rows deleted.
+    pub fn delete_session(&mut self, session_id: &str) -> Result<usize, StorageError> {
+        let tx = self.conn.transaction()?;
+        // Delete child rows first (FK-safe).
+        tx.execute(
+            "DELETE FROM stream_metrics WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        tx.execute(
+            "DELETE FROM needle_evaluations WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM benchmark_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 }
 

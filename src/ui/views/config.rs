@@ -149,7 +149,7 @@ impl Field {
             ),
             Field::Tokens => Some(
                 "Maximum tokens to generate per request\n\
-                 (max_tokens). 256 = quick. 2000 = standard.\n\
+                 (max_tokens). 256 = quick. 10000 = standard.\n\
                  8192+ = stress. Higher = more stable averages\n\
                  but longer test time.",
             ),

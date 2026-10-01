@@ -138,7 +138,7 @@ CLI flag  >  environment variable  >  config file  >  built-in default
   "url": "http://192.168.51.163:8000/v1",
   "model": "qwen3.8-27b",
   "mode": "long",
-  "tokens": 2000,
+  "tokens": 10000,
   "iterations": 3,
   "timeout": 120,
   "ladder": [1, 2, 3, 4, 8, 12, 16, 24, 32],
@@ -161,7 +161,7 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--url <URL>` | *(built-in)* | Endpoint: bare host, base URL, or full completions path. |
 | `--model <NAME>` | `default` | Model name sent in the request. |
 | `--mode <short\|long>` | `short` | `short` = fixed ~50-token prompt; `long` = padded to `--tokens`. (`base` is an alias for `short`.) |
-| `--tokens <N>` | `2000` | Target prompt tokens for `long` mode. |
+| `--tokens <N>` | `10000` | Target prompt tokens for `long` mode. |
 | `--iterations <N>` | `1` | Number of headless single-stream runs (Engine A). |
 | `--api-key <KEY>` | — | Sent as `Authorization: Bearer <KEY>`. |
 | `--timeout <SECS>` | `120` | Connection / idle-read timeout. |

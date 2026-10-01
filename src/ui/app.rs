@@ -55,7 +55,7 @@ use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::theme::{self, palette, style};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
-use crate::ui::views::history::HistoryState;
+use crate::ui::views::history::{HistoryMode, HistoryState};
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
 /// The five dashboard views (blueprint §6).
@@ -502,11 +502,15 @@ impl App {
     /// A storage failure leaves the state `None`: the view renders its
     /// "no stored runs" placeholder and never panics.
     pub fn ensure_history(&mut self) {
-        if self.history.is_some() {
-            return;
-        }
         let path = Database::default_path();
-        self.history = HistoryState::load(&path).ok();
+        if let Some(h) = self.history.as_mut() {
+            // Reload the session list (picks up any runs persisted since
+            // the last visit). The mode/cursor are preserved.
+            h.db_path = path;
+            h.reload();
+        } else {
+            self.history = HistoryState::load(&path).ok();
+        }
     }
 
     /// Set the `e`-key export format (`--export` wiring, Chunk 13).
@@ -900,7 +904,8 @@ impl App {
         // while a benchmark sequence runs: the takeover's URL stage
         // fires an HTTP discovery request, which must not land on the
         // endpoint mid-benchmark.
-        if key.code == KeyCode::Char('c') && self.view != View::Config {
+        if key.code == KeyCode::Char('c') && self.view != View::Config && self.view != View::History
+        {
             if self.seq.is_running() {
                 self.push_log(
                     "[setup] locked while a benchmark is running — press Space to pause, Q to quit"
@@ -1030,6 +1035,79 @@ impl App {
             }
         }
 
+        // History view (Chunk 14 + rewrite): full keyboard navigation.
+        // Scoped to the History view; the `c` key is consumed here (not
+        // routed to the Setup takeover) and `Esc` returns to the List.
+        // History view (Chunk 14 + rewrite): full keyboard navigation.
+        // Only the specific History keys are consumed here; all other
+        // keys (digit 1-5, Space, etc.) fall through to the general
+        // handler so view switching and quit always work.
+        if self.view == View::History {
+            if let Some(h) = self.history.as_mut() {
+                match key.code {
+                    // Navigate: j/k/arrows (List and Compare-select modes).
+                    KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                        let delta = if matches!(key.code, KeyCode::Char('j') | KeyCode::Down) {
+                            1
+                        } else {
+                            -1
+                        };
+                        match &h.mode {
+                            HistoryMode::List | HistoryMode::Compare { second: None, .. } => {
+                                h.move_cursor(delta);
+                                return KeyAction::HistoryNext;
+                            }
+                            _ => return KeyAction::Continue,
+                        }
+                    }
+                    // Enter: view details (List) or select second run (Compare).
+                    KeyCode::Enter => {
+                        match &h.mode {
+                            HistoryMode::List => h.enter_detail(),
+                            HistoryMode::Compare { .. } => h.select_compare_second(),
+                            _ => {}
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // C: enter compare mode (List only).
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        if matches!(h.mode, HistoryMode::List) {
+                            h.enter_compare();
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // D: delete the selected run (List only, with confirmation).
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        if matches!(h.mode, HistoryMode::List) {
+                            h.enter_delete_confirm();
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // Esc: back to the List (from Detail / Compare / DeleteConfirm).
+                    KeyCode::Esc => {
+                        h.back_to_list();
+                        return KeyAction::Continue;
+                    }
+                    // y: confirm the delete.
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if matches!(h.mode, HistoryMode::DeleteConfirm(_)) {
+                            h.confirm_delete();
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // n: cancel the delete.
+                    KeyCode::Char('n') => {
+                        if matches!(h.mode, HistoryMode::DeleteConfirm(_)) {
+                            h.back_to_list();
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // Any other key: fall through to the general handler below.
+                    _ => {}
+                }
+            }
+        }
+
         match key.code {
             KeyCode::Char(c @ '1'..='5') => {
                 // `c as u8` is the Unicode code point (49 for '1') — use
@@ -1111,39 +1189,6 @@ impl App {
             KeyCode::Char('r') => {
                 self.start_run();
                 KeyAction::Run
-            }
-            // Chunk 14 — History view navigation/selection. These keys are
-            // scoped to the History view; elsewhere they are inert.
-            KeyCode::Char('j')
-            | KeyCode::Down
-            | KeyCode::Char('k')
-            | KeyCode::Up
-            | KeyCode::Char('a')
-            | KeyCode::Char('b')
-                if self.view == View::History && self.history.is_some() =>
-            {
-                let h = self
-                    .history
-                    .as_mut()
-                    .expect("history is Some (guard above)");
-                match key.code {
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        h.move_cursor(1);
-                        KeyAction::HistoryNext
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        h.move_cursor(-1);
-                        KeyAction::HistoryPrev
-                    }
-                    KeyCode::Char('a') => {
-                        h.select_a();
-                        KeyAction::HistorySelectA
-                    }
-                    _ => {
-                        h.select_b();
-                        KeyAction::HistorySelectB
-                    }
-                }
             }
             _ => KeyAction::Continue,
         }
