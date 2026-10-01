@@ -9,9 +9,11 @@
 
 ## Active Work
 
-(none — all leases signed out)
+- [ACTIVE] ID: docs-license | AGENT: general (Implementation Agent) | BRANCH: branch/docs-license | FILES: LICENSE, docs/USER_GUIDE.md, CONTRIBUTING.md, Cargo.toml, .gitignore
 
 ## Completed Milestones
+
+- **arch-doc** — Wrote `ARCHITECTURE.md` (547 lines): comprehensive architecture and measurement methodology document covering the system overview (ASCII diagram), core measurement pipeline (HTTP/SSE, quanta timing T0→Tn, token counting, SSE parser), all six engines (A: Speed, B: Concurrency, C1: NIAH, C2: Reasoning, C3: Structured, D: Energy) with their methodology, what the numbers mean, data flow diagram, technology stack, and five design principles. Derived from actual source code (`speed.rs`, `concurrency.rs`, `niah.rs`, `reasoning.rs`, `structured.rs`, `hardware.rs`, `stream.rs`, `parser.rs`, `timing.rs`, `state.rs`, `hw/mod.rs`, `nvml.rs`, `sequence.rs`). Committed to master as `1771ed0`.
 
 - **merge-ctrl-c-quit-and-label-spacing** — Merged `branch/ctrl-c-quit-and-label-spacing` into `master`: clean **fast-forward** `aa72241..80b34f3` (merge base = master tip, zero conflicts; 3 files: `src/ui/app.rs`, `src/ui/views/live.rs`, `src/ui/views/setup.rs`). Branch `branch/ctrl-c-quit-and-label-spacing` deleted. Post-merge QA: `cargo build --release` ✓ (24.93 s; binary `target/release/crucible-llm`, 14 MB, `--help` smoke exit 0). Master is now at `80b34f3`. QA log: `work/scratch/build_ctrlc_merge.log`.
 
