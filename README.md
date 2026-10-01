@@ -5,7 +5,7 @@
 **Terminal-based LLM inference benchmarking suite.**
 
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./crucible_llm_architecture_blueprint.md)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
 [![Tests](https://img.shields.io/badge/tests-460%20green-brightgreen)](#)
 
@@ -280,13 +280,13 @@ Crucible is a single static binary organized around one core invariant: **measur
 - **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; `eventsource-stream` + `reqwest` (HTTP/2) drive low-allocation SSE parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
 - **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); NVIDIA telemetry is feature-gated and absent by default; GPU/CPU telemetry degrades to N/A where a driver is missing.
 
-See [`crucible_llm_architecture_blueprint.md`](./crucible_llm_architecture_blueprint.md) for the full system specification, metric formulations, and database schema.
+See [`docs/blueprint.md`](./docs/blueprint.md) for the full system specification, metric formulations, and database schema.
 
 ---
 
 ## License
 
-[GPL-3.0](./crucible_llm_architecture_blueprint.md). This is a copyleft-licensed tool: you may use, study, modify, and share it, provided any derivative works carry the same license.
+[GPL-3.0](./LICENSE). This is a copyleft-licensed tool: you may use, study, modify, and share it, provided any derivative works carry the same license.
 
 ---
 

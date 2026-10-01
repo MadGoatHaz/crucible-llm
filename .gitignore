@@ -1,20 +1,24 @@
-# Kilo multi-agent scratchpad and staging (plans/ and docs/ remain tracked)
-work/scratch/
-work/sysops/
+# Internal working directory
+work/
 
-# Rust build artifacts
+# Build artifacts
 target/
 # Release binaries + checksums (uploaded to GitHub Releases, never committed)
 /crucible-llm-*
+
 # Local benchmark database (persisted at runtime)
 benchmarks.db
 
-# Python
-*.pyc
-__pycache__/
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
 
 # Environment
 .env
 
-# Logs
-*.log
+# Python
+*.pyc
+__pycache__/
