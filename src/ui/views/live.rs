@@ -32,15 +32,15 @@ use std::sync::Arc;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::EngineSelection;
 use crate::engines::capability::CaseVerdict;
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
 
 /// Render the Live view into `area`.
@@ -226,18 +226,18 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
     // sequence completes the metrics pipeline freezes and the hero shows its
     // final, static state ("final" + a ✓ COMPLETE badge, green border).
     let title = if frozen {
-        " LIVE THROUGHPUT — ✓ COMPLETE (final, frozen) "
+        "LIVE THROUGHPUT — ✓ COMPLETE (final, frozen)"
     } else {
-        " LIVE THROUGHPUT — real-time generation speed (tokens/sec) "
+        "LIVE THROUGHPUT — real-time generation speed (tokens/sec)"
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(if frozen {
+    let block = theme::block(
+        theme::panel_title(title),
+        if frozen {
             style::value_ok()
         } else {
             style::active_border()
-        })
-        .title(title);
+        },
+    );
     if area.width < 8 || area.height < 5 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -260,21 +260,23 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
     // The header line: the *live* now / peak / avg for the window — or, once
     // frozen, the *final* window average + peak (the run is over, so there is
     // no live "now" and the instantaneous rate would read 0.0).
+    // Information hierarchy: the live `now` is the primary (bright) value,
+    // `peak` the warning, `avg` the dimmed secondary.
     let value_line = if frozen {
         Line::from(vec![
             Span::styled("final ", style::label()),
-            Span::styled(format!("{avg:.1} t/s"), style::value_ok()),
+            Span::styled(fmt::format_rate(avg), style::value_ok()),
             Span::styled("  │  peak ", style::footer()),
-            Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+            Span::styled(fmt::format_rate(peak), style::value_warn()),
         ])
     } else {
         Line::from(vec![
             Span::styled("now ", style::label()),
-            Span::styled(format!("{current:.1} t/s"), style::value()),
+            Span::styled(fmt::format_rate(current), style::value()),
             Span::styled("  │  peak ", style::footer()),
-            Span::styled(format!("{peak:.1} t/s"), style::value_warn()),
+            Span::styled(fmt::format_rate(peak), style::value_warn()),
             Span::styled("  │  avg ", style::footer()),
-            Span::styled(format!("{avg:.1} t/s"), style::value()),
+            Span::styled(fmt::format_rate(avg), style::value_secondary()),
         ])
     };
 
@@ -487,10 +489,10 @@ fn build_throughput_chart(
 /// the same column. No more `Total Tokens33,108` or `Streamavg` collisions.
 fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let o = &m.overall;
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title(" OVERALL METRICS (all engines) ");
+    let block = theme::block(
+        theme::panel_title("OVERALL METRICS (all engines)"),
+        style::border(),
+    );
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -520,7 +522,7 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
         stat_row("TTFT", &ttft.0, &ttft.1, &ttft.2, None),
         stat_row("ITL p50", &itl50.0, &itl50.1, &itl50.2, None),
         stat_row("ITL p99", &itl99.0, &itl99.1, &itl99.2, None),
-        simple_row("Total Tokens", &grouped(o.total_tokens)),
+        simple_row("Total Tokens", &fmt::format_tokens(o.total_tokens)),
         simple_row(
             "Streams",
             &format!(
@@ -529,7 +531,7 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
                 b = o.active_max
             ),
         ),
-        simple_row("Total Duration", &fmt_duration(o.duration_sec)),
+        simple_row("Total Duration", &fmt::format_duration(o.duration_sec)),
         Line::from(Span::styled(
             "ℹ All engines. p5 = 5th percentile (worst 5%).",
             style::info(),
@@ -606,21 +608,6 @@ fn fmt_stat(v: f64) -> String {
     }
 }
 
-/// `4m 32s` (or `32s` / `--`) for a duration in seconds.
-fn fmt_duration(sec: f64) -> String {
-    if sec <= 0.0 {
-        return "--".to_string();
-    }
-    let total = sec as u64;
-    let m = total / 60;
-    let s = total % 60;
-    if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
 // ── Concurrency curve (Engine B) ───────────────────────────────────────────
 
 /// The prominent concurrency panel: aggregate t/s vs parallel users —
@@ -630,10 +617,10 @@ fn fmt_duration(sec: f64) -> String {
 /// published yet) it shows an in-progress note; with no sweep at all it
 /// shows the run-a-sweep hint.
 fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title(" CONCURRENCY CURVE — t/s vs parallel users ");
+    let block = theme::block(
+        theme::panel_title("CONCURRENCY CURVE — t/s vs parallel users"),
+        style::border(),
+    );
     if area.width < 8 || area.height < 4 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -711,10 +698,7 @@ fn score_color(pct: Option<f64>) -> Color {
 /// when the score is poor, and an **OVERALL** practical summary line at
 /// the bottom. Engines that haven't run are omitted (never shown empty).
 fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut Frame) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title(" CAPABILITY ASSESSMENT ");
+    let block = theme::block(theme::panel_title("CAPABILITY ASSESSMENT"), style::border());
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -776,7 +760,12 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
             v.push(CapScore {
                 label: "Reasoning",
                 pct: Some(pct),
-                detail: format!("{pct:.1}%  ({}/{})", r.score.solved, r.score.total),
+                detail: format!(
+                    "{}  ({}/{} solved)",
+                    fmt::format_pct(pct),
+                    r.score.solved,
+                    r.score.total
+                ),
                 detail_style: style::value(),
                 color: score_color(Some(pct)),
                 info: "Math, logic, code problems. Measures analytical ability.",
@@ -797,7 +786,7 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
             v.push(CapScore {
                 label: "Long Context",
                 pct: Some(pct),
-                detail: format!("{pct:.1}%  ({retrieved}/{total})",),
+                detail: format!("{}  ({retrieved}/{total})", fmt::format_pct(pct)),
                 detail_style: style::value(),
                 color: score_color(Some(pct)),
                 info: "Retrieval from large documents. Critical for RAG / chat history.",
@@ -985,8 +974,7 @@ fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'
 /// scores mean for actually using the model (pure — unit-testable).
 fn capability_overall(scores: &[CapScore]) -> String {
     if scores.is_empty() {
-        return "No capability engines have run — select C1–C3/D in Config (View 5) and press R."
-            .to_string();
+        return "Run benchmarks to see capability scores".to_string();
     }
     let mut parts: Vec<String> = Vec::new();
     let mut caveats: Vec<String> = Vec::new();
@@ -1137,12 +1125,10 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
 
     f.render_widget(
         Paragraph::new(Line::from(spans))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title(" BENCHMARK SEQUENCE "),
-            )
+            .block(theme::block(
+                theme::panel_title("BENCHMARK SEQUENCE"),
+                border_style,
+            ))
             .style(Style::default().bg(Color::Black)),
         area,
     );
@@ -1215,33 +1201,16 @@ fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Styl
 fn render_log(area: Rect, app: &App, f: &mut Frame) {
     f.render_widget(
         Paragraph::new(Text::from(app.log.clone()))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style::border())
-                    .title(" EVENT LOG "),
-            )
+            .block(theme::block(
+                theme::panel_title("EVENT LOG"),
+                style::border(),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
 // ── Shared formatting helpers ──────────────────────────────────────────────
-
-/// Format an integer with thousands separators (`1332 → "1,332"`) for the
-/// token readout.
-fn grouped(v: u64) -> String {
-    let s = v.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
 
 /// Color gradient for the throughput chart: green (high) → yellow (medium)
 /// → red (low), relative to the rolling-window maximum.
@@ -1697,8 +1666,8 @@ mod tests {
         assert!(overall.contains("RAG"), "{overall}");
         assert!(overall.contains("tool-calling"), "{overall}");
 
-        // No scores at all → the run-them hint.
-        assert!(capability_overall(&[]).contains("No capability engines"));
+        // No scores at all → the empty-state hint.
+        assert!(capability_overall(&[]).contains("Run benchmarks to see capability scores"));
     }
 
     // ── energy line (Engine D) ───────────────────────────────────────────

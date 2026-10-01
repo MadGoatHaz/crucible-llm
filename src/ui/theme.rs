@@ -1,27 +1,66 @@
-//! ANSI color palette / styles for the dashboard (green/yellow/red/cyan/
-//! magenta per the blueprint §6 mockups).
+//! Cohesive color palette + shared style constructors for the TUI.
 //!
-//! Every view draws from `palette` + `style` so all five views stay
-//! visually consistent.
+//! Every view draws from `palette` + `style` + the `block` / `panel_title`
+//! helpers so all five views (and the Setup takeover) stay visually
+//! consistent: one accent (cyan), a semantic success/warning/danger set,
+//! blue for informational text, dark-gray for chrome, bright white for the
+//! primary data, and rounded borders on every panel.
+//!
+//! **Palette roles**
+//! * `ACCENT`  (cyan)   — active elements, panel titles, selected items.
+//! * `OK`      (green)  — passing tests, complete states, gains.
+//! * `WARN`    (yellow) — degraded performance, cautions.
+//! * `ERR`     (red)    — failures, errors, critical warnings.
+//! * `INFO`    (blue)   — descriptions, help text (the `ℹ` notes).
+//! * `MUTED`   (dark)   — secondary text, labels, chrome, inactive hints.
+//! * `TEXT`    (white)  — primary data values.
+//! * `HIGHLIGHT`(magenta)— MTP / speculative-decoding values, active tab.
+
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders};
 
 /// Canonical palette.
 pub mod palette {
     use ratatui::style::Color;
 
-    /// Info / accent: titles, active borders, primary values.
+    /// Accent (cyan): titles, active borders, selected items.
     pub const ACCENT: Color = Color::Cyan;
-    /// Healthy / success / improvement (green NIAH cells, gains).
+    /// Success (green): passing tests, complete states, gains.
     pub const OK: Color = Color::Green;
-    /// Warning / throttled (yellow NIAH cells, approaching limits).
+    /// Warning (yellow): degraded performance, cautions.
     pub const WARN: Color = Color::Yellow;
-    /// Error / regression / failure (red NIAH cells, regressions).
+    /// Danger (red): failures, errors, critical warnings.
     pub const ERR: Color = Color::Red;
-    /// Highlight: MTP / speculative-decoding values, active tab.
+    /// Info (blue): descriptions, help text (the `ℹ` notes).
+    pub const INFO: Color = Color::Blue;
+    /// Highlight (magenta): MTP / speculative-decoding values, active tab.
     pub const HIGHLIGHT: Color = Color::Magenta;
-    /// Muted chrome: borders, inactive hints.
+    /// Muted chrome (dark gray): borders, inactive hints, secondary labels.
     pub const MUTED: Color = Color::DarkGray;
-    /// Body text.
+    /// Bright body text (white): primary data values.
     pub const TEXT: Color = Color::White;
+}
+
+/// A bordered panel: **rounded** corners, the given border style, and title.
+///
+/// Every view builds its panels through this so the border treatment is
+/// uniform (the "all panels use `BorderType::Rounded`" rule).
+pub fn block(title: impl Into<Line<'static>>, border_style: Style) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(title)
+}
+
+/// A styled panel title line: bold + accent, uppercased (the "panel titles:
+/// bold + accent, uppercase" rule).
+pub fn panel_title(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(
+        text.into().to_ascii_uppercase(),
+        style::title(),
+    ))
 }
 
 /// Shared style constructors.
@@ -59,11 +98,20 @@ pub mod style {
         Style::default().fg(palette::TEXT)
     }
 
-    /// Primary value.
+    /// Primary value (bright white, bold) — the headline number.
     pub fn value() -> Style {
         Style::default()
             .fg(palette::TEXT)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// Secondary value (bright white, normal weight, slightly dimmed) —
+    /// the avg / p5 companions that support a primary value without
+    /// competing with it.
+    pub fn value_secondary() -> Style {
+        Style::default()
+            .fg(palette::TEXT)
+            .add_modifier(Modifier::DIM)
     }
 
     /// Healthy value (green).
@@ -104,18 +152,19 @@ pub mod style {
         Style::default().fg(palette::MUTED)
     }
 
-    /// Dimmed informational text (the `ℹ` notes that explain what a panel's
-    /// numbers mean — muted + dim so they never compete with the data).
+    /// Informational text (the `ℹ` notes that explain what a panel's numbers
+    /// mean) — **blue**, dimmed so it reads as "help" and never competes
+    /// with the bright primary data.
     pub fn info() -> Style {
         Style::default()
-            .fg(palette::MUTED)
+            .fg(palette::INFO)
             .add_modifier(Modifier::DIM)
     }
 
-    /// Active tab in the tab bar.
+    /// Active tab in the tab bar (accent + bold — the current view).
     pub fn tab_active() -> Style {
         Style::default()
-            .fg(palette::HIGHLIGHT)
+            .fg(palette::ACCENT)
             .add_modifier(Modifier::BOLD)
     }
 

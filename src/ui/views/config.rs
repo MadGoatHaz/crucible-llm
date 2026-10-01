@@ -33,13 +33,13 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::{default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode};
 use crate::engines::concurrency::DEFAULT_LADDER;
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 
 /// The editable fields, in display / cursor order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,10 +540,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// so no key can be swallowed by the editor and the user can never get
 /// stuck.
 fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title(" CONFIG (read-only — press Enter to edit) ");
+    let block = theme::block(
+        theme::panel_title("CONFIG (read-only — press Enter to edit)"),
+        style::border(),
+    );
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -622,12 +622,10 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
     };
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border)
-                    .title(" CONFIG (editing — Esc to save & exit) "),
-            )
+            .block(theme::block(
+                theme::panel_title("CONFIG (editing — Esc to save & exit)"),
+                border,
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -636,8 +634,16 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
 /// `(label, value, value_style)` for one form field.
 fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
     match field {
-        Field::Url => ("Target URL".to_string(), c.url.clone(), style::value()),
-        Field::Model => ("Model".to_string(), c.model.clone(), style::value()),
+        Field::Url => (
+            "Target URL".to_string(),
+            fmt::truncate(&c.url, 44),
+            style::value(),
+        ),
+        Field::Model => (
+            "Model".to_string(),
+            fmt::truncate(&c.model, 44),
+            style::value(),
+        ),
         Field::Mode => (
             "Mode".to_string(),
             c.mode.label().to_string(),
@@ -660,10 +666,14 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
         ),
         Field::ApiKey => (
             "API key".to_string(),
-            c.api_key
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| "(none)".to_string()),
+            fmt::truncate(
+                c.api_key
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "(none)".to_string())
+                    .as_str(),
+                44,
+            ),
             style::value(),
         ),
         Field::Nocache => (
@@ -673,10 +683,14 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
         ),
         Field::Tokenizer => (
             "Tokenizer".to_string(),
-            c.tokenizer
-                .as_deref()
-                .map(str::to_string)
-                .unwrap_or_else(|| "(chars/4, estimated)".to_string()),
+            fmt::truncate(
+                c.tokenizer
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "(chars/4, estimated)".to_string())
+                    .as_str(),
+                44,
+            ),
             if c.tokenizer.is_some() {
                 style::value()
             } else {
@@ -721,11 +735,12 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
     }
 }
 
+/// The toggle state glyph: `[✓]` on, `[ ]` off (clear, at-a-glance state).
 fn bool_str(b: bool) -> String {
     if b {
-        "on".to_string()
+        "[✓]".to_string()
     } else {
-        "off".to_string()
+        "[ ]".to_string()
     }
 }
 

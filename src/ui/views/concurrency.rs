@@ -22,12 +22,12 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::engines::concurrency::{Envelope, SweepLevel, SweepResult, DEFAULT_LADDER};
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 
 /// Render the Concurrency view into `area`.
 ///
@@ -64,18 +64,28 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// diminishing-returns zone past the knee drawn dim/red, and a
 /// plain-language "what to do with this" note underneath.
 fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title("CONCURRENCY SWEEP — Aggregate Throughput vs Parallel Users");
+    // The primary title is uppercase + accent; the descriptive subtitle keeps
+    // its natural casing (the "… vs Parallel Users" phrasing).
+    let title = Line::from(vec![
+        Span::styled("CONCURRENCY SWEEP — ", style::title()),
+        Span::styled("Aggregate Throughput vs Parallel Users", style::title()),
+    ]);
+    let block = theme::block(title, style::border());
 
     let sweep = app.sweep.load();
     let Some(result) = sweep.as_ref().as_ref().filter(|r| !r.levels.is_empty()) else {
+        // Empty state: no sweep has run yet.
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Run a sweep (Engine B in the Config view, or [r]) to plot the curve.",
-                style::footer(),
-            )))
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    "Concurrency sweep will populate this view.",
+                    style::info(),
+                )),
+                Line::from(Span::styled(
+                    "Run a sweep (Engine B in the Config view, or [r]) to plot the curve.",
+                    style::footer(),
+                )),
+            ]))
             .block(block),
             area,
         );
@@ -220,7 +230,7 @@ pub(crate) fn build_curve_lines(
             y: y as u16,
             color: zone_color(l.concurrency),
             marker: if is_knee { '▲' } else { '●' },
-            value: format!("{:.1} t/s", l.aggregate_tps),
+            value: fmt::format_rate(l.aggregate_tps),
             label: l.concurrency.to_string(),
             knee_note: is_knee.then(|| format!("KNEE @ {}", l.concurrency)),
         });
@@ -618,12 +628,10 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
                 Constraint::Percentage(38),
             ],
         )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style::border())
-                .title("CONCURRENCY SWEEP — Aggregate vs Per-Stream t/s"),
-        ),
+        .block(theme::block(
+            theme::panel_title("CONCURRENCY SWEEP — Aggregate vs Per-Stream t/s"),
+            style::border(),
+        )),
         area,
     );
 }
@@ -685,8 +693,8 @@ fn sweep_row<'a>(
     };
     Row::new(vec![
         Cell::from(level.concurrency.to_string()).style(value_style),
-        Cell::from(format!("{:.1} t/s", level.aggregate_tps)).style(value_style),
-        Cell::from(format!("{:.1} t/s", per)).style(value_style),
+        Cell::from(fmt::format_rate(level.aggregate_tps)).style(value_style),
+        Cell::from(fmt::format_rate(per)).style(value_style),
         Cell::from(format!("{:.1} ms", level.p90_tpot_ms())).style(value_style),
         Cell::from(Line::from(vec![
             Span::styled(state, state_style),
@@ -778,12 +786,10 @@ fn render_recommendation(area: Rect, app: &App, f: &mut Frame) {
         });
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style::active_border())
-                    .title("CONCURRENCY RECOMMENDATION"),
-            )
+            .block(theme::block(
+                theme::panel_title("CONCURRENCY RECOMMENDATION"),
+                style::active_border(),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );

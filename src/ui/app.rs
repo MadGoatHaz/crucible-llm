@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -41,9 +41,10 @@ use ratatui::Frame;
 use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
 use crate::engines::{
-    fragmentation_warning, queue_for, BenchmarkSequence, NiahEngineConfig, NiahSlot, ProgressBus,
-    ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState, SeqStateSlot, SpeedResult,
-    StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD,
+    fragmentation_warning, queue_for, BenchmarkSequence, EngineProgress, NiahEngineConfig,
+    NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState,
+    SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
+    VRAM_FRAGMENTATION_THRESHOLD,
 };
 use crate::hw::HwPoller;
 use crate::log::{Context, RunLogger};
@@ -51,7 +52,7 @@ use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
-use crate::ui::theme::{palette, style};
+use crate::ui::theme::{self, palette, style};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::HistoryState;
@@ -1312,6 +1313,12 @@ impl App {
     /// footer across the entire frame. The dashboard keeps the classic
     /// status bar / tab bar / view / footer layout.
     pub fn render(&self, f: &mut Frame) {
+        // Edge case: the layout needs at least 80 columns. On a narrower
+        // terminal show a clear message instead of a broken, clipped frame.
+        if f.area().width < 80 {
+            self.render_too_narrow(f.area(), f);
+            return;
+        }
         if self.phase == Phase::Setup {
             views::setup::render(f.area(), self, f);
         } else {
@@ -1336,6 +1343,21 @@ impl App {
         if self.pending_quit {
             self.render_quit_overlay(f);
         }
+    }
+
+    /// The "terminal too narrow" full-frame message (shown when the width is
+    /// under the 80-column minimum the layout needs).
+    fn render_too_narrow(&self, area: Rect, f: &mut Frame) {
+        let block = theme::block(theme::panel_title("CRUCIBLE-LLM"), style::value_err());
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Terminal too narrow (minimum 80 columns)",
+                style::value_err(),
+            )))
+            .block(block)
+            .alignment(Alignment::Center),
+            area,
+        );
     }
 
     /// The `[y/N]` quit-confirmation overlay: a small centered box on top
@@ -1440,131 +1462,221 @@ impl App {
     }
 
     /// The footer line for the current state (pure — testable without a
-    /// terminal):
+    /// terminal). A single clean line:
     ///
-    /// * **confirming** (`n` pressed, `[Y/N]` on screen): the prompt
-    ///   itself, with the request count and the two live keys;
-    /// * **running** (sequence or standalone NIAH in flight): views,
-    ///   pause/resume, export, quit — with `N`/`C`/`+`/`R` shown locked;
-    /// * **idle**: views, run, NIAH (with its request count), config,
-    ///   export, quit.
+    /// ```text
+    /// [1]Live [2]Conc [3]NIAH [4]Hist [5]Cfg │ ● Connected │ Engine B: Step 5/9 │ [Space]Pause [q]Quit
+    /// ```
+    ///
+    /// * the five view tabs — the current view in **accent** (bold), the
+    ///   rest dim;
+    /// * a connection-status dot (green `● Connected`, red `● Disconnected`);
+    /// * the running engine's status (`Engine B: Step 5/9`) — shown only
+    ///   while a sequence with live progress is in flight;
+    /// * the action keys (`[Space]Pause` / `[Space]Resume` while running,
+    ///   `[R]Run` when idle, `[q]Quit` always).
+    ///
+    /// The `[Y/N]` NIAH confirmation is a modal footer (its own shape).
     pub fn footer_line(&self) -> Line<'static> {
-        let sep = Span::styled(" | ", style::tab_separator());
-        let live = |t: &str| Span::styled(t.to_string(), style::footer());
-        let locked = |t: &str| {
-            Span::styled(
-                t.to_string(),
-                Style::default()
-                    .fg(palette::MUTED)
-                    .add_modifier(Modifier::DIM),
-            )
-        };
-        // The current view, highlighted, so a user who switched with
-        // `1`-`5` always knows which dashboard panel is on screen.
-        let view_tag = Span::styled(
-            format!(" ▸ {} ", self.view.label()),
-            Style::default()
-                .fg(palette::HIGHLIGHT)
-                .add_modifier(Modifier::BOLD),
-        );
-
         if self.pending_niah {
-            let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
-            return Line::from(vec![
-                view_tag,
-                live(&format!(
-                    " [Y] Run NIAH test? {requests} requests ({s} sizes × {d} depths) ",
-                    s = NIAH_SIZES.len(),
-                    d = NIAH_DEPTHS.len()
-                )),
-                sep.clone(),
-                live(" [N/Esc] Cancel "),
-                sep.clone(),
-                live("[q] Quit"),
-            ]);
+            return self.niah_confirm_footer();
         }
-
-        let busy = self.seq.is_running() || self.niah.is_running();
-        if busy {
-            let space_key = if self.paused {
-                live("[Space] Resume")
-            } else {
-                live("[Space] Pause")
-            };
-            return Line::from(vec![
-                view_tag,
-                live("[1-5] Views"),
-                sep.clone(),
-                space_key,
-                sep.clone(),
-                live("[E] Export"),
-                sep.clone(),
-                live("[q] Quit"),
-                sep.clone(),
-                locked("[N] [C] [+] [R] locked"),
-            ]);
+        let mut spans: Vec<Span> = Vec::new();
+        spans.extend(self.footer_view_tabs());
+        spans.push(footer_sep());
+        spans.push(self.footer_connection());
+        if let Some(st) = self.footer_engine_status() {
+            spans.push(footer_sep());
+            spans.push(st);
         }
+        spans.push(footer_sep());
+        spans.extend(self.footer_action_keys());
+        Line::from(spans)
+    }
 
+    /// The `[Y/N]` NIAH-confirmation modal footer: the request count and
+    /// the two live keys.
+    fn niah_confirm_footer(&self) -> Line<'static> {
+        let sep = footer_sep();
+        let live = |t: &str| Span::styled(t.to_string(), style::footer());
         let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
         Line::from(vec![
-            view_tag,
-            live("[1-5] Views"),
+            live(&format!(
+                "[Y] Run NIAH test? {requests} requests ({s} sizes × {d} depths) ",
+                s = NIAH_SIZES.len(),
+                d = NIAH_DEPTHS.len()
+            )),
             sep.clone(),
-            live("[R] Run Benchmark"),
-            sep.clone(),
-            live(&format!("[N] NIAH ({requests} req, confirms)")),
-            sep.clone(),
-            live("[C] Config"),
-            sep.clone(),
-            live("[E] Export"),
+            live("[N/Esc] Cancel "),
             sep.clone(),
             live("[q] Quit"),
         ])
     }
+
+    /// The five view tabs: `[1]Live [2]Conc [3]NIAH [4]Hist [5]Cfg` — the
+    /// current view in **accent** (bold), the rest dim.
+    fn footer_view_tabs(&self) -> Vec<Span<'static>> {
+        View::ALL
+            .iter()
+            .enumerate()
+            .flat_map(|(i, v)| {
+                let label = format!("[{}]{}", i + 1, footer_view_label(*v));
+                let st = if *v == self.view {
+                    style::title()
+                } else {
+                    style::footer()
+                };
+                vec![Span::styled(label, st), Span::raw(" ")]
+            })
+            .collect()
+    }
+
+    /// The connection-status dot: green `● Connected` when a target URL is
+    /// set, red `● Disconnected` otherwise.
+    fn footer_connection(&self) -> Span<'static> {
+        if self.config.url.trim().is_empty() {
+            Span::styled("● Disconnected", style::value_err())
+        } else {
+            Span::styled("● Connected", style::value_ok())
+        }
+    }
+
+    /// The running-engine status segment (`Engine B: Step 5/9`) — present
+    /// only while a sequence with live progress is in flight.
+    fn footer_engine_status(&self) -> Option<Span<'static>> {
+        let state = self.seq.load()?;
+        if state.phase != SeqPhase::Running {
+            return None;
+        }
+        let letter = state.engine.label().split(':').next().unwrap_or("").trim();
+        let step = engine_step_label(&state.progress);
+        Some(Span::styled(
+            format!("Engine {letter}: {step}"),
+            Style::default()
+                .fg(palette::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }
+
+    /// The action keys: `[Space]Pause` / `[Space]Resume` while running,
+    /// `[R]Run` when idle, and `[q]Quit` always.
+    fn footer_action_keys(&self) -> Vec<Span<'static>> {
+        let running = self.seq.is_running() || self.niah.is_running();
+        let primary = if running {
+            if self.paused {
+                "[Space]Resume"
+            } else {
+                "[Space]Pause"
+            }
+        } else {
+            "[R]Run"
+        };
+        vec![
+            Span::styled(primary.to_string(), style::footer()),
+            Span::raw(" "),
+            Span::styled("[q]Quit".to_string(), style::footer()),
+        ]
+    }
 }
 
-/// Small formatting helpers shared by the views.
+/// The footer's `│` separator span.
+fn footer_sep() -> Span<'static> {
+    Span::styled(" │ ", style::tab_separator())
+}
+
+/// The compact tab label for a view (the footer's `[n]Label` tabs).
+fn footer_view_label(v: View) -> &'static str {
+    match v {
+        View::Live => "Live",
+        View::Concurrency => "Conc",
+        View::Needle => "NIAH",
+        View::History => "Hist",
+        View::Config => "Cfg",
+    }
+}
+
+/// The compact `Step X/Y` (or `Sampling…`) for a running engine's progress.
+fn engine_step_label(progress: &Option<EngineProgress>) -> String {
+    match progress {
+        Some(EngineProgress::Speed {
+            iteration, total, ..
+        }) => format!("Step {iteration}/{total}"),
+        Some(EngineProgress::Concurrency {
+            step, total_steps, ..
+        }) => format!("Step {step}/{total_steps}"),
+        Some(EngineProgress::Niah {
+            cell, total_cells, ..
+        }) => format!("Step {cell}/{total_cells}"),
+        Some(EngineProgress::Reasoning { challenge, total }) => format!("Step {challenge}/{total}"),
+        Some(EngineProgress::Structured { run, total }) => format!("Step {run}/{total}"),
+        Some(EngineProgress::Sampling { .. }) => "Sampling…".to_string(),
+        None => "Starting…".to_string(),
+    }
+}
+
+/// Number-formatting helpers shared by every view (the "consistent number
+/// formatting" rule). Pure string builders — unit-testable, no terminal.
+///
+/// * [`format_rate`]   — `142.3 t/s` (one decimal).
+/// * [`format_duration`] — `4m 32s` for a minute or more, else `1.2s`.
+/// * [`format_tokens`] — `33,108` (thousands separator) or `1.2M` for ≥1M.
+/// * [`format_pct`]    — `92.3%` (one decimal).
 pub mod fmt {
-    /// `2048` or `--` when absent.
-    pub fn tokens(v: Option<u64>) -> String {
-        v.map(|v| v.to_string()).unwrap_or_else(|| "--".to_string())
+    /// `142.3 t/s` — tokens/sec, one decimal.
+    pub fn format_rate(tps: f64) -> String {
+        format!("{tps:.1} t/s")
     }
 
-    /// `0.182 s` or `--` when absent.
-    pub fn sec(v: Option<f64>) -> String {
-        v.map(|v| format!("{v:.3} s"))
-            .unwrap_or_else(|| "--".to_string())
-    }
-
-    /// `72.4 t/s` or `--` when absent.
-    pub fn tps(v: Option<f64>) -> String {
-        v.map(|v| format!("{v:.1} t/s"))
-            .unwrap_or_else(|| "--".to_string())
-    }
-
-    /// `1.84 x` or `--` when absent.
-    pub fn mult(v: Option<f64>) -> String {
-        v.map(|v| format!("{v:.2} x"))
-            .unwrap_or_else(|| "--".to_string())
-    }
-
-    /// ASCII progress bar body, e.g. `========>      ` (head is `>`).
-    pub fn progress_bar(p: f64, width: usize) -> String {
-        let width = width.max(1);
-        let filled = (p.clamp(0.0, 1.0) * width as f64).round() as usize;
-        let mut s = String::with_capacity(width);
-        for i in 0..width {
-            if i < filled {
-                s.push(if i == filled - 1 && filled < width {
-                    '>'
-                } else {
-                    '='
-                });
-            } else {
-                s.push(' ');
-            }
+    /// `4m 32s` for a duration of a minute or more, else `1.2s` (one
+    /// decimal). `--` for a non-positive duration (never blank).
+    pub fn format_duration(secs: f64) -> String {
+        if secs <= 0.0 {
+            return "--".to_string();
         }
-        s
+        if secs < 60.0 {
+            return format!("{secs:.1}s");
+        }
+        let total = secs as u64;
+        let m = total / 60;
+        let s = total % 60;
+        format!("{m}m {s}s")
+    }
+
+    /// `33,108` with thousands separators, or `1.2M` once a count reaches a
+    /// million. Zero renders as `0` (never blank).
+    pub fn format_tokens(n: u64) -> String {
+        if n >= 1_000_000 {
+            return format!("{:.1}M", n as f64 / 1_000_000.0);
+        }
+        let s = n.to_string();
+        let bytes = s.as_bytes();
+        let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
+        for (i, b) in bytes.iter().enumerate() {
+            if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(*b as char);
+        }
+        out
+    }
+
+    /// `92.3%` — one decimal.
+    pub fn format_pct(p: f64) -> String {
+        format!("{p:.1}%")
+    }
+
+    /// Truncate `s` to at most `max` columns, appending `…` when it is
+    /// shortened (char-boundary safe — a multi-byte char is never split).
+    /// Used for long model names / URLs that must fit a fixed panel width.
+    pub fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            return s.to_string();
+        }
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
     }
 }
 
@@ -2204,9 +2316,18 @@ mod tests {
         let mut app = App::new();
         app.view = View::Concurrency;
         let t = line_text(&app.footer_line());
-        assert!(
-            t.contains("Concurrency Matrix"),
-            "footer names the view: {t}"
+        assert!(t.contains("[2]Conc"), "footer names the current view: {t}");
+        // The current view's tab is the accent-highlighted one.
+        let line = app.footer_line();
+        let span = line
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "[2]Conc")
+            .expect("the Concurrency tab span");
+        assert_eq!(
+            span.style.fg,
+            Some(palette::ACCENT),
+            "current view is accent"
         );
     }
 
@@ -2216,10 +2337,25 @@ mod tests {
     fn footer_is_idle_when_nothing_runs() {
         let app = App::new();
         let t = line_text(&app.footer_line());
-        assert!(t.contains("[R] Run Benchmark"), "{t}");
-        assert!(t.contains("[N] NIAH (77 req, confirms)"), "{t}");
-        assert!(t.contains("[C] Config"), "{t}");
-        assert!(!t.contains("locked"), "{t}");
+        // All five view tabs, the connection dot, and the idle action keys.
+        assert!(t.contains("[1]Live"), "{t}");
+        assert!(t.contains("[5]Cfg"), "{t}");
+        assert!(t.contains("●"), "connection dot present: {t}");
+        assert!(t.contains("[R]Run"), "idle shows the run key: {t}");
+        assert!(t.contains("[q]Quit"), "{t}");
+    }
+
+    #[test]
+    fn footer_shows_the_connection_state() {
+        // A target URL is set (the default config has one) → connected.
+        let app = App::new();
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("Connected"), "connected dot: {t}");
+        // No target → disconnected.
+        let mut app2 = App::new();
+        app2.config.url.clear();
+        let t2 = line_text(&app2.footer_line());
+        assert!(t2.contains("Disconnected"), "disconnected dot: {t2}");
     }
 
     #[test]
@@ -2227,9 +2363,30 @@ mod tests {
         let app = App::new();
         app.seq.set_running(true);
         let t = line_text(&app.footer_line());
-        assert!(t.contains("[Space] Pause"), "{t}");
-        assert!(t.contains("[1-5] Views"), "{t}");
-        assert!(t.contains("locked"), "{t}");
+        assert!(t.contains("[Space]Pause"), "running shows pause: {t}");
+        assert!(t.contains("[q]Quit"), "{t}");
+    }
+
+    #[test]
+    fn footer_shows_the_engine_status_while_running() {
+        // A sequence with live progress → `Engine B: Step 5/9`.
+        let app = App::new();
+        app.seq.store(crate::engines::SeqState {
+            phase: crate::engines::SeqPhase::Running,
+            queue: vec![crate::engines::Engine::Concurrency],
+            engine: crate::engines::Engine::Concurrency,
+            progress: Some(crate::engines::EngineProgress::Concurrency {
+                level: 16,
+                step: 5,
+                total_steps: 9,
+                active: 16,
+            }),
+            summary: String::new(),
+            completed: Vec::new(),
+            engine_started_ms: 0,
+        });
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("Engine B: Step 5/9"), "engine status: {t}");
     }
 
     #[test]
@@ -2238,8 +2395,7 @@ mod tests {
         app.seq.set_running(true);
         app.handle_key(&char_key(' '));
         let t = line_text(&app.footer_line());
-        assert!(t.contains("[Space] Resume"), "{t}");
-        assert!(t.contains("locked"), "{t}");
+        assert!(t.contains("[Space]Resume"), "paused shows resume: {t}");
     }
 
     #[test]
@@ -2252,5 +2408,38 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("[N/Esc] Cancel"), "{t}");
+    }
+
+    // ── terminal-size edge case ──────────────────────────────────────────
+
+    fn rendered_text(app: &App, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| app.render(f)).expect("draw frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn render_shows_the_too_narrow_message_under_80_cols() {
+        let app = App::new();
+        let text = rendered_text(&app, 60, 24);
+        assert!(text.contains("Terminal too narrow"), "{text}");
+        assert!(text.contains("minimum 80 columns"), "{text}");
+    }
+
+    #[test]
+    fn render_shows_the_full_ui_at_80_cols_and_wider() {
+        let app = App::new();
+        for (w, h) in [(80, 24), (120, 40)] {
+            let text = rendered_text(&app, w, h);
+            assert!(!text.contains("Terminal too narrow"), "{w}x{h}: {text}");
+            assert!(text.contains("BENCHMARK SEQUENCE"), "dashboard: {text}");
+        }
     }
 }

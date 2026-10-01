@@ -33,13 +33,13 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::client::models::ModelInfo;
 use crate::config::EngineSelection;
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 use crate::ui::views::config::ConfigState;
 
 /// The four stages of the setup flow (stage 2 has two sub-states: the
@@ -67,6 +67,16 @@ impl SetupPhase {
             SetupPhase::Discover | SetupPhase::Model => 1,
             SetupPhase::Config => 2,
             SetupPhase::Confirm => 3,
+        }
+    }
+
+    /// The human-readable phase name for the "Step N of 4: …" indicator.
+    pub fn name(self) -> &'static str {
+        match self {
+            SetupPhase::Url => "Server URL",
+            SetupPhase::Discover | SetupPhase::Model => "Model Selection",
+            SetupPhase::Config => "Benchmark Config",
+            SetupPhase::Confirm => "Confirm & Launch",
         }
     }
 }
@@ -680,34 +690,41 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// Top bar: brand + the four-step progress indicator.
 fn render_top_bar(area: Rect, s: &SetupState, f: &mut Frame) {
     let step = s.phase.step_index();
-    let mut spans = vec![Span::styled(
-        " CRUCIBLE-LLM — SETUP ",
-        Style::default()
-            .fg(palette::HIGHLIGHT)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let mut spans = vec![
+        Span::styled(
+            " CRUCIBLE-LLM — SETUP ",
+            Style::default()
+                .fg(palette::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        // The explicit phase indicator: "Step 1 of 4: Server URL".
+        Span::styled(" │ ", style::tab_separator()),
+        Span::styled(
+            format!(" Step {} of 4: {} ", step + 1, s.phase.name()),
+            style::title(),
+        ),
+        Span::styled(" │ ", style::tab_separator()),
+    ];
     for (i, label) in STEP_LABELS.iter().enumerate() {
         let st = if i == step {
-            style::highlight()
+            style::tab_active()
         } else if i < step {
             style::value_ok()
         } else {
             style::tab_inactive()
         };
-        spans.push(Span::styled(format!("{label:<12}"), st));
+        spans.push(Span::styled(format!("{label}  "), st));
         if i + 1 < STEP_LABELS.len() {
-            spans.push(Span::styled(" ▸ ", style::tab_separator()));
+            spans.push(Span::styled("▸", style::tab_separator()));
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The panel border used by every stage.
-fn panel(title: impl Into<Line<'static>>) -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::active_border())
-        .title(title)
+/// The panel border used by every stage (rounded, accent — the active
+/// takeover panel).
+fn panel(title: impl Into<Line<'static>>) -> ratatui::widgets::Block<'static> {
+    theme::block(title, style::active_border())
 }
 
 /// Stage 1: the URL prompt with a visible text cursor.
@@ -738,7 +755,7 @@ fn render_url(area: Rect, s: &SetupState, f: &mut Frame) {
         style::footer(),
     )));
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel("SETUP — CONNECTION")),
+        Paragraph::new(Text::from(lines)).block(panel(theme::panel_title("SETUP — CONNECTION"))),
         area,
     );
 }
@@ -767,7 +784,8 @@ fn render_discover(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         )),
     ];
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel("SETUP — MODEL DISCOVERY")),
+        Paragraph::new(Text::from(lines))
+            .block(panel(theme::panel_title("SETUP — MODEL DISCOVERY"))),
         area,
     );
 }
@@ -818,14 +836,16 @@ fn render_model(area: Rect, s: &SetupState, f: &mut Frame) {
             .saturating_sub(visible / 2)
             .min(filtered.len().saturating_sub(1));
         for (i, m) in filtered.iter().enumerate().skip(start).take(visible) {
-            let st = if i == s.model_cursor {
-                style::highlight()
+            let selected = i == s.model_cursor;
+            let st = if selected {
+                style::tab_active()
             } else {
                 style::value()
             };
             lines.push(Line::from(vec![
-                Span::styled(if i == s.model_cursor { "> " } else { "  " }, st),
-                Span::styled(m.clone(), st),
+                Span::styled(if selected { "> " } else { "  " }, st),
+                // Truncate long model names to fit the panel width.
+                Span::styled(fmt::truncate(m, 46), st),
             ]));
         }
         if filtered.is_empty() {
@@ -888,7 +908,7 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel("SETUP — BENCHMARK CONFIGURATION"))
+            .block(panel(theme::panel_title("SETUP — BENCHMARK CONFIGURATION")))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -928,9 +948,10 @@ fn form_value(field: SetupField, c: &ConfigState) -> (String, Style) {
     }
 }
 
+/// The toggle glyph: `✓` when on, blank when off (the `[✓]`/`[ ]` state).
 fn tick(b: bool) -> &'static str {
     if b {
-        "x"
+        "✓"
     } else {
         " "
     }
@@ -963,8 +984,8 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     let lines = vec![
         Line::from(Span::styled("Benchmark summary", style::title())),
         Line::raw(""),
-        summary_line("Target URL", &s.url, style::value()),
-        summary_line("Model", &c.model, style::value_ok()),
+        summary_line("Target URL", &fmt::truncate(&s.url, 40), style::value()),
+        summary_line("Model", &fmt::truncate(&c.model, 40), style::value_ok()),
         summary_line("Mode", c.mode.label(), style::value()),
         summary_line("Tokens", &c.tokens.to_string(), style::value()),
         summary_line("Iterations", &c.iterations.to_string(), style::value()),
@@ -981,7 +1002,9 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         )),
     ];
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel("SETUP — CONFIRM & LAUNCH")),
+        Paragraph::new(Text::from(lines))
+            .block(panel(theme::panel_title("SETUP — CONFIRM & LAUNCH")))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }

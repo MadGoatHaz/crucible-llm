@@ -249,7 +249,8 @@ fn render_without_history_shows_placeholder() {
     let app = App::new(); // history: None
     let buf = render_history(&app, W, H);
     let text = buf_text(&buf);
-    assert!(text.contains("No stored runs found"));
+    assert!(text.contains("No previous runs found"));
+    assert!(text.contains("first benchmark"));
     assert!(text.contains("RUN A"));
     assert!(text.contains("RUN B"));
     assert!(text.contains("DELTA"));
@@ -260,7 +261,8 @@ fn render_with_empty_session_list_shows_placeholder() {
     let mut app = App::new();
     app.history = Some(HistoryState::default());
     let text = buf_text(&render_history(&app, W, H));
-    assert!(text.contains("No stored sessions yet"));
+    assert!(text.contains("No previous runs found"));
+    assert!(text.contains("first benchmark"));
 }
 
 // ---- rendering: the side-by-side table with signed, color-coded deltas ----

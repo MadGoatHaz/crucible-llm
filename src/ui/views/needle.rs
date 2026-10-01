@@ -12,12 +12,12 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::engines::capability::{NiahCellState, NIAH_DEPTHS, NIAH_SIZES};
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 
 /// Context token sizes, 2k…128k (blueprint §5, Engine C1) — labels for the
 /// grid rows (the engine's `NIAH_SIZES` are the values).
@@ -73,7 +73,7 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
             .as_ref()
             .and_then(|r| r.size_pass_rate(NIAH_SIZES[i]))
         {
-            Some(p) => (format!("{p:.1}%"), Style::default().fg(pass_rate_color(p))),
+            Some(p) => (fmt::format_pct(p), Style::default().fg(pass_rate_color(p))),
             None => ("--".to_string(), Style::default().fg(palette::MUTED)),
         };
         cells.push(Cell::from(pr_text).style(pr_style));
@@ -81,12 +81,10 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
     }
 
     f.render_widget(
-        Table::new(rows, widths).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style::border())
-                .title("NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
-        ),
+        Table::new(rows, widths).block(theme::block(
+            theme::panel_title("NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
+            style::border(),
+        )),
         area,
     );
 }
@@ -147,6 +145,14 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
         ]),
         Line::from(Span::styled(status, style::footer())),
     ];
+    // Empty state: no result yet and nothing in flight → say what will
+    // appear and when.
+    if slot.load().is_none() && !slot.is_running() && !app.seq.is_running() {
+        lines.push(Line::from(Span::styled(
+            "NIAH results will appear here after Engine C1 completes.",
+            style::info(),
+        )));
+    }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("ℹ {NIAH_INFO}"),
@@ -163,12 +169,7 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(style::border())
-                    .title("LEGEND"),
-            )
+            .block(theme::block(theme::panel_title("LEGEND"), style::border()))
             .wrap(Wrap { trim: true }),
         area,
     );

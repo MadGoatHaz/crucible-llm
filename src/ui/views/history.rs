@@ -21,13 +21,13 @@ use std::path::Path;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::storage::db::{Database, StorageError};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
-use crate::ui::app::App;
-use crate::ui::theme::{palette, style};
+use crate::ui::app::{fmt, App};
+use crate::ui::theme::{self, palette, style};
 
 // ── pure diff computation (no locks, no I/O) ────────────────────────────
 
@@ -309,7 +309,7 @@ fn render_run_panel(
                 "{}  ·  {}  ·  {}",
                 &s.session_id[..s.session_id.len().min(8)],
                 s.timestamp.as_deref().unwrap_or("--"),
-                s.model_name
+                fmt::truncate(&s.model_name, 24)
             )
         }
         _ => "no run selected".to_string(),
@@ -343,47 +343,51 @@ fn render_run_panel(
             Cell::from(value).style(value_style),
         ]));
     }
+    let title_line = Line::from(vec![
+        Span::styled(format!("{title}  "), style::title()),
+        Span::styled(subtitle, style::footer()),
+    ]);
     f.render_widget(
         Table::new(
             rows,
             [Constraint::Percentage(50), Constraint::Percentage(50)],
         )
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style::border())
-                .title(Line::from(vec![
-                    Span::styled(format!("{title}  "), style::title()),
-                    Span::styled(subtitle, style::footer()),
-                ])),
-        ),
+        .block(theme::block(title_line, style::border())),
         area,
     );
 }
 
 /// The stored-session list with the A/B selection markers and cursor.
 fn render_session_list(area: Rect, app: &App, f: &mut Frame) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title("STORED SESSIONS (newest first)   [j/k] move · [a]=Run A · [b]=Run B");
+    // The primary title is uppercase + accent; the key hints stay in their
+    // natural (lowercase) casing.
+    let title_line = Line::from(vec![
+        Span::styled("STORED SESSIONS (newest first)", style::title()),
+        Span::styled("   [j/k] move · [a]=Run A · [b]=Run B", style::footer()),
+    ]);
+    let block = theme::block(title_line, style::border());
     match app.history.as_ref() {
         None => {
-            let lines = vec![
-                Line::from(Span::styled("No stored runs found.", style::footer())),
-                Line::from(Span::styled(
-                    "Run a headless benchmark (--url …) to populate the history.",
-                    style::footer(),
-                )),
-            ];
-            f.render_widget(Paragraph::new(lines).block(block), area);
+            let lines = vec![Line::from(Span::styled(
+                "No previous runs found. Results will appear here after your first benchmark.",
+                style::info(),
+            ))];
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(block.clone())
+                    .wrap(Wrap { trim: true }),
+                area,
+            );
         }
         Some(h) if h.sessions.is_empty() => {
             let lines = vec![Line::from(Span::styled(
-                "No stored sessions yet — run a headless benchmark to populate the history.",
-                style::footer(),
+                "No previous runs found. Results will appear here after your first benchmark.",
+                style::info(),
             ))];
-            f.render_widget(Paragraph::new(lines).block(block), area);
+            f.render_widget(
+                Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+                area,
+            );
         }
         Some(h) => {
             let rows: Vec<Row> = h
@@ -407,8 +411,8 @@ fn render_session_list(area: Rect, app: &App, f: &mut Frame) {
                         Cell::from(format!("#{}", i + 1)).style(style::footer()),
                         marks_cell,
                         Cell::from(s.timestamp.as_deref().unwrap_or("--")).style(style::label()),
-                        Cell::from(s.model_name.clone()).style(style::value()),
-                        Cell::from(shorten(&s.target_url, 24)).style(style::footer()),
+                        Cell::from(fmt::truncate(&s.model_name, 20)).style(style::value()),
+                        Cell::from(fmt::truncate(&s.target_url, 24)).style(style::footer()),
                     ])
                 })
                 .collect();
@@ -439,10 +443,10 @@ const DELTA_INFO: &str = "Δ% = run B vs run A. Green = gain, red = regression. 
 /// Delta panel: signed % change per metric, green = gain, red =
 /// regression, with a dimmed `ℹ` note explaining the numbers.
 fn render_delta(area: Rect, app: &App, f: &mut Frame) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(style::border())
-        .title("DELTA (signed % change, B vs A)");
+    let block = theme::block(
+        theme::panel_title("DELTA (signed % change, B vs A)"),
+        style::border(),
+    );
     match app.history.as_ref().and_then(|h| h.diff.as_ref()) {
         None => {
             let lines = vec![
@@ -523,7 +527,7 @@ fn format_metric(label: &str, v: Option<f64>) -> String {
     };
     match label {
         "TTFT (ms)" => format!("{v:.1} ms"),
-        "Tokens/s" => format!("{v:.1} t/s"),
+        "Tokens/s" => fmt::format_rate(v),
         "MTP rate" => format!("{v:.2} x"),
         "J/token" => format!("{v:.3} J/tok"),
         _ => format!("{v:.3}"),
@@ -536,16 +540,11 @@ fn format_delta(d: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
-/// Truncate a URL to `max` chars (byte-safe: back off to a char boundary).
+/// Truncate a name / URL to `max` columns (char-boundary safe) — delegates
+/// to the shared [`fmt::truncate`] helper.
+#[cfg(test)]
 fn shorten(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    fmt::truncate(s, max)
 }
 
 #[cfg(test)]
