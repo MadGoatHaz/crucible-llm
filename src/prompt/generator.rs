@@ -75,6 +75,12 @@ impl PromptGenerator {
         }
     }
 
+    /// Access to the underlying tokenizer (if one was loaded).
+    #[must_use]
+    pub fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
+        self.tokenizer.clone()
+    }
+
     /// The fixed ~50-token short prompt.
     pub fn short(&self) -> GeneratedPrompt {
         let c = count_tokens(SHORT_PROMPT, self.tokenizer.as_deref());

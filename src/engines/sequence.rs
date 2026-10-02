@@ -190,7 +190,7 @@ impl Engine {
                 "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
             }
             Engine::FlatOut => {
-                "Sustained max-speed test. 60 seconds, decreasing token\ntargets (10k→1k). Finds your server's absolute best-case\nthroughput — the \"big number\" to end on."
+                "Sustained maximum decode speed. 6×10s windows with\nminimal prefill. Measures your server's peak rate."
             }
         }
     }
@@ -747,7 +747,7 @@ impl BenchmarkSequence {
                 // Engine D runs last in the canonical order, so the
                 // cumulative token count is final when it samples.
                 Engine::Hardware => self.run_hardware(total_tokens).await,
-                // Engine F (Flat Out) runs after D: the "big number" finale.
+                // Engine F (Flat Out) runs after D: the max decode speed finale.
                 Engine::FlatOut => self.run_flatout().await,
             };
             total_tokens += match engine {
@@ -1060,9 +1060,9 @@ impl BenchmarkSequence {
         summary
     }
 
-    /// Engine F — Flat Out: the sustained max-speed finale. Six sequential
-    /// single-stream segments with decreasing token targets (10k→1k).
-    /// Returns the one-line summary (`BEST: X t/s (segment N, Mk tokens)`).
+    /// Engine F — Flat Out: the sustained maximum decode speed finale. Six
+    /// sequential 10-second windows with a minimal prompt and decreasing
+    /// `max_tokens` caps (10k→1k). Returns the one-line summary.
     async fn run_flatout(&self) -> String {
         self.slots.flatout.set_running(true);
         let engine = match FlatOutEngine::new(&self.cfg) {

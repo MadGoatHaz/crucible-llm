@@ -915,7 +915,7 @@ fn build_capability_scores(
         });
     }
 
-    // Flat Out (F) — the "big number" finale: best-case t/s.
+    // Flat Out (F) — sustained maximum decode speed: best-case t/s.
     if sel.flatout {
         if let Some(r) = app.flatout_slot.load().as_ref() {
             v.push(CapScore {
@@ -924,7 +924,7 @@ fn build_capability_scores(
                 detail: format!("BEST: {:.1} t/s", r.best_tps),
                 detail_style: style::value_ok(th),
                 color: th.success(),
-                info: "Sustained max-speed test. 60s, decreasing targets (10k→1k).",
+                info: "Sustained max decode. 6×10s windows, minimal prefill.",
                 warn: None,
             });
         }

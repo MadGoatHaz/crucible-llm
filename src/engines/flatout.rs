@@ -1,7 +1,11 @@
-//! Engine F — Flat Out: sustained max-speed test.
+//! Engine F — Flat Out: sustained maximum decode speed.
 //!
-//! The goal is to find the absolute best-case speed the server can produce
-//! and give the user a satisfying "big number" to end on.
+//! The goal is to measure the server's **true maximum sustained decode
+//! speed** with zero prefill interference. A minimal (~15-token) open-ended
+//! prompt is used for all 6 segments so prefill takes <100 ms — negligible.
+//! The 10-second hard timeout is the only real stop condition; the
+//! decreasing `max_tokens` caps (10k→1k) are a safety limit that a
+//! 1000+ t/s server would hit on later segments.
 //!
 //! The test runs for up to 60 seconds total, divided into 6 segments of a
 //! hard **10-second time window** each, with DECREASING `max_tokens` caps:
@@ -27,9 +31,7 @@
 //!   arrive in those 10s.
 //!
 //! Either way, every segment is at most 10 seconds, so the whole test is at
-//! most ~60 seconds. This is what made the old design wrong: it waited for
-//! the *full* token target to complete, so a ~29 t/s server took 147s for
-//! segment 1 alone (8+ minutes total).
+//! most ~60 seconds.
 //!
 //! The segment's t/s is measured from the tokens we **observed on the wire**
 //! (not the server's self-reported `usage.completion_tokens`, which some
@@ -52,6 +54,7 @@ use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
+use crate::prompt::tokenizer::count_tokens;
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
 use crate::sse::Usage;
 use crate::timing::MonotonicInstant;
@@ -76,6 +79,15 @@ const SEGMENT_WINDOW_NS: u64 = 10 * 1_000_000_000;
 
 /// Total nominal duration (6 × 10s).
 pub const TOTAL_DURATION_SECS: f64 = 60.0;
+
+/// The minimal open-ended prompt (~15 tokens) used for all 6 segments.
+///
+/// Short enough that prefill takes <100 ms (negligible), open-ended enough
+/// that the model keeps generating without stopping, and not a question
+/// (questions get short answers). The same prompt is reused for every
+/// segment so the only variable is the decreasing `max_tokens` cap.
+pub const MINIMAL_PROMPT: &str =
+    "Continue this story: The old lighthouse keeper walked down the spiral stairs and";
 
 /// Results from one segment of the Flat Out test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,11 +371,18 @@ impl FlatOutEngine {
 
     /// The prompt for this run (generated once and reused across segments).
     ///
-    /// Flat Out always uses a short prompt to minimize prefill time and
-    /// maximize decode speed. The per-segment `max_tokens` cap is controlled
-    /// by [`SEGMENT_TARGETS`]; the 10s window is the real limit.
+    /// Flat Out uses a **minimal** (~15-token) open-ended prompt to keep
+    /// prefill <100 ms — negligible compared to the 10-second decode window.
+    /// The per-segment `max_tokens` cap is controlled by [`SEGMENT_TARGETS`];
+    /// the 10s window is the real limit.
     pub fn generate_prompt(&self) -> GeneratedPrompt {
-        self.generator.short()
+        let c = count_tokens(MINIMAL_PROMPT, self.generator.tokenizer().as_deref());
+        GeneratedPrompt {
+            text: MINIMAL_PROMPT.to_string(),
+            token_count: c.tokens,
+            estimated: c.estimated,
+            nocache: false,
+        }
     }
 
     /// Run one segment within a hard [`SEGMENT_WINDOW_SECS`] time window.

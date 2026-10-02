@@ -203,7 +203,7 @@ impl Default for EngineSelection {
             // machine with the GPU, and is opt-in for GPU-box users.
             hardware: false,
             // Engine F (Flat Out) is on by default (like A–C3): the
-            // 60-second sustained max-speed "big number" finale runs in
+            // 60-second sustained maximum decode speed finale runs in
             // every default sequence. Only Engine D (Energy) is opt-in.
             flatout: true,
         }
