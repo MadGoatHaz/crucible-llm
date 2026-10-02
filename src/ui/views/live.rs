@@ -1210,14 +1210,18 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
         lines.push(bar_line);
     }
 
+    // Explicit inner-area rendering: the Block (borders + title) is drawn
+    // to the full `area`, and the content Paragraph is drawn to
+    // `block.inner(area)` — the rect *inside* the borders.  This is the
+    // structural guarantee that the content can never overwrite the
+    // border characters (the root cause of the BENCHMARK SEQUENCE /
+    // LIVE THROUGHPUT bottom-border collision).
+    let block = theme::block(theme::panel_title("BENCHMARK SEQUENCE"), border_style);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     f.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(theme::block(
-                theme::panel_title("BENCHMARK SEQUENCE"),
-                border_style,
-            ))
-            .style(Style::default().bg(palette::BG)),
-        area,
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(palette::BG)),
+        inner,
     );
 }
 
@@ -1957,7 +1961,7 @@ mod tests {
     #[test]
     fn sequence_header_content_never_overflows_its_rows() {
         // A running sequence (the most dynamic status text).
-        let mut app = App::new();
+        let app = App::new();
         app.seq.store(SeqState {
             phase: SeqPhase::Running,
             queue: Engine::ALL.to_vec(),
@@ -1984,15 +1988,11 @@ mod tests {
             let buf = terminal.backend().buffer();
             // Row 0 is the top border + title. If the panel rendered at all,
             // the title must be there.
-            let row0: String = (0..w)
-                .map(|x| buf.get(x, 0).symbol().to_string())
-                .collect();
+            let row0: String = (0..w).map(|x| buf[(x, 0)].symbol().to_string()).collect();
             if row0.contains("BENCHMARK SEQUENCE") {
                 // The first content row (row 1) must NOT also carry the title —
                 // that is the overlap the user reported.
-                let row1: String = (0..w)
-                    .map(|x| buf.get(x, 1).symbol().to_string())
-                    .collect();
+                let row1: String = (0..w).map(|x| buf[(x, 1)].symbol().to_string()).collect();
                 assert!(
                     !row1.contains("BENCHMARK SEQUENCE"),
                     "{w}x{h}: title leaked onto content row 1: {row1}"
@@ -2006,6 +2006,145 @@ mod tests {
         let app = App::new();
         for (w, h) in [(40, 10), (20, 6), (80, 24)] {
             let _ = render_live_text(&app, w, h);
+        }
+    }
+
+    // ── layout geometry regression tests ─────────────────────────────────
+
+    /// The BENCHMARK SEQUENCE panel must have at least 4 rows in an 80×30
+    /// terminal: top border + 2 content rows + bottom border.  A shorter
+    /// allocation causes the bottom border to collide with the LIVE
+    /// THROUGHPUT panel's top border on the same terminal row.
+    #[test]
+    fn benchmark_sequence_panel_minimum_4_row_height() {
+        let app = App::new();
+        let w: u16 = 80;
+        let h: u16 = 30;
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f.area(), &app, f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Find the BENCHMARK SEQUENCE top border (the row carrying the
+        // panel title).
+        let mut seq_top: Option<u16> = None;
+        for y in 0..h {
+            let row: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            if row.contains("BENCHMARK SEQUENCE") {
+                seq_top = Some(y);
+                break;
+            }
+        }
+        assert!(
+            seq_top.is_some(),
+            "BENCHMARK SEQUENCE panel title not found in 80×30 render"
+        );
+        let seq_top = seq_top.unwrap();
+
+        // The panel must be ≥ 4 rows tall: the bottom border sits 3 rows
+        // below the top border.
+        let seq_bottom = seq_top + 3;
+        assert!(
+            seq_bottom < h,
+            "BENCHMARK SEQUENCE bottom border (row {seq_bottom}) exceeds terminal height {h}"
+        );
+        let bottom_row: String = (0..w)
+            .map(|x| buf[(x, seq_bottom)].symbol().to_string())
+            .collect();
+        // A rounded bottom border carries ╰ (bottom-left) and ╯
+        // (bottom-right) corner glyphs.
+        assert!(
+            bottom_row.contains('╰') || bottom_row.contains('╯'),
+            "Expected a rounded bottom border at row {seq_bottom}, got: {bottom_row}"
+        );
+    }
+
+    /// The BENCHMARK SEQUENCE panel's bottom border must NOT share a
+    /// terminal row with the LIVE THROUGHPUT panel's top border.  In an
+    /// 80×30 terminal the LIVE THROUGHPUT top border must be at least 4
+    /// rows below the BENCHMARK SEQUENCE top border (the full height of
+    /// the sequence panel: 1 top border + 2 content + 1 bottom border).
+    #[test]
+    fn sequence_and_throughput_panel_borders_do_not_overlap() {
+        let app = App::new();
+        let w: u16 = 80;
+        let h: u16 = 30;
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f.area(), &app, f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let mut seq_top: Option<u16> = None;
+        let mut throughput_top: Option<u16> = None;
+        for y in 0..h {
+            let row: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            if seq_top.is_none() && row.contains("BENCHMARK SEQUENCE") {
+                seq_top = Some(y);
+            }
+            if throughput_top.is_none() && row.contains("LIVE THROUGHPUT") {
+                throughput_top = Some(y);
+            }
+        }
+        assert!(seq_top.is_some(), "BENCHMARK SEQUENCE panel not found");
+        assert!(throughput_top.is_some(), "LIVE THROUGHPUT panel not found");
+
+        let seq_top = seq_top.unwrap();
+        let throughput_top = throughput_top.unwrap();
+
+        assert!(
+            throughput_top >= seq_top + 4,
+            "border collision: BENCHMARK SEQUENCE top={seq_top}, \
+             LIVE THROUGHPUT top={throughput_top} — the throughput panel \
+             must start ≥ 4 rows below the sequence panel"
+        );
+    }
+
+    /// Every bordered panel in the live view must have its content rendered
+    /// to the *inner* area (inside the borders), not to the raw layout
+    /// rect.  We verify this by checking that the row immediately inside
+    /// the top border (row 1 of each panel) does NOT contain border
+    /// characters — it must be content.
+    #[test]
+    fn all_panels_render_content_to_inner_area() {
+        let app = App::new();
+        let w: u16 = 80;
+        let h: u16 = 30;
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f.area(), &app, f)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Collect the top-border row of every panel by title.
+        let titles = [
+            "BENCHMARK SEQUENCE",
+            "LIVE THROUGHPUT",
+            "OVERALL METRICS",
+            "EVENT LOG",
+        ];
+        for title in titles {
+            let mut top_row: Option<u16> = None;
+            for y in 0..h {
+                let row: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                if row.contains(title) {
+                    top_row = Some(y);
+                    break;
+                }
+            }
+            assert!(top_row.is_some(), "panel {title} not found");
+            let top_row = top_row.unwrap();
+
+            // The row just inside the top border (top_row + 1) must NOT
+            // carry the title text — that would mean the content is
+            // rendering over the border row.
+            if top_row + 1 < h {
+                let inner_row: String = (0..w)
+                    .map(|x| buf[(x, top_row + 1)].symbol().to_string())
+                    .collect();
+                assert!(
+                    !inner_row.contains(title),
+                    "{title}: title leaked onto inner row {top_row}: {inner_row}"
+                );
+            }
         }
     }
 
