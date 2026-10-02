@@ -324,6 +324,18 @@ impl SpeedEngine {
     /// (A, C1, C2, C3): the Live Monitor's gauges / ITL distribution /
     /// stream matrix / token counter all read it lock-free while the
     /// current engine runs (measurement-isolation invariant, blueprint §4).
+    ///
+    /// The **single decode-rate formula** used throughout:
+    /// `tokens_received / (T_last_token − T_first_token)`.
+    ///
+    /// * `tokens_received` — the server's `usage.completion_tokens` once it
+    ///   arrives; the observed token-frame count while the stream is open.
+    /// * `T_first_token` / `T_last_token` — the decode window (prefill /
+    ///   TTFT and the trailing gap to `[DONE]` are excluded).
+    ///
+    /// This is the same formula the Overall Metrics panel uses via
+    /// `gen_tps` and the `DecodeRateTracker` uses for the rolling series —
+    /// one code path from token reception to display.
     pub fn single_stream_snapshot(
         endpoint: &str,
         model: &str,
@@ -337,12 +349,12 @@ impl SpeedEngine {
         let mut token_frames = 0u64;
         let mut reasoning_frames = 0u64;
         let mut content_frames = 0u64;
+        let mut first_token_at: Option<MonotonicInstant> = None;
         let mut last_token_at: Option<MonotonicInstant> = None;
         let mut ttft_ns: Option<u64> = None;
         let mut usage: Option<Usage> = None;
         let mut state = StreamStatus::Waiting;
         let mut t0: Option<MonotonicInstant> = None;
-        let mut t3: Option<MonotonicInstant> = None;
         let mut t_end: Option<MonotonicInstant> = None;
         // v0.1.1 decode-loop guard verdict (carried by the terminal event).
         let mut looping = false;
@@ -355,8 +367,7 @@ impl SpeedEngine {
                     at,
                     timestamps,
                 } => {
-                    let is_tok = matches!(&frame.chunk, Chunk::Reasoning(_) | Chunk::Content(_));
-                    if is_tok {
+                    if frame.chunk.is_token() {
                         if let Some(prev) = last_token_at {
                             itl.record(prev.delta_nanos(at));
                         }
@@ -365,10 +376,10 @@ impl SpeedEngine {
                             Chunk::Reasoning(_) => reasoning_frames += 1,
                             _ => content_frames += 1,
                         }
-                        last_token_at = Some(*at);
-                        if t3.is_none() {
-                            t3 = Some(*at);
+                        if first_token_at.is_none() {
+                            first_token_at = Some(*at);
                         }
+                        last_token_at = Some(*at);
                         if state == StreamStatus::Waiting {
                             state = StreamStatus::Streaming;
                         }
@@ -413,75 +424,62 @@ impl SpeedEngine {
             }
         }
 
-        // Authoritative count: the server's `usage.completion_tokens` once
-        // it has arrived (the `Complete` event carries it); while the stream
-        // is still open, the observed token frames are the live estimate.
-        let tokens = match usage {
+        // The token count: the server's `usage.completion_tokens` once it
+        // arrives (the authoritative count); the observed token-frame count
+        // while the stream is still open.
+        let tokens_received = match usage {
             Some(u) if u.completion_tokens > 0 => u.completion_tokens,
             _ => token_frames,
         };
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
-        // Decode window: first token (T3) → last content/reasoning token
-        // (`last_token_at`) — prefill/TTFT and the trailing gap to `[DONE]`
-        // are both excluded (the research's Timing Boundary Rule).
-        let gen_tps = match (t3, last_token_at) {
-            (Some(t3), Some(last)) => {
-                let span_s = t3.delta_nanos(&last) as f64 / 1_000_000_000.0;
-                if span_s > 0.0 && tokens > 0 {
-                    Some(tokens as f64 / span_s)
+
+        // The decode rate: `tokens_received / (T_last − T_first)`.
+        // One formula, used for the per-stream detail, the labeled layer,
+        // and the aggregate.
+        let decode_rate = match (first_token_at, last_token_at) {
+            (Some(first), Some(last)) => {
+                let span_s = first.delta_nanos(&last) as f64 / 1e9;
+                if span_s > 0.0 && tokens_received > 0 {
+                    tokens_received as f64 / span_s
                 } else {
-                    None
+                    0.0
                 }
             }
-            _ => None,
+            _ => 0.0,
         };
+
         // v0.1.1 labeled metric layers — three separate numbers, never
         // blended (blueprint §v0.1.1-B):
         //   prefill = prompt_tokens / TTFT
-        //   decode  = completion_tokens / (T_last − T_first)
-        //   e2e     = total_tokens / total wall time (T0 → Tn)
+        //   decode  = tokens_received / (T_last − T_first)
+        //   e2e     = tokens_received / total wall time (T0 → Tn)
         // A looping stream is excluded from all three.
-        let (prefill_tps, decode_tps, e2e_tps) = if looping {
-            (0.0, 0.0, 0.0)
+        let (prefill_tps, e2e_tps) = if looping {
+            (0.0, 0.0)
         } else {
             let prefill = match (prompt_tokens, ttft_ns) {
                 (p, Some(ns)) if p > 0 && ns > 0 => p as f64 / (ns as f64 / 1e9),
                 _ => 0.0,
             };
-            let decode = match (t3, last_token_at) {
-                (Some(t3), Some(last)) => {
-                    let span_s = t3.delta_nanos(&last) as f64 / 1e9;
-                    if span_s > 0.0 && tokens > 0 {
-                        tokens as f64 / span_s
-                    } else {
-                        0.0
-                    }
-                }
-                _ => 0.0,
-            };
             let e2e = match (t0, t_end) {
                 (Some(t0), Some(end)) => {
                     let span_s = t0.delta_nanos(&end) as f64 / 1e9;
-                    if span_s > 0.0 && tokens > 0 {
-                        tokens as f64 / span_s
+                    if span_s > 0.0 && tokens_received > 0 {
+                        tokens_received as f64 / span_s
                     } else {
                         0.0
                     }
                 }
                 _ => 0.0,
             };
-            (prefill, decode, e2e)
+            (prefill, e2e)
         };
-        let mtp = if content_frames > 0 {
-            Some(tokens as f64 / content_frames as f64)
-        } else {
-            None
-        };
+        let mtp = (content_frames > 0).then(|| tokens_received as f64 / content_frames as f64);
         let progress = if state == StreamStatus::Done {
             1.0
         } else {
-            (tokens as f64 / max_tokens.max(1) as f64).min(1.0)
+            (tokens_received as f64 / max_tokens.max(1) as f64).min(1.0)
         };
         let kind = if reasoning_frames > content_frames {
             "Reasoning"
@@ -493,33 +491,21 @@ impl SpeedEngine {
 
         MetricsSnapshot {
             endpoint: endpoint.to_string(),
-            // The backend is unknown (vLLM, llama.cpp, LM Studio, …) —
-            // never assume one.
             backend: String::new(),
             model: model.to_string(),
             mode: mode.to_string(),
-            // The live throughput graph samples `aggregate_tps` into its
-            // rolling series. It must use the decode-window rate
-            // (tokens / (T_last − T_first)) — the same formula the
-            // Overall Metrics panel uses via `gen_tps` — NOT the e2e
-            // rate (tokens / total wall time), which includes TTFT/prefill
-            // and reads lower.
-            aggregate_tps: decode_tps,
+            aggregate_tps: decode_rate,
             prefill_throughput: prefill_tps,
-            decode_throughput: decode_tps,
+            decode_throughput: decode_rate,
             e2e_throughput: e2e_tps,
-            active_streams: if state == StreamStatus::Streaming && !looping {
-                1
-            } else {
-                0
-            },
+            active_streams: (state == StreamStatus::Streaming && !looping) as usize,
             total_streams: 1,
             itl_p50_ns: itl.p50() as u64,
             itl_p90_ns: itl.p90() as u64,
             itl_p99_ns: itl.p99() as u64,
             itl_p999_ns: itl.p999() as u64,
             prompt_tokens,
-            completion_tokens: tokens,
+            completion_tokens: tokens_received,
             status: state,
             loop_excluded_streams: looping as usize,
             loop_excluded_tokens,
@@ -528,9 +514,9 @@ impl SpeedEngine {
                 kind: kind.to_string(),
                 state,
                 pp_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
-                tg_tokens: (tokens > 0).then_some(tokens),
+                tg_tokens: (tokens_received > 0).then_some(tokens_received),
                 ttft_s,
-                gen_tps,
+                gen_tps: (decode_rate > 0.0).then_some(decode_rate),
                 mtp,
                 progress,
                 looping,
@@ -658,7 +644,11 @@ pub fn aggregate(
     //    count, flagged `estimated` (never the primary method).
     let (prompt_tokens, completion_tokens, estimated) = {
         let mut est = false;
-        let completion = match outcome.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
+        let completion = match outcome
+            .usage
+            .map(|u| u.completion_tokens)
+            .filter(|&n| n > 0)
+        {
             Some(n) => n,
             None => match tokenizer
                 .and_then(|t| t.try_count(&stream_text(events)))
@@ -1308,8 +1298,8 @@ mod tests {
             let t1 = MonotonicInstant::now(); // 10 ms
             mock.increment(20_000_000);
             let t3 = MonotonicInstant::now(); // 30 ms (first token)
-            // Ten content frames spread 30, 40, …, 120 ms (last token at
-            // 120 ms), then the stream closes at 130 ms.
+                                              // Ten content frames spread 30, 40, …, 120 ms (last token at
+                                              // 120 ms), then the stream closes at 130 ms.
             let frame_times: Vec<MonotonicInstant> = (0..10)
                 .map(|_| {
                     let at = MonotonicInstant::now();

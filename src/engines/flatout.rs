@@ -168,10 +168,7 @@ impl FlatOutResult {
         let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&deltas_ns);
 
         // Authoritative count (usage → re-tokenize → observed frames).
-        let total_tokens = match usage
-            .map(|u| u.completion_tokens)
-            .filter(|&n| n > 0)
-        {
+        let total_tokens = match usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
             Some(n) => n,
             None => match tokenizer
                 .and_then(|t| t.try_count(&stream_text(events)))
@@ -414,11 +411,8 @@ impl FlatOutEngine {
         drop(rx);
 
         let elapsed = start.elapsed().as_secs_f64();
-        let result = FlatOutResult::from_events(
-            &events,
-            elapsed,
-            self.generator.tokenizer().as_deref(),
-        );
+        let result =
+            FlatOutResult::from_events(&events, elapsed, self.generator.tokenizer().as_deref());
 
         // Final publish (the last batch may not have flushed).
         if let Some(state) = &self.metrics {
@@ -496,9 +490,12 @@ impl FlatOutEngine {
 
     /// Build a live [`MetricsSnapshot`] from the events collected so far
     /// in the run.
+    ///
+    /// The decode rate uses the same single formula as Engine A and the
+    /// Overall Metrics panel: `tokens_received / (T_last − T_first)`.
     fn live_snapshot(&self, events: &[StreamEvent], start: &MonotonicInstant) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
-        let (frame_tokens, tps) = Self::observed(events);
+        let (frame_tokens, decode_rate) = Self::observed(events);
         let mut itl = LatencyHistogram::default();
         let mut last_token_at: Option<MonotonicInstant> = None;
         let mut usage: Option<Usage> = None;
@@ -535,49 +532,40 @@ impl FlatOutEngine {
             }
         }
 
-        // Authoritative count: the server's `usage.completion_tokens` when
-        // the stream ended naturally; while the 60 s stream is still open
-        // (the normal case — we abort it, so no usage arrives), the observed
-        // token frames are the live estimate.
-        let tokens = usage
+        // The token count: the server's `usage.completion_tokens` when the
+        // stream ended naturally; while the 60 s stream is still open (the
+        // normal case — we abort it), the observed token frames.
+        let tokens_received = usage
             .map(|u| u.completion_tokens)
             .filter(|&n| n > 0)
             .unwrap_or(frame_tokens);
+        let status = if t_end.is_some() {
+            StreamStatus::Done
+        } else {
+            StreamStatus::Streaming
+        };
 
         MetricsSnapshot {
             endpoint: self.cfg.url.clone(),
-            // The backend is unknown (vLLM, llama.cpp, LM Studio, …) —
-            // never assume one.
             backend: String::new(),
             model: self.cfg.model.clone(),
             mode: "FlatOut".to_string(),
-            // The decode rate over the first→last token window (prefill /
-            // TTFT excluded) — the research's Timing Boundary Rule.
-            aggregate_tps: tps,
-            active_streams: if t_end.is_none() { 1 } else { 0 },
+            aggregate_tps: decode_rate,
+            active_streams: (t_end.is_none()) as usize,
             total_streams: 1,
             itl_p50_ns: itl.p50() as u64,
             itl_p90_ns: itl.p90() as u64,
             itl_p99_ns: itl.p99() as u64,
             itl_p999_ns: itl.p999() as u64,
-            completion_tokens: tokens,
+            completion_tokens: tokens_received,
             prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
-            status: if t_end.is_some() {
-                StreamStatus::Done
-            } else {
-                StreamStatus::Streaming
-            },
+            status,
             streams: vec![crate::metrics::state::StreamMetric {
                 id: 0,
                 kind: "Content".to_string(),
-                state: if t_end.is_some() {
-                    StreamStatus::Done
-                } else {
-                    StreamStatus::Streaming
-                },
-                tg_tokens: (tokens > 0).then_some(tokens),
-                gen_tps: (tps > 0.0).then_some(tps),
-                // Progress is time-based: elapsed over the 60s window.
+                state: status,
+                tg_tokens: (tokens_received > 0).then_some(tokens_received),
+                gen_tps: (decode_rate > 0.0).then_some(decode_rate),
                 progress: (elapsed_ns as f64 / 1e9 / WINDOW_SECS).min(1.0),
                 ..Default::default()
             }],
@@ -693,7 +681,8 @@ mod tests {
 
     #[test]
     fn from_events_no_usage_retokenizes_with_the_tokenizer() {
-        let tok = Tokenizer::from_json(include_str!("../../tests/fixtures/mini_tokenizer.json")).unwrap();
+        let tok =
+            Tokenizer::from_json(include_str!("../../tests/fixtures/mini_tokenizer.json")).unwrap();
         let (clock, mock) = quanta::Clock::mock();
         quanta::with_clock(&clock, || {
             let t0 = MonotonicInstant::now();

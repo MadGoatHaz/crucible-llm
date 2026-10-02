@@ -262,7 +262,11 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, th: The
     });
 
     let series = &m.throughput_series;
-    let current = m.aggregate_tps;
+    // The "now" value is the cumulative decode rate (the last sample of
+    // the rolling series) — the same number the rightmost bar of the
+    // graph shows. Falls back to `aggregate_tps` when the series is
+    // empty (no tokens yet).
+    let current = series.last().copied().unwrap_or(m.aggregate_tps);
     let peak = series.iter().cloned().fold(0.0_f64, f64::max);
     let avg = if series.is_empty() {
         0.0

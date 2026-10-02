@@ -215,27 +215,45 @@ fn snapshot_update_load_roundtrip() {
 /// The rolling window persists across `update()` calls (the engines
 /// publish fresh `..Default::default()` snapshots, which would otherwise
 /// wipe the series on every batch) and samples at most once per second.
+///
+/// The series samples the **cumulative decode rate**
+/// (`completion_tokens / elapsed_since_first_token`), so the exact values
+/// depend on wall-clock timing. The test verifies the structural
+/// behavior: one sample per period, persistence across updates, and
+/// positive rates when tokens are present.
 #[test]
 fn update_maintains_the_rolling_throughput_series() {
     let state = MetricsState::new();
     state.update(MetricsSnapshot {
         aggregate_tps: 100.0,
+        completion_tokens: 100,
         ..Default::default()
     });
-    assert_eq!(state.load().throughput_series, vec![100.0]);
+    // One sample recorded; the cumulative rate is positive (100 tokens
+    // over a sub-millisecond window).
+    let series = state.load().throughput_series.clone();
+    assert_eq!(series.len(), 1);
+    assert!(series[0] > 0.0, "rate must be positive: {}", series[0]);
 
     // A fresh default snapshot (as every engine batch publishes) does
-    // not wipe the window.
+    // not wipe the window (the 1 s sample period has not elapsed).
     state.update(MetricsSnapshot::default());
-    assert_eq!(state.load().throughput_series, vec![100.0]);
+    assert_eq!(state.load().throughput_series.len(), 1);
 
-    // After the 1 s sample period, the latest value is appended.
+    // After the 1 s sample period, a new sample is appended.
     std::thread::sleep(Duration::from_millis(1100));
     state.update(MetricsSnapshot {
         aggregate_tps: 200.0,
+        completion_tokens: 200,
         ..Default::default()
     });
-    assert_eq!(state.load().throughput_series, vec![100.0, 200.0]);
+    let series2 = state.load().throughput_series.clone();
+    assert_eq!(series2.len(), 2);
+    assert!(
+        series2[1] > 0.0,
+        "second sample must be positive: {}",
+        series2[1]
+    );
 }
 
 /// A later `update` atomically replaces the pointee; `load` sees the latest.

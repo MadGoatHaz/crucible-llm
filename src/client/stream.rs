@@ -587,25 +587,25 @@ impl StreamWorker {
                         .await;
                 }
                 ChunkRead::Error(msg) => {
-                        if ts.t2.is_some() {
-                            // Premature close mid-stream: a broken `chunked`
-                            // close or connection reset. Flush the pending
-                            // frame, keep every captured timestamp.
-                            if let Ok((_, tc)) = self
-                                .emit_frames(
-                                    parser.finish(),
-                                    &at,
-                                    ts,
-                                    tx,
-                                    &mut guard,
-                                    &mut last_token_at,
-                                )
-                                .await
-                            {
-                                tokens += tc;
-                            }
-                            ts.t_end = Some(at);
-                            self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
+                    if ts.t2.is_some() {
+                        // Premature close mid-stream: a broken `chunked`
+                        // close or connection reset. Flush the pending
+                        // frame, keep every captured timestamp.
+                        if let Ok((_, tc)) = self
+                            .emit_frames(
+                                parser.finish(),
+                                &at,
+                                ts,
+                                tx,
+                                &mut guard,
+                                &mut last_token_at,
+                            )
+                            .await
+                        {
+                            tokens += tc;
+                        }
+                        ts.t_end = Some(at);
+                        self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
                         let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                         return self
                             .finish_complete(
@@ -1169,7 +1169,9 @@ pub fn normalize_endpoint(base: &str) -> String {
 /// token frame arrived (a pure control/usage stream, a failure, or a
 /// non-streaming plain-JSON blob counted separately).
 #[must_use]
-pub fn token_window(events: &[StreamEvent]) -> (Option<MonotonicInstant>, Option<MonotonicInstant>) {
+pub fn token_window(
+    events: &[StreamEvent],
+) -> (Option<MonotonicInstant>, Option<MonotonicInstant>) {
     let mut first: Option<MonotonicInstant> = None;
     let mut last: Option<MonotonicInstant> = None;
     for e in events {
@@ -1455,7 +1457,8 @@ mod tests {
             "authoritative usage line missing: {latest}"
         );
         assert!(
-            latest.contains("test stream complete: ~119 tokens (est, no usage) in 0.2s (~595.0 t/s)"),
+            latest
+                .contains("test stream complete: ~119 tokens (est, no usage) in 0.2s (~595.0 t/s)"),
             "estimate line missing: {latest}"
         );
         assert!(

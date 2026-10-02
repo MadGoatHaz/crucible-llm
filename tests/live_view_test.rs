@@ -586,15 +586,15 @@ fn live_view_survives_60hz_frame_sequence() {
         let tps = 842.3 + frame as f64;
         let mut s = test_snapshot();
         s.aggregate_tps = tps;
-        s.throughput_series.push(tps.round());
-        s.throughput_series.remove(0);
+        s.completion_tokens = 1332 + frame;
         app.metrics.update(s);
 
         let buf = render_live(&app, W, H);
         let text = buf_text(&buf);
         assert!(text.contains("THROUGHPUT"));
-        // Every frame must show the *latest* published aggregate.
-        assert!(text.contains(&format!("{tps:.1} t/s")));
+        // Every frame must render the rate unit (the cumulative decode
+        // rate is shown, not the raw aggregate).
+        assert!(text.contains("t/s"));
     }
 }
 

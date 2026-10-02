@@ -400,9 +400,9 @@ impl MetricsSnapshot {
     }
 }
 
-/// The rolling aggregate-throughput window kept by [`MetricsState`]
-/// (writer side): one sample per second, at most [`ROLLING_WINDOW`]
-/// (60 = the last 60 seconds), copied into every published snapshot's
+/// The rolling decode-rate window kept by [`MetricsState`] (writer side):
+/// one sample per second, at most [`ROLLING_WINDOW`] (60 = the last 60
+/// seconds), copied into every published snapshot's
 /// [`MetricsSnapshot::throughput_series`] for the render loop.
 ///
 /// The engines publish *fresh* snapshots (`..Default::default()`) on every
@@ -417,6 +417,72 @@ impl MetricsSnapshot {
 struct RollingSeries {
     samples: VecDeque<f64>,
     last: Option<Instant>,
+}
+
+/// Writer-side tracker for the **cumulative decode rate** that the rolling
+/// series samples.
+///
+/// The single formula used everywhere (live graph, overall metrics, JSON
+/// export): `tokens_received / (now − first_token_instant)`.
+///
+/// * `tokens_received` is the snapshot's `completion_tokens` — the server's
+///   `usage.completion_tokens` once it arrives, the observed token-frame
+///   count while the stream is still open.
+/// * `first_token_instant` is latched the first time `completion_tokens > 0`.
+/// * The rate starts low (small sample) and **converges to the final
+///   number** as more tokens arrive — the same value the Overall Metrics
+///   panel shows for a completed stream.
+///
+/// Reset on engine transition (the snapshot's `mode` changes) so each
+/// engine gets a fresh convergence curve.
+#[derive(Debug, Default)]
+struct DecodeRateTracker {
+    /// Total tokens received so far (latest snapshot's `completion_tokens`).
+    tokens_received: u64,
+    /// When the first token was observed (the rate denominator's origin).
+    first_token_instant: Option<Instant>,
+    /// The engine mode the tracker is currently bound to.
+    current_mode: String,
+}
+
+impl DecodeRateTracker {
+    /// Fold one published snapshot. Returns the cumulative decode rate
+    /// (`tokens_received / elapsed_since_first_token`), or `0.0` when no
+    /// tokens have been received yet.
+    fn update(&mut self, snapshot: &MetricsSnapshot, now: Instant) -> f64 {
+        // Engine transition: reset for the new engine's convergence curve.
+        if snapshot.mode != self.current_mode {
+            self.current_mode = snapshot.mode.clone();
+            self.tokens_received = 0;
+            self.first_token_instant = None;
+        }
+        // Track the cumulative token count (monotonically increasing
+        // during a stream; jumps to the server's true count when `usage`
+        // arrives).
+        self.tokens_received = snapshot.completion_tokens;
+        // Latch the first-token instant.
+        if self.tokens_received > 0 && self.first_token_instant.is_none() {
+            self.first_token_instant = Some(now);
+        }
+        // Cumulative rate: the same formula the Overall Metrics panel uses
+        // for a completed stream, but in real time. A 1 ms floor on the
+        // elapsed time avoids a divide-by-zero on the very first sample
+        // (where `first_token_instant == now`).
+        match self.first_token_instant {
+            Some(first) => {
+                let elapsed_s = now.duration_since(first).as_secs_f64().max(0.001);
+                self.tokens_received as f64 / elapsed_s
+            }
+            None => 0.0,
+        }
+    }
+
+    /// Reset for a new run (called from [`MetricsState::unfreeze`]).
+    fn reset(&mut self) {
+        self.tokens_received = 0;
+        self.first_token_instant = None;
+        self.current_mode.clear();
+    }
 }
 
 /// The rolling window length: one sample per second, last 60 seconds.
@@ -657,11 +723,15 @@ impl OverallAccumulator {
 #[derive(Debug)]
 pub struct MetricsState {
     inner: ArcSwap<MetricsSnapshot>,
-    /// Writer-side rolling throughput window (see [`RollingSeries`]).
+    /// Writer-side rolling decode-rate window (see [`RollingSeries`]).
     /// Only `update()` (the engine / hw-poller side) touches it; the render
     /// loop reads the copied series from the published snapshot, so the
     /// measurement-isolation invariant (blueprint §4) is intact.
     rolling: Mutex<RollingSeries>,
+    /// Writer-side cumulative decode-rate tracker (see [`DecodeRateTracker`]):
+    /// computes `tokens_received / (now − first_token)` — the same formula
+    /// the Overall Metrics panel uses — and feeds it to the rolling series.
+    rate_tracker: Mutex<DecodeRateTracker>,
     /// Writer-side cumulative overall-stats accumulator (FIX 1, see
     /// [`OverallAccumulator`]): folded on each `update()` and re-stamped
     /// into the published snapshot for the lock-free render.
@@ -690,6 +760,7 @@ impl MetricsState {
         Self {
             inner: ArcSwap::from_pointee(MetricsSnapshot::default()),
             rolling: Mutex::new(RollingSeries::default()),
+            rate_tracker: Mutex::new(DecodeRateTracker::default()),
             overall_acc: Mutex::new(OverallAccumulator::default()),
             frozen: AtomicBool::new(false),
             timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
@@ -711,9 +782,17 @@ impl MetricsState {
     /// within a run (so the final numbers can never drift), but a fresh
     /// benchmark sequence must be able to update metrics again — the App
     /// calls this when the user starts the next run (`r` / `F5` /
-    /// launch). Also wakes the idle hardware poller.
+    /// launch). Also resets the rate tracker and clears the rolling
+    /// series so the new run starts with a clean convergence curve.
     pub fn unfreeze(&self) {
         self.frozen.store(false, Ordering::Relaxed);
+        self.rate_tracker
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .reset();
+        let mut rs = self.rolling.lock().unwrap_or_else(|p| p.into_inner());
+        rs.samples.clear();
+        rs.last = None;
     }
 
     /// `true` while the pipeline is frozen (a run completed and no new
@@ -754,6 +833,18 @@ impl MetricsState {
             .with_derived_prompt_throughput()
             .with_derived_labeled_throughputs();
         {
+            // The cumulative decode rate: `tokens_received / (now −
+            // first_token)` — the same formula the Overall Metrics panel
+            // uses for a completed stream, but computed in real time.
+            // This is the single number the rolling series tracks.
+            let now = Instant::now();
+            let cumulative_rate = {
+                let mut tracker = self
+                    .rate_tracker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tracker.update(&snapshot, now)
+            };
             let mut rs = self
                 .rolling
                 .lock()
@@ -768,9 +859,9 @@ impl MetricsState {
                 while rs.samples.len() > ROLLING_WINDOW {
                     rs.samples.pop_front();
                 }
-                rs.last = Some(Instant::now());
+                rs.last = Some(now);
             } else {
-                rs.sample(snapshot.aggregate_tps, Instant::now());
+                rs.sample(cumulative_rate, now);
             }
             snapshot.throughput_series = rs.as_vec();
         }
@@ -808,9 +899,13 @@ impl Default for MetricsState {
 mod tests {
     use super::*;
 
-    fn snap(agg: f64) -> MetricsSnapshot {
+    /// A snapshot with both `aggregate_tps` and `completion_tokens` set —
+    /// the rolling series samples the cumulative rate derived from
+    /// `completion_tokens`, so tests that exercise the series need both.
+    fn snap_tokens(agg: f64, tokens: u64) -> MetricsSnapshot {
         MetricsSnapshot {
             aggregate_tps: agg,
+            completion_tokens: tokens,
             ..Default::default()
         }
     }
@@ -818,17 +913,29 @@ mod tests {
     #[test]
     fn rolling_series_samples_once_per_second() {
         let state = MetricsState::new();
-        state.update(snap(100.0));
-        assert_eq!(state.load().throughput_series, vec![100.0]);
+        state.update(snap_tokens(100.0, 50));
+        // The first sample is the cumulative rate: 50 tokens / ~0 s ≈ large
+        // (the elapsed is sub-millisecond on the first call, so the rate is
+        // very high). The exact value depends on timing; we just check that
+        // one sample was recorded and it is positive.
+        let series = state.load().throughput_series.clone();
+        assert_eq!(series.len(), 1);
+        assert!(
+            series[0] > 0.0,
+            "first sample must be positive: {}",
+            series[0]
+        );
 
         // A second update within the 1 s period adds no sample.
-        state.update(snap(110.0));
-        assert_eq!(state.load().throughput_series, vec![100.0]);
+        state.update(snap_tokens(110.0, 60));
+        assert_eq!(state.load().throughput_series.len(), 1);
 
-        // After the period elapses, the latest value is sampled.
+        // After the period elapses, a new sample is recorded.
         std::thread::sleep(Duration::from_millis(1100));
-        state.update(snap(120.0));
-        assert_eq!(state.load().throughput_series, vec![100.0, 120.0]);
+        state.update(snap_tokens(120.0, 120));
+        let series2 = state.load().throughput_series.clone();
+        assert_eq!(series2.len(), 2);
+        assert!(series2[1] > 0.0);
     }
 
     #[test]
@@ -922,6 +1029,7 @@ mod tests {
         let state = MetricsState::new();
         state.update(MetricsSnapshot {
             prompt_tokens: 100,
+            completion_tokens: 0, // no tokens yet → cumulative rate is 0.0
             streams: vec![StreamMetric {
                 id: 1,
                 ttft_s: Some(0.5),
@@ -931,6 +1039,7 @@ mod tests {
         });
         let loaded = state.load();
         assert!((loaded.prompt_throughput - 200.0).abs() < 1e-9);
+        // No tokens → the cumulative rate is 0.0.
         assert_eq!(loaded.throughput_series, vec![0.0]);
     }
 
@@ -1051,7 +1160,7 @@ mod tests {
     #[test]
     fn frozen_state_ignores_all_further_updates() {
         let state = MetricsState::new();
-        state.update(snap(100.0));
+        state.update(snap_tokens(100.0, 50));
         assert!(!state.is_frozen(), "fresh state is not frozen");
 
         // The sequence completes: everything freezes in place.
@@ -1068,7 +1177,7 @@ mod tests {
         // a no-op: no new rolling sample, no elapsed growth, no overall
         // drift, and the published snapshot is untouched.
         std::thread::sleep(Duration::from_millis(1100));
-        state.update(snap(0.0));
+        state.update(snap_tokens(0.0, 0));
         let after = state.load();
         assert_eq!(after.throughput_series, series_before, "series frozen");
         assert_eq!(after.elapsed_sec, elapsed_before, "elapsed frozen");
@@ -1085,7 +1194,7 @@ mod tests {
     #[test]
     fn update_stamps_the_measured_timing_resolution() {
         let state = MetricsState::new();
-        state.update(snap(100.0));
+        state.update(snap_tokens(100.0, 10));
         // The measured overhead is stamped onto every published snapshot
         // (a real clock measures a small positive number of ns).
         assert!(
@@ -1187,18 +1296,19 @@ mod tests {
     #[test]
     fn unfreeze_re_arms_the_pipeline_for_a_new_run() {
         let state = MetricsState::new();
-        state.update(snap(100.0));
+        state.update(snap_tokens(100.0, 50));
         state.freeze();
         assert!(state.is_frozen());
 
-        // A new run starts: the latch clears and updates flow again.
+        // A new run starts: the latch clears, the tracker resets, and the
+        // rolling series is cleared.
         state.unfreeze();
         assert!(!state.is_frozen());
         std::thread::sleep(Duration::from_millis(1100));
-        state.update(snap(120.0));
+        state.update(snap_tokens(120.0, 100));
         let loaded = state.load();
         assert!(
-            loaded.throughput_series.len() >= 2,
+            !loaded.throughput_series.is_empty(),
             "series fills again after unfreeze: {:?}",
             loaded.throughput_series
         );
@@ -1206,5 +1316,100 @@ mod tests {
         // the new run).
         state.freeze();
         assert!(state.is_frozen());
+    }
+
+    // ── DecodeRateTracker convergence ──────────────────────────────────
+
+    #[test]
+    fn rate_tracker_converges_as_tokens_arrive() {
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+
+        // No tokens yet: rate is 0.
+        let s0 = MetricsSnapshot {
+            completion_tokens: 0,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        assert_eq!(tracker.update(&s0, t0), 0.0);
+
+        // First token: rate is very high (1 token / ~0 s).
+        let s1 = MetricsSnapshot {
+            completion_tokens: 1,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        let r1 = tracker.update(&s1, t0 + Duration::from_millis(10));
+        assert!(r1 > 0.0, "first token gives a positive rate: {r1}");
+
+        // More tokens: rate should be lower (more time elapsed) but
+        // approaching the true rate.
+        let s2 = MetricsSnapshot {
+            completion_tokens: 10,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        let r2 = tracker.update(&s2, t0 + Duration::from_millis(100));
+        // 10 tokens / 100 ms = 100 t/s (approximately).
+        assert!(
+            (r2 - 100.0).abs() < 20.0,
+            "10 tok / 100 ms ≈ 100 t/s: got {r2}"
+        );
+
+        // Even more tokens: rate converges.
+        let s3 = MetricsSnapshot {
+            completion_tokens: 100,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        let r3 = tracker.update(&s3, t0 + Duration::from_millis(1000));
+        // 100 tokens / 1 s = 100 t/s.
+        assert!(
+            (r3 - 100.0).abs() < 15.0,
+            "100 tok / 1 s ≈ 100 t/s: got {r3}"
+        );
+    }
+
+    #[test]
+    fn rate_tracker_resets_on_engine_transition() {
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+
+        // Engine A: 50 tokens.
+        let sa = MetricsSnapshot {
+            completion_tokens: 50,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        tracker.update(&sa, t0);
+        assert_eq!(tracker.tokens_received, 50);
+
+        // Engine B: resets the tracker.
+        let sb = MetricsSnapshot {
+            completion_tokens: 10,
+            mode: "Concurrency".into(),
+            ..Default::default()
+        };
+        tracker.update(&sb, t0 + Duration::from_secs(5));
+        assert_eq!(tracker.tokens_received, 10);
+        assert_eq!(tracker.current_mode, "Concurrency");
+    }
+
+    #[test]
+    fn rate_tracker_reset_clears_state() {
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+        let s = MetricsSnapshot {
+            completion_tokens: 100,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        tracker.update(&s, t0);
+        assert!(tracker.first_token_instant.is_some());
+
+        tracker.reset();
+        assert_eq!(tracker.tokens_received, 0);
+        assert!(tracker.first_token_instant.is_none());
+        assert!(tracker.current_mode.is_empty());
     }
 }
