@@ -214,6 +214,15 @@ pub struct MetricsSnapshot {
     // ---- token counts ----
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// The token frames **observed on the wire** (each `Reasoning` /
+    /// `Content` delta), cumulative across the stream. This is the
+    /// ground-truth numerator for the live decode rate: unlike
+    /// [`completion_tokens`](Self::completion_tokens) it never jumps to the
+    /// server's self-reported `usage` (which some backends — Unsloth /
+    /// llama.cpp — inflate to the requested `max_tokens` target). `0` when
+    /// the publishing engine does not report it (the rate tracker then falls
+    /// back to `completion_tokens`).
+    pub observed_frames: u64,
     pub reasoning_tokens: u64,
 
     // ---- decode-loop guard (v0.1.1) ----
@@ -267,6 +276,7 @@ impl Default for MetricsSnapshot {
             timing_resolution_ns: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
+            observed_frames: 0,
             reasoning_tokens: 0,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
@@ -419,25 +429,43 @@ struct RollingSeries {
     last: Option<Instant>,
 }
 
+/// The minimum time (seconds) that must elapse after the first token before
+/// the tracker emits a rate sample.
+///
+/// Without this gate the very first sample divides the token count by a
+/// near-zero elapsed time (`first_token_instant` is latched to the same
+/// instant it is first read), producing a spike of `tokens / ~0` (e.g.
+/// 8 000 t/s for 8 tokens). That single spike becomes the first rolling
+/// sample, the hero chart's y-axis auto-scales to it, and every real
+/// (~60 t/s) bar collapses to a sub-pixel sliver for a full 60 s window —
+/// the "graph shows the wrong number" symptom. Requiring a real elapsed
+/// time keeps the first sample bounded (and it still converges to the true
+/// rate as more tokens arrive).
+const MIN_ELAPSED_SECS: f64 = 0.05;
+
 /// Writer-side tracker for the **cumulative decode rate** that the rolling
 /// series samples.
 ///
 /// The single formula used everywhere (live graph, overall metrics, JSON
 /// export): `tokens_received / (now − first_token_instant)`.
 ///
-/// * `tokens_received` is the snapshot's `completion_tokens` — the server's
-///   `usage.completion_tokens` once it arrives, the observed token-frame
-///   count while the stream is still open.
-/// * `first_token_instant` is latched the first time `completion_tokens > 0`.
-/// * The rate starts low (small sample) and **converges to the final
-///   number** as more tokens arrive — the same value the Overall Metrics
-///   panel shows for a completed stream.
+/// * `tokens_received` is the snapshot's **observed token frames** (the wire
+///   truth) — it never jumps to the server's self-reported `usage` (which
+///   some backends inflate to the requested `max_tokens` target). Writers
+///   that don't report `observed_frames` fall back to `completion_tokens`.
+/// * `first_token_instant` is latched the first time the token count is
+///   non-zero.
+/// * No sample is emitted until at least [`MIN_ELAPSED_SECS`] has elapsed
+///   since the first token (avoids the divide-by-near-zero spike); after
+///   that the rate **converges to the final number** as more tokens arrive —
+///   the same value the Overall Metrics panel shows for a completed stream.
 ///
 /// Reset on engine transition (the snapshot's `mode` changes) so each
 /// engine gets a fresh convergence curve.
 #[derive(Debug, Default)]
 struct DecodeRateTracker {
-    /// Total tokens received so far (latest snapshot's `completion_tokens`).
+    /// Total tokens received so far (latest snapshot's `observed_frames`,
+    /// else `completion_tokens`).
     tokens_received: u64,
     /// When the first token was observed (the rate denominator's origin).
     first_token_instant: Option<Instant>,
@@ -447,33 +475,43 @@ struct DecodeRateTracker {
 
 impl DecodeRateTracker {
     /// Fold one published snapshot. Returns the cumulative decode rate
-    /// (`tokens_received / elapsed_since_first_token`), or `0.0` when no
-    /// tokens have been received yet.
-    fn update(&mut self, snapshot: &MetricsSnapshot, now: Instant) -> f64 {
+    /// (`tokens_received / elapsed_since_first_token`) once a meaningful
+    /// elapsed time has accumulated, or `None` when no sample should be
+    /// recorded yet (no tokens, or the elapsed is still below
+    /// [`MIN_ELAPSED_SECS`]).
+    fn update(&mut self, snapshot: &MetricsSnapshot, now: Instant) -> Option<f64> {
         // Engine transition: reset for the new engine's convergence curve.
         if snapshot.mode != self.current_mode {
             self.current_mode = snapshot.mode.clone();
             self.tokens_received = 0;
             self.first_token_instant = None;
         }
-        // Track the cumulative token count (monotonically increasing
-        // during a stream; jumps to the server's true count when `usage`
-        // arrives).
-        self.tokens_received = snapshot.completion_tokens;
+        // The numerator: the observed token frames on the wire (the ground
+        // truth — it stays monotonic and never jumps to an over-reported
+        // `usage`), falling back to `completion_tokens` for writers that do
+        // not report `observed_frames`.
+        let observed = snapshot.observed_frames;
+        self.tokens_received = if observed > 0 {
+            observed
+        } else {
+            snapshot.completion_tokens
+        };
         // Latch the first-token instant.
         if self.tokens_received > 0 && self.first_token_instant.is_none() {
             self.first_token_instant = Some(now);
         }
-        // Cumulative rate: the same formula the Overall Metrics panel uses
-        // for a completed stream, but in real time. A 1 ms floor on the
-        // elapsed time avoids a divide-by-zero on the very first sample
-        // (where `first_token_instant == now`).
         match self.first_token_instant {
             Some(first) => {
-                let elapsed_s = now.duration_since(first).as_secs_f64().max(0.001);
-                self.tokens_received as f64 / elapsed_s
+                let elapsed_s = now.duration_since(first).as_secs_f64();
+                // Not enough time has passed since the first token: emitting
+                // now would divide by a near-zero duration and spike. Skip
+                // this update (no rolling sample) until the elapsed is real.
+                if elapsed_s < MIN_ELAPSED_SECS {
+                    return None;
+                }
+                Some(self.tokens_received as f64 / elapsed_s)
             }
-            None => 0.0,
+            None => None,
         }
     }
 
@@ -836,7 +874,10 @@ impl MetricsState {
             // The cumulative decode rate: `tokens_received / (now −
             // first_token)` — the same formula the Overall Metrics panel
             // uses for a completed stream, but computed in real time.
-            // This is the single number the rolling series tracks.
+            // This is the single number the rolling series tracks. The
+            // tracker returns `None` until a meaningful elapsed time has
+            // accumulated (no divide-by-near-zero spike), so no rolling
+            // sample is recorded for those early updates.
             let now = Instant::now();
             let cumulative_rate = {
                 let mut tracker = self
@@ -860,8 +901,8 @@ impl MetricsState {
                     rs.samples.pop_front();
                 }
                 rs.last = Some(now);
-            } else {
-                rs.sample(cumulative_rate, now);
+            } else if let Some(rate) = cumulative_rate {
+                rs.sample(rate, now);
             }
             snapshot.throughput_series = rs.as_vec();
         }
@@ -899,13 +940,15 @@ impl Default for MetricsState {
 mod tests {
     use super::*;
 
-    /// A snapshot with both `aggregate_tps` and `completion_tokens` set —
-    /// the rolling series samples the cumulative rate derived from
-    /// `completion_tokens`, so tests that exercise the series need both.
+    /// A snapshot with both `aggregate_tps` and a token count set —
+    /// the rolling series samples the cumulative decode rate, so tests that
+    /// exercise the series need a non-zero token count (`observed_frames`,
+    /// the wire-truth numerator the tracker reads).
     fn snap_tokens(agg: f64, tokens: u64) -> MetricsSnapshot {
         MetricsSnapshot {
             aggregate_tps: agg,
             completion_tokens: tokens,
+            observed_frames: tokens,
             ..Default::default()
         }
     }
@@ -913,29 +956,36 @@ mod tests {
     #[test]
     fn rolling_series_samples_once_per_second() {
         let state = MetricsState::new();
+        // The first update latches the first-token origin. With ~0 elapsed
+        // time the tracker emits no sample (a divide-by-near-zero would
+        // spike to `tokens / 0.001` and dominate the chart's y-axis).
         state.update(snap_tokens(100.0, 50));
-        // The first sample is the cumulative rate: 50 tokens / ~0 s ≈ large
-        // (the elapsed is sub-millisecond on the first call, so the rate is
-        // very high). The exact value depends on timing; we just check that
-        // one sample was recorded and it is positive.
-        let series = state.load().throughput_series.clone();
-        assert_eq!(series.len(), 1);
-        assert!(
-            series[0] > 0.0,
-            "first sample must be positive: {}",
-            series[0]
+        assert_eq!(
+            state.load().throughput_series.len(),
+            0,
+            "no sample on the zero-elapsed first update"
         );
 
-        // A second update within the 1 s period adds no sample.
+        // A second update in the same instant still has no real elapsed.
         state.update(snap_tokens(110.0, 60));
-        assert_eq!(state.load().throughput_series.len(), 1);
+        assert_eq!(state.load().throughput_series.len(), 0);
 
-        // After the period elapses, a new sample is recorded.
+        // After a real elapsed (1.1 s) the first sample lands — a bounded
+        // cumulative rate (120 tokens / ~1.1 s), never a spike.
         std::thread::sleep(Duration::from_millis(1100));
         state.update(snap_tokens(120.0, 120));
-        let series2 = state.load().throughput_series.clone();
-        assert_eq!(series2.len(), 2);
-        assert!(series2[1] > 0.0);
+        let series = state.load().throughput_series.clone();
+        assert_eq!(
+            series.len(),
+            1,
+            "one sample after a real elapsed: {series:?}"
+        );
+        assert!(series[0] > 0.0, "sample is positive: {}", series[0]);
+        assert!(
+            series[0] < 1000.0,
+            "first sample is bounded (no divide-by-floor spike): {}",
+            series[0]
+        );
     }
 
     #[test]
@@ -1039,8 +1089,9 @@ mod tests {
         });
         let loaded = state.load();
         assert!((loaded.prompt_throughput - 200.0).abs() < 1e-9);
-        // No tokens → the cumulative rate is 0.0.
-        assert_eq!(loaded.throughput_series, vec![0.0]);
+        // No tokens → no decode-rate sample yet (the series stays empty;
+        // the hero renders "Awaiting first tokens…").
+        assert!(loaded.throughput_series.is_empty());
     }
 
     // ── overall stats (FIX 1) ────────────────────────────────────────────
@@ -1304,8 +1355,13 @@ mod tests {
         // rolling series is cleared.
         state.unfreeze();
         assert!(!state.is_frozen());
-        std::thread::sleep(Duration::from_millis(1100));
+        // The first update after unfreeze re-latches the origin (no sample
+        // yet — the elapsed since the latch is ~0).
         state.update(snap_tokens(120.0, 100));
+        assert!(state.load().throughput_series.is_empty());
+        // After a real elapsed the series fills again.
+        std::thread::sleep(Duration::from_millis(1100));
+        state.update(snap_tokens(130.0, 200));
         let loaded = state.load();
         assert!(
             !loaded.throughput_series.is_empty(),
@@ -1325,48 +1381,62 @@ mod tests {
         let mut tracker = DecodeRateTracker::default();
         let t0 = Instant::now();
 
-        // No tokens yet: rate is 0.
+        // No tokens yet: no sample.
         let s0 = MetricsSnapshot {
             completion_tokens: 0,
+            observed_frames: 0,
             mode: "short".into(),
             ..Default::default()
         };
-        assert_eq!(tracker.update(&s0, t0), 0.0);
+        assert!(tracker.update(&s0, t0).is_none());
 
-        // First token: rate is very high (1 token / ~0 s).
+        // First token: the origin latches, but with ~0 elapsed no sample is
+        // emitted — this is exactly what prevents the divide-by-floor spike
+        // (1 token / 0.001 s = 1000 t/s) from reaching the rolling series.
         let s1 = MetricsSnapshot {
             completion_tokens: 1,
+            observed_frames: 1,
             mode: "short".into(),
             ..Default::default()
         };
-        let r1 = tracker.update(&s1, t0 + Duration::from_millis(10));
-        assert!(r1 > 0.0, "first token gives a positive rate: {r1}");
+        assert!(
+            tracker
+                .update(&s1, t0 + Duration::from_millis(10))
+                .is_none(),
+            "zero-elapsed first token emits no sample"
+        );
 
-        // More tokens: rate should be lower (more time elapsed) but
+        // More tokens after a real elapsed: a bounded cumulative rate
         // approaching the true rate.
         let s2 = MetricsSnapshot {
             completion_tokens: 10,
+            observed_frames: 10,
             mode: "short".into(),
             ..Default::default()
         };
-        let r2 = tracker.update(&s2, t0 + Duration::from_millis(100));
-        // 10 tokens / 100 ms = 100 t/s (approximately).
+        let r2 = tracker
+            .update(&s2, t0 + Duration::from_millis(100))
+            .expect("real elapsed yields a rate");
+        // 10 tokens / 90 ms (since the latch at +10 ms) ≈ 111 t/s.
         assert!(
-            (r2 - 100.0).abs() < 20.0,
-            "10 tok / 100 ms ≈ 100 t/s: got {r2}"
+            (r2 - 100.0).abs() < 25.0,
+            "10 tok / ~90 ms ≈ 100 t/s: got {r2}"
         );
 
-        // Even more tokens: rate converges.
+        // Even more tokens: the rate converges to the true 100 t/s.
         let s3 = MetricsSnapshot {
             completion_tokens: 100,
+            observed_frames: 100,
             mode: "short".into(),
             ..Default::default()
         };
-        let r3 = tracker.update(&s3, t0 + Duration::from_millis(1000));
-        // 100 tokens / 1 s = 100 t/s.
+        let r3 = tracker
+            .update(&s3, t0 + Duration::from_millis(1000))
+            .expect("real elapsed yields a rate");
+        // 100 tokens / 990 ms (since the latch at +10 ms) ≈ 101 t/s.
         assert!(
             (r3 - 100.0).abs() < 15.0,
-            "100 tok / 1 s ≈ 100 t/s: got {r3}"
+            "100 tok / ~990 ms ≈ 100 t/s: got {r3}"
         );
     }
 
@@ -1378,19 +1448,21 @@ mod tests {
         // Engine A: 50 tokens.
         let sa = MetricsSnapshot {
             completion_tokens: 50,
+            observed_frames: 50,
             mode: "short".into(),
             ..Default::default()
         };
-        tracker.update(&sa, t0);
+        let _ = tracker.update(&sa, t0);
         assert_eq!(tracker.tokens_received, 50);
 
         // Engine B: resets the tracker.
         let sb = MetricsSnapshot {
             completion_tokens: 10,
+            observed_frames: 10,
             mode: "Concurrency".into(),
             ..Default::default()
         };
-        tracker.update(&sb, t0 + Duration::from_secs(5));
+        let _ = tracker.update(&sb, t0 + Duration::from_secs(5));
         assert_eq!(tracker.tokens_received, 10);
         assert_eq!(tracker.current_mode, "Concurrency");
     }
@@ -1401,10 +1473,11 @@ mod tests {
         let t0 = Instant::now();
         let s = MetricsSnapshot {
             completion_tokens: 100,
+            observed_frames: 100,
             mode: "short".into(),
             ..Default::default()
         };
-        tracker.update(&s, t0);
+        let _ = tracker.update(&s, t0);
         assert!(tracker.first_token_instant.is_some());
 
         tracker.reset();

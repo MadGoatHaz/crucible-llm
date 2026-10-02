@@ -558,6 +558,9 @@ impl FlatOutEngine {
             itl_p99_ns: itl.p99() as u64,
             itl_p999_ns: itl.p999() as u64,
             completion_tokens: tokens_received,
+            // The wire-truth numerator: the token frames actually observed
+            // on the wire (never the server's self-reported `usage`).
+            observed_frames: frame_tokens,
             prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
             status,
             streams: vec![crate::metrics::state::StreamMetric {

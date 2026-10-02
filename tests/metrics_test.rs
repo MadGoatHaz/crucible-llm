@@ -224,35 +224,42 @@ fn snapshot_update_load_roundtrip() {
 #[test]
 fn update_maintains_the_rolling_throughput_series() {
     let state = MetricsState::new();
+    // The first update latches the first-token origin; with ~0 elapsed the
+    // tracker emits no sample (a divide-by-near-zero would spike and
+    // dominate the chart's auto-scaled y-axis).
     state.update(MetricsSnapshot {
         aggregate_tps: 100.0,
         completion_tokens: 100,
+        observed_frames: 100,
         ..Default::default()
     });
-    // One sample recorded; the cumulative rate is positive (100 tokens
-    // over a sub-millisecond window).
-    let series = state.load().throughput_series.clone();
-    assert_eq!(series.len(), 1);
-    assert!(series[0] > 0.0, "rate must be positive: {}", series[0]);
+    assert_eq!(state.load().throughput_series.len(), 0);
 
-    // A fresh default snapshot (as every engine batch publishes) does
-    // not wipe the window (the 1 s sample period has not elapsed).
+    // A fresh default snapshot (as every engine batch publishes) does not
+    // add a sample (no tokens) and does not wipe the (empty) window.
     state.update(MetricsSnapshot::default());
-    assert_eq!(state.load().throughput_series.len(), 1);
+    assert_eq!(state.load().throughput_series.len(), 0);
 
-    // After the 1 s sample period, a new sample is appended.
+    // After a real elapsed (1.1 s) the first sample is recorded — a bounded
+    // cumulative rate (200 tokens / ~1.1 s), never a spike.
     std::thread::sleep(Duration::from_millis(1100));
     state.update(MetricsSnapshot {
         aggregate_tps: 200.0,
         completion_tokens: 200,
+        observed_frames: 200,
         ..Default::default()
     });
-    let series2 = state.load().throughput_series.clone();
-    assert_eq!(series2.len(), 2);
+    let series = state.load().throughput_series.clone();
+    assert_eq!(
+        series.len(),
+        1,
+        "one sample after a real elapsed: {series:?}"
+    );
+    assert!(series[0] > 0.0, "sample must be positive: {}", series[0]);
     assert!(
-        series2[1] > 0.0,
-        "second sample must be positive: {}",
-        series2[1]
+        series[0] < 1000.0,
+        "sample must be bounded, not a divide-by-floor spike: {}",
+        series[0]
     );
 }
 

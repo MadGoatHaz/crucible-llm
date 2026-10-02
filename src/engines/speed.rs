@@ -506,6 +506,11 @@ impl SpeedEngine {
             itl_p999_ns: itl.p999() as u64,
             prompt_tokens,
             completion_tokens: tokens_received,
+            // The wire-truth numerator for the live decode rate: the token
+            // frames actually observed on the wire (never the server's
+            // self-reported `usage`, which some backends inflate to the
+            // `max_tokens` target).
+            observed_frames: token_frames,
             status: state,
             loop_excluded_streams: looping as usize,
             loop_excluded_tokens,

@@ -1140,6 +1140,14 @@ impl Sweep {
             // seam derives `prompt_throughput` = prompt / mean TTFT from
             // this plus the per-stream TTFTs.
             prompt_tokens: acc.prompt_tokens_so_far(),
+            // The cumulative token count so the decode-rate tracker (and the
+            // hardware J/token gauge) has a real numerator while Engine B
+            // runs — previously this stayed `0`, which made the live
+            // throughput graph sample flat zeros for the whole sweep.
+            completion_tokens: non_looping,
+            // The wire-truth numerator: the token frames actually observed
+            // on the wire (excluding looping streams).
+            observed_frames: acc.tokens_so_far(),
             prefill_throughput: prefill,
             decode_throughput: decode,
             e2e_throughput: e2e,
