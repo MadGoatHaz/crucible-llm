@@ -37,7 +37,7 @@ use arc_swap::ArcSwap;
 use rand::Rng;
 use tokio::sync::mpsc;
 
-use crate::client::{run_worker, StreamEvent, StreamWorker};
+use crate::client::{join_worker, spawn_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
@@ -674,8 +674,9 @@ impl NiahEngine {
         }
 
         let start = MonotonicInstant::now();
-        // A worker-task panic becomes a failed outcome, never a crash.
-        let outcome = run_worker(worker, tx).await;
+        // Spawn without awaiting: drain the channel concurrently to avoid
+        // the >capacity deadlock (server-agnostic fix).
+        let handle = spawn_worker(worker, tx);
         let mut response = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
@@ -722,6 +723,9 @@ impl NiahEngine {
                 NIAH_MAX_GEN_TOKENS,
             ));
         }
+
+        // Channel closed: collect the outcome.
+        let outcome = join_worker(handle).await;
 
         let retrieved = needle.is_retrieved(&response);
         // §7 timing deltas (the worker owns the quanta stamps).

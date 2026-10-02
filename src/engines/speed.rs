@@ -26,7 +26,9 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::client::{run_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker};
+use crate::client::{
+    join_worker, spawn_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker,
+};
 use crate::config::{Config, Mode};
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
@@ -258,8 +260,12 @@ impl SpeedEngine {
         }
 
         let start = MonotonicInstant::now();
-        // A worker-task panic becomes a failed outcome, never a crash.
-        let outcome = run_worker(worker, tx).await;
+        // Spawn the worker without awaiting it: the channel must be
+        // drained concurrently, or a >capacity frame count deadlocks
+        // the worker's `tx.send()` (server-agnostic fix: llama.cpp,
+        // LM Studio, Unsloth emit one SSE frame per token including
+        // reasoning_content, easily exceeding the 256-slot channel).
+        let handle = spawn_worker(worker, tx);
         let mut events = Vec::new();
         let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
@@ -284,6 +290,9 @@ impl SpeedEngine {
         if let Some(state) = &self.metrics {
             state.update(self.live_snapshot(&events, &start));
         }
+        // Channel is closed (worker done): collect the outcome. A task
+        // panic becomes a failed outcome, never a crash.
+        let outcome = join_worker(handle).await;
         (aggregate(&self.cfg, prompt, &outcome, &events), events)
     }
 
