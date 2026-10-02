@@ -437,28 +437,69 @@ struct RollingSeries {
 /// instant it is first read), producing a spike of `tokens / ~0` (e.g.
 /// 8 000 t/s for 8 tokens). That single spike becomes the first rolling
 /// sample, the hero chart's y-axis auto-scales to it, and every real
-/// (~60 t/s) bar collapses to a sub-pixel sliver for a full 60 s window —
-/// the "graph shows the wrong number" symptom. Requiring a real elapsed
-/// time keeps the first sample bounded (and it still converges to the true
-/// rate as more tokens arrive).
+/// (~60 t/s) bar collapses to a sub-pixel sliver — the "graph shows the
+/// wrong number" symptom. Requiring a real elapsed time keeps the sample
+/// bounded (and the rate still converges to the true number as more tokens
+/// arrive).
 const MIN_ELAPSED_SECS: f64 = 0.05;
+
+/// The minimum time (seconds) of *real decoding* before the **first**
+/// cumulative sample is emitted.
+///
+/// The 50 ms floor alone is not enough: the first publish carrying tokens
+/// arrives a batch (8/16 frames) after the true first token, so a sample
+/// taken 50 ms after that latch divides a *small* token count by a *short*
+/// duration and spikes (10 tokens / 0.05 s = 200 t/s for a ~55 t/s stream).
+/// That spike auto-scales the hero chart's y-axis to ~220 and collapses
+/// every real (~55 t/s) bar to a sliver — the graph then reads *lower*
+/// than the OVERALL METRICS panel next to it. Requiring half a second of
+/// decoding keeps the first sample close to the true rate; the cumulative
+/// curve then converges, and the stream's *exact* final rate
+/// (`gen_tps` = `total_tokens / generation_duration`, the same value the
+/// Overall Metrics panel records) lands as the last sample.
+const FIRST_SAMPLE_ELAPSED: f64 = 0.5;
+
+/// One decoded-rate sample for the rolling series.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RateSample {
+    /// A live cumulative sample (`tokens_received / elapsed`) — appended
+    /// through the window's normal 1 s cadence.
+    Live(f64),
+    /// The stream's **exact** final rate (its `gen_tps`): `total_tokens /
+    /// generation_duration` — the same formula and value the OVERALL
+    /// METRICS panel records for the completed stream. Forced into the
+    /// series even when it lands inside the 1 s cadence of the last live
+    /// sample (a short stream), so the graph's last bar is the true
+    /// number, never a decaying estimate.
+    Final(f64),
+}
 
 /// Writer-side tracker for the **cumulative decode rate** that the rolling
 /// series samples.
 ///
-/// The single formula used everywhere (live graph, overall metrics, JSON
-/// export): `tokens_received / (now − first_token_instant)`.
-///
-/// * `tokens_received` is the snapshot's **observed token frames** (the wire
-///   truth) — it never jumps to the server's self-reported `usage` (which
-///   some backends inflate to the requested `max_tokens` target). Writers
-///   that don't report `observed_frames` fall back to `completion_tokens`.
-/// * `first_token_instant` is latched the first time the token count is
-///   non-zero.
-/// * No sample is emitted until at least [`MIN_ELAPSED_SECS`] has elapsed
-///   since the first token (avoids the divide-by-near-zero spike); after
-///   that the rate **converges to the final number** as more tokens arrive —
-///   the same value the Overall Metrics panel shows for a completed stream.
+/// * While a stream is open the tracker emits the cumulative rate
+///   `tokens_received / (now − first_token_instant)` (gated by
+///   [`FIRST_SAMPLE_ELAPSED`] for the first sample so it cannot spike).
+///   `tokens_received` is the snapshot's **observed token frames** (the
+///   wire truth) — it never jumps to the server's self-reported `usage`
+///   (which some backends inflate to the requested `max_tokens` target).
+///   Writers that don't report `observed_frames` fall back to
+///   `completion_tokens`. `first_token_instant` is latched the first time
+///   the token count is non-zero.
+/// * When a stream row completes (non-terminal → terminal — the *same*
+///   transition the [`OverallAccumulator`] folds on), the tracker emits
+///   [`RateSample::Final`] with that stream's **exact** `gen_tps`
+///   (`total_tokens / generation_duration`) — the same value the OVERALL
+///   METRICS panel shows. The graph's last bar is therefore the same
+///   number as the panel's.
+/// * After a `Final`, the tracker is *finished*: it emits no further
+///   samples. Post-completion updates (the engine's duplicate final
+///   publish, the 100 ms hardware poller re-publishing the merged
+///   snapshot, the summary hold) would otherwise divide the fixed token
+///   count by a *growing* elapsed and drag the series below the true rate
+///   — the "graph shows a lower number than Overall Metrics" symptom.
+///   A new stream in the same mode (a re-used stream id, the next
+///   iteration, the next Engine B level) re-arms the tracker.
 ///
 /// Reset on engine transition (the snapshot's `mode` changes) so each
 /// engine gets a fresh convergence curve.
@@ -471,20 +512,33 @@ struct DecodeRateTracker {
     first_token_instant: Option<Instant>,
     /// The engine mode the tracker is currently bound to.
     current_mode: String,
+    /// The previous per-stream state (completion-transition detection —
+    /// the same signal the [`OverallAccumulator`] folds on).
+    prev_state: HashMap<u32, StreamStatus>,
+    /// No cumulative sample has been emitted yet for the current stream
+    /// (the first one needs [`FIRST_SAMPLE_ELAPSED`], not just
+    /// [`MIN_ELAPSED_SECS`]).
+    first_sample: bool,
+    /// The current stream completed and its exact `gen_tps` was pushed as
+    /// the final sample: no further samples until a new stream starts.
+    finished: bool,
 }
 
 impl DecodeRateTracker {
-    /// Fold one published snapshot. Returns the cumulative decode rate
-    /// (`tokens_received / elapsed_since_first_token`) once a meaningful
-    /// elapsed time has accumulated, or `None` when no sample should be
-    /// recorded yet (no tokens, or the elapsed is still below
-    /// [`MIN_ELAPSED_SECS`]).
-    fn update(&mut self, snapshot: &MetricsSnapshot, now: Instant) -> Option<f64> {
+    /// Fold one published snapshot. Returns the rate sample to record —
+    /// [`RateSample::Final`] on a stream completion (the exact `gen_tps`),
+    /// [`RateSample::Live`] once a meaningful elapsed time has accumulated,
+    /// or `None` when no sample should be recorded yet (no tokens, below
+    /// the first-sample gate, or the stream is already finished).
+    fn update(&mut self, snapshot: &MetricsSnapshot, now: Instant) -> Option<RateSample> {
         // Engine transition: reset for the new engine's convergence curve.
         if snapshot.mode != self.current_mode {
             self.current_mode = snapshot.mode.clone();
             self.tokens_received = 0;
             self.first_token_instant = None;
+            self.first_sample = true;
+            self.finished = false;
+            self.prev_state.clear();
         }
         // The numerator: the observed token frames on the wire (the ground
         // truth — it stays monotonic and never jumps to an over-reported
@@ -496,6 +550,57 @@ impl DecodeRateTracker {
         } else {
             snapshot.completion_tokens
         };
+
+        // Completion: any stream row transitions non-terminal → terminal
+        // (the same detection the `OverallAccumulator` uses to fold the
+        // stream's `gen_tps` into the overall stats). The final rolling
+        // sample is that exact `gen_tps` — `total_tokens /
+        // generation_duration` — so the graph's last bar carries the same
+        // number the OVERALL METRICS panel reports.
+        let mut any_transition = false;
+        let mut final_rate: Option<f64> = None;
+        for st in &snapshot.streams {
+            let terminal = matches!(st.state, StreamStatus::Done | StreamStatus::Error);
+            let was_terminal = self
+                .prev_state
+                .get(&st.id)
+                .is_some_and(|p| matches!(p, StreamStatus::Done | StreamStatus::Error));
+            if terminal && !was_terminal {
+                any_transition = true;
+                // Looping streams are excluded — exactly as the overall
+                // accumulator excludes them from its `gen` samples.
+                if !st.looping {
+                    if let Some(g) = st.gen_tps.filter(|g| *g > 0.0) {
+                        final_rate = Some(final_rate.map_or(g, |c| c.max(g)));
+                    }
+                }
+            }
+            self.prev_state.insert(st.id, st.state);
+        }
+        if any_transition {
+            self.finished = true;
+            return final_rate.map(RateSample::Final);
+        }
+
+        // A finished stream emits no further samples (no post-completion
+        // decay). A *new* stream in the same mode — a re-used stream id
+        // (next iteration / next Engine B level) reporting a non-terminal
+        // state with tokens — re-arms the tracker. Snapshots with no stream
+        // rows (the hardware poller's merge, the app seed) do not.
+        if self.finished {
+            let new_stream = snapshot
+                .streams
+                .iter()
+                .any(|st| matches!(st.state, StreamStatus::Waiting | StreamStatus::Streaming))
+                && self.tokens_received > 0;
+            if !new_stream {
+                return None;
+            }
+            self.finished = false;
+            self.first_sample = true;
+            self.first_token_instant = None;
+        }
+
         // Latch the first-token instant.
         if self.tokens_received > 0 && self.first_token_instant.is_none() {
             self.first_token_instant = Some(now);
@@ -503,13 +608,22 @@ impl DecodeRateTracker {
         match self.first_token_instant {
             Some(first) => {
                 let elapsed_s = now.duration_since(first).as_secs_f64();
-                // Not enough time has passed since the first token: emitting
-                // now would divide by a near-zero duration and spike. Skip
-                // this update (no rolling sample) until the elapsed is real.
-                if elapsed_s < MIN_ELAPSED_SECS {
+                // The first sample needs real decoding time
+                // ([`FIRST_SAMPLE_ELAPSED`]): an earlier one divides a
+                // small token count by a short duration and spikes the
+                // chart's y-axis. After the first sample, the window's 1 s
+                // cadence gates the rest (and [`MIN_ELAPSED_SECS`] keeps a
+                // same-instant re-publish from re-sampling).
+                let gate = if self.first_sample {
+                    FIRST_SAMPLE_ELAPSED
+                } else {
+                    MIN_ELAPSED_SECS
+                };
+                if elapsed_s < gate {
                     return None;
                 }
-                Some(self.tokens_received as f64 / elapsed_s)
+                self.first_sample = false;
+                Some(RateSample::Live(self.tokens_received as f64 / elapsed_s))
             }
             None => None,
         }
@@ -520,6 +634,9 @@ impl DecodeRateTracker {
         self.tokens_received = 0;
         self.first_token_instant = None;
         self.current_mode.clear();
+        self.prev_state.clear();
+        self.first_sample = true;
+        self.finished = false;
     }
 }
 
@@ -564,6 +681,21 @@ impl RollingSeries {
                     true
                 }
             }
+        }
+    }
+
+    /// Append `value` **unconditionally** (bypassing the 1 s cadence) and
+    /// advance the cadence anchor.
+    ///
+    /// Used for a stream's exact final rate ([`RateSample::Final`]): the
+    /// last bar of the graph must be the true number even when the
+    /// stream completes less than a second after the previous live sample
+    /// (a short stream), where the normal cadence would drop it.
+    fn force_sample(&mut self, value: f64, now: Instant) {
+        self.samples.push_back(value);
+        self.last = Some(now);
+        while self.samples.len() > ROLLING_WINDOW {
+            self.samples.pop_front();
         }
     }
 
@@ -872,14 +1004,17 @@ impl MetricsState {
             .with_derived_labeled_throughputs();
         {
             // The cumulative decode rate: `tokens_received / (now −
-            // first_token)` — the same formula the Overall Metrics panel
-            // uses for a completed stream, but computed in real time.
-            // This is the single number the rolling series tracks. The
-            // tracker returns `None` until a meaningful elapsed time has
-            // accumulated (no divide-by-near-zero spike), so no rolling
-            // sample is recorded for those early updates.
+            // first_token)` — computed in real time while the stream is
+            // open. On stream completion the tracker instead emits the
+            // stream's *exact* `gen_tps` (`total_tokens /
+            // generation_duration`) — the same value the Overall Metrics
+            // panel records — as the series' final sample, so the graph
+            // ends on the true number. The tracker returns `None` until a
+            // meaningful elapsed time has accumulated (no
+            // divide-by-near-zero spike), and emits nothing after a
+            // completed stream (no post-completion decay).
             let now = Instant::now();
-            let cumulative_rate = {
+            let rate_sample = {
                 let mut tracker = self
                     .rate_tracker
                     .lock()
@@ -901,8 +1036,16 @@ impl MetricsState {
                     rs.samples.pop_front();
                 }
                 rs.last = Some(now);
-            } else if let Some(rate) = cumulative_rate {
-                rs.sample(rate, now);
+            } else if let Some(sample) = rate_sample {
+                match sample {
+                    RateSample::Live(rate) => {
+                        rs.sample(rate, now);
+                    }
+                    // The exact final rate bypasses the 1 s cadence: the
+                    // graph's last bar is the stream's true number even
+                    // for a short stream.
+                    RateSample::Final(rate) => rs.force_sample(rate, now),
+                }
             }
             snapshot.throughput_series = rs.as_vec();
         }
@@ -1451,38 +1594,64 @@ mod tests {
             "zero-elapsed first token emits no sample"
         );
 
-        // More tokens after a real elapsed: a bounded cumulative rate
-        // approaching the true rate.
+        // 10 tokens, 90 ms since the latch: the first-sample gate (0.5 s of
+        // real decoding) still holds. Sampling here would be 10 / 0.09 and
+        // earlier still 10 / 0.05 = 200 t/s for a ~100 t/s stream — a spike
+        // that would auto-scale the chart's y-axis and collapse every real
+        // bar to a sliver.
         let s2 = MetricsSnapshot {
             completion_tokens: 10,
             observed_frames: 10,
             mode: "short".into(),
             ..Default::default()
         };
-        let r2 = tracker
-            .update(&s2, t0 + Duration::from_millis(100))
-            .expect("real elapsed yields a rate");
-        // 10 tokens / 90 ms (since the latch at +10 ms) ≈ 111 t/s.
         assert!(
-            (r2 - 100.0).abs() < 25.0,
-            "10 tok / ~90 ms ≈ 100 t/s: got {r2}"
+            tracker
+                .update(&s2, t0 + Duration::from_millis(100))
+                .is_none(),
+            "no first sample before 0.5 s of real decoding"
         );
 
-        // Even more tokens: the rate converges to the true 100 t/s.
+        // Half a second of real decoding: the first sample is bounded and
+        // close to the true rate.
         let s3 = MetricsSnapshot {
+            completion_tokens: 60,
+            observed_frames: 60,
+            mode: "short".into(),
+            ..Default::default()
+        };
+        let r3 = tracker
+            .update(&s3, t0 + Duration::from_millis(560))
+            .expect("real elapsed yields a rate");
+        match r3 {
+            RateSample::Live(r) => {
+                assert!(
+                    (r - 100.0).abs() < 25.0,
+                    "60 tok / ~0.5 s ≈ 100 t/s: got {r}"
+                );
+            }
+            RateSample::Final(_) => panic!("no stream completed in this test"),
+        }
+
+        // Even more tokens: the rate converges to the true 100 t/s.
+        let s4 = MetricsSnapshot {
             completion_tokens: 100,
             observed_frames: 100,
             mode: "short".into(),
             ..Default::default()
         };
-        let r3 = tracker
-            .update(&s3, t0 + Duration::from_millis(1000))
+        let r4 = tracker
+            .update(&s4, t0 + Duration::from_millis(1000))
             .expect("real elapsed yields a rate");
-        // 100 tokens / 990 ms (since the latch at +10 ms) ≈ 101 t/s.
-        assert!(
-            (r3 - 100.0).abs() < 15.0,
-            "100 tok / ~990 ms ≈ 100 t/s: got {r3}"
-        );
+        match r4 {
+            RateSample::Live(r) => {
+                assert!(
+                    (r - 100.0).abs() < 15.0,
+                    "100 tok / ~0.99 s ≈ 101 t/s: got {r}"
+                );
+            }
+            RateSample::Final(_) => panic!("no stream completed in this test"),
+        }
     }
 
     #[test]
@@ -1529,5 +1698,246 @@ mod tests {
         assert_eq!(tracker.tokens_received, 0);
         assert!(tracker.first_token_instant.is_none());
         assert!(tracker.current_mode.is_empty());
+        assert!(tracker.prev_state.is_empty());
+        assert!(tracker.first_sample);
+        assert!(!tracker.finished);
+    }
+
+    // ── completion: the graph ends on the Overall Metrics' number ─────
+
+    fn done_stream_snap(id: u32, gen: Option<f64>, tokens: u64, looping: bool) -> MetricsSnapshot {
+        MetricsSnapshot {
+            completion_tokens: tokens,
+            observed_frames: tokens,
+            mode: "short".into(),
+            status: StreamStatus::Done,
+            streams: vec![StreamMetric {
+                id,
+                state: StreamStatus::Done,
+                gen_tps: gen,
+                tg_tokens: (tokens > 0).then_some(tokens),
+                looping,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn live_stream_snap(id: u32, tokens: u64) -> MetricsSnapshot {
+        MetricsSnapshot {
+            completion_tokens: tokens,
+            observed_frames: tokens,
+            mode: "short".into(),
+            status: StreamStatus::Streaming,
+            streams: vec![StreamMetric {
+                id,
+                state: StreamStatus::Streaming,
+                tg_tokens: (tokens > 0).then_some(tokens),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rate_tracker_final_sample_is_the_exact_gen_tps() {
+        // The user-reported Live-vs-Overall discrepancy: the rolling
+        // series' last sample must be the stream's exact `gen_tps`
+        // (`total_tokens / generation_duration`) — the same value the
+        // OVERALL METRICS panel records — not the tracker's decaying
+        // cumulative estimate.
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+
+        // In flight at ~100 t/s.
+        let _ = tracker.update(&live_stream_snap(0, 100), t0 + Duration::from_millis(600));
+
+        // The stream completes at exactly 55.16 t/s (the overall number).
+        let final_rate = tracker
+            .update(
+                &done_stream_snap(0, Some(55.16), 256, false),
+                t0 + Duration::from_millis(2000),
+            )
+            .expect("completion yields the final sample");
+        assert_eq!(final_rate, RateSample::Final(55.16));
+
+        // Post-completion updates (the engine's duplicate final publish,
+        // the 100 ms hardware poller re-publishing the merged snapshot)
+        // must NOT sample: the fixed token count over a growing elapsed
+        // would decay the series below the true rate.
+        assert!(
+            tracker
+                .update(
+                    &done_stream_snap(0, Some(55.16), 256, false),
+                    t0 + Duration::from_millis(3000)
+                )
+                .is_none(),
+            "no sample after completion (duplicate publish)"
+        );
+        assert!(
+            tracker
+                .update(
+                    &done_stream_snap(0, Some(55.16), 256, false),
+                    t0 + Duration::from_millis(4500)
+                )
+                .is_none(),
+            "no sample after completion (hardware poller, 1.5 s later)"
+        );
+    }
+
+    #[test]
+    fn rate_tracker_final_sample_excludes_looping_streams() {
+        // A looping stream's repeating output is not a measurement: the
+        // overall panel excludes it from its `gen` samples, and so must
+        // the final rolling sample.
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+        let _ = tracker.update(&live_stream_snap(0, 100), t0 + Duration::from_millis(600));
+        // A snapshot with a looping Done row and a clean Done row: the
+        // final sample is the clean row's rate, matching the overall
+        // accumulator's exclusion.
+        let snap = MetricsSnapshot {
+            completion_tokens: 150,
+            observed_frames: 150,
+            mode: "short".into(),
+            status: StreamStatus::Done,
+            streams: vec![
+                StreamMetric {
+                    id: 0,
+                    state: StreamStatus::Done,
+                    gen_tps: Some(999.0),
+                    tg_tokens: Some(100),
+                    looping: true,
+                    ..Default::default()
+                },
+                StreamMetric {
+                    id: 1,
+                    state: StreamStatus::Done,
+                    gen_tps: Some(42.0),
+                    tg_tokens: Some(50),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            tracker.update(&snap, t0 + Duration::from_millis(2000)),
+            Some(RateSample::Final(42.0)),
+            "looping stream's rate is excluded from the final sample"
+        );
+    }
+
+    #[test]
+    fn rate_tracker_re_arms_when_a_new_stream_starts() {
+        let mut tracker = DecodeRateTracker::default();
+        let t0 = Instant::now();
+
+        // Complete a stream.
+        let _ = tracker.update(&live_stream_snap(0, 100), t0 + Duration::from_millis(600));
+        let _ = tracker.update(
+            &done_stream_snap(0, Some(55.0), 256, false),
+            t0 + Duration::from_millis(2000),
+        );
+        assert!(tracker.finished);
+
+        // A new iteration re-uses stream id 0: the tracker re-arms and
+        // latches a fresh convergence curve.
+        let next = tracker.update(&live_stream_snap(0, 12), t0 + Duration::from_millis(2100));
+        assert!(
+            next.is_none(),
+            "re-armed stream has no sample yet (0 elapsed)"
+        );
+        assert!(!tracker.finished, "re-armed for the new stream");
+        assert!(tracker.first_token_instant.is_some(), "fresh latch");
+
+        // A snapshot with no stream rows (the hardware poller's merge —
+        // same mode, same tokens, no new stream state) does NOT re-arm a
+        // finished tracker.
+        let mut tracker2 = DecodeRateTracker::default();
+        let _ = tracker2.update(
+            &done_stream_snap(0, Some(55.0), 256, false),
+            t0 + Duration::from_millis(600),
+        );
+        assert!(tracker2.finished);
+        let poller_like = MetricsSnapshot {
+            mode: "short".into(),
+            completion_tokens: 256,
+            observed_frames: 256,
+            ..Default::default()
+        };
+        assert!(tracker2
+            .update(&poller_like, t0 + Duration::from_millis(700))
+            .is_none());
+        assert!(
+            tracker2.finished,
+            "stream-less snapshot keeps the tracker finished"
+        );
+    }
+
+    #[test]
+    fn final_sample_bypasses_the_cadence_for_short_streams() {
+        // A short stream can complete less than a second after its last
+        // live sample; the normal 1 s cadence would drop the exact final
+        // rate. `force_sample` guarantees the series ends on it.
+        let state = MetricsState::new();
+        state.update(live_stream_snap(0, 100));
+        std::thread::sleep(Duration::from_millis(600));
+        state.update(live_stream_snap(0, 200));
+        // Complete 300 ms later (inside the 1 s cadence of the last sample).
+        std::thread::sleep(Duration::from_millis(300));
+        state.update(done_stream_snap(0, Some(55.16), 256, false));
+
+        let series = state.load().throughput_series.clone();
+        assert!(series.len() >= 2, "live sample + final sample: {series:?}");
+        assert_eq!(
+            series.last().copied(),
+            Some(55.16),
+            "the series ends on the stream's exact gen_tps: {series:?}"
+        );
+    }
+
+    #[test]
+    fn live_series_ends_where_the_overall_metrics_begin() {
+        // The end-to-end regression for the user-reported discrepancy:
+        // the LIVE THROUGHPUT graph (the rolling series) must end on the
+        // *same number* the OVERALL METRICS panel reports — one value,
+        // one source. The stream runs at ~55 t/s and completes at
+        // exactly 55.16 (256 tokens / its decode window).
+        let state = MetricsState::new();
+        state.update(live_stream_snap(0, 100));
+        std::thread::sleep(Duration::from_millis(600));
+        state.update(live_stream_snap(0, 200));
+        state.update(done_stream_snap(0, Some(55.16), 256, false));
+
+        // A post-completion update (the hardware poller re-publishing
+        // the merged snapshot a second later) must not move the series.
+        std::thread::sleep(Duration::from_millis(1100));
+        state.update(done_stream_snap(0, Some(55.16), 256, false));
+
+        let loaded = state.load();
+        let series = &loaded.throughput_series;
+        assert!(!series.is_empty(), "the graph has samples: {series:?}");
+        assert_eq!(
+            series.last().copied(),
+            Some(55.16),
+            "the graph's final bar is the stream's exact gen_tps: {series:?}"
+        );
+        // The OVERALL METRICS panel reads the same value from the same
+        // completion transition.
+        assert!(
+            (loaded.overall.gen.avg - 55.16).abs() < 1e-9,
+            "overall avg: {}",
+            loaded.overall.gen.avg
+        );
+        assert!(
+            (loaded.overall.gen.max - 55.16).abs() < 1e-9,
+            "overall max: {}",
+            loaded.overall.gen.max
+        );
+        assert_eq!(
+            series.last().copied(),
+            Some(loaded.overall.gen.avg),
+            "graph final == overall avg: the two panels read the same number"
+        );
     }
 }

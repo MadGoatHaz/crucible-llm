@@ -2340,6 +2340,98 @@ mod tests {
     }
 
     #[test]
+    fn frozen_graph_ends_on_the_overall_metrics_number() {
+        // The user-reported discrepancy that previous fixes did not resolve:
+        // the LIVE THROUGHPUT graph showed a LOWER number than OVERALL
+        // METRICS. Full pipeline here, exactly as the engine drives it:
+        // in-flight batch publishes, the stream completing at 55.16 t/s
+        // (256 tokens / its decode window), then post-completion updates
+        // (the duplicate final publish + the 100 ms hardware poller
+        // re-publishing a merged snapshot). The frozen view must show ONE
+        // consistent number: the graph's final sample, the hero's `final`
+        // label, and the overall panel's `avg` / `max` are all 55.16 —
+        // and the post-completion updates did not decay the graph.
+        use crate::metrics::state::{StreamMetric, StreamStatus};
+        let app = App::new();
+
+        let live = |tokens: u64| MetricsSnapshot {
+            mode: "short".into(),
+            completion_tokens: tokens,
+            observed_frames: tokens,
+            status: StreamStatus::Streaming,
+            streams: vec![StreamMetric {
+                id: 0,
+                state: StreamStatus::Streaming,
+                tg_tokens: Some(tokens),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let done = || MetricsSnapshot {
+            mode: "short".into(),
+            completion_tokens: 256,
+            observed_frames: 256,
+            status: StreamStatus::Done,
+            streams: vec![StreamMetric {
+                id: 0,
+                state: StreamStatus::Done,
+                gen_tps: Some(55.16),
+                tg_tokens: Some(256),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // In flight: two batch publishes (as Engine A publishes every 8
+        // frames), the second ~600 ms later (past the first-sample gate).
+        app.metrics.update(live(100));
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        app.metrics.update(live(200));
+        // The stream completes at exactly 55.16 t/s (the overall number).
+        app.metrics.update(done());
+        // Post-completion: the duplicate final publish …
+        app.metrics.update(done());
+        // … and the hardware poller re-publishing a merged snapshot
+        // 1.1 s later (same mode, same tokens, no stream rows).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        app.metrics.update(MetricsSnapshot {
+            mode: "short".into(),
+            completion_tokens: 256,
+            observed_frames: 256,
+            ..Default::default()
+        });
+
+        app.metrics.freeze();
+
+        // Data level: the graph (rolling series) ends on exactly the value
+        // the overall panel records — no post-completion decay.
+        let m = app.metrics.load();
+        assert_eq!(
+            m.throughput_series.last().copied(),
+            Some(55.16),
+            "the graph's final sample is the stream's exact rate: {:?}",
+            m.throughput_series
+        );
+        assert!(
+            (m.overall.gen.avg - 55.16).abs() < 1e-9,
+            "overall avg: {}",
+            m.overall.gen.avg
+        );
+        assert!(
+            (m.overall.gen.max - 55.16).abs() < 1e-9,
+            "overall max: {}",
+            m.overall.gen.max
+        );
+
+        // Display level: the frozen hero's `final` label and the OVERALL
+        // METRICS `Gen Throughput` row both render the same number.
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("55.2"), "both panels render 55.2 t/s: {text}");
+        assert!(text.contains("final"), "frozen hero label: {text}");
+        assert!(text.contains("OVERALL METRICS"), "overall panel: {text}");
+    }
+
+    #[test]
     fn live_view_hero_is_live_when_not_frozen() {
         // Not frozen → the hero keeps the live "now / peak / avg" line and
         // the real-time title (no COMPLETE badge) — behavior unchanged.
