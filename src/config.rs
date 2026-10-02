@@ -872,15 +872,11 @@ pub fn layer(
     // CLI has no `--theme` flag; layer env > file > the built-in default.
     // `theme_explicit` is set only when an explicit source named a theme
     // (a missing theme = first run → the TUI shows the theme picker).
-    let (theme, theme_explicit) = match env_get(env_vars::THEME)
-        .or_else(|| file.and_then(|f| f.theme.clone()))
-    {
-        Some(raw) => (
-            raw.to_ascii_lowercase(),
-            true,
-        ),
-        None => ("cyberpunk".to_string(), false),
-    };
+    let (theme, theme_explicit) =
+        match env_get(env_vars::THEME).or_else(|| file.and_then(|f| f.theme.clone())) {
+            Some(raw) => (raw.to_ascii_lowercase(), true),
+            None => ("cyberpunk".to_string(), false),
+        };
 
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
@@ -1143,7 +1139,13 @@ mod tests {
     #[test]
     fn env_theme_layer_wins_and_is_explicit() {
         let env = [(env_vars::THEME.to_string(), "monochrome".to_string())];
-        let cfg = layer(&cli_from(&["crucible-llm"]), &matches_from(&["crucible-llm"]), &env, None).expect("layer");
+        let cfg = layer(
+            &cli_from(&["crucible-llm"]),
+            &matches_from(&["crucible-llm"]),
+            &env,
+            None,
+        )
+        .expect("layer");
         assert_eq!(cfg.theme, "monochrome");
         assert!(cfg.theme_explicit);
     }

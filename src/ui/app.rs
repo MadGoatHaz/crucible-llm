@@ -891,8 +891,7 @@ impl App {
                     KeyAction::Continue
                 }
                 KeyCode::Down => {
-                    self.theme_picker.cursor =
-                        (self.theme_picker.cursor + 1) % Theme::ALL.len();
+                    self.theme_picker.cursor = (self.theme_picker.cursor + 1) % Theme::ALL.len();
                     KeyAction::Continue
                 }
                 KeyCode::Enter => {
@@ -904,7 +903,7 @@ impl App {
                     KeyAction::Continue
                 }
                 _ => KeyAction::Continue,
-            }
+            };
         }
 
         // The quit confirmation is a **modal overlay** (dashboard *and*
@@ -1116,8 +1115,7 @@ impl App {
                     if key.code == KeyCode::Esc {
                         let _ = self.config.save();
                         self.config.edit_mode = ConfigMode::Viewing;
-                        self.active_theme =
-                            Theme::from_id(&self.config.theme).unwrap_or_default();
+                        self.active_theme = Theme::from_id(&self.config.theme).unwrap_or_default();
                         return KeyAction::Continue;
                     }
                     // Everything else (including `1`–`9`, `0`, letters, Tab,
@@ -1125,8 +1123,7 @@ impl App {
                     let result = self.config.handle_key(key);
                     // Live preview: a theme change in the form re-skins the
                     // whole TUI immediately (the render reads `active_theme`).
-                    self.active_theme =
-                        Theme::from_id(&self.config.theme).unwrap_or_default();
+                    self.active_theme = Theme::from_id(&self.config.theme).unwrap_or_default();
                     match result {
                         ConfigKeyResult::Saved => {
                             self.push_log(
@@ -2035,8 +2032,7 @@ mod tests {
     #[test]
     fn confirm_theme_applies_and_persists_vampire() {
         let mut app = App::new().with_theme_picker(true);
-        app.config.config_path =
-            std::path::PathBuf::from("/tmp/crucible-test-theme-pick.json");
+        app.config.config_path = std::path::PathBuf::from("/tmp/crucible-test-theme-pick.json");
         assert_eq!(app.phase, Phase::ThemePicker);
         app.theme_picker.cursor = 1; // Vampire
         app.confirm_theme();
@@ -2049,8 +2045,7 @@ mod tests {
     #[test]
     fn confirm_theme_goes_to_dashboard_when_target_given() {
         let mut app = App::new().with_theme_picker(false);
-        app.config.config_path =
-            std::path::PathBuf::from("/tmp/crucible-test-theme-pick2.json");
+        app.config.config_path = std::path::PathBuf::from("/tmp/crucible-test-theme-pick2.json");
         app.theme_picker.cursor = 2; // Monochrome
         app.confirm_theme();
         assert_eq!(app.active_theme, Theme::Monochrome);
@@ -2063,8 +2058,7 @@ mod tests {
     #[test]
     fn confirm_theme_defaults_to_cyberpunk() {
         let mut app = App::new().with_theme_picker(true);
-        app.config.config_path =
-            std::path::PathBuf::from("/tmp/crucible-test-theme-pick3.json");
+        app.config.config_path = std::path::PathBuf::from("/tmp/crucible-test-theme-pick3.json");
         // Cursor 0 = Cyberpunk (the default).
         app.confirm_theme();
         assert_eq!(app.active_theme, Theme::Cyberpunk);

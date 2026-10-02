@@ -74,7 +74,10 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
             .as_ref()
             .and_then(|r| r.size_pass_rate(NIAH_SIZES[i]))
         {
-            Some(p) => (fmt::format_pct(p), Style::default().fg(pass_rate_color(th, p))),
+            Some(p) => (
+                fmt::format_pct(p),
+                Style::default().fg(pass_rate_color(th, p)),
+            ),
             None => ("--".to_string(), Style::default().fg(th.dim())),
         };
         cells.push(Cell::from(pr_text).style(pr_style));
@@ -170,7 +173,10 @@ fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(theme::block(theme::panel_title(th, "LEGEND"), style::border(th)))
+            .block(theme::block(
+                theme::panel_title(th, "LEGEND"),
+                style::border(th),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );

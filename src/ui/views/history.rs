@@ -409,7 +409,10 @@ fn render_empty(area: Rect, th: Theme, f: &mut Frame) {
     let block = theme::block(theme::panel_title(th, "HISTORY"), style::border(th));
     let lines = vec![
         Line::raw(""),
-        Line::from(Span::styled("No benchmark runs saved yet.", style::value(th))),
+        Line::from(Span::styled(
+            "No benchmark runs saved yet.",
+            style::value(th),
+        )),
         Line::from(Span::styled(
             "Complete a run and results will appear here.",
             style::info(th),
@@ -728,7 +731,14 @@ fn render_compare_select(area: Rect, h: &HistoryState, first: usize, th: Theme, 
 }
 
 /// Compare mode, both runs selected — show the diff table.
-fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, th: Theme, f: &mut Frame) {
+fn render_compare(
+    area: Rect,
+    h: &HistoryState,
+    first: usize,
+    second: usize,
+    th: Theme,
+    f: &mut Frame,
+) {
     let sa = h.sessions.get(first);
     let sb = h.sessions.get(second);
     let title = match (sa, sb) {

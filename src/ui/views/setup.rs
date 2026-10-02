@@ -763,7 +763,8 @@ fn render_url(area: Rect, s: &SetupState, th: Theme, f: &mut Frame) {
         style::footer(th),
     )));
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel(th, theme::panel_title(th, "SETUP — CONNECTION"))),
+        Paragraph::new(Text::from(lines))
+            .block(panel(th, theme::panel_title(th, "SETUP — CONNECTION"))),
         area,
     );
 }
@@ -871,7 +872,10 @@ fn render_model(area: Rect, s: &SetupState, th: Theme, f: &mut Frame) {
             ]));
         }
     }
-    f.render_widget(Paragraph::new(Text::from(lines)).block(panel(th, title)), area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(panel(th, title)),
+        area,
+    );
 }
 
 /// Stage 3: the benchmark configuration form (write-through to
@@ -918,7 +922,10 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel(th, theme::panel_title(th, "SETUP — BENCHMARK CONFIGURATION")))
+            .block(panel(
+                th,
+                theme::panel_title(th, "SETUP — BENCHMARK CONFIGURATION"),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -1000,11 +1007,26 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     let lines = vec![
         Line::from(Span::styled("Benchmark summary", style::title(th))),
         Line::raw(""),
-        summary_line(th, "Target URL", &fmt::truncate(&s.url, 40), style::value(th)),
-        summary_line(th, "Model", &fmt::truncate(&c.model, 40), style::value_ok(th)),
+        summary_line(
+            th,
+            "Target URL",
+            &fmt::truncate(&s.url, 40),
+            style::value(th),
+        ),
+        summary_line(
+            th,
+            "Model",
+            &fmt::truncate(&c.model, 40),
+            style::value_ok(th),
+        ),
         summary_line(th, "Mode", c.mode.label(), style::value(th)),
         summary_line(th, "Tokens", &c.tokens.to_string(), style::value(th)),
-        summary_line(th, "Iterations", &c.iterations.to_string(), style::value(th)),
+        summary_line(
+            th,
+            "Iterations",
+            &c.iterations.to_string(),
+            style::value(th),
+        ),
         summary_line(th, "Ladder", &c.ladder, style::value(th)),
         summary_line(th, "Engines", &engine_labels, style::highlight(th)),
         Line::raw(""),
@@ -1019,7 +1041,10 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     ];
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel(th, theme::panel_title(th, "SETUP — CONFIRM & LAUNCH")))
+            .block(panel(
+                th,
+                theme::panel_title(th, "SETUP — CONFIRM & LAUNCH"),
+            ))
             .wrap(Wrap { trim: true }),
         area,
     );

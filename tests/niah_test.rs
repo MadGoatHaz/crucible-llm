@@ -261,15 +261,21 @@ fn view3_renders_color_coded_grid_from_published_result() {
     // nominal = mint, throttled = electric purple, failed = hot pink).
     let colors = buf_colors(&buf);
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.success()),
+        colors
+            .iter()
+            .any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.success()),
         "a nominal (mint) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.warn()),
+        colors
+            .iter()
+            .any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.warn()),
         "a throttled (purple) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "✗" && *c == Theme::Cyberpunk.danger()),
+        colors
+            .iter()
+            .any(|(s, c)| s == "✗" && *c == Theme::Cyberpunk.danger()),
         "a failed (hot-pink) cell must render"
     );
 

@@ -255,7 +255,9 @@ fn throughput_hero_renders_block_chart_with_axes() {
         "the hot cap is bright white/cyan"
     );
     assert!(
-        buf.content().iter().any(|c| c.fg == Theme::Cyberpunk.floor()),
+        buf.content()
+            .iter()
+            .any(|c| c.fg == Theme::Cyberpunk.floor()),
         "the dim blue floor is present"
     );
 }

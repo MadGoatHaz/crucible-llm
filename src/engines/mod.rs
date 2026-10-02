@@ -51,11 +51,11 @@ pub use concurrency::{
     SweepResult, UsabilityProfile, DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,
     PRACTICAL_PER_STREAM_TPS, USABLE_PER_STREAM_TPS,
 };
+pub use flatout::{FlatOutEngine, FlatOutResult, SegmentResult, SEGMENT_TARGETS};
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
 };
-pub use flatout::{FlatOutEngine, FlatOutResult, SegmentResult, SEGMENT_TARGETS};
 pub use sequence::{
     queue_for, summarize_sweep, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunPause,
     RunSlots, SeqPhase, SeqState, SeqStateSlot,

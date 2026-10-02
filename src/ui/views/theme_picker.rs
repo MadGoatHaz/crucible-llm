@@ -171,7 +171,10 @@ mod tests {
         app.phase = Phase::ThemePicker;
         // Default cursor is 0 (Cyberpunk) → the `> ` marker leads it.
         let text = render_text(&app, 120, 40);
-        assert!(text.contains("> CYBERPUNK"), "cursor 0 marks Cyberpunk: {text}");
+        assert!(
+            text.contains("> CYBERPUNK"),
+            "cursor 0 marks Cyberpunk: {text}"
+        );
 
         // Move to Vampire (cursor 1) → the marker follows.
         app.theme_picker.cursor = 1;

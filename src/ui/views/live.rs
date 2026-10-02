@@ -609,10 +609,20 @@ fn label_cell(th: Theme, label: &str) -> Span<'static> {
 /// One `Label:   avg X │ max Y │ p5 Z [unit]` row for the overall panel
 /// (the pre-formatted value strings come from [`stat_triple`], which
 /// yields `--` across the board when the metric has no samples yet).
-fn stat_row(th: Theme, label: &str, a: &str, m: &str, p: &str, unit: Option<&str>) -> Line<'static> {
+fn stat_row(
+    th: Theme,
+    label: &str,
+    a: &str,
+    m: &str,
+    p: &str,
+    unit: Option<&str>,
+) -> Line<'static> {
     let mut spans = vec![
         label_cell(th, label),
-        Span::styled(format!("avg {a:<5} │ max {m:<5} │ p5 {p}"), style::value(th)),
+        Span::styled(
+            format!("avg {a:<5} │ max {m:<5} │ p5 {p}"),
+            style::value(th),
+        ),
     ];
     if let Some(u) = unit {
         spans.push(Span::styled(format!("  {u}"), style::footer(th)));
@@ -751,7 +761,10 @@ fn score_color(th: Theme, pct: Option<f64>) -> Color {
 /// when the score is poor, and an **OVERALL** practical summary line at
 /// the bottom. Engines that haven't run are omitted (never shown empty).
 fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, th: Theme, f: &mut Frame) {
-    let block = theme::block(theme::panel_title(th, "CAPABILITY ASSESSMENT"), style::border(th));
+    let block = theme::block(
+        theme::panel_title(th, "CAPABILITY ASSESSMENT"),
+        style::border(th),
+    );
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -797,7 +810,12 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, th: Them
 /// the engines that were **selected and have actually run** (FIX 1: an
 /// unselected engine never appears, even if a stale result is in its
 /// slot). Pure over its inputs, unit-testable.
-fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection, th: Theme) -> Vec<CapScore> {
+fn build_capability_scores(
+    app: &App,
+    m: &MetricsSnapshot,
+    sel: &EngineSelection,
+    th: Theme,
+) -> Vec<CapScore> {
     let mut v: Vec<CapScore> = Vec::with_capacity(4);
 
     // Reasoning (C2) — N/M solved as a percentage.
@@ -886,7 +904,11 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
             label: "Energy Efficiency",
             pct: None,
             detail: line,
-            detail_style: if na { style::footer(th) } else { style::value(th) },
+            detail_style: if na {
+                style::footer(th)
+            } else {
+                style::value(th)
+            },
             color: th.dim(),
             info: "Joules per token. Requires a local GPU with driver support.",
             warn: None,
@@ -966,7 +988,10 @@ fn build_cap_lines(s: &CapScore, th: Theme) -> Vec<Line<'static>> {
 }
 
 /// The `✓ label  ✗ label  …` check spans for one structured case.
-fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult, th: Theme) -> Vec<Span<'static>> {
+fn case_check_spans(
+    case: &crate::engines::capability::StructuredCaseResult,
+    th: Theme,
+) -> Vec<Span<'static>> {
     case.checks
         .iter()
         .map(|c| {
@@ -983,7 +1008,11 @@ fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult, th:
 /// line, and the auto-generated practical verdict. `empty` when C3 has not
 /// run **or was not selected** (FIX 1: the render path never shows an
 /// empty box, and never shows an unselected engine's detail).
-fn build_structured_detail_lines(app: &App, sel: &EngineSelection, th: Theme) -> Vec<Line<'static>> {
+fn build_structured_detail_lines(
+    app: &App,
+    sel: &EngineSelection,
+    th: Theme,
+) -> Vec<Line<'static>> {
     if !sel.structured {
         return Vec::new();
     }
@@ -1205,10 +1234,7 @@ fn render_sequence_header(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let bar_line = if bar_width > 0 {
         let filled = (ratio.clamp(0.0, 1.0) * bar_width as f64).round() as usize;
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
-        spans.push(Span::styled(
-            "[".to_string(),
-            Style::default().fg(th.dim()),
-        ));
+        spans.push(Span::styled("[".to_string(), Style::default().fg(th.dim())));
         for i in 0..bar_width {
             if i < filled {
                 let frac = i as f64 / bar_width as f64;
@@ -1221,10 +1247,7 @@ fn render_sequence_header(area: Rect, app: &App, th: Theme, f: &mut Frame) {
                 ));
             }
         }
-        spans.push(Span::styled(
-            "]".to_string(),
-            Style::default().fg(th.dim()),
-        ));
+        spans.push(Span::styled("]".to_string(), Style::default().fg(th.dim())));
         spans.push(Span::styled(
             format!(" {:4.0}%", ratio * 100.0),
             style::value(th),
@@ -1260,7 +1283,11 @@ fn render_sequence_header(area: Rect, app: &App, th: Theme, f: &mut Frame) {
 
 /// The header's (marker, marker style, text, text style, bar ratio,
 /// border style) for a [`SeqState`].
-fn seq_header_parts(state: &SeqState, tick: u64, th: Theme) -> (String, Style, String, Style, f64, Style) {
+fn seq_header_parts(
+    state: &SeqState,
+    tick: u64,
+    th: Theme,
+) -> (String, Style, String, Style, f64, Style) {
     match state.phase {
         SeqPhase::Idle => (
             "○".to_string(),
@@ -1401,7 +1428,8 @@ mod tests {
 
     #[test]
     fn throughput_chart_guard_degenerate_areas() {
-        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0, false, Theme::default());
+        let lines =
+            build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0, false, Theme::default());
         assert_eq!(lines[0].to_string(), "chart too small");
     }
 
@@ -1412,7 +1440,8 @@ mod tests {
         let series: Vec<f64> = (0..60)
             .map(|i| 100.0 + 200.0 * ((i as f64) * 0.3).sin())
             .collect();
-        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0, false, Theme::default());
+        let lines =
+            build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0, false, Theme::default());
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1481,7 +1510,10 @@ mod tests {
             "Streams",
             "Total Duration",
         ] {
-            let text = label_cell(Theme::default(), label).content.as_ref().to_string();
+            let text = label_cell(Theme::default(), label)
+                .content
+                .as_ref()
+                .to_string();
             assert_eq!(text.len(), 20, "{label}: {text:?}");
             let colon = text.find(':').expect("the label cell carries a colon");
             assert_eq!(&text[..colon], label, "{label}: {text:?}");
@@ -1505,7 +1537,8 @@ mod tests {
     fn throughput_chart_right_aligns_newest_sample() {
         // A single sample must plot at the rightmost plot column, not the
         // left.
-        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0, false, Theme::default());
+        let lines =
+            build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0, false, Theme::default());
         let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // Find a row containing a bar; its rightmost █ should be near the
         // right edge.
@@ -1521,7 +1554,16 @@ mod tests {
     fn throughput_chart_frozen_shows_the_complete_overlay() {
         // FIX 2: once the run completes (frozen), the chart carries a
         // `✓ COMPLETE` overlay and stays the final state.
-        let lines = build_throughput_chart(&[100.0, 120.0, 90.0], 40, 8, 100.0, &[], 0.0, true, Theme::default());
+        let lines = build_throughput_chart(
+            &[100.0, 120.0, 90.0],
+            40,
+            8,
+            100.0,
+            &[],
+            0.0,
+            true,
+            Theme::default(),
+        );
         let text: String = lines
             .iter()
             .map(|l| l.to_string())

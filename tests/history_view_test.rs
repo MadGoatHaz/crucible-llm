@@ -419,7 +419,11 @@ fn gains_render_green_and_regressions_red() {
     let buf = render_history(&app, W, H);
     let text = buf_text(&buf);
     let gain = cell_at(&buf, &text, "-20.0%").expect("TTFT gain delta rendered");
-    assert_eq!(gain.fg, Theme::Cyberpunk.success(), "TTFT improvement must be mint");
+    assert_eq!(
+        gain.fg,
+        Theme::Cyberpunk.success(),
+        "TTFT improvement must be mint"
+    );
 
     // Regressions: b3300 vs v0.6.
     let (c, mc) = run_c();
@@ -428,7 +432,11 @@ fn gains_render_green_and_regressions_red() {
     let buf2 = render_history(&app2, W, H);
     let text2 = buf_text(&buf2);
     let reg = cell_at(&buf2, &text2, "+20.0%").expect("TTFT regression delta rendered");
-    assert_eq!(reg.fg, Theme::Cyberpunk.danger(), "TTFT regression must be hot-pink");
+    assert_eq!(
+        reg.fg,
+        Theme::Cyberpunk.danger(),
+        "TTFT regression must be hot-pink"
+    );
 }
 
 // ---- small terminal ----

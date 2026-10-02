@@ -276,11 +276,7 @@ pub(crate) fn build_curve_lines(
             let prev = &pts[i - 1];
             let fill_top = (p.y as usize).min(prev.y as usize);
             let degraded = p.color == th.danger() || p.color == th.accent();
-            let fill = if degraded {
-                th.secondary()
-            } else {
-                th.floor()
-            };
+            let fill = if degraded { th.secondary() } else { th.floor() };
             for row in grid.iter_mut().take(base_row + 1).skip(fill_top) {
                 for cell in row.iter_mut().take(p.x as usize).skip(prev.x as usize + 1) {
                     if cell.0 == ' ' {
@@ -379,14 +375,7 @@ pub(crate) fn build_curve_lines(
 
     // Axis title + legend (full mode only).
     if let Some(r) = title_row {
-        write_text(
-            &mut grid,
-            r,
-            Y_AXIS_W,
-            "concurrent users",
-            th.dim(),
-            w,
-        );
+        write_text(&mut grid, r, Y_AXIS_W, "concurrent users", th.dim(), w);
     }
     if let Some(r) = legend_row {
         let legend: [(&str, Color); 3] = [
@@ -556,7 +545,10 @@ fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
         ls.push(Line::from(vec![
             Span::styled("  Pure Throughput Knee: ", style::label(th)),
             Span::styled(format!("{k}"), style::footer(th)),
-            Span::styled(" (reference only — total t/s peaks here)", style::footer(th)),
+            Span::styled(
+                " (reference only — total t/s peaks here)",
+                style::footer(th),
+            ),
         ]));
     }
     ls
@@ -608,7 +600,13 @@ fn render_matrix(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Opt
                 .map(|l| l.aggregate_tps / l.concurrency.max(1) as f64)
                 .unwrap_or(0.0);
             for level in &result.levels {
-                rows.push(sweep_row(th, level, envelope, app.concurrency_target, baseline));
+                rows.push(sweep_row(
+                    th,
+                    level,
+                    envelope,
+                    app.concurrency_target,
+                    baseline,
+                ));
             }
         }
         _ => {
@@ -1062,13 +1060,25 @@ mod tests {
     #[test]
     fn per_stream_status_tracks_the_baseline() {
         // Baseline 100 t/s (the single-user rate).
-        assert_eq!(per_stream_status(Theme::default(), 100.0, 100.0).0, "◆ optimal");
-        assert_eq!(per_stream_status(Theme::default(), 90.0, 100.0).0, "◆ optimal"); // 0.90
+        assert_eq!(
+            per_stream_status(Theme::default(), 100.0, 100.0).0,
+            "◆ optimal"
+        );
+        assert_eq!(
+            per_stream_status(Theme::default(), 90.0, 100.0).0,
+            "◆ optimal"
+        ); // 0.90
         assert_eq!(per_stream_status(Theme::default(), 60.0, 100.0).0, "◆ good"); // 0.60
         assert_eq!(per_stream_status(Theme::default(), 40.0, 100.0).0, "▲ knee"); // 0.40
-        assert_eq!(per_stream_status(Theme::default(), 20.0, 100.0).0, "✕ saturated"); // 0.20
-                                                                     // No baseline → treated as optimal (ratio 1.0).
-        assert_eq!(per_stream_status(Theme::default(), 50.0, 0.0).0, "◆ optimal");
+        assert_eq!(
+            per_stream_status(Theme::default(), 20.0, 100.0).0,
+            "✕ saturated"
+        ); // 0.20
+           // No baseline → treated as optimal (ratio 1.0).
+        assert_eq!(
+            per_stream_status(Theme::default(), 50.0, 0.0).0,
+            "◆ optimal"
+        );
     }
 
     #[test]

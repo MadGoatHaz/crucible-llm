@@ -293,11 +293,7 @@ pub fn panel_title(th: Theme, text: impl Into<String>) -> Line<'static> {
 /// render counter; every ~10 frames the shade flips.
 pub fn pulsing_border(th: Theme, tick: u64) -> Style {
     let on = (tick / 10).is_multiple_of(2);
-    Style::default().fg(if on {
-        th.border_active()
-    } else {
-        th.primary()
-    })
+    Style::default().fg(if on { th.border_active() } else { th.primary() })
 }
 
 /// Shared style constructors — every one takes the active [`Theme`] so the
@@ -326,9 +322,7 @@ pub mod style {
 
     /// Muted title / header row — dim, bold.
     pub fn muted_title(th: Theme) -> Style {
-        Style::default()
-            .fg(th.dim())
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(th.dim()).add_modifier(Modifier::BOLD)
     }
 
     /// Field label — dim (secondary info).
@@ -345,9 +339,7 @@ pub mod style {
 
     /// Secondary value (bright, dimmed) — the avg / p5 companions.
     pub fn value_secondary(th: Theme) -> Style {
-        Style::default()
-            .fg(th.bright())
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(th.bright()).add_modifier(Modifier::DIM)
     }
 
     /// Healthy value (success, bold).
@@ -359,9 +351,7 @@ pub mod style {
 
     /// Warning value (warn, bold).
     pub fn value_warn(th: Theme) -> Style {
-        Style::default()
-            .fg(th.warn())
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(th.warn()).add_modifier(Modifier::BOLD)
     }
 
     /// Error / regression value (danger, bold).
@@ -390,9 +380,7 @@ pub mod style {
 
     /// Informational text (the `ℹ` notes) — info color, dimmed.
     pub fn info(th: Theme) -> Style {
-        Style::default()
-            .fg(th.info())
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(th.info()).add_modifier(Modifier::DIM)
     }
 
     /// Active tab in the tab bar — primary, bold.

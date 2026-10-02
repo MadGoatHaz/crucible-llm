@@ -86,10 +86,7 @@ impl SegmentResult {
         outcome: &StreamOutcome,
         duration_secs: f64,
     ) -> Self {
-        let actual_tokens = outcome
-            .usage
-            .map(|u| u.completion_tokens)
-            .unwrap_or(0);
+        let actual_tokens = outcome.usage.map(|u| u.completion_tokens).unwrap_or(0);
         let ttft_ms = outcome
             .timestamps
             .ttft_nanos()

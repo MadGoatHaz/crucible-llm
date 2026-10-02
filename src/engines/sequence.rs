@@ -38,8 +38,8 @@ use crate::engines::capability::{
     NiahEngine, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
 };
 use crate::engines::concurrency::SweepResult;
-use crate::engines::hardware::profile;
 use crate::engines::flatout::{FlatOutEngine, FlatOutResult};
+use crate::engines::hardware::profile;
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::HwPoller;
@@ -289,9 +289,7 @@ impl EngineProgress {
                 segment,
                 total_segments,
                 ..
-            } => {
-                (*segment).saturating_sub(1) as f64 / (*total_segments).max(1) as f64
-            }
+            } => (*segment).saturating_sub(1) as f64 / (*total_segments).max(1) as f64,
         }
     }
 
