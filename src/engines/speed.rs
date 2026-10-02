@@ -474,7 +474,9 @@ impl SpeedEngine {
 
         MetricsSnapshot {
             endpoint: endpoint.to_string(),
-            backend: "vLLM".to_string(),
+            // The backend is unknown (vLLM, llama.cpp, LM Studio, …) —
+            // never assume one.
+            backend: String::new(),
             model: model.to_string(),
             mode: mode.to_string(),
             aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),

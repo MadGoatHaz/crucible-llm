@@ -443,7 +443,9 @@ impl FlatOutEngine {
 
         MetricsSnapshot {
             endpoint: self.cfg.url.clone(),
-            backend: "vLLM".to_string(),
+            // The backend is unknown (vLLM, llama.cpp, LM Studio, …) —
+            // never assume one.
+            backend: String::new(),
             model: self.cfg.model.clone(),
             mode: "FlatOut".to_string(),
             aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),

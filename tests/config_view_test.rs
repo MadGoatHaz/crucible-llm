@@ -351,6 +351,7 @@ async fn run_key_triggers_only_the_selected_engines() {
     app.config.engine_reasoning = false;
     app.config.engine_structured = false;
     app.config.hardware = true;
+    app.config.engine_flatout = false;
     // Point at a dead endpoint so the spawned speed task fails fast.
     app.config.url = "http://127.0.0.1:9".to_string();
     app.config.timeout = 1;
@@ -377,13 +378,14 @@ async fn run_key_triggers_only_the_selected_engines() {
 async fn f5_in_the_config_view_also_runs() {
     let mut app = App::new();
     app.view = View::Config;
-    // Select exactly Engine A + Engine D (the new default has A–C3 on).
+    // Select exactly Engine A + Engine D (the new default has A–C3, F on).
     app.config.engine_speed = true;
     app.config.engine_concurrency = false;
     app.config.engine_niah = false;
     app.config.engine_reasoning = false;
     app.config.engine_structured = false;
     app.config.hardware = true;
+    app.config.engine_flatout = false;
     app.config.url = "http://127.0.0.1:9".to_string();
     app.config.timeout = 1;
 
@@ -406,6 +408,7 @@ async fn no_engines_selected_logs_a_warning() {
     app.config.engine_reasoning = false;
     app.config.engine_structured = false;
     app.config.hardware = false;
+    app.config.engine_flatout = false;
     let action = app.handle_key(&key(KeyCode::Char('r')));
     assert_eq!(action, crucible_llm::ui::app::KeyAction::Run);
     // Nothing started (no sequence, no engine slots).

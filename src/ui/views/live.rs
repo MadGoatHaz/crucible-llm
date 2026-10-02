@@ -1674,8 +1674,8 @@ mod tests {
                 niah: true,
                 reasoning: true,
                 structured: true,
-                hardware: false, // FIX 4: D is off by default
-                flatout: false,  // F is off by default (opt-in)
+                hardware: false, // D is off by default (opt-in)
+                flatout: true,   // F is on by default
             }
         );
     }

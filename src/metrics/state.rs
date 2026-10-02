@@ -154,6 +154,10 @@ pub struct EngineMarker {
 pub struct MetricsSnapshot {
     // ---- identity / context (status bar) ----
     pub endpoint: String,
+    /// The inference backend name — **only when known** (we never assume:
+    /// the server may be vLLM, llama.cpp, LM Studio, Unsloth, SGLang, …).
+    /// Empty by default; the TUI status bar shows the endpoint host
+    /// (`host:port`) instead of a backend label.
     pub backend: String,
     pub model: String,
     pub mode: String,

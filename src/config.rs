@@ -163,13 +163,14 @@ impl std::str::FromStr for ExportFormat {
 /// * `speed` — Engine A (single-stream TTFT/PP/TG/MTP);
 /// * `concurrency` — Engine B (the ladder sweep);
 /// * `niah` / `reasoning` / `structured` — Engine C1/C2/C3;
-/// * `hardware` — Engine D (the 100 ms power/VRAM poller).
+/// * `hardware` — Engine D (the 100 ms power/VRAM poller);
+/// * `flatout` — Engine F (the 60 s sustained max-speed finale).
 ///
-/// The default run is **everything except Engine D**: `speed`,
-/// `concurrency`, `niah`, `reasoning`, and `structured` are on;
-/// `hardware` is off (it must run on the machine with the GPU — remote
-/// users get N/A — so it is opt-in; the user can enable it in Setup /
-/// View 5 when they are on the GPU box).
+/// The default run is **everything except Engine D (Energy)**: `speed`,
+/// `concurrency`, `niah`, `reasoning`, `structured`, and `flatout` are
+/// on; `hardware` is off (it must run on the machine with the GPU —
+/// remote users get N/A — so it is opt-in; the user can enable it in
+/// Setup / View 5 when they are on the GPU box).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSelection {
@@ -186,7 +187,7 @@ pub struct EngineSelection {
     /// Engine D — Hardware & Energy profiler.
     pub hardware: bool,
     /// Engine F — Flat Out (sustained max-speed, decreasing targets).
-    /// Opt-in: off by default (like Engine D).
+    /// On by default (like A–C3); only Engine D (Energy) is opt-in.
     pub flatout: bool,
 }
 
@@ -201,10 +202,10 @@ impl Default for EngineSelection {
             // Engine D (energy) is off by default: it must run on the
             // machine with the GPU, and is opt-in for GPU-box users.
             hardware: false,
-            // Engine F (Flat Out) is off by default: it is a 60-second
-            // sustained max-speed test, opt-in for users who want the
-            // "big number" finale.
-            flatout: false,
+            // Engine F (Flat Out) is on by default (like A–C3): the
+            // 60-second sustained max-speed "big number" finale runs in
+            // every default sequence. Only Engine D (Energy) is opt-in.
+            flatout: true,
         }
     }
 }
@@ -1471,10 +1472,10 @@ mod tests {
     // ── Chunk 18: engine selection, ladder, hardware ─────────────────────
 
     #[test]
-    fn engine_selection_default_is_everything_except_hardware_and_flatout() {
-        // FIX 4: the default run selects A, B, C1, C2, C3 — Energy (D)
-        // is off (it must run on the GPU box and is opt-in), and Flat Out
-        // (F) is off (60-second sustained test, opt-in).
+    fn engine_selection_default_is_everything_except_hardware() {
+        // The default run selects A, B, C1, C2, C3, F — everything
+        // except Energy (D), which must run on the GPU box and is
+        // opt-in.
         let e = EngineSelection::default();
         assert!(e.speed, "Engine A on by default");
         assert!(e.concurrency, "Engine B on by default");
@@ -1486,10 +1487,10 @@ mod tests {
             "Engine D off by default (opt-in on the GPU box)"
         );
         assert!(
-            !e.flatout,
-            "Engine F off by default (opt-in sustained max-speed test)"
+            e.flatout,
+            "Engine F on by default (sustained max-speed finale)"
         );
-        assert_eq!(e.count(), 5);
+        assert_eq!(e.count(), 6);
         assert!(!e.is_empty());
     }
 

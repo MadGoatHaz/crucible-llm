@@ -29,7 +29,7 @@ use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine, MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{
-    build_sweep, summarize_sweep, NiahEngine, ReasoningEngine, StructuredEngine,
+    build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StructuredEngine,
 };
 use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::log::{Context, RunLogger};
@@ -369,12 +369,12 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
         }
 
         // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
-        // C3) and report a one-line summary for each. Engine A (speed) is
-        // the run above; Engine D (hardware) is the continuous poller
-        // started earlier. A selection of only `speed` (the default) skips
-        // this block entirely — headless behavior is unchanged.
+        // C3 / F) and report a one-line summary for each. Engine A (speed)
+        // is the run above; Engine D (hardware) is the continuous poller
+        // started earlier. A selection of only `speed` skips this block
+        // entirely.
         let extra = cfg.engines;
-        if extra.concurrency || extra.niah || extra.reasoning || extra.structured {
+        if extra.concurrency || extra.niah || extra.reasoning || extra.structured || extra.flatout {
             if !cfg.json {
                 term.dim(&format!(
                     "  running selected engines: {}",
@@ -450,6 +450,21 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                     Err(e) => {
                         term.warning(&format!("[C3] structured init failed: {e}"));
                         logger.error(Context::EngineC3, format!("structured init failed: {e}"));
+                    }
+                }
+            }
+            if extra.flatout {
+                match FlatOutEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [F] flat out (60s sustained max-speed)…");
+                        }
+                        let r = engine.logger(logger.clone()).run().await;
+                        term.info(&format!("  [F] {}", r.summary_line()));
+                    }
+                    Err(e) => {
+                        term.warning(&format!("[F] flat out init failed: {e}"));
+                        logger.error(Context::EngineF, format!("flat out init failed: {e}"));
                     }
                 }
             }

@@ -388,7 +388,10 @@ impl App {
             endpoint: cfg.url.clone(),
             model: cfg.model.clone(),
             mode: cfg.mode.label().to_string(),
-            backend: "vLLM".to_string(),
+            // The backend is unknown (vLLM, llama.cpp, LM Studio, SGLang,
+            // …) — never assume one; the status bar shows the endpoint
+            // host instead.
+            backend: String::new(),
             ..Default::default()
         });
         self
@@ -513,7 +516,10 @@ impl App {
             endpoint: cfg.url.clone(),
             model: cfg.model.clone(),
             mode: cfg.mode.label().to_string(),
-            backend: "vLLM".to_string(),
+            // The backend is unknown (vLLM, llama.cpp, LM Studio, SGLang,
+            // …) — never assume one; the status bar shows the endpoint
+            // host instead.
+            backend: String::new(),
             ..Default::default()
         });
         self.push_log(
@@ -1574,13 +1580,21 @@ impl App {
         f.render_widget(Paragraph::new(text).block(block), overlay);
     }
 
-    /// Top status bar: version, backend, target model, mode (blueprint §6).
+    /// Top status bar: version, server address (`host:port`), target
+    /// model, mode (blueprint §6).
+    ///
+    /// The backend is deliberately **not** shown: we don't know what is
+    /// serving the endpoint (vLLM, llama.cpp, LM Studio, Unsloth, SGLang,
+    /// …), so the bar shows the actual server address instead.
     ///
     /// Reads the shared snapshot lock-free; a fresh `Arc` is taken each frame
     /// so the bar always reflects the latest published metrics.
     fn render_status_bar(&self, area: Rect, f: &mut Frame) {
         let th = self.active_theme;
         let m = self.metrics.load();
+        // The server address (host:port) from the endpoint URL — the
+        // `—` placeholder when no target has been set yet.
+        let host = fmt::url_host(&m.endpoint);
         let mut spans = vec![
             Span::styled(" ▐ ", style::tab_separator(th)),
             Span::styled("CRUCIBLE", style::title(th)),
@@ -1590,8 +1604,14 @@ impl App {
                     .fg(th.secondary())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), style::footer(th)),
-            Span::styled(format!("  ▐ [{}]", m.backend), style::value(th)),
+            Span::styled(
+                format!(" v{}", env!("CARGO_PKG_VERSION")),
+                style::footer(th),
+            ),
+            Span::styled(
+                format!("  ▐ [{}]", if host.is_empty() { "—" } else { &host }),
+                style::value(th),
+            ),
             Span::styled(" ▐ ", style::tab_separator(th)),
             Span::styled(format!("Target: {}", m.model), style::label(th)),
             Span::styled(" ▐ ", style::tab_separator(th)),
@@ -1832,6 +1852,7 @@ fn engine_step_label(progress: &Option<EngineProgress>) -> String {
 /// * [`format_duration`] — `4m 32s` for a minute or more, else `1.2s`.
 /// * [`format_tokens`] — `33,108` (thousands separator) or `1.2M` for ≥1M.
 /// * [`format_pct`]    — `92.3%` (one decimal).
+/// * [`url_host`]      — the `host:port` of a URL (status bar).
 pub mod fmt {
     /// `142.3 t/s` — tokens/sec, one decimal.
     pub fn format_rate(tps: f64) -> String {
@@ -1889,6 +1910,22 @@ pub mod fmt {
         }
         format!("{}…", &s[..end])
     }
+
+    /// The server address (`host:port`) of a URL —
+    /// `http://192.168.51.154:8888/v1` → `192.168.51.154:8888`. The status
+    /// bar shows this (never a backend name: the server could be vLLM,
+    /// llama.cpp, LM Studio, Unsloth, SGLang, … — we don't know). A bare
+    /// host passes through; the empty string stays empty.
+    pub fn url_host(url: &str) -> String {
+        let trimmed = url.trim();
+        let without_scheme = trimmed.split("://").last().unwrap_or(trimmed).trim();
+        without_scheme
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1909,6 +1946,47 @@ mod tests {
 
     fn char_key(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    // ── status-bar server address (never a backend name) ────────────────
+
+    #[test]
+    fn url_host_extracts_host_and_port() {
+        assert_eq!(
+            fmt::url_host("http://192.168.51.154:8888/v1"),
+            "192.168.51.154:8888"
+        );
+        assert_eq!(
+            fmt::url_host("https://example.com/v1/chat/completions"),
+            "example.com"
+        );
+        assert_eq!(fmt::url_host("localhost:8000"), "localhost:8000");
+        assert_eq!(fmt::url_host("http://localhost:8000"), "localhost:8000");
+        assert_eq!(fmt::url_host(""), "");
+        assert_eq!(fmt::url_host("  "), "");
+    }
+
+    #[test]
+    fn the_status_bar_never_shows_a_hardcoded_backend() {
+        // The snapshot's backend is empty (we don't know the server); the
+        // rendered status bar carries the endpoint host instead.
+        let app = App::new();
+        app.metrics.update(MetricsSnapshot {
+            endpoint: "http://192.168.51.154:8888/v1".to_string(),
+            model: "swift-27b".to_string(),
+            mode: "short".to_string(),
+            backend: String::new(),
+            ..Default::default()
+        });
+        let text = rendered_text(&app, 120, 40);
+        assert!(
+            text.contains("192.168.51.154:8888"),
+            "status bar shows the server address: {text}"
+        );
+        assert!(
+            !text.to_ascii_uppercase().contains("VLLM"),
+            "no hardcoded vLLM label anywhere in the frame: {text}"
+        );
     }
 
     // ── phase selection at launch ───────────────────────────────────────
