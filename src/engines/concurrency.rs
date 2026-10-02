@@ -1095,7 +1095,7 @@ impl Sweep {
     ) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let elapsed_s = elapsed_ns as f64 / 1e9;
-        let tokens = acc.tokens_so_far();
+        let _tokens = acc.tokens_so_far();
         let non_looping = acc.tokens_non_looping();
         // Prefill layer: non-looping prompt tokens / mean non-looping TTFT.
         let mut prefill = 0.0;
@@ -1130,7 +1130,12 @@ impl Sweep {
             endpoint: self.pool.endpoint().to_string(),
             model: self.pool.model().to_string(),
             mode: "Concurrency".to_string(),
-            aggregate_tps: tokens as f64 / elapsed_s,
+            // The live throughput graph samples `aggregate_tps` into its
+            // rolling series. Use the decode-window rate (non-looping
+            // tokens / first→last token span) — the same formula the
+            // Overall Metrics panel uses — NOT the e2e rate (tokens /
+            // total wall time), which includes TTFT/prefill.
+            aggregate_tps: decode,
             // Server-reported prompt totals (usage frames): the metrics
             // seam derives `prompt_throughput` = prompt / mean TTFT from
             // this plus the per-stream TTFTs.

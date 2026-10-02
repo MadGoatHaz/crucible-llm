@@ -332,7 +332,7 @@ impl SpeedEngine {
         start: &MonotonicInstant,
         max_tokens: u32,
     ) -> MetricsSnapshot {
-        let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
+        let _elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let mut itl = LatencyHistogram::default();
         let mut token_frames = 0u64;
         let mut reasoning_frames = 0u64;
@@ -498,7 +498,13 @@ impl SpeedEngine {
             backend: String::new(),
             model: model.to_string(),
             mode: mode.to_string(),
-            aggregate_tps: tokens as f64 / (elapsed_ns as f64 / 1_000_000_000.0),
+            // The live throughput graph samples `aggregate_tps` into its
+            // rolling series. It must use the decode-window rate
+            // (tokens / (T_last − T_first)) — the same formula the
+            // Overall Metrics panel uses via `gen_tps` — NOT the e2e
+            // rate (tokens / total wall time), which includes TTFT/prefill
+            // and reads lower.
+            aggregate_tps: decode_tps,
             prefill_throughput: prefill_tps,
             decode_throughput: decode_tps,
             e2e_throughput: e2e_tps,
