@@ -78,7 +78,8 @@ pub enum Context {
     EngineC3,
     /// Engine D — Hardware & Energy.
     EngineD,
-    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    /// Engine F — Flat Out (sustained max-speed, one continuous 60s
+    /// stream).
     EngineF,
     /// The Benchmark Sequence executor (engine transitions).
     Sequence,

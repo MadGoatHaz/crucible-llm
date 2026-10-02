@@ -44,7 +44,7 @@ use crate::engines::{
     fragmentation_warning, queue_for, BenchmarkSequence, EngineProgress, NiahEngineConfig,
     NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState,
     SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
-    VRAM_FRAGMENTATION_THRESHOLD,
+    VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
 use crate::hw::HwPoller;
 use crate::log::{Context, RunLogger};
@@ -1833,11 +1833,9 @@ fn engine_step_label(progress: &Option<EngineProgress>) -> String {
         Some(EngineProgress::Reasoning { challenge, total }) => format!("Step {challenge}/{total}"),
         Some(EngineProgress::Structured { run, total }) => format!("Step {run}/{total}"),
         Some(EngineProgress::Sampling { .. }) => "Sampling…".to_string(),
-        Some(EngineProgress::FlatOut {
-            segment,
-            total_segments,
-            ..
-        }) => format!("Segment {segment}/{total_segments}"),
+        Some(EngineProgress::FlatOut { elapsed_secs, .. }) => {
+            format!("{elapsed_secs:.0}s / {WINDOW_SECS:.0}s")
+        }
         None => "Starting…".to_string(),
     }
 }

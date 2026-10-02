@@ -915,16 +915,17 @@ fn build_capability_scores(
         });
     }
 
-    // Flat Out (F) — sustained maximum decode speed: best-case t/s.
+    // Flat Out (F) — sustained maximum decode speed: one continuous
+    // 60-second stream.
     if sel.flatout {
         if let Some(r) = app.flatout_slot.load().as_ref() {
             v.push(CapScore {
                 label: "Flat Out",
                 pct: None,
-                detail: format!("BEST: {:.1} t/s", r.best_tps),
+                detail: format!("{:.1} t/s", r.tps),
                 detail_style: style::value_ok(th),
                 color: th.success(),
-                info: "Sustained max decode. 6×10s windows, minimal prefill.",
+                info: "Sustained max decode. One continuous 60s stream.",
                 warn: None,
             });
         }

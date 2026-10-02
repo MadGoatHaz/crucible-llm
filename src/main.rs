@@ -251,9 +251,17 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
             .ok()
             .and_then(|g| g.gpu_name().map(str::to_string));
 
-        if cfg.json {
-            println!("{v}", v = json_report(cfg, &results));
+        // The `--json` document: Engine A's results now, the `flatout`
+        // single-object result appended once Engine F has run (the
+        // document is printed *after* the additional-engine block below,
+        // so the flatout object is included in one JSON document on
+        // stdout). Non-JSON mode prints the result box(es) + summary.
+        let mut json_doc = if cfg.json {
+            Some(json_report(cfg, &results))
         } else {
+            None
+        };
+        if !cfg.json {
             for (i, r) in results.iter().enumerate() {
                 match format_result_box(r, i + 1, iterations, term.color) {
                     Some(box_) => print!("{box_}"),
@@ -457,9 +465,14 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                 match FlatOutEngine::new(cfg) {
                     Ok(engine) => {
                         if !cfg.json {
-                            term.dim("  [F] flat out (60s sustained max-speed)…");
+                            term.dim("  [F] flat out (one 60s stream — peak sustained t/s)…");
                         }
                         let r = engine.logger(logger.clone()).run().await;
+                        // The `--json` document carries the single flatout
+                        // result object (no segments).
+                        if let Some(v) = &mut json_doc {
+                            v["flatout"] = r.to_dict();
+                        }
                         term.info(&format!("  [F] {}", r.summary_line()));
                     }
                     Err(e) => {
@@ -468,6 +481,12 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                     }
                 }
             }
+        }
+
+        // The `--json` document (printed after the additional engines so
+        // the `flatout` object is included): stdout stays pure JSON.
+        if let Some(v) = json_doc {
+            println!("{v}");
         }
 
         // Prototype exit-code rule: all runs failed → exit 1.

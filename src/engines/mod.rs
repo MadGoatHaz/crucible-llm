@@ -51,7 +51,7 @@ pub use concurrency::{
     SweepResult, UsabilityProfile, DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,
     PRACTICAL_PER_STREAM_TPS, USABLE_PER_STREAM_TPS,
 };
-pub use flatout::{FlatOutEngine, FlatOutResult, SegmentResult, SEGMENT_TARGETS};
+pub use flatout::{FlatOutEngine, FlatOutResult, MAX_TOKENS, MINIMAL_PROMPT, WINDOW_SECS};
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
@@ -145,7 +145,8 @@ pub struct RunReport {
     pub reasoning: Option<ReasoningResult>,
     /// Engine C3 — the structured-output penalty + compliance.
     pub structured: Option<StructuredResult>,
-    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    /// Engine F — Flat Out (sustained max-speed, one continuous 60s
+    /// stream).
     pub flatout: Option<FlatOutResult>,
 }
 

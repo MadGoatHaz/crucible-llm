@@ -186,8 +186,9 @@ pub struct EngineSelection {
     pub structured: bool,
     /// Engine D — Hardware & Energy profiler.
     pub hardware: bool,
-    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
-    /// On by default (like A–C3); only Engine D (Energy) is opt-in.
+    /// Engine F — Flat Out (sustained max-speed, one continuous 60s
+    /// stream). On by default (like A–C3); only Engine D (Energy) is
+    /// opt-in.
     pub flatout: bool,
 }
 

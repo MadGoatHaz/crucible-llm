@@ -38,7 +38,7 @@ use crate::engines::capability::{
     NiahEngine, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
 };
 use crate::engines::concurrency::SweepResult;
-use crate::engines::flatout::{FlatOutEngine, FlatOutResult};
+use crate::engines::flatout::{FlatOutEngine, FlatOutResult, WINDOW_SECS};
 use crate::engines::hardware::profile;
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
@@ -105,7 +105,8 @@ pub enum Engine {
     Structured,
     /// Engine D — Hardware & Energy profiler (continuous sampling).
     Hardware,
-    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    /// Engine F — Flat Out (sustained max-speed, one continuous 60s
+    /// stream).
     FlatOut,
 }
 
@@ -190,7 +191,7 @@ impl Engine {
                 "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
             }
             Engine::FlatOut => {
-                "Sustained maximum decode speed. 6×10s windows with\nminimal prefill. Measures your server's peak rate."
+                "Sustained maximum decode speed. One continuous\n60-second stream. Your server's peak tokens-per-second."
             }
         }
     }
@@ -229,11 +230,11 @@ pub enum EngineProgress {
     Structured { run: usize, total: usize },
     /// Engine D: `Sampling... {elapsed}s`.
     Sampling { elapsed: f64 },
-    /// Engine F: `Segment {n}/{total} ({target}k tokens) — {tps} t/s`.
+    /// Engine F: `{elapsed}s / 60s — {tokens} tokens ({tps} t/s)` (one
+    /// continuous stream).
     FlatOut {
-        segment: usize,
-        total_segments: usize,
-        target_tokens: u32,
+        elapsed_secs: f64,
+        tokens: u64,
         tps: f64,
     },
 }
@@ -284,12 +285,10 @@ impl EngineProgress {
             // Engine D: no known end — an indeterminate (0.0) bar; the
             // elapsed seconds carry the "alive" signal.
             EngineProgress::Sampling { .. } => 0.0,
-            // Engine F: completed segments over total.
-            EngineProgress::FlatOut {
-                segment,
-                total_segments,
-                ..
-            } => (*segment).saturating_sub(1) as f64 / (*total_segments).max(1) as f64,
+            // Engine F: elapsed time over the 60s window.
+            EngineProgress::FlatOut { elapsed_secs, .. } => {
+                (*elapsed_secs / WINDOW_SECS).clamp(0.0, 1.0)
+            }
         }
     }
 
@@ -320,14 +319,12 @@ impl EngineProgress {
             EngineProgress::Structured { run, total } => format!("Run {run}/{total}"),
             EngineProgress::Sampling { elapsed } => format!("Sampling… {elapsed:.1}s"),
             EngineProgress::FlatOut {
-                segment,
-                total_segments,
-                target_tokens,
+                elapsed_secs,
+                tokens,
                 tps,
             } => format!(
-                "Segment {segment}/{total_segments} ({}k tokens) — {:.1} t/s",
-                target_tokens / 1000,
-                tps
+                "{elapsed_secs:.0}s / {WINDOW_SECS:.0}s — {} tokens ({tps:.1} t/s)",
+                thousands(*tokens)
             ),
         }
     }
@@ -1060,9 +1057,10 @@ impl BenchmarkSequence {
         summary
     }
 
-    /// Engine F — Flat Out: the sustained maximum decode speed finale. Six
-    /// sequential 10-second windows with a minimal prompt and decreasing
-    /// `max_tokens` caps (10k→1k). Returns the one-line summary.
+    /// Engine F — Flat Out: the sustained maximum decode speed finale.
+    /// One continuous 60-second stream with a minimal prompt and an
+    /// effectively-unlimited `max_tokens` cap. Returns the one-line
+    /// summary.
     async fn run_flatout(&self) -> String {
         self.slots.flatout.set_running(true);
         let engine = match FlatOutEngine::new(&self.cfg) {
@@ -1087,6 +1085,21 @@ impl BenchmarkSequence {
 }
 
 // ── Summary helpers (pure) ────────────────────────────────────────────────
+
+/// `1,847` — thousands separators (the Flat Out progress label's token
+/// count).
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
 
 /// Engine A's one-line summary: the averaged decode speed across the
 /// valid runs (`N/A` when every run failed).
@@ -1415,14 +1428,51 @@ mod tests {
         );
         assert_eq!(
             EngineProgress::FlatOut {
-                segment: 3,
-                total_segments: 6,
-                target_tokens: 6000,
-                tps: 45.2,
+                elapsed_secs: 32.0,
+                tokens: 1847,
+                tps: 57.7,
             }
             .label(),
-            "Segment 3/6 (6k tokens) — 45.2 t/s"
+            "32s / 60s — 1,847 tokens (57.7 t/s)"
         );
+    }
+
+    #[test]
+    fn flatout_fraction_tracks_the_60s_window() {
+        assert_eq!(
+            EngineProgress::FlatOut {
+                elapsed_secs: 0.0,
+                tokens: 0,
+                tps: 0.0,
+            }
+            .fraction(),
+            0.0
+        );
+        let f = EngineProgress::FlatOut {
+            elapsed_secs: 30.0,
+            tokens: 1000,
+            tps: 33.3,
+        }
+        .fraction();
+        assert!((f - 0.5).abs() < 1e-9, "fraction: {f}");
+        // Overruns clamp to 1.0 (the window is the only stop).
+        assert_eq!(
+            EngineProgress::FlatOut {
+                elapsed_secs: 90.0,
+                tokens: 1000,
+                tps: 11.1,
+            }
+            .fraction(),
+            1.0
+        );
+    }
+
+    #[test]
+    fn thousands_groups_digits() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1847), "1,847");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     // ── slot / bus mechanics ────────────────────────────────────────────

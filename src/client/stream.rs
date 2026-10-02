@@ -237,6 +237,13 @@ pub struct StreamWorker {
     /// `"json_object"`) — Engine C3's grammar-constrained runs. `None`
     /// (the default) sends the body unchanged.
     response_format: Option<String>,
+    /// When `true`, the body gains `"ignore_eos": true` (a llama.cpp
+    /// server parameter): the model is not allowed to stop on its own
+    /// end-token, so generation runs until `max_tokens` — the engine's
+    /// own stop condition (Engine F's 60-second window). Servers that do
+    /// not know the field (vLLM, LM Studio, …) ignore it per the OpenAI
+    /// spec, so the request degrades to the model's natural behavior.
+    ignore_eos: bool,
     /// Optional run-log writer: when present, the worker logs its HTTP /
     /// SSE lifecycle (request, TTFB, first token, every 50th token,
     /// completion / failure) to the file-based [`RunLogger`].
@@ -267,6 +274,7 @@ impl StreamWorker {
             read_timeout: DEFAULT_READ_TIMEOUT,
             retries: 0,
             response_format: None,
+            ignore_eos: false,
             logger: None,
             tag: "stream".to_string(),
         }
@@ -297,6 +305,15 @@ impl StreamWorker {
     /// which server-side constrained-decoding engines honor.
     pub fn response_format(mut self, format: &str) -> Self {
         self.response_format = Some(format.to_string());
+        self
+    }
+
+    /// Disallow the model's own end-token from stopping generation
+    /// (`"ignore_eos": true`, honored by llama.cpp servers; unknown to —
+    /// and ignored by — other backends). Engine F sets this so the
+    /// 60-second window, not the model, is the only stop.
+    pub fn ignore_eos(mut self, v: bool) -> Self {
+        self.ignore_eos = v;
         self
     }
 
@@ -841,6 +858,9 @@ impl StreamWorker {
         if let Some(format) = &self.response_format {
             body["response_format"] = serde_json::json!({ "type": format });
         }
+        if self.ignore_eos {
+            body["ignore_eos"] = serde_json::json!(true);
+        }
         body
     }
 
@@ -1261,6 +1281,27 @@ mod tests {
         let body = w.request_body();
         assert_eq!(body["response_format"]["type"], "json_object");
         // The rest of the body is untouched.
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn request_body_ignore_eos_is_opt_in() {
+        // Default: the field is absent (Engine A / B / C bodies are
+        // byte-identical to before).
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        );
+        assert!(w.request_body().get("ignore_eos").is_none());
+
+        // Opt-in (Engine F): the field is present, the rest untouched.
+        let w = w.ignore_eos(true);
+        let body = w.request_body();
+        assert_eq!(body["ignore_eos"], true);
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 10);
     }
