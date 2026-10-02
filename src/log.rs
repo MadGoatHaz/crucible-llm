@@ -78,6 +78,8 @@ pub enum Context {
     EngineC3,
     /// Engine D — Hardware & Energy.
     EngineD,
+    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    EngineF,
     /// The Benchmark Sequence executor (engine transitions).
     Sequence,
     /// HTTP request/response lifecycle (the stream worker).
@@ -102,6 +104,7 @@ impl Context {
             Context::EngineC2 => "ENGINE_C2",
             Context::EngineC3 => "ENGINE_C3",
             Context::EngineD => "ENGINE_D",
+            Context::EngineF => "ENGINE_F",
             Context::Sequence => "SEQUENCE",
             Context::Http => "HTTP",
             Context::Sse => "SSE",

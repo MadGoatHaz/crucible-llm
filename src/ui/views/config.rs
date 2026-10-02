@@ -60,11 +60,12 @@ pub enum Field {
     EngineNiah,
     EngineReasoning,
     EngineStructured,
+    EngineFlatOut,
 }
 
 impl Field {
     /// Every field in cursor order.
-    pub const ALL: [Field; 16] = [
+    pub const ALL: [Field; 17] = [
         Field::Url,
         Field::Model,
         Field::Mode,
@@ -81,6 +82,7 @@ impl Field {
         Field::EngineNiah,
         Field::EngineReasoning,
         Field::EngineStructured,
+        Field::EngineFlatOut,
     ];
 
     /// The form label for this field.
@@ -102,6 +104,7 @@ impl Field {
             Field::EngineNiah => "Engine C1 — NIAH",
             Field::EngineReasoning => "Engine C2 — Reasoning",
             Field::EngineStructured => "Engine C3 — Structured",
+            Field::EngineFlatOut => "Engine F — Flat Out",
         }
     }
 
@@ -117,6 +120,7 @@ impl Field {
             Field::EngineReasoning => Some(Engine::Reasoning),
             Field::EngineStructured => Some(Engine::Structured),
             Field::Hardware => Some(Engine::Hardware),
+            Field::EngineFlatOut => Some(Engine::FlatOut),
             _ => None,
         }
     }
@@ -195,7 +199,8 @@ impl Field {
             | Field::EngineConcurrency
             | Field::EngineNiah
             | Field::EngineReasoning
-            | Field::EngineStructured => None,
+            | Field::EngineStructured
+            | Field::EngineFlatOut => None,
         }
     }
 }
@@ -254,6 +259,7 @@ pub struct ConfigState {
     pub engine_niah: bool,
     pub engine_reasoning: bool,
     pub engine_structured: bool,
+    pub engine_flatout: bool,
     /// The cursor's position in [`Field::ALL`].
     pub cursor: usize,
     /// Where `F2` writes the form.
@@ -304,6 +310,7 @@ impl ConfigState {
             engine_niah: cfg.engines.niah,
             engine_reasoning: cfg.engines.reasoning,
             engine_structured: cfg.engines.structured,
+            engine_flatout: cfg.engines.flatout,
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
@@ -334,6 +341,7 @@ impl ConfigState {
                 reasoning: self.engine_reasoning,
                 structured: self.engine_structured,
                 hardware: self.hardware,
+                flatout: self.engine_flatout,
             },
             ..Config::default()
         };
@@ -398,6 +406,7 @@ impl ConfigState {
                 reasoning: self.engine_reasoning,
                 structured: self.engine_structured,
                 hardware: self.hardware,
+                flatout: self.engine_flatout,
             }),
             // The matrix axis is a CLI/env concern — never persisted from the form.
             matrix_contexts: None,
@@ -562,6 +571,7 @@ impl ConfigState {
             Field::EngineNiah => self.engine_niah = !self.engine_niah,
             Field::EngineReasoning => self.engine_reasoning = !self.engine_reasoning,
             Field::EngineStructured => self.engine_structured = !self.engine_structured,
+            Field::EngineFlatOut => self.engine_flatout = !self.engine_flatout,
             _ => {}
         }
     }
@@ -841,6 +851,11 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
             "Engine C3 — Structured".to_string(),
             bool_str(c.engine_structured),
             bool_style(c.engine_structured),
+        ),
+        Field::EngineFlatOut => (
+            "Engine F — Flat Out".to_string(),
+            bool_str(c.engine_flatout),
+            bool_style(c.engine_flatout),
         ),
     }
 }

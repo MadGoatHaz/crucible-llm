@@ -213,6 +213,8 @@ pub struct App {
     pub reasoning_slot: Arc<ResultSlot<ReasoningResult>>,
     /// Lock-free Engine C3 (structured) result holder (Chunk 18).
     pub structured_slot: Arc<ResultSlot<StructuredResult>>,
+    /// Lock-free Engine F (Flat Out) result holder.
+    pub flatout_slot: Arc<ResultSlot<crate::engines::flatout::FlatOutResult>>,
     /// The editable Configuration form (View 5, Chunk 18). Seeded from the
     /// resolved [`Config`]; edited on the key path; `F2` persists it and
     /// `F5`/`r` runs the selected engines from it.
@@ -316,6 +318,7 @@ impl App {
             speed_slot: Arc::new(ResultSlot::new()),
             reasoning_slot: Arc::new(ResultSlot::new()),
             structured_slot: Arc::new(ResultSlot::new()),
+            flatout_slot: Arc::new(ResultSlot::new()),
             config: ConfigState::default(),
             hw: None,
             models: Arc::new(ResultSlot::new()),
@@ -777,6 +780,7 @@ impl App {
                 niah: self.niah.clone(),
                 reasoning: self.reasoning_slot.clone(),
                 structured: self.structured_slot.clone(),
+                flatout: self.flatout_slot.clone(),
             },
             Some(tx),
             self.pause.clone(),
@@ -1691,6 +1695,11 @@ fn engine_step_label(progress: &Option<EngineProgress>) -> String {
         Some(EngineProgress::Reasoning { challenge, total }) => format!("Step {challenge}/{total}"),
         Some(EngineProgress::Structured { run, total }) => format!("Step {run}/{total}"),
         Some(EngineProgress::Sampling { .. }) => "Sampling…".to_string(),
+        Some(EngineProgress::FlatOut {
+            segment,
+            total_segments,
+            ..
+        }) => format!("Segment {segment}/{total_segments}"),
         None => "Starting…".to_string(),
     }
 }

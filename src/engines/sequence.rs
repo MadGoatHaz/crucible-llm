@@ -39,6 +39,7 @@ use crate::engines::capability::{
 };
 use crate::engines::concurrency::SweepResult;
 use crate::engines::hardware::profile;
+use crate::engines::flatout::{FlatOutEngine, FlatOutResult};
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::HwPoller;
@@ -104,6 +105,8 @@ pub enum Engine {
     Structured,
     /// Engine D — Hardware & Energy profiler (continuous sampling).
     Hardware,
+    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    FlatOut,
 }
 
 impl Engine {
@@ -116,6 +119,7 @@ impl Engine {
             Engine::Reasoning => "C2: Reasoning",
             Engine::Structured => "C3: Structured",
             Engine::Hardware => "D: Energy",
+            Engine::FlatOut => "F: Flat Out",
         }
     }
 
@@ -128,6 +132,7 @@ impl Engine {
             Engine::Reasoning => "REASONING",
             Engine::Structured => "STRUCTURED",
             Engine::Hardware => "ENERGY",
+            Engine::FlatOut => "FLAT OUT",
         }
     }
 
@@ -140,18 +145,20 @@ impl Engine {
             Engine::Reasoning => "ENGINE C2: REASONING",
             Engine::Structured => "ENGINE C3: STRUCTURED",
             Engine::Hardware => "ENGINE D: ENERGY",
+            Engine::FlatOut => "ENGINE F: FLAT OUT",
         }
     }
 
     /// All six engines in the canonical run order (the default queue
     /// shown before a run starts).
-    pub const ALL: [Engine; 6] = [
+    pub const ALL: [Engine; 7] = [
         Engine::Speed,
         Engine::Concurrency,
         Engine::Niah,
         Engine::Reasoning,
         Engine::Structured,
         Engine::Hardware,
+        Engine::FlatOut,
     ];
 
     /// A concise, user-facing description of what this engine measures.
@@ -181,6 +188,9 @@ impl Engine {
             }
             Engine::Hardware => {
                 "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
+            }
+            Engine::FlatOut => {
+                "Sustained max-speed test. 60 seconds, decreasing token\ntargets (10k→1k). Finds your server's absolute best-case\nthroughput — the \"big number\" to end on."
             }
         }
     }
@@ -219,6 +229,13 @@ pub enum EngineProgress {
     Structured { run: usize, total: usize },
     /// Engine D: `Sampling... {elapsed}s`.
     Sampling { elapsed: f64 },
+    /// Engine F: `Segment {n}/{total} ({target}k tokens) — {tps} t/s`.
+    FlatOut {
+        segment: usize,
+        total_segments: usize,
+        target_tokens: u32,
+        tps: f64,
+    },
 }
 
 impl EngineProgress {
@@ -267,6 +284,14 @@ impl EngineProgress {
             // Engine D: no known end — an indeterminate (0.0) bar; the
             // elapsed seconds carry the "alive" signal.
             EngineProgress::Sampling { .. } => 0.0,
+            // Engine F: completed segments over total.
+            EngineProgress::FlatOut {
+                segment,
+                total_segments,
+                ..
+            } => {
+                (*segment).saturating_sub(1) as f64 / (*total_segments).max(1) as f64
+            }
         }
     }
 
@@ -296,6 +321,16 @@ impl EngineProgress {
             }
             EngineProgress::Structured { run, total } => format!("Run {run}/{total}"),
             EngineProgress::Sampling { elapsed } => format!("Sampling… {elapsed:.1}s"),
+            EngineProgress::FlatOut {
+                segment,
+                total_segments,
+                target_tokens,
+                tps,
+            } => format!(
+                "Segment {segment}/{total_segments} ({}k tokens) — {:.1} t/s",
+                target_tokens / 1000,
+                tps
+            ),
         }
     }
 }
@@ -460,6 +495,7 @@ pub struct RunSlots {
     pub niah: Arc<NiahSlot>,
     pub reasoning: Arc<ResultSlot<ReasoningResult>>,
     pub structured: Arc<ResultSlot<StructuredResult>>,
+    pub flatout: Arc<ResultSlot<FlatOutResult>>,
 }
 
 /// The sequential benchmark executor (one engine at a time).
@@ -503,6 +539,7 @@ pub fn queue_for(sel: &crate::config::EngineSelection) -> Vec<Engine> {
         (sel.reasoning, Engine::Reasoning),
         (sel.structured, Engine::Structured),
         (sel.hardware, Engine::Hardware),
+        (sel.flatout, Engine::FlatOut),
     ]
     .into_iter()
     .filter(|(on, _)| *on)
@@ -712,6 +749,8 @@ impl BenchmarkSequence {
                 // Engine D runs last in the canonical order, so the
                 // cumulative token count is final when it samples.
                 Engine::Hardware => self.run_hardware(total_tokens).await,
+                // Engine F (Flat Out) runs after D: the "big number" finale.
+                Engine::FlatOut => self.run_flatout().await,
             };
             total_tokens += match engine {
                 Engine::Speed => summary_tokens_speed(&self.slots.speed),
@@ -1022,6 +1061,31 @@ impl BenchmarkSequence {
             .info(Context::EngineD, format!("Engine D complete — {summary}"));
         summary
     }
+
+    /// Engine F — Flat Out: the sustained max-speed finale. Six sequential
+    /// single-stream segments with decreasing token targets (10k→1k).
+    /// Returns the one-line summary (`BEST: X t/s (segment N, Mk tokens)`).
+    async fn run_flatout(&self) -> String {
+        self.slots.flatout.set_running(true);
+        let engine = match FlatOutEngine::new(&self.cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                self.slots.flatout.set_running(false);
+                self.logger
+                    .error(Context::EngineF, format!("Engine F init failed: {e}"));
+                return format!("init failed: {e}");
+            }
+        };
+        let engine = engine
+            .metrics(self.metrics.clone())
+            .progress(self.bus.clone())
+            .pause(self.pause.clone())
+            .logger(self.logger.clone());
+        let result = engine.run().await;
+        self.slots.flatout.set_running(false);
+        self.slots.flatout.store(result.clone());
+        result.summary_line()
+    }
 }
 
 // ── Summary helpers (pure) ────────────────────────────────────────────────
@@ -1123,6 +1187,7 @@ mod tests {
                 niah: Arc::new(NiahSlot::new()),
                 reasoning: Arc::new(ResultSlot::new()),
                 structured: Arc::new(ResultSlot::new()),
+                flatout: Arc::new(ResultSlot::new()),
             },
             None,
             Arc::new(RunPause::new()),
@@ -1141,6 +1206,7 @@ mod tests {
             reasoning: true,
             structured: true,
             hardware: true,
+            flatout: true,
         };
         assert_eq!(
             seq(sel).engines(),
@@ -1150,7 +1216,8 @@ mod tests {
                 Engine::Niah,
                 Engine::Reasoning,
                 Engine::Structured,
-                Engine::Hardware
+                Engine::Hardware,
+                Engine::FlatOut
             ]
         );
     }
@@ -1164,6 +1231,7 @@ mod tests {
             reasoning: true,
             structured: false,
             hardware: false,
+            flatout: false,
         };
         assert_eq!(
             seq(sel).engines(),
@@ -1180,6 +1248,7 @@ mod tests {
             reasoning: false,
             structured: false,
             hardware: false,
+            flatout: false,
         };
         assert!(seq(sel).engines().is_empty());
     }
@@ -1346,6 +1415,16 @@ mod tests {
             EngineProgress::Sampling { elapsed: 3.0 }.label(),
             "Sampling… 3.0s"
         );
+        assert_eq!(
+            EngineProgress::FlatOut {
+                segment: 3,
+                total_segments: 6,
+                target_tokens: 6000,
+                tps: 45.2,
+            }
+            .label(),
+            "Segment 3/6 (6k tokens) — 45.2 t/s"
+        );
     }
 
     // ── slot / bus mechanics ────────────────────────────────────────────
@@ -1485,6 +1564,7 @@ mod tests {
             reasoning: false,
             structured: false,
             hardware: false,
+            flatout: false,
         };
         // The key path sets the slot running before spawning; the run
         // must clear it again on the no-op path.
@@ -1502,6 +1582,7 @@ mod tests {
                 niah: Arc::new(NiahSlot::new()),
                 reasoning: Arc::new(ResultSlot::new()),
                 structured: Arc::new(ResultSlot::new()),
+                flatout: Arc::new(ResultSlot::new()),
             },
             None,
             Arc::new(RunPause::new()),

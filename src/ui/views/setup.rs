@@ -113,11 +113,12 @@ pub enum SetupField {
     EngineReasoning,
     EngineStructured,
     EngineHardware,
+    EngineFlatOut,
 }
 
 impl SetupField {
     /// Every field in cursor order.
-    pub const ALL: [SetupField; 10] = [
+    pub const ALL: [SetupField; 11] = [
         SetupField::Mode,
         SetupField::Tokens,
         SetupField::Iterations,
@@ -128,6 +129,7 @@ impl SetupField {
         SetupField::EngineReasoning,
         SetupField::EngineStructured,
         SetupField::EngineHardware,
+        SetupField::EngineFlatOut,
     ];
 
     /// The short form label (value column carries the detail).
@@ -143,6 +145,7 @@ impl SetupField {
             SetupField::EngineReasoning => "Engine C2",
             SetupField::EngineStructured => "Engine C3",
             SetupField::EngineHardware => "Engine D",
+            SetupField::EngineFlatOut => "Engine F",
         }
     }
 
@@ -158,6 +161,7 @@ impl SetupField {
             SetupField::EngineReasoning => Some(Engine::Reasoning),
             SetupField::EngineStructured => Some(Engine::Structured),
             SetupField::EngineHardware => Some(Engine::Hardware),
+            SetupField::EngineFlatOut => Some(Engine::FlatOut),
             _ => None,
         }
     }
@@ -525,6 +529,7 @@ impl SetupState {
             SetupField::EngineReasoning => cfg.engine_reasoning = !cfg.engine_reasoning,
             SetupField::EngineStructured => cfg.engine_structured = !cfg.engine_structured,
             SetupField::EngineHardware => cfg.hardware = !cfg.hardware,
+            SetupField::EngineFlatOut => cfg.engine_flatout = !cfg.engine_flatout,
             _ => {}
         }
     }
@@ -947,6 +952,10 @@ fn form_value(field: SetupField, c: &ConfigState) -> (String, Style) {
             format!("[{}] Hardware / Energy", tick(c.hardware)),
             bool_style(c.hardware),
         ),
+        SetupField::EngineFlatOut => (
+            format!("[{}] Flat Out", tick(c.engine_flatout)),
+            bool_style(c.engine_flatout),
+        ),
     }
 }
 
@@ -977,6 +986,7 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         reasoning: c.engine_reasoning,
         structured: c.engine_structured,
         hardware: c.hardware,
+        flatout: c.engine_flatout,
     };
     let engine_labels: String = engines
         .iter_labels()

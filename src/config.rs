@@ -183,6 +183,9 @@ pub struct EngineSelection {
     pub structured: bool,
     /// Engine D — Hardware & Energy profiler.
     pub hardware: bool,
+    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    /// Opt-in: off by default (like Engine D).
+    pub flatout: bool,
 }
 
 impl Default for EngineSelection {
@@ -196,6 +199,10 @@ impl Default for EngineSelection {
             // Engine D (energy) is off by default: it must run on the
             // machine with the GPU, and is opt-in for GPU-box users.
             hardware: false,
+            // Engine F (Flat Out) is off by default: it is a 60-second
+            // sustained max-speed test, opt-in for users who want the
+            // "big number" finale.
+            flatout: false,
         }
     }
 }
@@ -218,6 +225,7 @@ impl EngineSelection {
             reasoning: false,
             structured: false,
             hardware: false,
+            flatout: false,
         };
         let mut unknown = Vec::new();
         for name in names {
@@ -228,6 +236,7 @@ impl EngineSelection {
                 "reasoning" | "c2" => sel.reasoning = true,
                 "structured" | "c3" => sel.structured = true,
                 "hardware" | "energy" | "d" => sel.hardware = true,
+                "flatout" | "flat" | "f" => sel.flatout = true,
                 other => unknown.push(other.to_string()),
             }
         }
@@ -242,6 +251,7 @@ impl EngineSelection {
             && !self.reasoning
             && !self.structured
             && !self.hardware
+            && !self.flatout
     }
 
     /// The number of selected engines.
@@ -253,6 +263,7 @@ impl EngineSelection {
             self.reasoning,
             self.structured,
             self.hardware,
+            self.flatout,
         ]
         .iter()
         .filter(|&&b| b)
@@ -269,6 +280,7 @@ impl EngineSelection {
             (self.reasoning, "C2 (reasoning)"),
             (self.structured, "C3 (structured)"),
             (self.hardware, "D (hardware)"),
+            (self.flatout, "F (flat out)"),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
@@ -1373,9 +1385,10 @@ mod tests {
     // ── Chunk 18: engine selection, ladder, hardware ─────────────────────
 
     #[test]
-    fn engine_selection_default_is_everything_except_hardware() {
+    fn engine_selection_default_is_everything_except_hardware_and_flatout() {
         // FIX 4: the default run selects A, B, C1, C2, C3 — Energy (D)
-        // is off (it must run on the GPU box and is opt-in).
+        // is off (it must run on the GPU box and is opt-in), and Flat Out
+        // (F) is off (60-second sustained test, opt-in).
         let e = EngineSelection::default();
         assert!(e.speed, "Engine A on by default");
         assert!(e.concurrency, "Engine B on by default");
@@ -1386,6 +1399,10 @@ mod tests {
             !e.hardware,
             "Engine D off by default (opt-in on the GPU box)"
         );
+        assert!(
+            !e.flatout,
+            "Engine F off by default (opt-in sustained max-speed test)"
+        );
         assert_eq!(e.count(), 5);
         assert!(!e.is_empty());
     }
@@ -1393,7 +1410,7 @@ mod tests {
     #[test]
     fn engine_selection_parses_names_and_aliases() {
         let (e, unknown) =
-            EngineSelection::from_names(["speed", "B", "niah", "C2", "structured", "D"]);
+            EngineSelection::from_names(["speed", "B", "niah", "C2", "structured", "D", "F"]);
         assert!(unknown.is_empty(), "no unknown names: {unknown:?}");
         assert!(e.speed);
         assert!(e.concurrency); // "B"
@@ -1401,7 +1418,8 @@ mod tests {
         assert!(e.reasoning); // "C2"
         assert!(e.structured);
         assert!(e.hardware); // "D"
-        assert_eq!(e.count(), 6);
+        assert!(e.flatout); // "F"
+        assert_eq!(e.count(), 7);
     }
 
     #[test]
@@ -1539,7 +1557,8 @@ mod tests {
             &p,
             r#"{"url":"http://f:1/v1","ladder":[1,8,32],"hardware":false,
                 "engines":{"speed":true,"concurrency":true,"niah":true,
-                           "reasoning":false,"structured":true,"hardware":false}}"#,
+                           "reasoning":false,"structured":true,"hardware":false,
+                           "flatout":false}}"#,
         )
         .unwrap();
         let f = load_config_file(&p).unwrap().unwrap();
@@ -1552,5 +1571,6 @@ mod tests {
         assert!(c.engines.structured);
         assert!(!c.engines.reasoning);
         assert!(!c.engines.hardware);
+        assert!(!c.engines.flatout);
     }
 }

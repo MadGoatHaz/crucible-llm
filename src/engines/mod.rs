@@ -33,6 +33,7 @@ use crate::metrics::state::MetricsState;
 
 pub mod capability;
 pub mod concurrency;
+pub mod flatout;
 pub mod hardware;
 pub mod sequence;
 pub mod speed;
@@ -54,6 +55,7 @@ pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
 };
+pub use flatout::{FlatOutEngine, FlatOutResult, SegmentResult, SEGMENT_TARGETS};
 pub use sequence::{
     queue_for, summarize_sweep, BenchmarkSequence, Engine, EngineProgress, ProgressBus, RunPause,
     RunSlots, SeqPhase, SeqState, SeqStateSlot,
@@ -143,6 +145,8 @@ pub struct RunReport {
     pub reasoning: Option<ReasoningResult>,
     /// Engine C3 — the structured-output penalty + compliance.
     pub structured: Option<StructuredResult>,
+    /// Engine F — Flat Out (sustained max-speed, decreasing targets).
+    pub flatout: Option<FlatOutResult>,
 }
 
 impl RunReport {
@@ -163,6 +167,9 @@ impl RunReport {
         }
         if let Some(s) = &self.structured {
             parts.push(format!("C3: {}", s.summary_line()));
+        }
+        if let Some(f) = &self.flatout {
+            parts.push(format!("F: {}", f.summary_line()));
         }
         if parts.is_empty() {
             "no engines selected".to_string()
@@ -213,6 +220,12 @@ pub async fn run_selected(cfg: &Config) -> RunReport {
     if sel.structured {
         if let Ok(engine) = StructuredEngine::new(cfg) {
             report.structured = Some(engine.run().await);
+        }
+    }
+
+    if sel.flatout {
+        if let Ok(engine) = FlatOutEngine::new(cfg) {
+            report.flatout = Some(engine.run().await);
         }
     }
 
@@ -427,6 +440,7 @@ mod tests {
             reasoning: true,
             structured: false,
             hardware: false,
+            flatout: false,
         };
         assert_eq!(sel.count(), 1);
         assert!(sel.reasoning);

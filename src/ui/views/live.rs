@@ -124,6 +124,7 @@ fn selected(app: &App) -> EngineSelection {
             reasoning: seq.queue.contains(&Engine::Reasoning),
             structured: seq.queue.contains(&Engine::Structured),
             hardware: seq.queue.contains(&Engine::Hardware),
+            flatout: seq.queue.contains(&Engine::FlatOut),
         };
     }
     let c = &app.config;
@@ -134,6 +135,7 @@ fn selected(app: &App) -> EngineSelection {
         reasoning: c.engine_reasoning,
         structured: c.engine_structured,
         hardware: c.hardware,
+        flatout: c.engine_flatout,
     }
 }
 
@@ -169,7 +171,7 @@ fn should_show_concurrency(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
 /// user did not select (FIX 1).
 fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
     let sel = selected(app);
-    if !sel.niah && !sel.reasoning && !sel.structured && !sel.hardware {
+    if !sel.niah && !sel.reasoning && !sel.structured && !sel.hardware && !sel.flatout {
         return false;
     }
     match seq.as_deref() {
@@ -177,21 +179,31 @@ fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
             s.completed.iter().any(|(e, _)| {
                 matches!(
                     e,
-                    Engine::Niah | Engine::Reasoning | Engine::Structured | Engine::Hardware
+                    Engine::Niah
+                        | Engine::Reasoning
+                        | Engine::Structured
+                        | Engine::Hardware
+                        | Engine::FlatOut
                 )
             }) || (sel.niah && app.niah.load().as_ref().is_some())
                 || (sel.reasoning && app.reasoning_slot.load().as_ref().is_some())
                 || (sel.structured && app.structured_slot.load().as_ref().is_some())
+                || (sel.flatout && app.flatout_slot.load().as_ref().is_some())
         }
         Some(s) => matches!(
             s.engine,
-            Engine::Niah | Engine::Reasoning | Engine::Structured | Engine::Hardware
+            Engine::Niah
+                | Engine::Reasoning
+                | Engine::Structured
+                | Engine::Hardware
+                | Engine::FlatOut
         ),
         None => {
             (sel.niah && app.niah.load().as_ref().is_some())
                 || (sel.reasoning && app.reasoning_slot.load().as_ref().is_some())
                 || (sel.structured && app.structured_slot.load().as_ref().is_some())
                 || (sel.hardware && app.hw.is_some())
+                || (sel.flatout && app.flatout_slot.load().as_ref().is_some())
         }
     }
 }
@@ -873,6 +885,21 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
             info: "Joules per token. Requires a local GPU with driver support.",
             warn: None,
         });
+    }
+
+    // Flat Out (F) — the "big number" finale: best-case t/s.
+    if sel.flatout {
+        if let Some(r) = app.flatout_slot.load().as_ref() {
+            v.push(CapScore {
+                label: "Flat Out",
+                pct: None,
+                detail: format!("BEST: {:.1} t/s", r.best_tps),
+                detail_style: style::value_ok(),
+                color: palette::OK,
+                info: "Sustained max-speed test. 60s, decreasing targets (10k→1k).",
+                warn: None,
+            });
+        }
     }
 
     v
@@ -1641,6 +1668,7 @@ mod tests {
                 reasoning: true,
                 structured: true,
                 hardware: false, // FIX 4: D is off by default
+                flatout: false,  // F is off by default (opt-in)
             }
         );
     }
