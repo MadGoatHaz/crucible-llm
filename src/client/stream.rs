@@ -518,8 +518,16 @@ impl StreamWorker {
             )
         };
         let mut tokens = 0u64;
+        let mut last_token_at: Option<MonotonicInstant> = None;
         let mut done = match self
-            .emit_frames(parser.feed(head.as_ref()), &head_at, ts, tx, &mut guard)
+            .emit_frames(
+                parser.feed(head.as_ref()),
+                &head_at,
+                ts,
+                tx,
+                &mut guard,
+                &mut last_token_at,
+            )
             .await
         {
             Ok((d, tc)) => {
@@ -558,13 +566,13 @@ impl StreamWorker {
                 ChunkRead::Eof => {
                     // Clean EOF without `[DONE]`: premature close.
                     if let Ok((_, tc)) = self
-                        .emit_frames(parser.finish(), &at, ts, tx, &mut guard)
+                        .emit_frames(parser.finish(), &at, ts, tx, &mut guard, &mut last_token_at)
                         .await
                     {
                         tokens += tc;
                     }
                     ts.t_end = Some(at);
-                    self.log_stream_end(ts, tokens, parser.usage(), true);
+                    self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
                     let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                     return self
                         .finish_complete(
@@ -579,18 +587,25 @@ impl StreamWorker {
                         .await;
                 }
                 ChunkRead::Error(msg) => {
-                    if ts.t2.is_some() {
-                        // Premature close mid-stream: a broken `chunked`
-                        // close or connection reset. Flush the pending
-                        // frame, keep every captured timestamp.
-                        if let Ok((_, tc)) = self
-                            .emit_frames(parser.finish(), &at, ts, tx, &mut guard)
-                            .await
-                        {
-                            tokens += tc;
-                        }
-                        ts.t_end = Some(at);
-                        self.log_stream_end(ts, tokens, parser.usage(), true);
+                        if ts.t2.is_some() {
+                            // Premature close mid-stream: a broken `chunked`
+                            // close or connection reset. Flush the pending
+                            // frame, keep every captured timestamp.
+                            if let Ok((_, tc)) = self
+                                .emit_frames(
+                                    parser.finish(),
+                                    &at,
+                                    ts,
+                                    tx,
+                                    &mut guard,
+                                    &mut last_token_at,
+                                )
+                                .await
+                            {
+                                tokens += tc;
+                            }
+                            ts.t_end = Some(at);
+                            self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
                         let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                         return self
                             .finish_complete(
@@ -614,7 +629,14 @@ impl StreamWorker {
                         ts.t2 = Some(at);
                     }
                     match self
-                        .emit_frames(parser.feed(b.as_ref()), &at, ts, tx, &mut guard)
+                        .emit_frames(
+                            parser.feed(b.as_ref()),
+                            &at,
+                            ts,
+                            tx,
+                            &mut guard,
+                            &mut last_token_at,
+                        )
                         .await
                     {
                         Ok((d, tc)) => {
@@ -644,7 +666,7 @@ impl StreamWorker {
 
         // `[DONE]` received: Tn — stream close.
         ts.t_end = Some(MonotonicInstant::now());
-        self.log_stream_end(ts, tokens, parser.usage(), false);
+        self.log_stream_end(ts, tokens, parser.usage(), last_token_at, false);
         let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
         self.finish_complete(
             tx,
@@ -701,58 +723,53 @@ impl StreamWorker {
 
     /// Log the stream's completion.
     ///
-    /// The decode rate is measured from the tokens we **observed on the wire**
-    /// (`frames`) over the T3→Tn window, not from the server's self-reported
-    /// `usage.completion_tokens`. Some servers (notably Unsloth / llama.cpp
-    /// GGUF builds) report `completion_tokens` as the requested `max_tokens`
-    /// target rather than the tokens they actually generated, which
-    /// overstates a `completion_tokens / decode-window` rate by a wide margin
-    /// (the `68 t/s`-vs-`29 t/s` discrepancy). When the server claims a count
-    /// that diverges from what arrived, both are shown and the over-report is
-    /// flagged. A usage-only stream (no token frames) falls back to the
-    /// server figure, and a no-usage stream reports the frame estimate.
+    /// The count is the **authoritative** one: the server's
+    /// `usage.completion_tokens` when it arrived (the primary method — the
+    /// server's own count), else the observed frame count as a last-resort
+    /// estimate (flagged `~`), which only happens when a non-compliant proxy
+    /// omits `usage` entirely. The rate is measured over the **decode
+    /// window** — first content/reasoning token to the last
+    /// (`T3` → `last_token_at`) — which excludes prefill/TTFT and the trailing
+    /// gap to `[DONE]`, matching how every backend measures its own decode
+    /// speed.
     fn log_stream_end(
         &self,
         ts: &StreamTimestamps,
         frames: u64,
         usage: Option<Usage>,
+        last_token_at: Option<MonotonicInstant>,
         premature: bool,
     ) {
-        // Rate basis: what we observed, else the server figure (usage-only).
-        let observed = if frames > 0 {
-            frames
-        } else {
-            usage.map(|u| u.completion_tokens).unwrap_or(0)
+        // Authoritative count: the server's figure first; the observed frame
+        // count is a last-resort estimate only when no usage arrived.
+        let (count, estimated) = match usage {
+            Some(u) if u.completion_tokens > 0 => (u.completion_tokens, false),
+            _ => (frames, true),
         };
-        let (total_s, rate) = match (ts.t0, ts.t_end, ts.t3) {
-            (Some(t0), Some(end), Some(t3)) => {
-                let total = t0.delta_nanos(&end) as f64 / 1e9;
-                let span = t3.delta_nanos(&end).max(1) as f64 / 1e9;
-                (total, (observed as f64 / span).max(0.0))
+        // Decode window: first token (T3) → last content/reasoning token.
+        let (total_s, rate) = match (ts.t3, last_token_at) {
+            (Some(t3), Some(last)) => {
+                let total = ts
+                    .t0
+                    .map(|t0| t0.delta_nanos(&last))
+                    .unwrap_or_else(|| t3.delta_nanos(&last)) as f64
+                    / 1e9;
+                let span = t3.delta_nanos(&last) as f64 / 1e9;
+                (total, if span > 0.0 { count as f64 / span } else { 0.0 })
             }
-            (Some(t0), Some(end), None) => (t0.delta_nanos(&end) as f64 / 1e9, 0.0),
             _ => (0.0, 0.0),
         };
         let tag = if premature { " (premature close)" } else { "" };
-        let msg = match usage {
-            Some(u) if u.completion_tokens > 0 && frames > 0 => {
-                let over = (u.completion_tokens as f64 - frames as f64).abs()
-                    / u.completion_tokens as f64
-                    > 0.15;
-                let note = if over { " [server over-reported]" } else { "" };
-                format!(
-                    "{} stream complete: {frames} tokens observed ({} server-claimed) in {total_s:.1}s ({rate:.1} t/s){note}{tag}",
-                    self.tag, u.completion_tokens
-                )
-            }
-            Some(u) => format!(
-                "{} stream complete: {} tokens in {total_s:.1}s ({rate:.1} t/s){tag}",
-                self.tag, u.completion_tokens
-            ),
-            None => format!(
-                "{} stream complete: {frames} frames in {total_s:.1}s (~{rate:.1} t/s est){tag}",
+        let msg = if estimated {
+            format!(
+                "{} stream complete: ~{count} tokens (est, no usage) in {total_s:.1}s (~{rate:.1} t/s){tag}",
                 self.tag
-            ),
+            )
+        } else {
+            format!(
+                "{} stream complete: {count} tokens in {total_s:.1}s ({rate:.1} t/s){tag}",
+                self.tag
+            )
         };
         self.logl(Level::Info, Context::Sse, &msg);
     }
@@ -791,6 +808,7 @@ impl StreamWorker {
         // A single non-streaming completion cannot loop (at most one token
         // frame), but the guard is fed for a uniform `emit_frames` contract.
         let mut guard = LoopGuard::new();
+        let mut last_token_at: Option<MonotonicInstant> = None;
         let parsed_at = MonotonicInstant::now();
         match parse_plain_completion(&body) {
             Ok((content, usage)) => {
@@ -815,7 +833,7 @@ impl StreamWorker {
                 // — the server's `usage` is. Report `0` observed frames so the
                 // downstream rate falls back to `usage.completion_tokens`.
                 let tokens = match self
-                    .emit_frames(&frames, &parsed_at, ts, tx, &mut guard)
+                    .emit_frames(&frames, &parsed_at, ts, tx, &mut guard, &mut last_token_at)
                     .await
                 {
                     Ok(_) => 0,
@@ -829,7 +847,7 @@ impl StreamWorker {
                     }
                 };
                 ts.t_end = Some(MonotonicInstant::now());
-                self.log_stream_end(ts, tokens, usage, false);
+                self.log_stream_end(ts, tokens, usage, last_token_at, false);
                 // A complete plain-JSON response is a normal completion, not
                 // a premature one (there is no `[DONE]` to expect).
                 self.finish_complete(tx, ts, usage, false, 0, (false, 0), tokens)
@@ -1041,12 +1059,13 @@ impl StreamWorker {
     ///
     /// `frame.t_nanos` is set to the arrival time in nanoseconds since
     /// `T0` (the parser leaves it `0` by contract); `T3` is latched on the
-    /// first token frame. Each decoded token string is also fed to the
-    /// per-stream [`LoopGuard`] (v0.1.1) — the first detection logs a
-    /// `[LOOP_GUARD]` warning line. Returns `(done, token_frames)`: `true`
-    /// when a terminal `[DONE]` frame was among them, plus the number of
-    /// token frames emitted in this call (the worker's log-milestone
-    /// counter).
+    /// first token frame and `*last_token_at` is advanced to the arrival of
+    /// every token frame (the decode window's end). Each decoded token
+    /// string is also fed to the per-stream [`LoopGuard`] (v0.1.1) — the
+    /// first detection logs a `[LOOP_GUARD]` warning line. Returns
+    /// `(done, token_frames)`: `true` when a terminal `[DONE]` frame was
+    /// among them, plus the number of token frames emitted in this call
+    /// (the worker's log-milestone counter).
     async fn emit_frames(
         &self,
         frames: &[ParsedFrame],
@@ -1054,6 +1073,7 @@ impl StreamWorker {
         ts: &mut StreamTimestamps,
         tx: &mut mpsc::Sender<StreamEvent>,
         guard: &mut LoopGuard,
+        last_token_at: &mut Option<MonotonicInstant>,
     ) -> Result<(bool, u64), ()> {
         let mut done_seen = false;
         let mut token_frames = 0u64;
@@ -1077,6 +1097,7 @@ impl StreamWorker {
                 if ts.t3.is_none() {
                     ts.t3 = Some(*at);
                 }
+                *last_token_at = Some(*at);
             }
             if frame.done {
                 done_seen = true;
@@ -1134,6 +1155,51 @@ pub fn normalize_endpoint(base: &str) -> String {
     } else {
         format!("{base}{COMPLETIONS_PATH}")
     }
+}
+
+/// The **(first, last) content/reasoning token arrival** instants across a
+/// stream's events — the research's **decode window**
+/// (`T_first` → `T_last`): the moment the first generated token lands to the
+/// moment the last one lands.
+///
+/// This is the window every throughput calculation must use: it excludes
+/// prefill/TTFT (before the first token) and the trailing gap to `[DONE]`
+/// (after the last token) — exactly how vLLM, llama.cpp, SGLang, LM Studio,
+/// Ollama, and TGI each measure their own decode rate. `(None, None)` when no
+/// token frame arrived (a pure control/usage stream, a failure, or a
+/// non-streaming plain-JSON blob counted separately).
+#[must_use]
+pub fn token_window(events: &[StreamEvent]) -> (Option<MonotonicInstant>, Option<MonotonicInstant>) {
+    let mut first: Option<MonotonicInstant> = None;
+    let mut last: Option<MonotonicInstant> = None;
+    for e in events {
+        if let StreamEvent::Frame { frame, at, .. } = e {
+            if frame.chunk.is_token() {
+                if first.is_none() {
+                    first = Some(*at);
+                }
+                last = Some(*at);
+            }
+        }
+    }
+    (first, last)
+}
+
+/// The **concatenated reasoning + content text** of a stream, in arrival
+/// order — the research's re-tokenization input. A non-compliant proxy that
+/// omits `usage` is counted by re-encoding this text with the model's exact
+/// tokenizer (counting SSE chunks directly is fundamentally inaccurate).
+#[must_use]
+pub fn stream_text(events: &[StreamEvent]) -> String {
+    let mut text = String::new();
+    for e in events {
+        if let StreamEvent::Frame { frame, .. } = e {
+            if let Some(t) = frame.chunk.token_text() {
+                text.push_str(t);
+            }
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -1329,10 +1395,9 @@ mod tests {
             mock.increment(100_000_000);
             let t_end = MonotonicInstant::now(); // 200 ms
 
-            // Server reports usage (256 claimed) but only 119 frames
-            // arrived: the rate is measured from the observed 119 over the
-            // T3→Tn window (119 / 0.1 s = 1190 t/s), and the large
-            // over-report is flagged.
+            // Usage arrived (256): the authoritative count, measured over the
+            // decode window T3 (100 ms) → last token (200 ms) = 0.1 s →
+            // 256 / 0.1 = 2560 t/s.
             w.log_stream_end(
                 &StreamTimestamps {
                     t0: Some(t0),
@@ -1346,9 +1411,11 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 256,
                 }),
+                Some(t_end),
                 false,
             );
-            // No usage: the frame count is only an estimate.
+            // No usage: the frame count (119) is only an estimate, over the
+            // full T3 (0 ms) → last token (200 ms) = 0.2 s window.
             w.log_stream_end(
                 &StreamTimestamps {
                     t0: Some(t0),
@@ -1359,6 +1426,7 @@ mod tests {
                 },
                 119,
                 None,
+                Some(t_end),
                 false,
             );
             // A premature close keeps the marker.
@@ -1375,6 +1443,7 @@ mod tests {
                     prompt_tokens: 10,
                     completion_tokens: 256,
                 }),
+                Some(t_end),
                 true,
             );
         });
@@ -1382,19 +1451,15 @@ mod tests {
         // The writer flushes on every newline; read after finish.
         let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
         assert!(
-            latest.contains(
-                "test stream complete: 119 tokens observed (256 server-claimed) in 0.2s (1190.0 t/s) [server over-reported]"
-            ),
-            "observed/claimed line missing: {latest}"
+            latest.contains("test stream complete: 256 tokens in 0.2s (2560.0 t/s)"),
+            "authoritative usage line missing: {latest}"
         );
         assert!(
-            latest.contains("test stream complete: 119 frames in 0.2s (~595.0 t/s est)"),
+            latest.contains("test stream complete: ~119 tokens (est, no usage) in 0.2s (~595.0 t/s)"),
             "estimate line missing: {latest}"
         );
         assert!(
-            latest.contains(
-                "119 tokens observed (256 server-claimed) in 0.2s (1190.0 t/s) [server over-reported] (premature close)"
-            ),
+            latest.contains("256 tokens in 0.2s (2560.0 t/s) (premature close)"),
             "premature marker missing: {latest}"
         );
         let _ = std::fs::remove_dir_all(&dir);

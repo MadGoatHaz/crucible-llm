@@ -1231,9 +1231,12 @@ impl StreamTracker {
     fn row(&self, max_tokens: u32) -> StreamMetric {
         let tg = self.tokens();
         let ttft_s = self.ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
-        let gen_tps = match (self.t3, self.t_end) {
-            (Some(t3), Some(end)) => {
-                let span_s = t3.delta_nanos(&end) as f64 / 1_000_000_000.0;
+        // Decode window: first token (T3) → last content/reasoning token
+        // (`last_token_at`) — prefill/TTFT and the trailing gap to `[DONE]`
+        // are both excluded (the research's Timing Boundary Rule).
+        let gen_tps = match (self.t3, self.last_token_at) {
+            (Some(t3), Some(last)) => {
+                let span_s = t3.delta_nanos(&last) as f64 / 1_000_000_000.0;
                 if span_s > 0.0 && tg > 0 {
                     Some(tg as f64 / span_s)
                 } else {
@@ -1427,8 +1430,10 @@ impl LevelAccumulator {
     }
 
     /// The decode window (v0.1.1 labeled layer): the span from the first
-    /// token to the last token across the non-looping streams
-    /// (`(T_first, T_last)`). `None` when no span can be formed.
+    /// token to the **last content/reasoning token** across the
+    /// non-looping streams (`(T_first, T_last)`) — prefill/TTFT and the
+    /// trailing gap to `[DONE]` are both excluded (the research's Timing
+    /// Boundary Rule). `None` when no span can be formed.
     fn decode_span(&self) -> Option<(MonotonicInstant, MonotonicInstant)> {
         // Any instant serves as the ordering anchor (the clock is
         // monotonic, so deltas from it preserve order).
@@ -1444,7 +1449,9 @@ impl LevelAccumulator {
                     first = Some(t3);
                 }
             }
-            if let Some(end) = t.t_end.or(t.last_token_at) {
+            // Last content/reasoning token first (the decode window's end);
+            // fall back to the stream close only when no token was seen.
+            if let Some(end) = t.last_token_at.or(t.t_end) {
                 if last.is_none_or(|l| anchor.delta_nanos(&end) > anchor.delta_nanos(&l)) {
                     last = Some(end);
                 }

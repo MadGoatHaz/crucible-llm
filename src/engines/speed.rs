@@ -27,7 +27,8 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::client::{
-    join_worker, spawn_worker, StreamError, StreamEvent, StreamOutcome, StreamWorker,
+    join_worker, spawn_worker, stream_text, token_window, StreamError, StreamEvent, StreamOutcome,
+    StreamWorker,
 };
 use crate::config::{Config, Mode};
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
@@ -293,7 +294,16 @@ impl SpeedEngine {
         // Channel is closed (worker done): collect the outcome. A task
         // panic becomes a failed outcome, never a crash.
         let outcome = join_worker(handle).await;
-        (aggregate(&self.cfg, prompt, &outcome, &events), events)
+        (
+            aggregate(
+                &self.cfg,
+                prompt,
+                &outcome,
+                &events,
+                self.generator.tokenizer().as_deref(),
+            ),
+            events,
+        )
     }
 
     /// Build a live [`MetricsSnapshot`] from the events collected so far
@@ -403,21 +413,21 @@ impl SpeedEngine {
             }
         }
 
-        // Measure the decode rate from the token frames we OBSERVED on the
-        // wire, not the server's self-reported `usage.completion_tokens` —
-        // some servers (Unsloth / llama.cpp GGUF) report it as the requested
-        // `max_tokens` target, which overstates the rate. Fall back to the
-        // server figure only when no token frames arrived (usage-only stream).
-        let tokens = if token_frames > 0 {
-            token_frames
-        } else {
-            usage.map(|u| u.completion_tokens).unwrap_or(0)
+        // Authoritative count: the server's `usage.completion_tokens` once
+        // it has arrived (the `Complete` event carries it); while the stream
+        // is still open, the observed token frames are the live estimate.
+        let tokens = match usage {
+            Some(u) if u.completion_tokens > 0 => u.completion_tokens,
+            _ => token_frames,
         };
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
-        let gen_tps = match (t3, t_end) {
-            (Some(t3), Some(end)) => {
-                let span_s = t3.delta_nanos(&end) as f64 / 1_000_000_000.0;
+        // Decode window: first token (T3) → last content/reasoning token
+        // (`last_token_at`) — prefill/TTFT and the trailing gap to `[DONE]`
+        // are both excluded (the research's Timing Boundary Rule).
+        let gen_tps = match (t3, last_token_at) {
+            (Some(t3), Some(last)) => {
+                let span_s = t3.delta_nanos(&last) as f64 / 1_000_000_000.0;
                 if span_s > 0.0 && tokens > 0 {
                     Some(tokens as f64 / span_s)
                 } else {
@@ -439,9 +449,9 @@ impl SpeedEngine {
                 (p, Some(ns)) if p > 0 && ns > 0 => p as f64 / (ns as f64 / 1e9),
                 _ => 0.0,
             };
-            let decode = match (t3, t_end) {
-                (Some(t3), Some(end)) => {
-                    let span_s = t3.delta_nanos(&end) as f64 / 1e9;
+            let decode = match (t3, last_token_at) {
+                (Some(t3), Some(last)) => {
+                    let span_s = t3.delta_nanos(&last) as f64 / 1e9;
                     if span_s > 0.0 && tokens > 0 {
                         tokens as f64 / span_s
                     } else {
@@ -597,6 +607,7 @@ pub fn aggregate(
     prompt: &GeneratedPrompt,
     outcome: &StreamOutcome,
     events: &[StreamEvent],
+    tokenizer: Option<&Tokenizer>,
 ) -> SpeedResult {
     let ts: StreamTimestamps = outcome.timestamps;
     let stream_time = ts.total_nanos().unwrap_or(0) as f64 / 1e9;
@@ -612,7 +623,6 @@ pub fn aggregate(
     let mut content_chunks = 0u64;
     let mut reasoning_chunks = 0u64;
     let mut other_chunks = 0u64;
-    let mut content_chars = 0usize;
     for event in events {
         let StreamEvent::Frame { frame, .. } = event else {
             continue;
@@ -621,44 +631,43 @@ pub fn aggregate(
             continue;
         }
         match &frame.chunk {
-            Chunk::Content(text) => {
-                content_chunks += 1;
-                content_chars += text.len();
-            }
+            Chunk::Content(_) => content_chunks += 1,
             Chunk::Reasoning(_) => reasoning_chunks += 1,
             Chunk::Usage(_) | Chunk::Control => other_chunks += 1,
         }
     }
     let total_chunks = content_chunks + reasoning_chunks + other_chunks;
 
-    // Token counts: server `usage` first; the prototype's fallbacks
-    // otherwise (prompt → `chars/4` of the prompt; completion →
-    // `chars/4` of the content, only when some chunk arrived), flagging
-    // `estimated`.
+    // Token counts — the research's **Authoritative Counting Rule**:
     //
-    // Completion tokens prefer what we OBSERVED on the wire
-    // (`outcome.frames`) over the server's self-reported
-    // `usage.completion_tokens` — some servers (Unsloth / llama.cpp GGUF)
-    // inflate the latter to the requested `max_tokens` target, which would
-    // overstate the decode rate. The server figure is used only when no token
-    // frames arrived; the `chars/4` estimate is the last resort.
+    // 1. **PRIMARY** — the server's own `usage.completion_tokens` (the
+    //    terminal usage chunk; every compliant backend populates it under
+    //    `stream_options.include_usage`). This is the count the server
+    //    reports, so matching it is the goal.
+    // 2. **FALLBACK** (a non-compliant proxy that omits `usage`) —
+    //    re-tokenize the full reasoning + content text with the model's
+    //    exact tokenizer. Counting SSE chunks is fundamentally inaccurate
+    //    (multi-token frames, speculative batching, keepalives).
+    // 3. **LAST RESORT** (no usage AND no tokenizer) — the observed frame
+    //    count, flagged `estimated` (never the primary method).
     let (prompt_tokens, completion_tokens, estimated) = {
         let mut est = false;
-        let completion = if outcome.frames > 0 {
-            outcome.frames
-        } else {
-            match outcome
-                .usage
-                .map(|u| u.completion_tokens)
+        let completion = match outcome.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
+            Some(n) => n,
+            None => match tokenizer
+                .and_then(|t| t.try_count(&stream_text(events)))
                 .filter(|&n| n > 0)
             {
-                Some(n) => n,
-                None if total_chunks > 0 => {
+                Some(n) => n as u64,
+                None => {
                     est = true;
-                    (content_chars / 4).max(1) as u64
+                    if total_chunks > 0 {
+                        outcome.frames.max(1)
+                    } else {
+                        0
+                    }
                 }
-                None => 0,
-            }
+            },
         };
         let prompt = outcome
             .usage
@@ -682,8 +691,17 @@ pub fn aggregate(
     } else {
         0.0
     };
-    // §7.2: isolate the decode window from the prefill.
-    let generation_time = (stream_time - ttft).max(0.001);
+    // §7.2 — the research's **Timing Boundary Rule**: the decode window is
+    // the first content/reasoning token to the last (`T_first` → `T_last`),
+    // which excludes prefill/TTFT and the trailing gap to `[DONE]`. This is
+    // exactly the window vLLM / llama.cpp / SGLang / LM Studio / Ollama /
+    // TGI use for their own decode rate, so `completion_tokens / window`
+    // matches the server's displayed t/s.
+    let (t_first, t_last) = token_window(events);
+    let generation_time = match (t_first, t_last) {
+        (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+        _ => (stream_time - ttft).max(0.001), // no token window: legacy fallback
+    };
     let tg_speed = if looping {
         0.0
     } else {
@@ -981,130 +999,106 @@ mod tests {
         }
     }
 
-    /// A synthetic completed run: T0 → T1 (immediate) → T3 (+1ms) →
-    /// Tn (+2ms), with 2 content frames, 1 reasoning frame, 1 usage
-    /// frame, and the `[DONE]` terminator.
+    /// A synthetic completed run on an exact mock clock: T0 (0 ms) → T1
+    /// (5 ms) → first token (10 ms) → last token (30 ms) → Tn (40 ms), with
+    /// 1 reasoning frame + 2 content frames (the 3 token frames spread over
+    /// 10→30 ms), a usage frame, and the `[DONE]` terminator.
     fn completed_run() -> (StreamOutcome, Vec<StreamEvent>) {
-        let t0 = MonotonicInstant::now();
-        let t1 = MonotonicInstant::now();
-        std::thread::sleep(Duration::from_millis(1));
-        let t3 = MonotonicInstant::now();
-        std::thread::sleep(Duration::from_millis(1));
-        let t_end = MonotonicInstant::now();
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now(); // 5 ms
+            mock.increment(5_000_000);
+            let t3 = MonotonicInstant::now(); // 10 ms (first token)
+            mock.increment(10_000_000);
+            let t_mid = MonotonicInstant::now(); // 20 ms
+            mock.increment(10_000_000);
+            let t_last = MonotonicInstant::now(); // 30 ms (last token)
+            mock.increment(10_000_000);
+            let t_end = MonotonicInstant::now(); // 40 ms
 
-        let usage = Usage {
-            prompt_tokens: 128,
-            completion_tokens: 34,
-        };
-        let frames = [
-            ParsedFrame {
-                chunk: Chunk::Reasoning("think".into()),
-                t_nanos: 0,
-                done: false,
-            },
-            ParsedFrame {
-                chunk: Chunk::Content("Hello, ".into()),
-                t_nanos: 0,
-                done: false,
-            },
-            ParsedFrame {
-                chunk: Chunk::Content("world!".into()),
-                t_nanos: 0,
-                done: false,
-            },
-            ParsedFrame {
-                chunk: Chunk::Usage(usage),
-                t_nanos: 0,
-                done: false,
-            },
-            ParsedFrame {
-                chunk: Chunk::Control,
-                t_nanos: 0,
-                done: true,
-            },
-        ];
-        let events: Vec<StreamEvent> = frames
-            .iter()
-            .map(|f| StreamEvent::Frame {
-                frame: f.clone(),
-                at: t3,
-                timestamps: StreamTimestamps {
-                    t0: Some(t0),
-                    t1: Some(t1),
-                    t2: Some(t1),
-                    t3: Some(t3),
-                    t_end: Some(t_end),
-                },
-            })
-            .chain(std::iter::once(StreamEvent::Complete {
-                timestamps: StreamTimestamps {
-                    t0: Some(t0),
-                    t1: Some(t1),
-                    t2: Some(t1),
-                    t3: Some(t3),
-                    t_end: Some(t_end),
-                },
-                usage: Some(usage),
-                premature: false,
-                malformed_frames: 0,
-                looping: false,
-                loop_excluded_tokens: 0,
-            }))
-            .collect();
-        let outcome = StreamOutcome {
-            timestamps: StreamTimestamps {
+            let usage = Usage {
+                prompt_tokens: 128,
+                completion_tokens: 34,
+            };
+            let ts = StreamTimestamps {
                 t0: Some(t0),
                 t1: Some(t1),
                 t2: Some(t1),
                 t3: Some(t3),
                 t_end: Some(t_end),
-            },
-            usage: Some(usage),
-            premature: false,
-            malformed_frames: 0,
-            error: None,
-
-            looping: false,
-            loop_excluded_tokens: 0,
-            frames: 0,
-        };
-        (outcome, events)
+            };
+            let frames: Vec<(Chunk, MonotonicInstant, bool)> = vec![
+                (Chunk::Reasoning("think".into()), t3, false),
+                (Chunk::Content("Hello, ".into()), t_mid, false),
+                (Chunk::Content("world!".into()), t_last, false),
+                (Chunk::Usage(usage), t_end, false),
+                (Chunk::Control, t_end, true),
+            ];
+            let events: Vec<StreamEvent> = frames
+                .iter()
+                .map(|(chunk, at, done)| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: chunk.clone(),
+                        t_nanos: 0,
+                        done: *done,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 3,
+            };
+            (outcome, events)
+        })
     }
 
     #[test]
     fn aggregate_computes_section7_formulas() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
 
-        // Chunk counting: `[DONE]` excluded; usage + … → "other".
+        // Chunk counting: `[DONE]` excluded; usage → "other".
         assert_eq!(r.content_chunks, 2);
         assert_eq!(r.reasoning_chunks, 1);
         assert_eq!(r.other_chunks, 1);
         assert_eq!(r.total_chunks, 4);
 
-        // Server usage wins over the (estimated) prompt count.
+        // Server usage is the authoritative count.
         assert_eq!(r.prompt_tokens, 128);
         assert_eq!(r.completion_tokens, 34);
         assert!(!r.estimated);
         assert!(r.error.is_none());
         assert!(!r.is_failed());
 
-        // TTFT ≈ 1ms (T3 − T1), stream time ≈ 2ms (Tn − T0).
+        // TTFT = 5 ms (T3 − T1); stream time = 40 ms (Tn − T0).
         let ttft_ms = r.ttft * 1000.0;
-        assert!(
-            (0.5..2.5).contains(&ttft_ms),
-            "ttft {ttft_ms}ms outside 0.5..2.5"
-        );
+        assert!((4.9..5.1).contains(&ttft_ms), "ttft {ttft_ms}ms");
         let stream_ms = r.stream_time * 1000.0;
-        assert!(
-            (1.5..4.0).contains(&stream_ms),
-            "stream {stream_ms}ms outside 1.5..4.0"
-        );
+        assert!((39.9..40.1).contains(&stream_ms), "stream {stream_ms}ms");
 
-        // PP = tokens / TTFT; TG = tokens / decode window; MTP = 34/2.
+        // PP = prompt / TTFT; TG = completion / decode window (first→last
+        // token = 10→30 ms = 20 ms); MTP = 34 / 2 content chunks.
         assert!((r.pp_speed - 128.0 / r.ttft).abs() < 1e-9);
-        let gen = (r.stream_time - r.ttft).max(0.001);
-        assert!((r.tg_speed - 34.0 / gen).abs() < 1e-9);
+        let gen = 0.02;
+        assert!((r.tg_speed - 34.0 / gen).abs() < 1e-9, "tg {}", r.tg_speed);
         assert!((r.mtp_efficiency - 17.0).abs() < 1e-9);
 
         assert_eq!(r.model, "test-model");
@@ -1112,13 +1106,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_falls_back_to_chars_over_4_and_flags_estimated() {
+    fn missing_usage_falls_back_to_frames_and_flags_estimated() {
         let (mut outcome, events) = completed_run();
         outcome.usage = None;
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         // Prompt fallback: the generated prompt's own (estimated) count.
         assert_eq!(r.prompt_tokens, 25);
-        // Completion fallback: content chars (14) / 4 = 3.
+        // Completion fallback (no usage, no tokenizer): the observed token
+        // frame count (3 in `completed_run`), flagged `estimated`.
         assert_eq!(r.completion_tokens, 3);
         assert!(r.estimated);
         assert!(r.error.is_none());
@@ -1144,7 +1139,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
         assert_eq!(r.error.as_deref(), Some("No data received from server"));
         assert_eq!(r.completion_tokens, 0);
         assert!(r.is_failed());
@@ -1172,7 +1167,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
         assert_eq!(r.error.as_deref(), Some("HTTP 500: boom"));
         assert!(r.is_failed());
     }
@@ -1195,7 +1190,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
         assert_eq!(
             r.error.as_deref(),
             Some("Connection refused — is the server running?")
@@ -1207,7 +1202,7 @@ mod tests {
     fn malformed_frames_are_a_note_not_a_failure() {
         let (mut outcome, events) = completed_run();
         outcome.malformed_frames = 2;
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         assert_eq!(r.error.as_deref(), Some("2 malformed chunk(s) skipped"));
         // Tokens were produced → not a failed run (prototype semantics).
         assert!(!r.is_failed());
@@ -1217,7 +1212,7 @@ mod tests {
     #[test]
     fn json_report_matches_prototype_shape() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
 
         // One valid run: no summary (the prototype emits one only for
         // >1 valid runs). v0.1.1: the `timing` + `methodology` blocks are
@@ -1289,7 +1284,7 @@ mod tests {
         let (mut outcome, events) = completed_run();
         outcome.looping = true;
         outcome.loop_excluded_tokens = outcome.usage.map(|u| u.completion_tokens).unwrap_or(0);
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         assert!(r.looping, "the flag survives into the result");
         assert_eq!(r.pp_speed, 0.0, "prefill excluded");
         assert_eq!(r.tg_speed, 0.0, "decode excluded");
@@ -1306,8 +1301,16 @@ mod tests {
             mock.increment(10_000_000);
             let t1 = MonotonicInstant::now(); // 10 ms
             mock.increment(20_000_000);
-            let t3 = MonotonicInstant::now(); // 30 ms
-            mock.increment(100_000_000);
+            let t3 = MonotonicInstant::now(); // 30 ms (first token)
+            // Ten content frames spread 30, 40, …, 120 ms (last token at
+            // 120 ms), then the stream closes at 130 ms.
+            let frame_times: Vec<MonotonicInstant> = (0..10)
+                .map(|_| {
+                    let at = MonotonicInstant::now();
+                    mock.increment(10_000_000);
+                    at
+                })
+                .collect();
             let t_end = MonotonicInstant::now(); // 130 ms
             let ts = StreamTimestamps {
                 t0: Some(t0),
@@ -1320,17 +1323,15 @@ mod tests {
                 prompt_tokens: 60,
                 completion_tokens: 10,
             };
-            // Ten 1-token content frames: the honest case where the observed
-            // frame count equals the server's `completion_tokens`, so the
-            // decode rate is measured from what arrived on the wire.
-            let events: Vec<StreamEvent> = (0..10)
-                .map(|_| StreamEvent::Frame {
+            let events: Vec<StreamEvent> = frame_times
+                .iter()
+                .map(|at| StreamEvent::Frame {
                     frame: crate::sse::ParsedFrame {
                         chunk: Chunk::Content("a".into()),
                         t_nanos: 0,
                         done: false,
                     },
-                    at: t3,
+                    at: *at,
                     timestamps: ts,
                 })
                 .chain(std::iter::once(StreamEvent::Complete {
@@ -1350,9 +1351,9 @@ mod tests {
                 "{}",
                 snap.prefill_throughput
             );
-            // decode = 10 tokens / (130−30) ms = 100 t/s.
+            // decode = 10 tokens / (first→last token = 120−30 ms = 90 ms).
             assert!(
-                (snap.decode_throughput - 100.0).abs() < 1e-6,
+                (snap.decode_throughput - 10.0 / 0.09).abs() < 1e-6,
                 "{}",
                 snap.decode_throughput
             );
@@ -1432,7 +1433,7 @@ mod tests {
     #[test]
     fn all_failed_only_when_every_run_failed() {
         let (outcome, events) = completed_run();
-        let ok = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let ok = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         let t0 = MonotonicInstant::now();
         let bad = StreamOutcome {
             timestamps: StreamTimestamps {
@@ -1448,7 +1449,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
+        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None);
         assert!(!all_failed(&[ok.clone(), failed.clone()]));
         assert!(all_failed(&[failed]));
         assert!(!all_failed(&[]));
@@ -1457,7 +1458,7 @@ mod tests {
     #[test]
     fn result_box_mirrors_prototype_layout() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         let box_ = format_result_box(&r, 1, 3, false).unwrap();
         let lines: Vec<&str> = box_.lines().collect();
 
@@ -1500,15 +1501,15 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let fr = aggregate(&cfg(), &prompt(), &failed, &[]);
+        let fr = aggregate(&cfg(), &prompt(), &failed, &[], None);
         assert!(format_result_box(&fr, 1, 1, false).is_none());
     }
 
     #[test]
     fn summary_renders_for_two_valid_runs() {
         let (outcome, events) = completed_run();
-        let a = aggregate(&cfg(), &prompt(), &outcome, &events);
-        let b = aggregate(&cfg(), &prompt(), &outcome, &events);
+        let a = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let b = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         let s = format_summary(&[a.clone(), b], false).unwrap();
         assert!(s.contains("── Summary (averaged) "));
         assert!(s.contains("TTFT:"));
@@ -1531,7 +1532,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
+        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None);
         assert!(format_summary(&[a.clone(), failed], false).is_none());
     }
 }

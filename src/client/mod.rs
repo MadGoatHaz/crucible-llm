@@ -20,8 +20,8 @@ pub mod stream;
 pub use loop_guard::{LoopGuard, LOOP_BUFFER, LOOP_REPETITIONS, LOOP_WINDOW};
 pub use models::{list_models, normalize_base_url, ModelError, ModelInfo};
 pub use stream::{
-    join_worker, normalize_endpoint, run_worker, spawn_worker, StreamError, StreamEvent,
-    StreamOutcome, StreamWorker, DEFAULT_READ_TIMEOUT,
+    join_worker, normalize_endpoint, run_worker, spawn_worker, stream_text, token_window,
+    StreamError, StreamEvent, StreamOutcome, StreamWorker, DEFAULT_READ_TIMEOUT,
 };
 
 /// Truncate `s` to at most `max` bytes on a character boundary, appending

@@ -86,12 +86,12 @@ async fn sse_run_produces_prototype_metrics() {
     assert!(r.error.is_none(), "unexpected error: {:?}", r.error);
     assert!(!r.is_failed());
 
-    // The mock stream over-reports `usage.completion_tokens` (34) for the
-    // 4 token frames it actually sends — the misreporting-server case. The
-    // engine measures completion from the OBSERVED frames (4), while prompt
-    // tokens come from the (reliable) usage figure. Not estimated.
+    // The mock stream's authoritative `usage.completion_tokens` is 34 (for
+    // the 4 token frames it sends). The engine uses the server's figure as
+    // the primary count, with prompt tokens from the same usage block. Not
+    // estimated.
     assert_eq!(r.prompt_tokens, 128);
-    assert_eq!(r.completion_tokens, 4);
+    assert_eq!(r.completion_tokens, 34);
     assert!(!r.estimated);
 
     // Chunk accounting: role + 2 reasoning + 2 content + usage = 6
@@ -101,13 +101,13 @@ async fn sse_run_produces_prototype_metrics() {
     assert_eq!(r.other_chunks, 2);
     assert_eq!(r.total_chunks, 6);
 
-    // §7 formulas: TTFT / PP / TG all positive; MTP = 4 observed / 2
-    // content frames = 2.
+    // §7 formulas: TTFT / PP / TG all positive; MTP = 34 completion / 2
+    // content frames = 17.
     assert!(r.ttft > 0.0);
     assert!(r.stream_time > r.ttft);
     assert!(r.pp_speed > 0.0);
     assert!(r.tg_speed > 0.0);
-    assert!((r.mtp_efficiency - 2.0).abs() < 1e-9);
+    assert!((r.mtp_efficiency - 17.0).abs() < 1e-9);
     assert_eq!(r.model, "test-model");
     assert_eq!(r.mode, "short");
     assert!(!prompt.nocache);
@@ -171,8 +171,8 @@ async fn json_report_matches_prototype_key_set() {
         "other_chunks must not be serialized"
     );
     assert_eq!(rj["prompt_tokens"], 128);
-    // Observed frame count (the mock over-reports `usage`; see above).
-    assert_eq!(rj["completion_tokens"], 4);
+    // The server's authoritative `usage.completion_tokens` (34).
+    assert_eq!(rj["completion_tokens"], 34);
     assert_eq!(rj["estimated"], false);
     assert_eq!(rj["error"], serde_json::Value::Null);
 

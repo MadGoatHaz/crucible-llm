@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::client::{join_worker, spawn_worker, StreamEvent, StreamWorker};
+use crate::client::{join_worker, spawn_worker, token_window, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
@@ -300,6 +300,9 @@ pub struct ReasoningEngine {
     model: String,
     api_key: Option<String>,
     timeout: u64,
+    /// Optional HF tokenizer for re-tokenizing a response when a proxy
+    /// omits `usage` (the research's fallback counting method).
+    tokenizer: Option<Arc<crate::prompt::Tokenizer>>,
     /// Optional sequence seam: publish `Challenge {n}/{total}` to the
     /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
     progress: Option<Arc<ProgressBus>>,
@@ -323,18 +326,20 @@ impl ReasoningEngine {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(cfg.timeout.max(1)))
             .build()?;
-        // Same tokenizer policy as Engine A: an explicit `--tokenizer` that
-        // fails to load is a hard error (validated here, not stored — the
-        // bank's prompts are fixed and need no counting).
-        if let Some(path) = &cfg.tokenizer {
-            crate::prompt::Tokenizer::from_file(path)?;
-        }
+        // An explicit `--tokenizer` that fails to load is a hard error; it is
+        // then stored for re-tokenizing responses when a proxy omits `usage`
+        // (the research's fallback counting method).
+        let tokenizer = match &cfg.tokenizer {
+            Some(path) => Some(Arc::new(crate::prompt::Tokenizer::from_file(path)?)),
+            None => None,
+        };
         Ok(Self {
             client,
             url: cfg.url.clone(),
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
+            tokenizer,
             progress: None,
             metrics: None,
             pause: None,
@@ -452,11 +457,33 @@ impl ReasoningEngine {
             Some(n) => n as f64 / 1e9,
             None => stream_time,
         };
-        let completion = outcome
+        // Authoritative count: the server's `usage.completion_tokens`
+        // first; re-tokenize the full response with the model's exact
+        // tokenizer when a proxy omits usage; the observed frame count as
+        // a last-resort estimate.
+        let completion = match outcome
             .usage
             .map(|u| u.completion_tokens)
-            .unwrap_or_else(|| (response.chars().count() / 4).max(1) as u64);
-        let generation_time = (stream_time - ttft).max(0.001);
+            .filter(|&n| n > 0)
+        {
+            Some(n) => n,
+            None => match self
+                .tokenizer
+                .as_deref()
+                .and_then(|t| t.try_count(&response))
+                .filter(|&n| n > 0)
+            {
+                Some(n) => n as u64,
+                None => outcome.frames.max(1),
+            },
+        };
+        // Decode window: first → last content/reasoning token (prefill /
+        // TTFT excluded) — the research's Timing Boundary Rule.
+        let (t_first, t_last) = token_window(&events);
+        let generation_time = match (t_first, t_last) {
+            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+            _ => (stream_time - ttft).max(0.001),
+        };
         let tg_speed = completion as f64 / generation_time;
         (response, ttft, tg_speed)
     }
