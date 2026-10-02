@@ -1,35 +1,44 @@
-//! Engine F — Flat Out: sustained max-speed test with decreasing token
-//! targets.
+//! Engine F — Flat Out: sustained max-speed test.
 //!
 //! The goal is to find the absolute best-case speed the server can produce
 //! and give the user a satisfying "big number" to end on.
 //!
-//! Runs for up to 60 seconds total, divided into 6 segments of 10 seconds
-//! each, with DECREASING token targets:
+//! The test runs for up to 60 seconds total, divided into 6 segments of a
+//! hard **10-second time window** each, with DECREASING `max_tokens` caps:
 //!
-//! | Segment | Target | Purpose                        |
-//! |---------|--------|--------------------------------|
-//! | 1       | 10,000 | Sustained throughput under load|
-//! | 2       | 8,000  | Sustained throughput           |
-//! | 3       | 6,000  | Sustained throughput           |
-//! | 4       | 4,000  | Moderate load                  |
-//! | 5       | 2,000  | Burst speed                    |
-//! | 6       | 1,000  | Best-case single-response speed|
+//! | Segment | `max_tokens` cap | Purpose                        |
+//! |---------|------------------|--------------------------------|
+//! | 1       | 10,000           | Sustained throughput under load|
+//! | 2       | 8,000            | Sustained throughput           |
+//! | 3       | 6,000            | Sustained throughput           |
+//! | 4       | 4,000            | Moderate load                  |
+//! | 5       | 2,000            | Burst speed                    |
+//! | 6       | 1,000            | Best-case single-response speed|
 //!
-//! The FINAL number (segment 6, 1k tokens) is typically the HIGHEST t/s
-//! because: shorter prompt = faster prefill, less KV cache pressure, server
-//! is warm. This is the "big number" the user sees.
+//! **The segments are 10-second time windows, not token targets.** Each
+//! segment lets the server run at full capacity for up to 10 seconds and
+//! counts how many tokens actually arrive in that window:
 //!
-//! Each segment:
-//! - Spawns a single stream (concurrency=1) requesting the target token count
-//! - If the stream completes before 10s, immediately start the next segment
-//! - If the stream is still going at 10s, let it finish (don't kill it) and
-//!   THEN start the next segment
-//! - Records: actual tokens produced, time taken, t/s for that segment
+//! * If the server is fast enough to hit the `max_tokens` cap *before* 10s,
+//!   the stream ends on its own and the segment finishes early.
+//! * If the server is slower, the 10s window elapses and the stream is
+//!   **aborted** (the worker task is dropped, closing the HTTP connection so
+//!   the server stops generating). The segment records whatever tokens did
+//!   arrive in those 10s.
+//!
+//! Either way, every segment is at most 10 seconds, so the whole test is at
+//! most ~60 seconds. This is what made the old design wrong: it waited for
+//! the *full* token target to complete, so a ~29 t/s server took 147s for
+//! segment 1 alone (8+ minutes total).
+//!
+//! The segment's t/s is measured from the tokens we **observed on the wire**
+//! (not the server's self-reported `usage.completion_tokens`, which some
+//! servers — e.g. Unsloth / llama.cpp GGUF — inflate to the requested
+//! `max_tokens` target, overstating the rate).
 //!
 //! Measurement-isolation note: all timing is captured in the worker
-//! (quanta, `T0..Tn`); this module only takes deltas of those records.
-//! Nothing here touches the TUI or the timing path.
+//! (quanta, `T0..Tn`); this module only takes deltas of those records and
+//! counts the frames that arrive. Nothing here touches the TUI render path.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::client::{join_worker, spawn_worker, StreamEvent, StreamOutcome, StreamWorker};
+use crate::client::{spawn_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
@@ -47,16 +56,23 @@ use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError}
 use crate::sse::Usage;
 use crate::timing::MonotonicInstant;
 
-/// The 6 segment targets (decreasing): 10k, 8k, 6k, 4k, 2k, 1k.
+/// The 6 per-segment `max_tokens` caps (decreasing): 10k, 8k, 6k, 4k, 2k,
+/// 1k. A segment is cut off at the 10s window before this cap is reached on
+/// a slow server; a fast server that hits the cap first ends early.
 pub const SEGMENT_TARGETS: [u32; 6] = [10_000, 8_000, 6_000, 4_000, 2_000, 1_000];
 
 /// Bounded worker→engine channel capacity.
 const CHANNEL_CAPACITY: usize = 256;
 
-/// The per-segment time window (seconds). The stream is not killed at this
-/// boundary — it is allowed to finish — but the window defines the segment's
-/// nominal duration for progress reporting.
+/// The per-segment hard time window (seconds). A segment never runs longer
+/// than this: when it elapses the stream is aborted and the next segment
+/// starts. This is what keeps the whole test to ~60s.
 pub const SEGMENT_WINDOW_SECS: f64 = 10.0;
+
+/// The per-segment hard time window in nanoseconds, as a `u64` (the same
+/// domain as [`MonotonicInstant::delta_nanos`]) for the exact window
+/// comparison. Kept in sync with [`SEGMENT_WINDOW_SECS`].
+const SEGMENT_WINDOW_NS: u64 = 10 * 1_000_000_000;
 
 /// Total nominal duration (6 × 10s).
 pub const TOTAL_DURATION_SECS: f64 = 60.0;
@@ -66,41 +82,64 @@ pub const TOTAL_DURATION_SECS: f64 = 60.0;
 pub struct SegmentResult {
     /// 0-based segment index (0–5).
     pub index: usize,
-    /// The target token count we asked for.
+    /// The `max_tokens` cap requested for this segment (the decreasing
+    /// 10k→1k ladder). Not a hard target — the segment is cut at the 10s
+    /// window if the server is slower than the cap.
     pub target_tokens: u32,
-    /// The actual tokens produced by the server.
+    /// The token frames **observed on the wire** during the segment (what the
+    /// server actually produced in the window).
     pub actual_tokens: u64,
-    /// How long the segment took (seconds).
+    /// How long the segment took (seconds; at most [`SEGMENT_WINDOW_SECS`]).
     pub duration_secs: f64,
-    /// Tokens/sec for this segment (`actual_tokens / duration_secs`).
+    /// Tokens/sec for this segment (`actual_tokens / duration_secs`),
+    /// measured from the observed frames.
     pub tps: f64,
-    /// Time to first token (seconds).
+    /// Time to first token (milliseconds).
     pub ttft_ms: f64,
 }
 
 impl SegmentResult {
-    /// Build from the stream outcome and timing.
-    pub fn from_outcome(
+    /// Build a segment result from the events observed during the window.
+    ///
+    /// The token count is the number of token-bearing frames that arrived
+    /// (a [`Chunk::Reasoning`] or [`Chunk::Content`] delta); a
+    /// [`Chunk::Usage`] / [`Chunk::Control`] frame is not a token. The t/s is
+    /// that count over the segment's wall time. This is the honest
+    /// wire-measured rate, independent of the server's self-reported usage.
+    #[must_use]
+    pub fn from_events(
         index: usize,
         target_tokens: u32,
-        outcome: &StreamOutcome,
+        events: &[StreamEvent],
         duration_secs: f64,
     ) -> Self {
-        let actual_tokens = outcome.usage.map(|u| u.completion_tokens).unwrap_or(0);
-        let ttft_ms = outcome
-            .timestamps
-            .ttft_nanos()
-            .map(|ns| ns as f64 / 1e6)
-            .unwrap_or(0.0);
+        let mut token_frames = 0u64;
+        let mut ttft_ms = 0.0f64;
+        for event in events {
+            if let StreamEvent::Frame {
+                frame, timestamps, ..
+            } = event
+            {
+                if frame.chunk.is_token() {
+                    token_frames += 1;
+                    if ttft_ms == 0.0 {
+                        ttft_ms = timestamps
+                            .ttft_nanos()
+                            .map(|ns| ns as f64 / 1e6)
+                            .unwrap_or(0.0);
+                    }
+                }
+            }
+        }
         let tps = if duration_secs > 0.0 {
-            actual_tokens as f64 / duration_secs
+            token_frames as f64 / duration_secs
         } else {
             0.0
         };
         Self {
             index,
             target_tokens,
-            actual_tokens,
+            actual_tokens: token_frames,
             duration_secs,
             tps,
             ttft_ms,
@@ -117,9 +156,9 @@ pub struct FlatOutResult {
     pub best_tps: f64,
     /// Which segment (0-based) produced the best t/s.
     pub best_segment: usize,
-    /// Sum of all tokens produced.
+    /// Sum of all tokens observed across the segments.
     pub total_tokens: u64,
-    /// Actual total time (seconds).
+    /// Actual total time (seconds; at most ~[`TOTAL_DURATION_SECS`]).
     pub total_duration: f64,
     /// Average t/s (`total_tokens / total_duration`).
     pub avg_tps: f64,
@@ -127,19 +166,17 @@ pub struct FlatOutResult {
 
 impl FlatOutResult {
     /// The one-line summary for the sequence header.
+    #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
-            "BEST: {:.1} t/s (segment {}, {}k tokens)",
+            "BEST: {:.1} t/s (segment {})",
             self.best_tps,
-            self.best_segment + 1,
-            self.segments
-                .get(self.best_segment)
-                .map(|s| s.target_tokens / 1000)
-                .unwrap_or(0)
+            self.best_segment + 1
         )
     }
 
     /// The `--json` object for this result.
+    #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::json!({
             "segments": self.segments.iter().map(|s| serde_json::json!({
@@ -170,8 +207,8 @@ pub enum FlatOutError {
     Tokenizer(#[from] TokenizerError),
 }
 
-/// The Flat Out engine: 6 sequential single-stream segments with decreasing
-/// token targets.
+/// The Flat Out engine: 6 sequential single-stream 10-second time windows
+/// with decreasing `max_tokens` caps.
 #[derive(Debug)]
 pub struct FlatOutEngine {
     cfg: Config,
@@ -232,7 +269,7 @@ impl FlatOutEngine {
         self
     }
 
-    /// Run all 6 segments sequentially.
+    /// Run all 6 segments sequentially, each capped at a 10-second window.
     pub async fn run(&self) -> FlatOutResult {
         let prompt = self.generate_prompt();
         let mut segments = Vec::with_capacity(6);
@@ -257,16 +294,16 @@ impl FlatOutEngine {
             if let Some(l) = &self.logger {
                 l.info(
                     Context::EngineF,
-                    format!("Flat Out segment {}/6: targeting {} tokens", i + 1, target),
+                    format!(
+                        "Flat Out segment {}/6: 10s window, max_tokens cap {}",
+                        i + 1,
+                        target
+                    ),
                 );
             }
 
-            // Run one stream for this segment.
-            let seg_start = MonotonicInstant::now();
-            let outcome = self.run_segment(&prompt, target).await;
-            let duration = seg_start.elapsed().as_secs_f64();
-
-            let seg = SegmentResult::from_outcome(i, target, &outcome, duration);
+            // Run one 10-second time-window segment.
+            let seg = self.run_segment(i, &prompt, target).await;
 
             // Publish progress at segment completion.
             if let Some(bus) = &self.progress {
@@ -282,7 +319,7 @@ impl FlatOutEngine {
                 l.info(
                     Context::EngineF,
                     format!(
-                        "Flat Out segment {}/6 complete: {} tok in {:.1}s ({:.1} t/s, TTFT {:.0} ms)",
+                        "Flat Out segment {}/6: {} tok in {:.1}s ({:.1} t/s, TTFT {:.0} ms)",
                         i + 1,
                         seg.actual_tokens,
                         seg.duration_secs,
@@ -321,16 +358,30 @@ impl FlatOutEngine {
     }
 
     /// The prompt for this run (generated once and reused across segments).
+    ///
+    /// Flat Out always uses a short prompt to minimize prefill time and
+    /// maximize decode speed. The per-segment `max_tokens` cap is controlled
+    /// by [`SEGMENT_TARGETS`]; the 10s window is the real limit.
     pub fn generate_prompt(&self) -> GeneratedPrompt {
-        // Flat Out always uses a short prompt to minimize prefill time and
-        // maximize decode speed. The token target is controlled per-segment
-        // via `max_tokens`.
         self.generator.short()
     }
 
-    /// Run one segment: spawn a single stream with the target token count,
-    /// drain its channel, and return the outcome.
-    async fn run_segment(&self, prompt: &GeneratedPrompt, target_tokens: u32) -> StreamOutcome {
+    /// Run one segment within a hard [`SEGMENT_WINDOW_SECS`] time window.
+    ///
+    /// Spawns a single stream with the segment's `max_tokens` cap, drains its
+    /// channel counting the token frames that arrive, and stops the segment
+    /// as soon as either (a) the stream ends on its own (the server hit the
+    /// cap before 10s) or (b) the 10s window elapses (the stream is aborted,
+    /// closing the HTTP connection so the server stops generating). The
+    /// returned [`SegmentResult`] counts what was actually observed.
+    async fn run_segment(
+        &self,
+        i: usize,
+        prompt: &GeneratedPrompt,
+        target_tokens: u32,
+    ) -> SegmentResult {
+        let seg_start = MonotonicInstant::now();
+
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
             self.client.clone(),
@@ -348,36 +399,64 @@ impl FlatOutEngine {
             worker = worker.logger(logger.clone());
         }
 
-        let start = MonotonicInstant::now();
-        // Spawn the worker without awaiting it: the channel must be
-        // drained concurrently (same pattern as Engine A's fix).
+        // Spawn the worker without awaiting it: the channel must be drained
+        // concurrently (the same pattern as Engine A's server-agnostic fix).
         let handle = spawn_worker(worker, tx);
+
         let mut events = Vec::new();
         let mut batch = 0u32;
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-            batch += 1;
-            if let Some(state) = &self.metrics {
-                let is_terminal = matches!(
-                    events.last(),
-                    Some(StreamEvent::Complete { .. }) | Some(StreamEvent::Failed { .. })
-                );
-                if batch >= 8 || is_terminal {
-                    state.update(self.live_snapshot(&events, &start, target_tokens));
-                    batch = 0;
+
+        // Drain until the 10s window elapses (then abort) or the stream ends
+        // on its own. `tokio::time::timeout` bounds each `recv` to the time
+        // remaining in the window, so a slow server is cut at 10s.
+        loop {
+            let elapsed_ns = seg_start.delta_nanos(&MonotonicInstant::now());
+            if elapsed_ns >= SEGMENT_WINDOW_NS {
+                break;
+            }
+            let remaining = Duration::from_nanos(SEGMENT_WINDOW_NS - elapsed_ns);
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(event)) => {
+                    let is_terminal = matches!(
+                        event,
+                        StreamEvent::Complete { .. } | StreamEvent::Failed { .. }
+                    );
+                    events.push(event);
+                    batch += 1;
+                    if let Some(state) = &self.metrics {
+                        if batch >= 8 || is_terminal {
+                            state.update(self.live_snapshot(&events, &seg_start, target_tokens));
+                            batch = 0;
+                        }
+                    }
+                    if is_terminal {
+                        break;
+                    }
                 }
+                Ok(None) => break, // channel closed (worker done)
+                Err(_) => break,   // 10s window elapsed
             }
         }
-        // Final publish.
+
+        // Stop the stream: abort the worker task (drops the HTTP response →
+        // the connection closes → the server stops generating). A no-op if
+        // the stream already ended on its own before the window.
+        handle.abort();
+        drop(rx);
+
+        let elapsed = seg_start.elapsed().as_secs_f64();
+        let seg = SegmentResult::from_events(i, target_tokens, &events, elapsed);
+
+        // Final publish (the terminal event may have been batched out).
         if let Some(state) = &self.metrics {
-            state.update(self.live_snapshot(&events, &start, target_tokens));
+            state.update(self.live_snapshot(&events, &seg_start, target_tokens));
         }
-        // Channel is closed (worker done): collect the outcome.
-        let outcome = join_worker(handle).await;
-        outcome
+
+        seg
     }
 
-    /// Build a live [`MetricsSnapshot`] from the events collected so far.
+    /// Build a live [`MetricsSnapshot`] from the events collected so far in
+    /// the current segment.
     fn live_snapshot(
         &self,
         events: &[StreamEvent],
@@ -397,11 +476,7 @@ impl FlatOutEngine {
                     at,
                     timestamps,
                 } => {
-                    let is_tok = matches!(
-                        &frame.chunk,
-                        crate::sse::Chunk::Reasoning(_) | crate::sse::Chunk::Content(_)
-                    );
-                    if is_tok {
+                    if frame.chunk.is_token() {
                         token_frames += 1;
                         if t3.is_none() {
                             t3 = Some(*at);
@@ -425,7 +500,15 @@ impl FlatOutEngine {
             }
         }
 
-        let tokens = usage.map(|u| u.completion_tokens).unwrap_or(token_frames);
+        // Measure the rate from the frames we OBSERVED on the wire, not the
+        // server's self-reported `usage.completion_tokens` (some servers
+        // inflate it to the `max_tokens` target). Fall back to the server
+        // figure only when no token frames arrived (a usage-only stream).
+        let tokens = if token_frames > 0 {
+            token_frames
+        } else {
+            usage.map(|u| u.completion_tokens).unwrap_or(0)
+        };
         let gen_tps = match (t3, t_end) {
             (Some(t3), Some(end)) => {
                 let span_s = t3.delta_nanos(&end) as f64 / 1_000_000_000.0;
@@ -480,28 +563,19 @@ impl FlatOutEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sse::{Chunk, ParsedFrame, Usage};
     use crate::timing::StreamTimestamps;
 
-    /// A synthetic stream outcome for testing.
-    fn mock_outcome(tokens: u64, _ttft_ns: u64, _total_ns: u64) -> StreamOutcome {
-        let t0 = MonotonicInstant::now();
-        // We can't easily set absolute timestamps, so we use a simple
-        // synthetic outcome for unit tests of the result struct.
-        StreamOutcome {
-            timestamps: StreamTimestamps {
-                t0: Some(t0),
-                t_end: Some(t0),
-                ..StreamTimestamps::default()
+    /// A single content frame at `at` with the given timestamps.
+    fn content_frame(at: MonotonicInstant, ts: StreamTimestamps) -> StreamEvent {
+        StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk: Chunk::Content("a".into()),
+                t_nanos: 0,
+                done: false,
             },
-            usage: Some(Usage {
-                prompt_tokens: 100,
-                completion_tokens: tokens,
-            }),
-            premature: false,
-            malformed_frames: 0,
-            error: None,
-            looping: false,
-            loop_excluded_tokens: 0,
+            at,
+            timestamps: ts,
         }
     }
 
@@ -519,21 +593,87 @@ mod tests {
     }
 
     #[test]
-    fn segment_result_from_outcome_computes_tps() {
-        let outcome = mock_outcome(1000, 0, 0);
-        let seg = SegmentResult::from_outcome(0, 10_000, &outcome, 5.0);
+    fn segment_from_events_counts_observed_frames_not_server_usage() {
+        let t0 = MonotonicInstant::now();
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t0),
+            t2: Some(t0),
+            t3: Some(t0),
+            t_end: Some(t0),
+        };
+        // Three content frames, plus a usage frame claiming 10,000 tokens
+        // (the misreporting-server case). Only the 3 token frames count.
+        let events = vec![
+            content_frame(t0, ts),
+            content_frame(t0, ts),
+            content_frame(t0, ts),
+            StreamEvent::Frame {
+                frame: ParsedFrame {
+                    chunk: Chunk::Usage(Usage {
+                        prompt_tokens: 5,
+                        completion_tokens: 10_000,
+                    }),
+                    t_nanos: 0,
+                    done: false,
+                },
+                at: t0,
+                timestamps: ts,
+            },
+        ];
+        let seg = SegmentResult::from_events(0, 10_000, &events, 10.0);
         assert_eq!(seg.index, 0);
         assert_eq!(seg.target_tokens, 10_000);
-        assert_eq!(seg.actual_tokens, 1000);
-        assert!((seg.tps - 200.0).abs() < 1e-9, "tps: {}", seg.tps);
-        assert!((seg.duration_secs - 5.0).abs() < 1e-9);
+        assert_eq!(seg.actual_tokens, 3, "observed frames, not the 10k claim");
+        assert!((seg.tps - 0.3).abs() < 1e-9, "tps: {}", seg.tps); // 3 / 10s
+        assert!((seg.duration_secs - 10.0).abs() < 1e-9);
     }
 
     #[test]
-    fn segment_result_zero_duration_gives_zero_tps() {
-        let outcome = mock_outcome(100, 0, 0);
-        let seg = SegmentResult::from_outcome(0, 1000, &outcome, 0.0);
+    fn segment_from_events_zero_duration_gives_zero_tps() {
+        let t0 = MonotonicInstant::now();
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t0),
+            t2: Some(t0),
+            t3: Some(t0),
+            t_end: Some(t0),
+        };
+        let events = vec![content_frame(t0, ts)];
+        let seg = SegmentResult::from_events(0, 1_000, &events, 0.0);
+        assert_eq!(seg.actual_tokens, 1);
         assert_eq!(seg.tps, 0.0);
+    }
+
+    #[test]
+    fn segment_from_events_ignores_control_and_counts_reasoning() {
+        let t0 = MonotonicInstant::now();
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t0),
+            t2: Some(t0),
+            t3: Some(t0),
+            t_end: Some(t0),
+        };
+        let mut reasoning = content_frame(t0, ts);
+        if let StreamEvent::Frame { frame, .. } = &mut reasoning {
+            frame.chunk = Chunk::Reasoning("think".into());
+        }
+        let control = StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk: Chunk::Control,
+                t_nanos: 0,
+                done: true,
+            },
+            at: t0,
+            timestamps: ts,
+        };
+        let events = vec![reasoning, control];
+        let seg = SegmentResult::from_events(2, 6_000, &events, 5.0);
+        // One reasoning token frame; the `[DONE]` control frame is not a
+        // token.
+        assert_eq!(seg.actual_tokens, 1);
+        assert!((seg.tps - 0.2).abs() < 1e-9);
     }
 
     #[test]
@@ -543,30 +683,29 @@ mod tests {
                 SegmentResult {
                     index: 0,
                     target_tokens: 10_000,
-                    actual_tokens: 10_000,
+                    actual_tokens: 289,
                     duration_secs: 10.0,
-                    tps: 1000.0,
+                    tps: 28.9,
                     ttft_ms: 50.0,
                 },
                 SegmentResult {
                     index: 5,
                     target_tokens: 1_000,
-                    actual_tokens: 1_000,
-                    duration_secs: 2.0,
-                    tps: 500.0,
+                    actual_tokens: 300,
+                    duration_secs: 10.0,
+                    tps: 30.0,
                     ttft_ms: 10.0,
                 },
             ],
-            best_tps: 1000.0,
-            best_segment: 0,
-            total_tokens: 11_000,
-            total_duration: 12.0,
-            avg_tps: 916.7,
+            best_tps: 30.0,
+            best_segment: 1,
+            total_tokens: 589,
+            total_duration: 20.0,
+            avg_tps: 29.45,
         };
         let line = result.summary_line();
-        assert!(line.contains("BEST: 1000.0 t/s"), "{line}");
-        assert!(line.contains("segment 1"), "{line}");
-        assert!(line.contains("10k tokens"), "{line}");
+        assert!(line.contains("BEST: 30.0 t/s"), "{line}");
+        assert!(line.contains("segment 2"), "{line}");
     }
 
     #[test]
@@ -575,23 +714,23 @@ mod tests {
             segments: vec![SegmentResult {
                 index: 0,
                 target_tokens: 10_000,
-                actual_tokens: 9_500,
-                duration_secs: 12.5,
-                tps: 760.0,
+                actual_tokens: 289,
+                duration_secs: 10.0,
+                tps: 28.9,
                 ttft_ms: 85.0,
             }],
-            best_tps: 760.0,
+            best_tps: 28.9,
             best_segment: 0,
-            total_tokens: 9_500,
-            total_duration: 12.5,
-            avg_tps: 760.0,
+            total_tokens: 289,
+            total_duration: 10.0,
+            avg_tps: 28.9,
         };
         let v = result.to_dict();
-        assert_eq!(v["best_tps"], 760.0);
+        assert_eq!(v["best_tps"], 28.9);
         assert_eq!(v["best_segment"], 0);
-        assert_eq!(v["total_tokens"], 9_500);
+        assert_eq!(v["total_tokens"], 289);
         assert_eq!(v["segments"][0]["target_tokens"], 10_000);
-        assert_eq!(v["segments"][0]["actual_tokens"], 9_500);
+        assert_eq!(v["segments"][0]["actual_tokens"], 289);
     }
 
     #[test]

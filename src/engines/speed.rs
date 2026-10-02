@@ -403,7 +403,16 @@ impl SpeedEngine {
             }
         }
 
-        let tokens = usage.map(|u| u.completion_tokens).unwrap_or(token_frames);
+        // Measure the decode rate from the token frames we OBSERVED on the
+        // wire, not the server's self-reported `usage.completion_tokens` —
+        // some servers (Unsloth / llama.cpp GGUF) report it as the requested
+        // `max_tokens` target, which overstates the rate. Fall back to the
+        // server figure only when no token frames arrived (usage-only stream).
+        let tokens = if token_frames > 0 {
+            token_frames
+        } else {
+            usage.map(|u| u.completion_tokens).unwrap_or(0)
+        };
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
         let gen_tps = match (t3, t_end) {
@@ -626,25 +635,19 @@ pub fn aggregate(
     // otherwise (prompt → `chars/4` of the prompt; completion →
     // `chars/4` of the content, only when some chunk arrived), flagging
     // `estimated`.
-    let (prompt_tokens, completion_tokens, estimated);
-    match outcome.usage {
-        Some(Usage {
-            prompt_tokens: p,
-            completion_tokens: c,
-        }) if p > 0 && c > 0 => {
-            (prompt_tokens, completion_tokens, estimated) = (p, c, false);
-        }
-        _ => {
-            let mut est = false;
-            prompt_tokens = outcome
-                .usage
-                .map(|u| u.prompt_tokens)
-                .filter(|&n| n > 0)
-                .unwrap_or_else(|| {
-                    est = true;
-                    prompt.token_count.max(1) as u64
-                });
-            completion_tokens = match outcome
+    //
+    // Completion tokens prefer what we OBSERVED on the wire
+    // (`outcome.frames`) over the server's self-reported
+    // `usage.completion_tokens` — some servers (Unsloth / llama.cpp GGUF)
+    // inflate the latter to the requested `max_tokens` target, which would
+    // overstate the decode rate. The server figure is used only when no token
+    // frames arrived; the `chars/4` estimate is the last resort.
+    let (prompt_tokens, completion_tokens, estimated) = {
+        let mut est = false;
+        let completion = if outcome.frames > 0 {
+            outcome.frames
+        } else {
+            match outcome
                 .usage
                 .map(|u| u.completion_tokens)
                 .filter(|&n| n > 0)
@@ -655,10 +658,18 @@ pub fn aggregate(
                     (content_chars / 4).max(1) as u64
                 }
                 None => 0,
-            };
-            estimated = est;
-        }
-    }
+            }
+        };
+        let prompt = outcome
+            .usage
+            .map(|u| u.prompt_tokens)
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                est = true;
+                prompt.token_count.max(1) as u64
+            });
+        (prompt, completion, est)
+    };
 
     // The v0.1.1 decode-loop guard: a looping stream's repeating output is
     // excluded from the throughput numbers (the layers are zeroed, the
@@ -1055,6 +1066,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         (outcome, events)
     }
@@ -1130,6 +1142,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(r.error.as_deref(), Some("No data received from server"));
@@ -1157,6 +1170,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(r.error.as_deref(), Some("HTTP 500: boom"));
@@ -1179,6 +1193,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let r = aggregate(&cfg(), &prompt(), &outcome, &[]);
         assert_eq!(
@@ -1305,8 +1320,11 @@ mod tests {
                 prompt_tokens: 60,
                 completion_tokens: 10,
             };
-            let events = vec![
-                StreamEvent::Frame {
+            // Ten 1-token content frames: the honest case where the observed
+            // frame count equals the server's `completion_tokens`, so the
+            // decode rate is measured from what arrived on the wire.
+            let events: Vec<StreamEvent> = (0..10)
+                .map(|_| StreamEvent::Frame {
                     frame: crate::sse::ParsedFrame {
                         chunk: Chunk::Content("a".into()),
                         t_nanos: 0,
@@ -1314,16 +1332,16 @@ mod tests {
                     },
                     at: t3,
                     timestamps: ts,
-                },
-                StreamEvent::Complete {
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
                     timestamps: ts,
                     usage: Some(usage),
                     premature: false,
                     malformed_frames: 0,
                     looping: false,
                     loop_excluded_tokens: 0,
-                },
-            ];
+                }))
+                .collect();
             let snap =
                 SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, &t0, 256);
             // prefill = 60 prompt tokens / 20 ms TTFT = 3000 t/s.
@@ -1428,6 +1446,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
         assert!(!all_failed(&[ok.clone(), failed.clone()]));
@@ -1479,6 +1498,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let fr = aggregate(&cfg(), &prompt(), &failed, &[]);
         assert!(format_result_box(&fr, 1, 1, false).is_none());
@@ -1509,6 +1529,7 @@ mod tests {
 
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         };
         let failed = aggregate(&cfg(), &prompt(), &bad, &[]);
         assert!(format_summary(&[a.clone(), failed], false).is_none());

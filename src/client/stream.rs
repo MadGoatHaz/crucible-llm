@@ -179,6 +179,18 @@ pub struct StreamOutcome {
     /// The stream's total token count when `looping` (excluded from
     /// throughput), else `0`.
     pub loop_excluded_tokens: u64,
+    /// The number of token-bearing SSE frames the client **observed** on the
+    /// wire (a [`Chunk::Reasoning`] or [`Chunk::Content`] delta per frame).
+    ///
+    /// This is the ground-truth output count for a decode-rate measurement:
+    /// it is what actually arrived, independent of the server's self-reported
+    /// [`Usage::completion_tokens`]. Some servers (notably Unsloth /
+    /// llama.cpp GGUF builds) report `completion_tokens` as the requested
+    /// `max_tokens` target rather than the tokens they generated, which
+    /// inflates a `completion_tokens / decode-window` rate by a wide margin.
+    /// `0` when no token frames were observed (a failure, an empty body, or a
+    /// non-streaming plain-JSON response that is counted separately).
+    pub frames: u64,
 }
 
 impl StreamOutcome {
@@ -186,6 +198,23 @@ impl StreamOutcome {
     /// `premature` completions, which preserve partial data).
     pub fn is_ok(&self) -> bool {
         self.error.is_none()
+    }
+
+    /// The authoritative completion-token count for a decode-rate
+    /// measurement: the frames actually observed on the wire when any were
+    /// received, else the server-reported [`Usage::completion_tokens`].
+    ///
+    /// Preferring the observed count keeps the measured rate honest for
+    /// servers that misreport `usage` (see [`Self::frames`]); it falls back
+    /// to the server figure only when no token frames arrived at all
+    /// (e.g. a usage-only stream), so an honest server's number is retained.
+    #[must_use]
+    pub fn effective_completion(&self) -> u64 {
+        if self.frames > 0 {
+            self.frames
+        } else {
+            self.usage.map(|u| u.completion_tokens).unwrap_or(0)
+        }
     }
 }
 
@@ -377,7 +406,15 @@ impl StreamWorker {
                 // Empty 200 body: nothing to measure.
                 ts.t_end = Some(MonotonicInstant::now());
                 return self
-                    .finish_complete(tx, &ts, None, false, parser.malformed_frames(), (false, 0))
+                    .finish_complete(
+                        tx,
+                        &ts,
+                        None,
+                        false,
+                        parser.malformed_frames(),
+                        (false, 0),
+                        0,
+                    )
                     .await;
             }
             ChunkRead::Timeout => {
@@ -485,6 +522,7 @@ impl StreamWorker {
                         true,
                         parser.malformed_frames(),
                         (looping, excluded),
+                        tokens,
                     )
                     .await;
             }
@@ -519,6 +557,7 @@ impl StreamWorker {
                             true,
                             parser.malformed_frames(),
                             (looping, excluded),
+                            tokens,
                         )
                         .await;
                 }
@@ -544,6 +583,7 @@ impl StreamWorker {
                                 true,
                                 parser.malformed_frames(),
                                 (looping, excluded),
+                                tokens,
                             )
                             .await;
                     }
@@ -576,6 +616,7 @@ impl StreamWorker {
                                     !done,
                                     parser.malformed_frames(),
                                     (looping, excluded),
+                                    tokens,
                                 )
                                 .await;
                         }
@@ -595,6 +636,7 @@ impl StreamWorker {
             false,
             parser.malformed_frames(),
             (looping, excluded),
+            tokens,
         )
         .await
     }
@@ -640,14 +682,18 @@ impl StreamWorker {
         }
     }
 
-    /// Log the stream's completion. `frames` is the count of SSE chunks
-    /// that carried tokens — an *estimate*, not the server's token count.
-    /// When the server reported `usage.completion_tokens`, that is the
-    /// authoritative count and the line reads
-    /// `… N tokens (M frames) in Xs (Y t/s)`; otherwise it reads
-    /// `… M frames in Xs (~Y t/s est)`. The rate is over the T3→Tn
-    /// window, and a `premature` marker is added when the stream closed
-    /// without `[DONE]`.
+    /// Log the stream's completion.
+    ///
+    /// The decode rate is measured from the tokens we **observed on the wire**
+    /// (`frames`) over the T3→Tn window, not from the server's self-reported
+    /// `usage.completion_tokens`. Some servers (notably Unsloth / llama.cpp
+    /// GGUF builds) report `completion_tokens` as the requested `max_tokens`
+    /// target rather than the tokens they actually generated, which
+    /// overstates a `completion_tokens / decode-window` rate by a wide margin
+    /// (the `68 t/s`-vs-`29 t/s` discrepancy). When the server claims a count
+    /// that diverges from what arrived, both are shown and the over-report is
+    /// flagged. A usage-only stream (no token frames) falls back to the
+    /// server figure, and a no-usage stream reports the frame estimate.
     fn log_stream_end(
         &self,
         ts: &StreamTimestamps,
@@ -655,21 +701,36 @@ impl StreamWorker {
         usage: Option<Usage>,
         premature: bool,
     ) {
-        let tokens = usage.map(|u| u.completion_tokens).unwrap_or(frames);
+        // Rate basis: what we observed, else the server figure (usage-only).
+        let observed = if frames > 0 {
+            frames
+        } else {
+            usage.map(|u| u.completion_tokens).unwrap_or(0)
+        };
         let (total_s, rate) = match (ts.t0, ts.t_end, ts.t3) {
             (Some(t0), Some(end), Some(t3)) => {
                 let total = t0.delta_nanos(&end) as f64 / 1e9;
                 let span = t3.delta_nanos(&end).max(1) as f64 / 1e9;
-                (total, (tokens as f64 / span).max(0.0))
+                (total, (observed as f64 / span).max(0.0))
             }
             (Some(t0), Some(end), None) => (t0.delta_nanos(&end) as f64 / 1e9, 0.0),
             _ => (0.0, 0.0),
         };
         let tag = if premature { " (premature close)" } else { "" };
         let msg = match usage {
+            Some(u) if u.completion_tokens > 0 && frames > 0 => {
+                let over = (u.completion_tokens as f64 - frames as f64).abs()
+                    / u.completion_tokens as f64
+                    > 0.15;
+                let note = if over { " [server over-reported]" } else { "" };
+                format!(
+                    "{} stream complete: {frames} tokens observed ({} server-claimed) in {total_s:.1}s ({rate:.1} t/s){note}{tag}",
+                    self.tag, u.completion_tokens
+                )
+            }
             Some(u) => format!(
-                "{} stream complete: {} tokens ({} frames) in {total_s:.1}s ({:.1} t/s){tag}",
-                self.tag, u.completion_tokens, frames, rate
+                "{} stream complete: {} tokens in {total_s:.1}s ({rate:.1} t/s){tag}",
+                self.tag, u.completion_tokens
             ),
             None => format!(
                 "{} stream complete: {frames} frames in {total_s:.1}s (~{rate:.1} t/s est){tag}",
@@ -732,16 +793,21 @@ impl StreamWorker {
                     });
                 }
                 // `emit_frames` stamps `t_nanos` and sets T3 on the first
-                // token (content) frame.
+                // token (content) frame. A non-streamed blob is a single
+                // frame, so its frame count is not a meaningful token count
+                // — the server's `usage` is. Report `0` observed frames so the
+                // downstream rate falls back to `usage.completion_tokens`.
                 let tokens = match self
                     .emit_frames(&frames, &parsed_at, ts, tx, &mut guard)
                     .await
                 {
-                    Ok((_, tc)) => tc,
+                    Ok(_) => 0,
                     Err(_) => {
+                        // Receiver gone before the token count is known: no
+                        // frames are confirmed, so report `0`.
                         ts.t_end = Some(parsed_at);
                         return self
-                            .finish_complete(tx, ts, usage, true, 0, (false, 0))
+                            .finish_complete(tx, ts, usage, true, 0, (false, 0), 0)
                             .await;
                     }
                 };
@@ -749,7 +815,7 @@ impl StreamWorker {
                 self.log_stream_end(ts, tokens, usage, false);
                 // A complete plain-JSON response is a normal completion, not
                 // a premature one (there is no `[DONE]` to expect).
-                self.finish_complete(tx, ts, usage, false, 0, (false, 0))
+                self.finish_complete(tx, ts, usage, false, 0, (false, 0), tokens)
                     .await
             }
             Err(msg) => {
@@ -792,7 +858,9 @@ impl StreamWorker {
     ///
     /// `looping` / `loop_excluded_tokens` (v0.1.1) carry the decode-loop
     /// guard's verdict so the engines can exclude a looping stream's
-    /// tokens from throughput.
+    /// tokens from throughput. `frames` is the observed token-frame count
+    /// (the wire truth for the decode rate).
+    #[allow(clippy::too_many_arguments)]
     async fn finish_complete(
         &self,
         tx: &mut mpsc::Sender<StreamEvent>,
@@ -801,6 +869,7 @@ impl StreamWorker {
         premature: bool,
         malformed_frames: u64,
         loop_state: (bool, u64),
+        frames: u64,
     ) -> StreamOutcome {
         let (looping, loop_excluded_tokens) = loop_state;
         let event = StreamEvent::Complete {
@@ -820,6 +889,7 @@ impl StreamWorker {
             error: None,
             looping,
             loop_excluded_tokens,
+            frames,
         }
     }
 
@@ -852,6 +922,7 @@ impl StreamWorker {
             error: Some(error),
             looping,
             loop_excluded_tokens,
+            frames: 0,
         }
     }
 }
@@ -880,6 +951,7 @@ pub async fn run_worker(worker: StreamWorker, tx: mpsc::Sender<StreamEvent>) -> 
             error: Some(StreamError::Read(format!("worker task failed: {join}"))),
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         },
     }
 }
@@ -915,6 +987,7 @@ pub async fn join_worker(handle: tokio::task::JoinHandle<StreamOutcome>) -> Stre
             error: Some(StreamError::Read(format!("worker task failed: {join}"))),
             looping: false,
             loop_excluded_tokens: 0,
+            frames: 0,
         },
     }
 }
@@ -1215,9 +1288,10 @@ mod tests {
             mock.increment(100_000_000);
             let t_end = MonotonicInstant::now(); // 200 ms
 
-            // Server reports usage: the authoritative token count (256)
-            // is logged alongside the 119 counted frames; the rate is
-            // 256 / 0.1 s over the T3→Tn window.
+            // Server reports usage (256 claimed) but only 119 frames
+            // arrived: the rate is measured from the observed 119 over the
+            // T3→Tn window (119 / 0.1 s = 1190 t/s), and the large
+            // over-report is flagged.
             w.log_stream_end(
                 &StreamTimestamps {
                     t0: Some(t0),
@@ -1267,15 +1341,19 @@ mod tests {
         // The writer flushes on every newline; read after finish.
         let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
         assert!(
-            latest.contains("test stream complete: 256 tokens (119 frames) in 0.2s (2560.0 t/s)"),
-            "usage line missing: {latest}"
+            latest.contains(
+                "test stream complete: 119 tokens observed (256 server-claimed) in 0.2s (1190.0 t/s) [server over-reported]"
+            ),
+            "observed/claimed line missing: {latest}"
         );
         assert!(
             latest.contains("test stream complete: 119 frames in 0.2s (~595.0 t/s est)"),
             "estimate line missing: {latest}"
         );
         assert!(
-            latest.contains("256 tokens (119 frames) in 0.2s (2560.0 t/s) (premature close)"),
+            latest.contains(
+                "119 tokens observed (256 server-claimed) in 0.2s (1190.0 t/s) [server over-reported] (premature close)"
+            ),
             "premature marker missing: {latest}"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -403,6 +403,7 @@ impl WorkerPool {
                                         error: Some(StreamError::WorkerTimeout(d)),
                                         looping: false,
                                         loop_excluded_tokens: 0,
+                                        frames: 0,
                                     }
                                 }
                             }
@@ -437,6 +438,7 @@ impl WorkerPool {
                         error: Some(StreamError::Read("worker task panicked".to_string())),
                         looping: false,
                         loop_excluded_tokens: 0,
+                        frames: 0,
                     },
                 })
                 .collect()
