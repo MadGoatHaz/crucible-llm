@@ -1132,9 +1132,16 @@ const SPINNERS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 /// engine runs, turns green on completion, and magenta when the whole
 /// sequence is done.
 fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
-    if area.width < 12 || area.height < 4 {
+    // The panel is a bordered block whose title sits **on** the top border
+    // row, so the inner area is `area.height - 2` rows. The content is
+    // clamped to that inner height (below), so it can *never* overflow the
+    // rows the layout allocates — the root cause of the title/content
+    // overlap. We need at least one inner row (a 3-row panel: top border +
+    // one content row + bottom border) to show anything.
+    if area.width < 12 || area.height < 3 {
         return;
     }
+    let inner_height = (area.height - 2) as usize;
 
     // (marker, marker style, text, text style, bar ratio, border style)
     let (marker, marker_style, text, text_style, ratio, border_style) = match app.seq.load() {
@@ -1194,8 +1201,17 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
         Line::raw("")
     };
 
+    // Always show the status line; add the progress-bar line only when the
+    // inner area has room for a second row. This clamps the rendered content
+    // to the allocated rows, so the title (top border) and the content can
+    // never collide — even if a smaller terminal starves the panel.
+    let mut lines: Vec<Line> = vec![status_line];
+    if inner_height >= 2 {
+        lines.push(bar_line);
+    }
+
     f.render_widget(
-        Paragraph::new(Text::from(vec![status_line, bar_line]))
+        Paragraph::new(Text::from(lines))
             .block(theme::block(
                 theme::panel_title("BENCHMARK SEQUENCE"),
                 border_style,
@@ -1931,6 +1947,58 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// The BENCHMARK SEQUENCE panel must never let its content overflow the
+    /// rows the layout allocates: the title sits on the top border row, so
+    /// the inner area is `area.height - 2` rows, and the rendered content
+    /// lines are clamped to that. This is the root-cause guard against the
+    /// title/content overlap (it holds for any allocation, not just 4).
+    #[test]
+    fn sequence_header_content_never_overflows_its_rows() {
+        // A running sequence (the most dynamic status text).
+        let mut app = App::new();
+        app.seq.store(SeqState {
+            phase: SeqPhase::Running,
+            queue: Engine::ALL.to_vec(),
+            engine: Engine::Speed,
+            progress: Some(EngineProgress::Speed {
+                iteration: 2,
+                total: 5,
+                tokens: 248,
+            }),
+            summary: String::new(),
+            completed: Vec::new(),
+            engine_started_ms: 0,
+        });
+        // Sweep allocations from the minimum up. For every height the panel
+        // is drawn in, the title row (top border) and the first content row
+        // must be on *different* rows — i.e. no overlap.
+        for h in [3u16, 4, 5, 6, 8, 12] {
+            let w: u16 = 120;
+            let backend = ratatui::backend::TestBackend::new(w, h);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| render_sequence_header(f.area(), &app, f))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            // Row 0 is the top border + title. If the panel rendered at all,
+            // the title must be there.
+            let row0: String = (0..w)
+                .map(|x| buf.get(x, 0).symbol().to_string())
+                .collect();
+            if row0.contains("BENCHMARK SEQUENCE") {
+                // The first content row (row 1) must NOT also carry the title —
+                // that is the overlap the user reported.
+                let row1: String = (0..w)
+                    .map(|x| buf.get(x, 1).symbol().to_string())
+                    .collect();
+                assert!(
+                    !row1.contains("BENCHMARK SEQUENCE"),
+                    "{w}x{h}: title leaked onto content row 1: {row1}"
+                );
+            }
+        }
     }
 
     #[test]
