@@ -382,8 +382,10 @@ impl FlatOutEngine {
                     if batch >= 8 || is_terminal {
                         // Live TUI snapshot + sequence progress bus (the
                         // 10 Hz ticker mirrors the bus into the state slot).
+                        // While the window is open the stream is live
+                        // (`finished = false`).
                         if let Some(state) = &self.metrics {
-                            state.update(self.live_snapshot(&events, &start));
+                            state.update(self.live_snapshot(&events, &start, false));
                         }
                         if let Some(bus) = &self.progress {
                             let (tokens, tps) = Self::observed(&events);
@@ -414,9 +416,12 @@ impl FlatOutEngine {
         let result =
             FlatOutResult::from_events(&events, elapsed, self.generator.tokenizer().as_deref());
 
-        // Final publish (the last batch may not have flushed).
+        // Final publish (the last batch may not have flushed). The 60 s
+        // window is over and the worker is aborted: this is a *completed*
+        // stream, so it is reported `Done` (the accumulator counts its
+        // decode rate — the last engine must appear in OVERALL METRICS).
         if let Some(state) = &self.metrics {
-            state.update(self.live_snapshot(&events, &start));
+            state.update(self.live_snapshot(&events, &start, true));
         }
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::FlatOut {
@@ -493,7 +498,22 @@ impl FlatOutEngine {
     ///
     /// The decode rate uses the same single formula as Engine A and the
     /// Overall Metrics panel: `tokens_received / (T_last − T_first)`.
-    fn live_snapshot(&self, events: &[StreamEvent], start: &MonotonicInstant) -> MetricsSnapshot {
+    ///
+    /// `finished` marks the **final** publish (the 60 s window elapsed and
+    /// the worker was aborted): the stream is a *completed* benchmark
+    /// stream and is reported `Done`. The abort means no terminal
+    /// `Complete` event ever arrives and every captured frame carries
+    /// `t_end = None`, so without this flag the stream would stay
+    /// `Streaming` forever and the `OverallAccumulator`'s non-terminal →
+    /// terminal detector would never count this stream's decode rate —
+    /// the last engine would silently vanish from the OVERALL METRICS
+    /// panel (the user-reported Live-vs-Overall discrepancy).
+    fn live_snapshot(
+        &self,
+        events: &[StreamEvent],
+        start: &MonotonicInstant,
+        finished: bool,
+    ) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let (frame_tokens, decode_rate) = Self::observed(events);
         let mut itl = LatencyHistogram::default();
@@ -539,7 +559,7 @@ impl FlatOutEngine {
             .map(|u| u.completion_tokens)
             .filter(|&n| n > 0)
             .unwrap_or(frame_tokens);
-        let status = if t_end.is_some() {
+        let status = if t_end.is_some() || finished {
             StreamStatus::Done
         } else {
             StreamStatus::Streaming
@@ -551,7 +571,7 @@ impl FlatOutEngine {
             model: self.cfg.model.clone(),
             mode: "FlatOut".to_string(),
             aggregate_tps: decode_rate,
-            active_streams: (t_end.is_none()) as usize,
+            active_streams: (status == StreamStatus::Streaming) as usize,
             total_streams: 1,
             itl_p50_ns: itl.p50() as u64,
             itl_p90_ns: itl.p90() as u64,
@@ -621,6 +641,46 @@ mod tests {
         // ~15 tokens; the chars/4 estimate keeps this a soft bound.
         let c = count_tokens(MINIMAL_PROMPT, None);
         assert!(c.tokens <= 30, "prompt should be ~15 tokens: {}", c.tokens);
+    }
+
+    /// A timestamp record with `t_end` unset — the shape of every frame
+    /// captured from an *aborted* stream (the worker is dropped before it
+    /// can send the terminal event, so `Tn` is never recorded).
+    fn ts_open(t: MonotonicInstant) -> StreamTimestamps {
+        StreamTimestamps {
+            t0: Some(t),
+            t1: Some(t),
+            t2: Some(t),
+            t3: Some(t),
+            t_end: None,
+        }
+    }
+
+    #[test]
+    fn final_publish_reports_the_aborted_stream_done() {
+        // The 60 s window aborts the worker: no terminal `Complete` event
+        // arrives, so every captured frame has `t_end = None`. The final
+        // publish (`finished = true`) must still report the stream `Done` —
+        // otherwise the Overall Metrics accumulator never counts this
+        // stream's decode rate (the user-reported Live-vs-Overall
+        // discrepancy: the last engine missing from the overall panel).
+        let engine = FlatOutEngine::new(&Config {
+            url: "http://127.0.0.1:9".to_string(),
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        let t0 = MonotonicInstant::now();
+        let events = vec![content_frame(t0, ts_open(t0))];
+        // Live publish (window still open): Streaming, one active stream.
+        let live = engine.live_snapshot(&events, &t0, false);
+        assert_eq!(live.streams[0].state, StreamStatus::Streaming);
+        assert_eq!(live.active_streams, 1);
+        // Final publish (window elapsed, worker aborted): Done, zero
+        // active streams.
+        let final_snap = engine.live_snapshot(&events, &t0, true);
+        assert_eq!(final_snap.streams[0].state, StreamStatus::Done);
+        assert_eq!(final_snap.active_streams, 0);
     }
 
     #[test]

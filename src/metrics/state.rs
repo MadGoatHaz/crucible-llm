@@ -1165,6 +1165,51 @@ mod tests {
     }
 
     #[test]
+    fn overall_counts_every_engine_when_stream_ids_are_reused() {
+        // The user-reported Live-vs-Overall discrepancy, reproduced:
+        // Engine A (mode "short") completes *naturally* at 64.1 t/s;
+        // Engine F (mode "FlatOut") re-uses stream id 0, streams live, and
+        // its *final* publish (the 60 s window aborted the worker — no
+        // terminal event on the wire) reports Done at 27.9 t/s. Both
+        // streams must be counted, so the OVERALL METRICS panel covers
+        // *all* engines of the run.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            mode: "short".into(),
+            streams: vec![done_stream(0, Some(64.1), Some(0.393), Some(256))],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            mode: "FlatOut".into(),
+            streams: vec![streaming(0)],
+            ..Default::default()
+        });
+        state.update(MetricsSnapshot {
+            mode: "FlatOut".into(),
+            streams: vec![done_stream(0, Some(27.9), Some(0.198), Some(1667))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.completed_streams, 2, "both engines' streams counted");
+        assert_eq!(
+            o.total_tokens,
+            256 + 1667,
+            "total tokens across all engines"
+        );
+        assert!(
+            (o.gen.avg - (64.1 + 27.9) / 2.0).abs() < 1e-9,
+            "avg across all engines: {}",
+            o.gen.avg
+        );
+        assert!((o.gen.max - 64.1).abs() < 1e-9, "max: {}", o.gen.max);
+        assert!(
+            (o.gen.p5 - (27.9 * 0.95 + 64.1 * 0.05)).abs() < 1e-9,
+            "p5: {}",
+            o.gen.p5
+        );
+    }
+
+    #[test]
     fn overall_computes_max_avg_p5_triples() {
         let state = MetricsState::new();
         // Three completed streams with distinct gen rates: 100, 200, 300.

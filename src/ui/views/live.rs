@@ -275,16 +275,27 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, th: The
     };
 
     // The header line: the *live* now / peak / avg for the window — or, once
-    // frozen, the *final* window average + peak (the run is over, so there is
-    // no live "now" and the instantaneous rate would read 0.0).
+    // frozen, the run's *final* cumulative decode rate: the same `avg` /
+    // `max` the OVERALL METRICS panel shows, so both panels agree. The
+    // last-60 s window's own average is NOT the run's final number: earlier
+    // engines' samples age out of the window, and the window's cumulative-rate
+    // samples carry early transients. (The run is over, so there is no live
+    // "now" and the instantaneous rate would read 0.0.)
     // Information hierarchy: the live `now` is the primary (bright) value,
     // `peak` the warning, `avg` the dimmed secondary.
     let value_line = if frozen {
+        // No completed streams (every run failed) → fall back to the
+        // window's own figures rather than a blank line.
+        let (final_rate, peak_rate) = if m.overall.gen.avg > 0.0 || m.overall.gen.max > 0.0 {
+            (m.overall.gen.avg, m.overall.gen.max)
+        } else {
+            (avg, peak)
+        };
         Line::from(vec![
             Span::styled("final ", style::label(th)),
-            Span::styled(fmt::format_rate(avg), style::value_ok(th)),
+            Span::styled(fmt::format_rate(final_rate), style::value_ok(th)),
             Span::styled("  │  peak ", style::footer(th)),
-            Span::styled(fmt::format_rate(peak), style::value_warn(th)),
+            Span::styled(fmt::format_rate(peak_rate), style::value_warn(th)),
         ])
     } else {
         Line::from(vec![
@@ -2272,6 +2283,60 @@ mod tests {
             !text.contains("now "),
             "live 'now' gone when frozen: {text}"
         );
+    }
+
+    #[test]
+    fn frozen_hero_matches_the_overall_metrics_panel() {
+        // The user-reported discrepancy: after a multi-engine run, the
+        // frozen hero's `final` / `peak` must be the *same numbers* the
+        // OVERALL METRICS panel shows (cumulative across every completed
+        // stream) — not the last-60 s window's own average/peak, which
+        // excludes engines that aged out of the window and carries the
+        // cumulative-rate's early transients.
+        use crate::metrics::state::{StreamMetric, StreamStatus};
+        let app = App::new();
+        // Engine A's stream completes at 64.1 t/s …
+        app.metrics.update(MetricsSnapshot {
+            mode: "short".into(),
+            streams: vec![StreamMetric {
+                id: 0,
+                state: StreamStatus::Done,
+                gen_tps: Some(64.1),
+                tg_tokens: Some(256),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        // … Engine F re-uses stream id 0: live, then its final publish
+        // (the 60 s window aborted the worker) reports Done at 27.9 t/s.
+        app.metrics.update(MetricsSnapshot {
+            mode: "FlatOut".into(),
+            streams: vec![StreamMetric {
+                id: 0,
+                state: StreamStatus::Streaming,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.metrics.update(MetricsSnapshot {
+            mode: "FlatOut".into(),
+            streams: vec![StreamMetric {
+                id: 0,
+                state: StreamStatus::Done,
+                gen_tps: Some(27.9),
+                tg_tokens: Some(1667),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.metrics.freeze();
+        let text = render_live_text(&app, 120, 40);
+        // Both panels now carry the same cumulative numbers:
+        // avg (64.1 + 27.9) / 2 = 46.0, max 64.1.
+        assert!(text.contains("46.0"), "hero final = overall avg: {text}");
+        assert!(text.contains("64.1"), "hero peak = overall max: {text}");
+        assert!(text.contains("final"), "frozen hero label: {text}");
+        assert!(text.contains("OVERALL METRICS"), "overall panel: {text}");
     }
 
     #[test]
