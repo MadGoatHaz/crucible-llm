@@ -345,6 +345,7 @@ impl StructuredEngine {
                         &events,
                         &start,
                         STRUCTURED_MAX_GEN_TOKENS,
+                        self.tokenizer.as_deref(),
                     ));
                     batch = 0;
                 }
@@ -359,6 +360,7 @@ impl StructuredEngine {
                 &events,
                 &start,
                 STRUCTURED_MAX_GEN_TOKENS,
+                self.tokenizer.as_deref(),
             ));
         }
 

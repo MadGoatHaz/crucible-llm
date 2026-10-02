@@ -40,7 +40,7 @@ use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
-use crate::prompt::PromptGenerator;
+use crate::prompt::{count_tokens, PromptGenerator};
 use crate::sse::{Chunk, Usage};
 use crate::timing::MonotonicInstant;
 
@@ -1095,7 +1095,6 @@ impl Sweep {
     ) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let elapsed_s = elapsed_ns as f64 / 1e9;
-        let _tokens = acc.tokens_so_far();
         let non_looping = acc.tokens_non_looping();
         // Prefill layer: non-looping prompt tokens / mean non-looping TTFT.
         let mut prefill = 0.0;
@@ -1145,9 +1144,10 @@ impl Sweep {
             // runs — previously this stayed `0`, which made the live
             // throughput graph sample flat zeros for the whole sweep.
             completion_tokens: non_looping,
-            // The wire-truth numerator: the token frames actually observed
-            // on the wire (excluding looping streams).
-            observed_frames: acc.tokens_so_far(),
+            // The decode-rate numerator: the authoritative token count
+            // (usage → text estimate), matching `completion_tokens` and
+            // excluding looping streams.
+            observed_frames: non_looping,
             prefill_throughput: prefill,
             decode_throughput: decode,
             e2e_throughput: e2e,
@@ -1171,6 +1171,10 @@ struct StreamTracker {
     content_frames: u64,
     /// All data frames received (MTP packet denominator, blueprint §7).
     packets: u64,
+    /// The concatenated reasoning + content text — re-tokenized (`chars/4`
+    /// without a tokenizer file) for the token count when a proxy omits
+    /// `usage`. Counting raw frames undercounts batched servers.
+    text: String,
     last_token_at: Option<MonotonicInstant>,
     /// Wall-clock time of the last token (the stall log's "last token at
     /// HH:MM:SS" — a display concern, never on the quanta timing path).
@@ -1201,6 +1205,7 @@ impl StreamTracker {
             reasoning_frames: 0,
             content_frames: 0,
             packets: 0,
+            text: String::new(),
             last_token_at: None,
             last_token_wall: None,
             ttft_ns: None,
@@ -1222,12 +1227,15 @@ impl StreamTracker {
         self.reasoning_frames + self.content_frames
     }
 
-    /// Tokens generated: server-reported `usage` when available, else the
-    /// counted token frames (one token per frame is the worker's unit).
+    /// Tokens generated: server-reported `usage` when available (the
+    /// **primary** source), else the re-tokenized text (`chars/4` without a
+    /// tokenizer file). Counting raw frames is not used — it undercounts
+    /// servers that batch several tokens per frame (vLLM MTP).
     fn tokens(&self) -> u64 {
-        self.usage
-            .map(|u| u.completion_tokens)
-            .unwrap_or_else(|| self.token_frames())
+        match self.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
+            Some(n) => n,
+            None => count_tokens(&self.text, None).tokens as u64,
+        }
     }
 
     /// The stream-matrix `TYPE` column: the dominant phase.
@@ -1349,6 +1357,9 @@ impl LevelAccumulator {
                     if let Some(ns) = sample {
                         self.itl.record(ns);
                     }
+                    if let Some(txt) = frame.chunk.token_text() {
+                        t.text.push_str(txt);
+                    }
                     t.last_token_at = Some(*at);
                     t.last_token_wall = Some(SystemTime::now());
                     if t.t3.is_none() {
@@ -1407,16 +1418,6 @@ impl LevelAccumulator {
                 t.finished = true;
             }
         }
-    }
-
-    /// Token frames received so far (live-snapshot throughput numerator).
-    /// v0.1.1: looping streams' frames are excluded.
-    fn tokens_so_far(&self) -> u64 {
-        self.trackers
-            .iter()
-            .filter(|t| !t.looping)
-            .map(|t| t.token_frames())
-            .sum()
     }
 
     /// Server-reported tokens so far (usage-based, the authoritative
@@ -1620,7 +1621,7 @@ mod tests {
         PoolEvent::Frame {
             stream,
             frame: ParsedFrame {
-                chunk: Chunk::Content("tok".to_string()),
+                chunk: Chunk::Content("token".to_string()),
                 t_nanos: 0,
                 done: false,
             },

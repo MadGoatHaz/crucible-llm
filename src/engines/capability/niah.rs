@@ -707,6 +707,7 @@ impl NiahEngine {
                         &events,
                         &start,
                         NIAH_MAX_GEN_TOKENS,
+                        self.tokenizer.as_deref(),
                     ));
                     batch = 0;
                 }
@@ -721,6 +722,7 @@ impl NiahEngine {
                 &events,
                 &start,
                 NIAH_MAX_GEN_TOKENS,
+                self.tokenizer.as_deref(),
             ));
         }
 

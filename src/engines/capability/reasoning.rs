@@ -430,6 +430,7 @@ impl ReasoningEngine {
                         &events,
                         &start,
                         REASONING_MAX_GEN_TOKENS,
+                        self.tokenizer.as_deref(),
                     ));
                     batch = 0;
                 }
@@ -444,6 +445,7 @@ impl ReasoningEngine {
                 &events,
                 &start,
                 REASONING_MAX_GEN_TOKENS,
+                self.tokenizer.as_deref(),
             ));
         }
 

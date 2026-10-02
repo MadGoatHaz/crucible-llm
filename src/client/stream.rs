@@ -55,6 +55,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::log::{Context, Level, RunLogger};
+use crate::prompt::{count_tokens, Tokenizer};
 use crate::sse::{Chunk, ParsedFrame, SseParser, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -201,19 +202,20 @@ impl StreamOutcome {
     }
 
     /// The authoritative completion-token count for a decode-rate
-    /// measurement: the frames actually observed on the wire when any were
-    /// received, else the server-reported [`Usage::completion_tokens`].
+    /// measurement: the server-reported [`Usage::completion_tokens`] when it
+    /// arrived (the **primary** source — the server's own count), else the
+    /// frames observed on the wire as a last-resort estimate.
     ///
-    /// Preferring the observed count keeps the measured rate honest for
-    /// servers that misreport `usage` (see [`Self::frames`]); it falls back
-    /// to the server figure only when no token frames arrived at all
-    /// (e.g. a usage-only stream), so an honest server's number is retained.
+    /// The server's `usage` is authoritative because backends that batch
+    /// several tokens into one SSE frame (vLLM MTP / speculative decoding)
+    /// make the raw frame count understate the true output by 30–40 %. The
+    /// frame count is used only when no `usage` chunk arrived at all (an
+    /// aborted stream from a non-compliant proxy).
     #[must_use]
     pub fn effective_completion(&self) -> u64 {
-        if self.frames > 0 {
-            self.frames
-        } else {
-            self.usage.map(|u| u.completion_tokens).unwrap_or(0)
+        match self.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
+            Some(n) => n,
+            None => self.frames,
         }
     }
 }
@@ -1202,6 +1204,41 @@ pub fn stream_text(events: &[StreamEvent]) -> String {
         }
     }
     text
+}
+
+/// The authoritative completion-token count for a stream's events, with an
+/// `estimated` flag. This is the single source of truth every engine and the
+/// live decode-rate tracker use, so the count is never the raw SSE frame
+/// tally.
+///
+/// The **Authoritative Counting Rule**:
+///
+/// 1. **PRIMARY** — the server's own `usage.completion_tokens` (the terminal
+///    usage chunk; every compliant backend populates it under
+///    `stream_options.include_usage`). This is the count the server reports,
+///    so matching it is the goal.
+/// 2. **FALLBACK** (no `usage` — an aborted stream, or a non-compliant proxy)
+///    — re-tokenize the full reasoning + content text: the exact tokenizer
+///    when one is supplied, else the `chars/4` estimate (flagged
+///    `estimated`). Counting raw SSE frames is *not* a valid count here:
+///    servers that batch several tokens into one frame (vLLM MTP /
+///    speculative decoding) make the frame count understate the true output
+///    by 30–40 %.
+///
+/// Returns `(tokens, estimated)`.
+#[must_use]
+pub fn authoritative_tokens(
+    events: &[StreamEvent],
+    usage: Option<Usage>,
+    tokenizer: Option<&Tokenizer>,
+) -> (u64, bool) {
+    if let Some(u) = usage {
+        if u.completion_tokens > 0 {
+            return (u.completion_tokens, false);
+        }
+    }
+    let c = count_tokens(&stream_text(events), tokenizer);
+    (c.tokens as u64, c.estimated)
 }
 
 #[cfg(test)]

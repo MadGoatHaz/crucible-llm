@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::client::{spawn_worker, stream_text, StreamEvent, StreamWorker};
+use crate::client::{authoritative_tokens, spawn_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
@@ -99,17 +99,17 @@ impl FlatOutResult {
     /// Build the result from the events observed during the window.
     ///
     /// The token count follows the research's **Authoritative Counting
-    /// Rule**:
+    /// Rule** ([`authoritative_tokens`]):
     ///
     /// 1. **PRIMARY** — the server's `usage.completion_tokens`, present only
     ///    when the stream ended *naturally* before the 60 s window (Engine F
     ///    normally aborts it, so this is the rare path);
-    /// 2. **FALLBACK** — re-tokenize the full reasoning + content text with
-    ///    the model's exact tokenizer (the normal path for an aborted
-    ///    stream: counting SSE chunks is fundamentally inaccurate when
-    ///    speculative batching packs multiple tokens into one frame);
-    /// 3. **LAST RESORT** (no usage, no tokenizer) — the observed token
-    ///    frame count.
+    /// 2. **FALLBACK** — re-tokenize the full reasoning + content text: the
+    ///    model's exact tokenizer when one is supplied, else the `chars/4`
+    ///    estimate. This is the normal path for an aborted stream — counting
+    ///    SSE frames is fundamentally inaccurate when speculative batching
+    ///    (vLLM MTP) packs multiple tokens into one frame, which is exactly
+    ///    the 30–40 % undercount the user observed.
     ///
     /// The t/s is that count over the **decode window** — the first
     /// content/reasoning token to the last (`T_first` → `T_last`), which
@@ -124,7 +124,6 @@ impl FlatOutResult {
         tokenizer: Option<&Tokenizer>,
     ) -> Self {
         let mut deltas_ns: Vec<u64> = Vec::new();
-        let mut token_frames = 0u64;
         let mut ttft_ms = 0.0f64;
         let mut first_token_at: Option<MonotonicInstant> = None;
         let mut last_token_at: Option<MonotonicInstant> = None;
@@ -146,7 +145,6 @@ impl FlatOutResult {
                         if let Some(prev) = last_token_at {
                             deltas_ns.push(prev.delta_nanos(at));
                         }
-                        token_frames += 1;
                         if ttft_ms == 0.0 {
                             ttft_ms = timestamps
                                 .ttft_nanos()
@@ -167,17 +165,8 @@ impl FlatOutResult {
         }
         let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&deltas_ns);
 
-        // Authoritative count (usage → re-tokenize → observed frames).
-        let total_tokens = match usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
-            Some(n) => n,
-            None => match tokenizer
-                .and_then(|t| t.try_count(&stream_text(events)))
-                .filter(|&n| n > 0)
-            {
-                Some(n) => n as u64,
-                None => token_frames,
-            },
-        };
+        // Authoritative count (usage → re-tokenize the full text).
+        let (total_tokens, _estimated) = authoritative_tokens(events, usage, tokenizer);
 
         // Decode window: first → last content/reasoning token.
         let tps = match (first_token_at, last_token_at) {
@@ -388,7 +377,8 @@ impl FlatOutEngine {
                             state.update(self.live_snapshot(&events, &start, false));
                         }
                         if let Some(bus) = &self.progress {
-                            let (tokens, tps) = Self::observed(&events);
+                            let (tokens, tps) =
+                                Self::observed(&events, self.generator.tokenizer().as_deref());
                             bus.publish(EngineProgress::FlatOut {
                                 elapsed_secs: start.elapsed().as_secs_f64(),
                                 tokens,
@@ -461,24 +451,38 @@ impl FlatOutEngine {
         }
     }
 
-    /// The token frames observed so far + their decode rate over the
+    /// The authoritative token count so far + its decode rate over the
     /// first→last token window (the live progress figures; prefill/TTFT
     /// excluded, the research's Timing Boundary Rule).
-    fn observed(events: &[StreamEvent]) -> (u64, f64) {
+    ///
+    /// The count is the authoritative one ([`authoritative_tokens`]): the
+    /// server's `usage.completion_tokens` once it arrives, else the
+    /// re-tokenized text — never the raw frame tally (which undercounts
+    /// batched vLLM frames by 30–40 %).
+    fn observed(events: &[StreamEvent], tokenizer: Option<&Tokenizer>) -> (u64, f64) {
         let mut first: Option<MonotonicInstant> = None;
         let mut last: Option<MonotonicInstant> = None;
-        let mut tokens = 0u64;
+        let mut usage: Option<Usage> = None;
         for e in events {
-            if let StreamEvent::Frame { frame, at, .. } = e {
-                if frame.chunk.is_token() {
-                    if first.is_none() {
-                        first = Some(*at);
+            match e {
+                StreamEvent::Frame { frame, at, .. } => {
+                    if let Chunk::Usage(u) = &frame.chunk {
+                        usage = Some(*u);
                     }
-                    last = Some(*at);
-                    tokens += 1;
+                    if frame.chunk.is_token() {
+                        if first.is_none() {
+                            first = Some(*at);
+                        }
+                        last = Some(*at);
+                    }
                 }
+                StreamEvent::Complete { usage: u, .. } => {
+                    usage = *u;
+                }
+                StreamEvent::Failed { .. } => {}
             }
         }
+        let (tokens, _est) = authoritative_tokens(events, usage, tokenizer);
         let tps = match (first, last) {
             (Some(f), Some(l)) => {
                 let span_s = f.delta_nanos(&l) as f64 / 1e9;
@@ -515,7 +519,8 @@ impl FlatOutEngine {
         finished: bool,
     ) -> MetricsSnapshot {
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
-        let (frame_tokens, decode_rate) = Self::observed(events);
+        let (frame_tokens, decode_rate) =
+            Self::observed(events, self.generator.tokenizer().as_deref());
         let mut itl = LatencyHistogram::default();
         let mut last_token_at: Option<MonotonicInstant> = None;
         let mut usage: Option<Usage> = None;
@@ -552,13 +557,12 @@ impl FlatOutEngine {
             }
         }
 
-        // The token count: the server's `usage.completion_tokens` when the
-        // stream ended naturally; while the 60 s stream is still open (the
-        // normal case — we abort it), the observed token frames.
-        let tokens_received = usage
-            .map(|u| u.completion_tokens)
-            .filter(|&n| n > 0)
-            .unwrap_or(frame_tokens);
+        // The authoritative token count: the server's
+        // `usage.completion_tokens` when it arrived, else the re-tokenized
+        // text (the normal case — we abort the 60 s stream before the
+        // terminal usage chunk). Never the raw frame tally, which
+        // undercounts batched vLLM frames by 30–40 %.
+        let tokens_received = frame_tokens;
         let status = if t_end.is_some() || finished {
             StreamStatus::Done
         } else {
@@ -578,8 +582,8 @@ impl FlatOutEngine {
             itl_p99_ns: itl.p99() as u64,
             itl_p999_ns: itl.p999() as u64,
             completion_tokens: tokens_received,
-            // The wire-truth numerator: the token frames actually observed
-            // on the wire (never the server's self-reported `usage`).
+            // The decode-rate numerator: the authoritative token count
+            // (usage → text estimate), matching `completion_tokens`.
             observed_frames: frame_tokens,
             prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
             status,
@@ -724,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn from_events_no_usage_falls_back_to_frames() {
+    fn from_events_no_usage_estimates_from_the_text() {
         let (clock, mock) = quanta::Clock::mock();
         quanta::with_clock(&clock, || {
             let t0 = MonotonicInstant::now();
@@ -734,10 +738,23 @@ mod tests {
             let t2 = MonotonicInstant::now(); // last token
             let ts = ts_at(t0);
             // No usage frame (the aborted-stream case), no tokenizer: the
-            // observed token frames are the last-resort count.
-            let events = vec![content_frame(t1, ts), content_frame(t2, ts)];
+            // count is estimated from the full text (`chars/4`), NOT the raw
+            // frame tally — counting frames undercounts batched servers.
+            // Two frames of 4 chars each → 8 chars → 2 tokens.
+            let mut e1 = content_frame(t1, ts);
+            if let StreamEvent::Frame { frame, .. } = &mut e1 {
+                frame.chunk = Chunk::Content("abcd".into());
+            }
+            let mut e2 = content_frame(t2, ts);
+            if let StreamEvent::Frame { frame, .. } = &mut e2 {
+                frame.chunk = Chunk::Content("efgh".into());
+            }
+            let events = vec![e1, e2];
             let r = FlatOutResult::from_events(&events, 10.0, None);
-            assert_eq!(r.total_tokens, 2, "no usage + no tokenizer → frames");
+            assert_eq!(
+                r.total_tokens, 2,
+                "no usage + no tokenizer → chars/4 estimate"
+            );
             assert!((r.tps - 2.0 / 0.1).abs() < 1e-9, "tps: {}", r.tps); // 2 / 100 ms
         });
     }
@@ -774,9 +791,13 @@ mod tests {
     #[test]
     fn from_events_zero_duration_gives_zero_tps() {
         let t0 = MonotonicInstant::now();
-        let events = vec![content_frame(t0, ts_at(t0))];
+        let mut e = content_frame(t0, ts_at(t0));
+        if let StreamEvent::Frame { frame, .. } = &mut e {
+            frame.chunk = Chunk::Content("abcd".into());
+        }
+        let events = vec![e];
         let r = FlatOutResult::from_events(&events, 0.0, None);
-        assert_eq!(r.total_tokens, 1);
+        assert_eq!(r.total_tokens, 1); // 4 chars → chars/4 = 1 token
         assert_eq!(r.tps, 0.0); // a single frame → a zero decode window
     }
 

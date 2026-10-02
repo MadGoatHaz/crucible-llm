@@ -52,7 +52,7 @@ pub fn methodology_block(overhead_ns: u64) -> Value {
         "itl": "(T_last_content - T_first_content) / (output_tokens - 1)",
         "aggregate_throughput": "sum(all_completion_tokens) / wall_time",
         "per_stream_throughput": "aggregate_throughput / active_streams",
-        "token_counting": "server usage.completion_tokens (primary); exact-tokenizer re-encoding of the full reasoning+content text (fallback when a proxy omits usage); observed frame count (last resort, flagged estimated)",
+        "token_counting": "server usage.completion_tokens (primary); exact-tokenizer re-encoding of the full reasoning+content text (fallback when a proxy omits usage); chars/4 estimate of that text (last resort, flagged estimated) — never the raw SSE frame count, which undercounts servers that batch tokens per frame",
         "loop_guard": "32-token sequence × 3 consecutive repetitions",
         "warmup": "1 warmup request discarded before measurement"
     })

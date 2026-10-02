@@ -27,15 +27,15 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::client::{
-    join_worker, spawn_worker, stream_text, token_window, StreamError, StreamEvent, StreamOutcome,
-    StreamWorker,
+    authoritative_tokens, join_worker, spawn_worker, stream_text, token_window, StreamError,
+    StreamEvent, StreamOutcome, StreamWorker,
 };
 use crate::config::{Config, Mode};
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
-use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
+use crate::prompt::{count_tokens, GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
 use crate::sse::{Chunk, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -316,6 +316,7 @@ impl SpeedEngine {
             events,
             start,
             MAX_GEN_TOKENS,
+            self.generator.tokenizer().as_deref(),
         )
     }
 
@@ -329,7 +330,9 @@ impl SpeedEngine {
     /// `tokens_received / (T_last_token − T_first_token)`.
     ///
     /// * `tokens_received` — the server's `usage.completion_tokens` once it
-    ///   arrives; the observed token-frame count while the stream is open.
+    ///   arrives (the **primary** source); the re-tokenized text (exact
+    ///   tokenizer, else `chars/4`) while the stream is open. Never the raw
+    ///   frame tally — batched vLLM frames undercount by 30–40 %.
     /// * `T_first_token` / `T_last_token` — the decode window (prefill /
     ///   TTFT and the trailing gap to `[DONE]` are excluded).
     ///
@@ -343,10 +346,10 @@ impl SpeedEngine {
         events: &[StreamEvent],
         start: &MonotonicInstant,
         max_tokens: u32,
+        tokenizer: Option<&Tokenizer>,
     ) -> MetricsSnapshot {
         let _elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let mut itl = LatencyHistogram::default();
-        let mut token_frames = 0u64;
         let mut reasoning_frames = 0u64;
         let mut content_frames = 0u64;
         let mut first_token_at: Option<MonotonicInstant> = None;
@@ -371,7 +374,6 @@ impl SpeedEngine {
                         if let Some(prev) = last_token_at {
                             itl.record(prev.delta_nanos(at));
                         }
-                        token_frames += 1;
                         match &frame.chunk {
                             Chunk::Reasoning(_) => reasoning_frames += 1,
                             _ => content_frames += 1,
@@ -424,13 +426,11 @@ impl SpeedEngine {
             }
         }
 
-        // The token count: the server's `usage.completion_tokens` once it
-        // arrives (the authoritative count); the observed token-frame count
-        // while the stream is still open.
-        let tokens_received = match usage {
-            Some(u) if u.completion_tokens > 0 => u.completion_tokens,
-            _ => token_frames,
-        };
+        // The authoritative token count: the server's
+        // `usage.completion_tokens` once it arrives (the primary source),
+        // else the re-tokenized text (exact tokenizer, else `chars/4`).
+        // Never the raw frame tally — batched vLLM frames undercount.
+        let (tokens_received, _est) = authoritative_tokens(events, usage, tokenizer);
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
 
@@ -506,11 +506,9 @@ impl SpeedEngine {
             itl_p999_ns: itl.p999() as u64,
             prompt_tokens,
             completion_tokens: tokens_received,
-            // The wire-truth numerator for the live decode rate: the token
-            // frames actually observed on the wire (never the server's
-            // self-reported `usage`, which some backends inflate to the
-            // `max_tokens` target).
-            observed_frames: token_frames,
+            // The decode-rate numerator: the authoritative token count
+            // (usage → text estimate), matching `completion_tokens`.
+            observed_frames: tokens_received,
             status: state,
             loop_excluded_streams: looping as usize,
             loop_excluded_tokens,
@@ -661,12 +659,13 @@ pub fn aggregate(
             {
                 Some(n) => n as u64,
                 None => {
-                    est = true;
-                    if total_chunks > 0 {
-                        outcome.frames.max(1)
-                    } else {
-                        0
-                    }
+                    // No usage and no tokenizer: estimate from the full
+                    // reasoning + content text (`chars/4`) — counting raw
+                    // frames undercounts servers that batch several tokens
+                    // per frame (vLLM MTP / speculative decoding).
+                    let c = count_tokens(&stream_text(events), tokenizer);
+                    est = c.estimated;
+                    c.tokens as u64
                 }
             },
         };
@@ -1107,15 +1106,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_usage_falls_back_to_frames_and_flags_estimated() {
+    fn missing_usage_falls_back_to_text_estimate_and_flags_estimated() {
         let (mut outcome, events) = completed_run();
         outcome.usage = None;
         let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
         // Prompt fallback: the generated prompt's own (estimated) count.
         assert_eq!(r.prompt_tokens, 25);
-        // Completion fallback (no usage, no tokenizer): the observed token
-        // frame count (3 in `completed_run`), flagged `estimated`.
-        assert_eq!(r.completion_tokens, 3);
+        // Completion fallback (no usage, no tokenizer): the re-tokenized
+        // full text (`chars/4`) — 18 chars in `completed_run` ("think" +
+        // "Hello, " + "world!") → 4 tokens. Counting raw frames (3)
+        // undercounts batched servers, so it is no longer used. Flagged
+        // `estimated`.
+        assert_eq!(r.completion_tokens, 4);
         assert!(r.estimated);
         assert!(r.error.is_none());
     }
@@ -1344,8 +1346,9 @@ mod tests {
                     loop_excluded_tokens: 0,
                 }))
                 .collect();
-            let snap =
-                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, &t0, 256);
+            let snap = SpeedEngine::single_stream_snapshot(
+                "http://x", "m", "short", &events, &t0, 256, None,
+            );
             // prefill = 60 prompt tokens / 20 ms TTFT = 3000 t/s.
             assert!(
                 (snap.prefill_throughput - 3000.0).abs() < 1e-6,
@@ -1410,8 +1413,9 @@ mod tests {
                     loop_excluded_tokens: 10,
                 },
             ];
-            let snap =
-                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, &t0, 256);
+            let snap = SpeedEngine::single_stream_snapshot(
+                "http://x", "m", "short", &events, &t0, 256, None,
+            );
             assert_eq!(snap.prefill_throughput, 0.0);
             assert_eq!(snap.decode_throughput, 0.0);
             assert_eq!(snap.e2e_throughput, 0.0);
