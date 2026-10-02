@@ -39,7 +39,7 @@ use ratatui::Frame;
 use crate::config::{default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode};
 use crate::engines::concurrency::DEFAULT_LADDER;
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, style, Theme};
 
 /// The editable fields, in display / cursor order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,11 +61,12 @@ pub enum Field {
     EngineReasoning,
     EngineStructured,
     EngineFlatOut,
+    Theme,
 }
 
 impl Field {
     /// Every field in cursor order.
-    pub const ALL: [Field; 17] = [
+    pub const ALL: [Field; 18] = [
         Field::Url,
         Field::Model,
         Field::Mode,
@@ -83,6 +84,7 @@ impl Field {
         Field::EngineReasoning,
         Field::EngineStructured,
         Field::EngineFlatOut,
+        Field::Theme,
     ];
 
     /// The form label for this field.
@@ -105,6 +107,7 @@ impl Field {
             Field::EngineReasoning => "Engine C2 — Reasoning",
             Field::EngineStructured => "Engine C3 — Structured",
             Field::EngineFlatOut => "Engine F — Flat Out",
+            Field::Theme => "Theme",
         }
     }
 
@@ -193,6 +196,12 @@ impl Field {
                  Each level spawns that many simultaneous\n\
                  requests. Finds your server's practical limit.",
             ),
+            Field::Theme => Some(
+                "The color theme of the whole TUI.\n\
+                 ←/→ cycles (with a live preview); 1/2/3\n\
+                 selects Cyberpunk / Vampire / Monochrome.\n\
+                 Saved when you press Esc.",
+            ),
             // Engine fields use `Engine::description()` via `engine()`.
             Field::Hardware
             | Field::EngineSpeed
@@ -260,6 +269,8 @@ pub struct ConfigState {
     pub engine_reasoning: bool,
     pub engine_structured: bool,
     pub engine_flatout: bool,
+    /// The color theme (`"cyberpunk"` / `"vampire"` / `"monochrome"`).
+    pub theme: String,
     /// The cursor's position in [`Field::ALL`].
     pub cursor: usize,
     /// Where `F2` writes the form.
@@ -311,6 +322,7 @@ impl ConfigState {
             engine_reasoning: cfg.engines.reasoning,
             engine_structured: cfg.engines.structured,
             engine_flatout: cfg.engines.flatout,
+            theme: cfg.theme.clone(),
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
@@ -357,6 +369,7 @@ impl ConfigState {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        cfg.theme = self.theme.clone();
         cfg
     }
 
@@ -410,6 +423,9 @@ impl ConfigState {
             }),
             // The matrix axis is a CLI/env concern — never persisted from the form.
             matrix_contexts: None,
+            // The color theme is a pure preference — persisted so the
+            // first-run picker is skipped on the next launch.
+            theme: Some(self.theme.clone()),
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {
@@ -509,6 +525,14 @@ impl ConfigState {
                     self.timeout = self.timeout.saturating_mul(10).saturating_add(d as u64);
                 }
             }
+            // Theme: `1`/`2`/`3` select directly (the live preview follows).
+            Field::Theme => {
+                if let Some(n) = c.to_digit(10) {
+                    if (1..=Theme::ALL.len() as u32).contains(&n) {
+                        self.theme = Theme::ALL[(n - 1) as usize].id().to_string();
+                    }
+                }
+            }
             // Mode / booleans don't take typed text.
             _ => {}
         }
@@ -572,6 +596,13 @@ impl ConfigState {
             Field::EngineReasoning => self.engine_reasoning = !self.engine_reasoning,
             Field::EngineStructured => self.engine_structured = !self.engine_structured,
             Field::EngineFlatOut => self.engine_flatout = !self.engine_flatout,
+            Field::Theme => {
+                let idx = Theme::from_id(&self.theme)
+                    .and_then(|t| Theme::ALL.iter().position(|x| *x == t))
+                    .unwrap_or(0);
+                let next = (idx + 1) % Theme::ALL.len();
+                self.theme = Theme::ALL[next].id().to_string();
+            }
             _ => {}
         }
     }
@@ -608,6 +639,13 @@ impl ConfigState {
                     self.timeout.saturating_sub(5)
                 };
             }
+            Field::Theme => {
+                let idx = Theme::from_id(&self.theme)
+                    .and_then(|t| Theme::ALL.iter().position(|x| *x == t))
+                    .unwrap_or(0);
+                let next = (idx as i32 + dir).rem_euclid(Theme::ALL.len() as i32) as usize;
+                self.theme = Theme::ALL[next].id().to_string();
+            }
             _ => {}
         }
     }
@@ -627,11 +665,12 @@ impl Default for ConfigState {
 /// user sees on entry, so the number keys can never be captured by field
 /// editing (the user can always leave with `Esc` / `1`–`4`).
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let c = &app.config;
     if c.edit_mode == ConfigMode::Viewing {
-        render_gate(area, c, f);
+        render_gate(area, c, th, f);
     } else {
-        render_form(area, c, f);
+        render_form(area, c, th, f);
     }
 }
 
@@ -639,10 +678,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// edit" prompt, and the always-available exit keys. No field is focused,
 /// so no key can be swallowed by the editor and the user can never get
 /// stuck.
-fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
+fn render_gate(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
     let block = theme::block(
-        theme::panel_title("CONFIG (read-only — press Enter to edit)"),
-        style::border(),
+        theme::panel_title(th, "CONFIG (read-only — press Enter to edit)"),
+        style::border(th),
     );
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -651,29 +690,29 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
     let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 4);
     lines.push(Line::from(Span::styled(
         "You are in Config view. [Enter] to edit settings, or [Esc] / [1-4] to return to monitoring.",
-        style::value_warn(),
+        style::value_warn(th),
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "Current settings:",
-        style::label(),
+        style::label(th),
     )));
     for &field in &Field::ALL {
-        let (label, value, vstyle) = field_display(field, c);
+        let (label, value, vstyle) = field_display(field, c, th);
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{label:<22} "), style::label()),
+            Span::styled(format!("{label:<22} "), style::label(th)),
             Span::styled(value, vstyle),
         ]));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("Settings saved to {}", c.config_path.display()),
-        style::footer(),
+        style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
         "[Enter] Edit  ·  [Esc] Back to Live  ·  [R] Reset  ·  [F2] Save  ·  [F5] Run → Live",
-        style::footer(),
+        style::footer(th),
     )));
     f.render_widget(
         Paragraph::new(Text::from(lines))
@@ -687,19 +726,19 @@ fn render_gate(area: Rect, c: &ConfigState, f: &mut Frame) {
 /// with a cursor, the focused field's explanation (dimmed `ℹ` note in a
 /// reserved 4-line area), and the edit-mode key hints (`Esc` saves and
 /// returns to the gate; all other keys type into the focused field).
-fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
+fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
     let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 10);
     for &field in &Field::ALL {
         let is_cursor = field == c.current();
-        let (label, value, vstyle) = field_display(field, c);
+        let (label, value, vstyle) = field_display(field, c, th);
         let prefix = if is_cursor {
-            Span::styled("> ", style::highlight())
+            Span::styled("> ", style::highlight(th))
         } else {
             Span::raw("  ")
         };
         lines.push(Line::from(vec![
             prefix,
-            Span::styled(format!("{label:<22} "), style::label()),
+            Span::styled(format!("{label:<22} "), style::label(th)),
             Span::styled(value, vstyle),
         ]));
     }
@@ -709,10 +748,10 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
     let focused = c.current();
     if let Some(engine) = focused.engine() {
         // Engine fields: use the engine's description (≤3 lines).
-        lines.extend(crate::ui::views::engine_info_lines(engine));
+        lines.extend(crate::ui::views::engine_info_lines(th, engine));
     } else if let Some(text) = focused.explanation() {
         // Non-engine fields: use the field's own explanation (≤4 lines).
-        lines.extend(crate::ui::views::info_lines(text));
+        lines.extend(crate::ui::views::info_lines(th, text));
     }
     // Pad to always 4 lines (reserved space).
     let field_end = Field::ALL.len() + 1; // 16 fields + 1 blank
@@ -722,28 +761,28 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "[Esc] Save & exit  ·  [F2] Save  ·  [F5] Run → Live  ·  [R] Reset",
-        style::footer(),
+        style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
         "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [type] edit · [⌫] delete",
-        style::footer(),
+        style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
         format!("Settings saved to {}", c.config_path.display()),
-        style::footer(),
+        style::footer(th),
     )));
     if c.saved {
-        lines.push(Line::from(Span::styled("✓ saved", style::value_ok())));
+        lines.push(Line::from(Span::styled("✓ saved", style::value_ok(th))));
     }
     let border = if c.saved {
-        style::active_border()
+        style::active_border(th)
     } else {
-        style::border()
+        style::border(th)
     };
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(theme::block(
-                theme::panel_title("CONFIG (editing — Esc to save & exit)"),
+                theme::panel_title(th, "CONFIG (editing — Esc to save & exit)"),
                 border,
             ))
             .wrap(Wrap { trim: true }),
@@ -752,37 +791,37 @@ fn render_form(area: Rect, c: &ConfigState, f: &mut Frame) {
 }
 
 /// `(label, value, value_style)` for one form field.
-fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
+fn field_display(field: Field, c: &ConfigState, th: Theme) -> (String, String, Style) {
     match field {
         Field::Url => (
             "Target URL".to_string(),
             fmt::truncate(&c.url, 44),
-            style::value(),
+            style::value(th),
         ),
         Field::Model => (
             "Model".to_string(),
             fmt::truncate(&c.model, 44),
-            style::value(),
+            style::value(th),
         ),
         Field::Mode => (
             "Mode".to_string(),
             c.mode.label().to_string(),
-            style::value(),
+            style::value(th),
         ),
         Field::Tokens => (
             "Target tokens".to_string(),
             c.tokens.to_string(),
-            style::value(),
+            style::value(th),
         ),
         Field::Iterations => (
             "Iterations".to_string(),
             c.iterations.to_string(),
-            style::value(),
+            style::value(th),
         ),
         Field::Timeout => (
             "Timeout (s)".to_string(),
             c.timeout.to_string(),
-            style::value(),
+            style::value(th),
         ),
         Field::ApiKey => (
             "API key".to_string(),
@@ -794,12 +833,12 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
                     .as_str(),
                 44,
             ),
-            style::value(),
+            style::value(th),
         ),
         Field::Nocache => (
             "Cache bypass".to_string(),
             bool_str(c.nocache),
-            bool_style(c.nocache),
+            bool_style(th, c.nocache),
         ),
         Field::Tokenizer => (
             "Tokenizer".to_string(),
@@ -812,50 +851,57 @@ fn field_display(field: Field, c: &ConfigState) -> (String, String, Style) {
                 44,
             ),
             if c.tokenizer.is_some() {
-                style::value()
+                style::value(th)
             } else {
-                style::value_warn()
+                style::value_warn(th)
             },
         ),
         Field::Ladder => (
             "Concurrency ladder".to_string(),
             c.ladder.clone(),
-            style::value(),
+            style::value(th),
         ),
         Field::Hardware => (
             "Hardware telemetry".to_string(),
             bool_str(c.hardware),
-            bool_style(c.hardware),
+            bool_style(th, c.hardware),
         ),
         Field::EngineSpeed => (
             "Engine A — Speed".to_string(),
             bool_str(c.engine_speed),
-            bool_style(c.engine_speed),
+            bool_style(th, c.engine_speed),
         ),
         Field::EngineConcurrency => (
             "Engine B — Concurrency".to_string(),
             bool_str(c.engine_concurrency),
-            bool_style(c.engine_concurrency),
+            bool_style(th, c.engine_concurrency),
         ),
         Field::EngineNiah => (
             "Engine C1 — NIAH".to_string(),
             bool_str(c.engine_niah),
-            bool_style(c.engine_niah),
+            bool_style(th, c.engine_niah),
         ),
         Field::EngineReasoning => (
             "Engine C2 — Reasoning".to_string(),
             bool_str(c.engine_reasoning),
-            bool_style(c.engine_reasoning),
+            bool_style(th, c.engine_reasoning),
         ),
         Field::EngineStructured => (
             "Engine C3 — Structured".to_string(),
             bool_str(c.engine_structured),
-            bool_style(c.engine_structured),
+            bool_style(th, c.engine_structured),
         ),
         Field::EngineFlatOut => (
             "Engine F — Flat Out".to_string(),
             bool_str(c.engine_flatout),
-            bool_style(c.engine_flatout),
+            bool_style(th, c.engine_flatout),
+        ),
+        Field::Theme => (
+            "Theme".to_string(),
+            Theme::from_id(&c.theme)
+                .map(|t| t.name().to_string())
+                .unwrap_or_else(|| c.theme.clone()),
+            style::value(th),
         ),
     }
 }
@@ -869,11 +915,11 @@ fn bool_str(b: bool) -> String {
     }
 }
 
-fn bool_style(b: bool) -> Style {
+fn bool_style(th: Theme, b: bool) -> Style {
     if b {
-        style::value_ok()
+        style::value_ok(th)
     } else {
-        Style::default().fg(palette::MUTED)
+        Style::default().fg(th.dim())
     }
 }
 

@@ -93,7 +93,7 @@ impl EventLoop {
                                 if let Err(e) = app.export() {
                                     app.push_log(
                                         format!("[export] failed: {e}"),
-                                        style::value_warn(),
+                                        style::value_warn(app.active_theme),
                                     );
                                 }
                             }

@@ -38,6 +38,7 @@ use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
 use crucible_llm::timing::MonotonicInstant;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
+use crucible_llm::ui::theme::Theme;
 
 fn main() {
     let cfg = match Config::from_cli() {
@@ -550,14 +551,20 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
             let mut app = App::new()
                 .with_export_format(export_format)
                 .with_config(cfg)
+                .with_theme(Theme::from_id(&cfg.theme).unwrap_or_default())
                 .with_logger(logger.clone());
-            // The interactive Setup phase (full-screen takeover) opens
-            // only when the target (URL + model) was *not* fully given
-            // via CLI flags / env / config file: a bare `crucible-llm`
-            // starts at the URL prompt, while `--url … --model …` jumps
-            // straight to the Live view (`c` re-opens Setup from there).
-            // The placeholder model name ("default") counts as absent.
-            if !(cfg.target_explicit && cfg.model != DEFAULT_MODEL) {
+            // The target is "fully given" when an explicit URL + a
+            // non-placeholder model are present; otherwise the Setup
+            // takeover is needed to fill them in (the placeholder model
+            // name "default" counts as absent).
+            let needs_setup = !(cfg.target_explicit && cfg.model != DEFAULT_MODEL);
+            // **First run** (no theme ever chosen — `theme_explicit` is
+            // false): the full-screen theme picker comes *before* Setup.
+            // A subsequent run (a theme is saved in the config file) skips
+            // the picker and goes straight to Setup / the Dashboard.
+            if !cfg.theme_explicit {
+                app = app.with_theme_picker(needs_setup);
+            } else if needs_setup {
                 app = app.with_setup(cfg);
             }
             // The 100 ms hardware telemetry task (blueprint §4.3): it

@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 use crucible_llm::config::Config;
 use crucible_llm::engines::capability::{NiahCell, NiahCellState, NiahResult, NIAH_DEPTHS};
 use crucible_llm::ui::app::{App, View};
-use crucible_llm::ui::theme::palette;
+use crucible_llm::ui::theme::Theme;
 use crucible_llm::ui::views::needle;
 
 mod common;
@@ -261,15 +261,15 @@ fn view3_renders_color_coded_grid_from_published_result() {
     // nominal = mint, throttled = electric purple, failed = hot pink).
     let colors = buf_colors(&buf);
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == palette::OK),
+        colors.iter().any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.success()),
         "a nominal (mint) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "●" && *c == palette::WARN),
+        colors.iter().any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.warn()),
         "a throttled (purple) cell must render"
     );
     assert!(
-        colors.iter().any(|(s, c)| s == "✗" && *c == palette::ERR),
+        colors.iter().any(|(s, c)| s == "✗" && *c == Theme::Cyberpunk.danger()),
         "a failed (hot-pink) cell must render"
     );
 

@@ -1,87 +1,243 @@
-//! The **cyberpunk** palette + shared style constructors for the TUI.
+//! The TUI theme system: a `Theme` enum with three palettes
+//! (Cyberpunk, Vampire, Monochrome Pastel) plus the shared,
+//! theme-aware style constructors every view draws from.
 //!
-//! Neon-on-dark: a cyan primary, electric-purple + deep-blue secondaries,
-//! a hot-pink danger color, and a mint success color, all floating on a dark
-//! background. Every view draws from `palette` + `style` + the `block` /
-//! `panel_title` / `glyph` helpers so the five views (and the Setup
-//! takeover) stay visually cohesive: Blade-Runner-meets-terminal, Tron-meets
-//! data-viz.
+//! **Design** — the render path is a pure `&App` read
+//! (measurement-isolation invariant, blueprint §4). Every color a view
+//! needs comes from the active theme: `let th = app.active_theme;` and
+//! then `th.primary()` / `style::title(th)` / `theme::block(...,
+//! style::border(th))`. No view hardcodes a `Color::Rgb` — the whole
+//! screen re-skins when the user switches themes (first-run picker or
+//! the Config view's Theme field).
 //!
-//! **Palette roles**
-//! * `ACCENT`   (cyan `#00FFFF`)     — primary: titles, active borders,
-//!   selected items, the "now" glow.
-//! * `SECONDARY`(electric `#BF00FF`) — highlights, selected rows, warnings.
-//! * `DATA`     (deep blue `#0066FF`)— data values, graph bodies, `ℹ` notes.
-//! * `CALLOUT`  (pink `#FF0066`)     — knee markers, important callouts.
-//! * `OK`       (mint `#00FFAA`)     — passing, complete, good.
-//! * `ERR`      (hot pink `#FF0044`) — errors, failures, critical.
-//! * `MUTED`    (blue-gray `#4488AA`)- secondary info, labels, chrome.
-//! * `TEXT`     (white `#CCFFFF`)    — primary data values (the bright top).
-//! * `BORDER_DEFAULT` / `BORDER_ACTIVE` — the dim / bright cyan panel frames.
-//! * `FLOOR` / `BRIGHT` — the dim-blue base and hot-cyan top of a gradient.
+//! **Theme roles** (each theme supplies all of them):
+//! * `primary`        — titles, active borders, selected items, the glow.
+//! * `secondary`      — highlights, selected rows, warnings.
+//! * `tertiary`       — data values, graph bodies, `ℹ` notes.
+//! * `accent`         — knee markers, important callouts.
+//! * `success`        — passing, complete, good.
+//! * `danger`         — errors, failures, critical.
+//! * `dim`            — secondary info, labels, chrome.
+//! * `bright`         — primary data values (the bright top).
+//! * `border` / `border_active` — the dim / bright panel frames.
+//! * plus the gradient texture colors (`floor`, `bright_gradient`, `bg`)
+//!   that give the charts their depth.
 //!
-//! The old semantic names (`ACCENT`/`OK`/`WARN`/`ERR`/`INFO`/`HIGHLIGHT`/
-//! `MUTED`/`TEXT`) are kept so every existing call site keeps compiling;
-//! only their RGB values (and a few new constants) change.
+//! `Cyberpunk` is the default and preserves the original neon palette
+//! exactly, so switching to it is a no-op visual change.
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
 
-/// Canonical cyberpunk palette (all `Color::Rgb` — 256-color-safe neon).
-pub mod palette {
-    use ratatui::style::Color;
+/// The available color themes. `Cyberpunk` (the default) keeps the original
+/// neon palette; `Vampire` is a dark-red gothic skin; `Monochrome` is a
+/// clean pastel skin. Each is a complete palette — switching re-colors the
+/// entire TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    /// Neon cyan / electric purple / deep blue on dark (the original skin).
+    #[default]
+    Cyberpunk,
+    /// Crimson / gold / dark purple — dark, gothic.
+    Vampire,
+    /// Soft blue / lavender / clean pastels.
+    Monochrome,
+}
 
-    // ── Primary / secondary / tertiary ────────────────────────────────
-    /// Primary (cyan `#00FFFF`): titles, active borders, selected, the glow.
-    pub const ACCENT: Color = Color::Rgb(0, 255, 255);
-    /// Secondary (electric purple `#BF00FF`): highlights, selected rows.
-    pub const SECONDARY: Color = Color::Rgb(191, 0, 255);
-    /// Tertiary (deep blue `#0066FF`): data values, graph bodies, `ℹ` notes.
-    pub const DATA: Color = Color::Rgb(0, 102, 255);
-    /// Accent callout (magenta/pink `#FF0066`): knee markers, important text.
-    pub const CALLOUT: Color = Color::Rgb(255, 0, 102);
+impl Theme {
+    /// All themes in picker / cycle order.
+    pub const ALL: [Theme; 3] = [Theme::Cyberpunk, Theme::Vampire, Theme::Monochrome];
 
-    // ── Semantic (kept names; cyberpunk RGB values) ────────────────────
-    /// Success (teal/mint `#00FFAA`): passing, complete, good.
-    pub const OK: Color = Color::Rgb(0, 255, 170);
-    /// Warning (electric purple `#BF00FF`): degraded, cautions.
-    pub const WARN: Color = Color::Rgb(191, 0, 255);
-    /// Danger (hot pink `#FF0044`): failures, errors, critical.
-    pub const ERR: Color = Color::Rgb(255, 0, 68);
-    /// Info (deep blue `#0066FF`): descriptions, `ℹ` help text.
-    pub const INFO: Color = Color::Rgb(0, 102, 255);
-    /// Highlight (magenta/pink `#FF0066`): MTP values, active tab, callouts.
-    pub const HIGHLIGHT: Color = Color::Rgb(255, 0, 102);
-    /// Muted chrome (dim blue-gray `#4488AA`): labels, secondary hints.
-    pub const MUTED: Color = Color::Rgb(68, 136, 170);
-    /// Bright body text (cyan-tinted white `#CCFFFF`): primary data values.
-    pub const TEXT: Color = Color::Rgb(204, 255, 255);
+    /// The full theme name (shown in the picker + Config view).
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Cyberpunk => "Cyberpunk",
+            Theme::Vampire => "Vampire",
+            Theme::Monochrome => "Monochrome Pastel",
+        }
+    }
 
-    // ── Borders ────────────────────────────────────────────────────────
-    /// Default panel border (dark cyan `#004455`).
-    pub const BORDER_DEFAULT: Color = Color::Rgb(0, 68, 85);
-    /// Active / focused panel border (bright cyan `#00CCCC`).
-    pub const BORDER_ACTIVE: Color = Color::Rgb(0, 204, 204);
+    /// The short config-file value (`"cyberpunk"` / `"vampire"` /
+    /// `"monochrome"`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Theme::Cyberpunk => "cyberpunk",
+            Theme::Vampire => "vampire",
+            Theme::Monochrome => "monochrome",
+        }
+    }
 
-    // ── Gradient layers (the "glowing from within" texture) ────────────
-    /// Dim blue floor (the base of a gradient bar / area fill).
-    pub const FLOOR: Color = Color::Rgb(16, 52, 74);
-    /// Hot cyan (the bright body just under the white cap).
-    pub const BRIGHT: Color = Color::Rgb(140, 255, 255);
-    /// Near-black background (the dark base the neon floats on).
-    pub const BG: Color = Color::Rgb(5, 10, 18);
+    /// The one-line palette blurb shown under the name in the picker.
+    pub fn tagline(self) -> &'static str {
+        match self {
+            Theme::Cyberpunk => "Neon cyan \u{00b7} Electric purple \u{00b7} Digital glow",
+            Theme::Vampire => "Crimson \u{00b7} Gold \u{00b7} Dark purple \u{00b7} Gothic",
+            Theme::Monochrome => "Soft blue \u{00b7} Lavender \u{00b7} Clean \u{00b7} Minimal",
+        }
+    }
+
+    /// Parse a config-file / env value into a theme (`None` on unknown).
+    pub fn from_id(s: &str) -> Option<Theme> {
+        match s.to_ascii_lowercase().as_str() {
+            "cyberpunk" => Some(Theme::Cyberpunk),
+            "vampire" => Some(Theme::Vampire),
+            "monochrome" => Some(Theme::Monochrome),
+            _ => None,
+        }
+    }
+
+    // ── Palette roles ────────────────────────────────────────────────────
+
+    /// Primary: titles, active borders, selected items, the glow.
+    pub fn primary(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(0, 255, 255),
+            Theme::Vampire => Color::Rgb(220, 20, 60),
+            Theme::Monochrome => Color::Rgb(126, 182, 232),
+        }
+    }
+
+    /// Secondary: highlights, selected rows.
+    pub fn secondary(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(191, 0, 255),
+            Theme::Vampire => Color::Rgb(75, 0, 130),
+            Theme::Monochrome => Color::Rgb(200, 162, 200),
+        }
+    }
+
+    /// Tertiary: data values, graph bodies, `ℹ` notes.
+    pub fn tertiary(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(0, 102, 255),
+            Theme::Vampire => Color::Rgb(90, 50, 130),
+            Theme::Monochrome => Color::Rgb(160, 185, 215),
+        }
+    }
+
+    /// Accent callout: knee markers, important text.
+    pub fn accent(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(255, 0, 102),
+            Theme::Vampire => Color::Rgb(255, 215, 0),
+            Theme::Monochrome => Color::Rgb(255, 218, 185),
+        }
+    }
+
+    /// Success: passing, complete, good.
+    pub fn success(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(0, 255, 170),
+            Theme::Vampire => Color::Rgb(144, 238, 144),
+            Theme::Monochrome => Color::Rgb(184, 230, 208),
+        }
+    }
+
+    /// Danger: failures, errors, critical.
+    pub fn danger(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(255, 0, 68),
+            Theme::Vampire => Color::Rgb(255, 0, 0),
+            Theme::Monochrome => Color::Rgb(240, 128, 128),
+        }
+    }
+
+    /// Dim: secondary info, labels, chrome.
+    pub fn dim(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(68, 136, 170),
+            Theme::Vampire => Color::Rgb(92, 48, 48),
+            Theme::Monochrome => Color::Rgb(153, 153, 153),
+        }
+    }
+
+    /// Bright: primary data values (the bright top).
+    pub fn bright(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(204, 255, 255),
+            Theme::Vampire => Color::Rgb(255, 238, 236),
+            Theme::Monochrome => Color::Rgb(255, 255, 255),
+        }
+    }
+
+    /// Default panel border (inactive chrome).
+    pub fn border(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(0, 68, 85),
+            Theme::Vampire => Color::Rgb(74, 0, 0),
+            Theme::Monochrome => Color::Rgb(204, 204, 204),
+        }
+    }
+
+    /// Active / focused panel border.
+    pub fn border_active(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(0, 204, 204),
+            Theme::Vampire => Color::Rgb(220, 20, 60),
+            Theme::Monochrome => Color::Rgb(126, 182, 232),
+        }
+    }
+
+    // ── Extra palette roles (kept from the original cyberpunk set) ──────
+
+    /// Warning color (degraded, cautions) — mirrors `secondary`.
+    pub fn warn(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(191, 0, 255),
+            Theme::Vampire => Color::Rgb(255, 215, 0),
+            Theme::Monochrome => Color::Rgb(255, 218, 185),
+        }
+    }
+
+    /// Info color (`ℹ` notes) — mirrors `tertiary`.
+    pub fn info(self) -> Color {
+        self.tertiary()
+    }
+
+    /// Highlight / callout color (MTP values, active tab) — mirrors `accent`.
+    pub fn highlight(self) -> Color {
+        self.accent()
+    }
+
+    /// Dim floor: the base of a gradient bar / area fill.
+    pub fn floor(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(16, 52, 74),
+            Theme::Vampire => Color::Rgb(40, 12, 14),
+            Theme::Monochrome => Color::Rgb(55, 65, 85),
+        }
+    }
+
+    /// Hot top of a gradient bar (just under the bright cap).
+    pub fn bright_gradient(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(140, 255, 255),
+            Theme::Vampire => Color::Rgb(255, 170, 170),
+            Theme::Monochrome => Color::Rgb(220, 230, 245),
+        }
+    }
+
+    /// Panel background (the base a bright theme floats on — kept dark for
+    /// every theme so bright/white text stays readable on a dark terminal).
+    pub fn bg(self) -> Color {
+        match self {
+            Theme::Cyberpunk => Color::Rgb(5, 10, 18),
+            Theme::Vampire => Color::Rgb(15, 5, 7),
+            Theme::Monochrome => Color::Rgb(16, 18, 24),
+        }
+    }
 }
 
 /// The "digital" glyph set — the layered textures that give the graphs
-/// their cyberpunk depth (flat single-color bars are gone).
+/// their depth (flat single-color bars are gone).
 pub mod glyph {
     // Gradient layers, bottom → top (the 3-layer "glow from within").
     /// Light shade — the dim floor / area fill.
     pub const FLOOR: char = '░';
     /// Medium shade — the low band of a gradient.
     pub const LOW: char = '▒';
-    /// Dense shade — the mid (cyan) band.
+    /// Dense shade — the mid (primary) band.
     pub const MID: char = '▓';
     /// Full block — the bright top.
     pub const HIGH: char = '█';
@@ -90,7 +246,7 @@ pub mod glyph {
     pub const SEG_ON: char = '▰';
     /// Empty segment.
     pub const SEG_OFF: char = '▱';
-    // Curve markers (angular, cyberpunk).
+    // Curve markers (angular).
     /// A measured data point (diamond).
     pub const POINT: char = '◆';
     /// The saturation knee (triangle).
@@ -123,137 +279,220 @@ pub fn block(title: impl Into<Line<'static>>, border_style: Style) -> Block<'sta
         .title(title)
 }
 
-/// A styled panel title line: a `▸` caret prefix, bold + accent, uppercased
-/// (the "panel titles: `▸` + bold + accent, uppercase" rule).
-pub fn panel_title(text: impl Into<String>) -> Line<'static> {
+/// A styled panel title line: a `▸` caret prefix, bold + primary, uppercased
+/// (the "panel titles: `▸` + bold + primary, uppercase" rule).
+pub fn panel_title(th: Theme, text: impl Into<String>) -> Line<'static> {
     Line::from(Span::styled(
         format!("{} {}", glyph::PREFIX, text.into().to_ascii_uppercase()),
-        style::title(),
+        style::title(th),
     ))
 }
 
-/// A border that **pulses** between two cyan shades on successive frame
-/// groups — the "alive" signal for a running / focused panel. `tick` is the
-/// 60 Hz render counter; every ~10 frames the shade flips.
-pub fn pulsing_border(tick: u64) -> Style {
+/// A border that **pulses** between two shades on successive frame groups —
+/// the "alive" signal for a running / focused panel. `tick` is the 60 Hz
+/// render counter; every ~10 frames the shade flips.
+pub fn pulsing_border(th: Theme, tick: u64) -> Style {
     let on = (tick / 10).is_multiple_of(2);
     Style::default().fg(if on {
-        palette::BORDER_ACTIVE
+        th.border_active()
     } else {
-        palette::ACCENT
+        th.primary()
     })
 }
 
-/// Shared style constructors.
+/// Shared style constructors — every one takes the active [`Theme`] so the
+/// whole TUI re-skins from a single source of truth.
 pub mod style {
     use ratatui::style::{Modifier, Style};
 
-    use super::palette;
+    use super::Theme;
 
-    /// Panel border (inactive chrome) — dark cyan.
-    pub fn border() -> Style {
-        Style::default().fg(palette::BORDER_DEFAULT)
+    /// Panel border (inactive chrome).
+    pub fn border(th: Theme) -> Style {
+        Style::default().fg(th.border())
     }
 
-    /// Panel border for the focused / active panel — bright cyan.
-    pub fn active_border() -> Style {
-        Style::default().fg(palette::BORDER_ACTIVE)
+    /// Panel border for the focused / active panel.
+    pub fn active_border(th: Theme) -> Style {
+        Style::default().fg(th.border_active())
     }
 
-    /// Panel title (e.g. "LIVE THROUGHPUT") — bright cyan, bold.
-    pub fn title() -> Style {
+    /// Panel title — primary, bold.
+    pub fn title(th: Theme) -> Style {
         Style::default()
-            .fg(palette::ACCENT)
+            .fg(th.primary())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Muted title / header row — dim blue-gray, bold.
-    pub fn muted_title() -> Style {
+    /// Muted title / header row — dim, bold.
+    pub fn muted_title(th: Theme) -> Style {
         Style::default()
-            .fg(palette::MUTED)
+            .fg(th.dim())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Field label — dim blue-gray (secondary info).
-    pub fn label() -> Style {
-        Style::default().fg(palette::MUTED)
+    /// Field label — dim (secondary info).
+    pub fn label(th: Theme) -> Style {
+        Style::default().fg(th.dim())
     }
 
-    /// Primary value (cyan-tinted white, bold) — the headline number.
-    pub fn value() -> Style {
+    /// Primary value (bright, bold) — the headline number.
+    pub fn value(th: Theme) -> Style {
         Style::default()
-            .fg(palette::TEXT)
+            .fg(th.bright())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Secondary value (cyan-tinted white, dimmed) — the avg / p5
-    /// companions that support a primary value without competing with it.
-    pub fn value_secondary() -> Style {
+    /// Secondary value (bright, dimmed) — the avg / p5 companions.
+    pub fn value_secondary(th: Theme) -> Style {
         Style::default()
-            .fg(palette::TEXT)
+            .fg(th.bright())
             .add_modifier(Modifier::DIM)
     }
 
-    /// Healthy value (teal/mint, bold).
-    pub fn value_ok() -> Style {
+    /// Healthy value (success, bold).
+    pub fn value_ok(th: Theme) -> Style {
         Style::default()
-            .fg(palette::OK)
+            .fg(th.success())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Warning value (electric purple, bold).
-    pub fn value_warn() -> Style {
+    /// Warning value (warn, bold).
+    pub fn value_warn(th: Theme) -> Style {
         Style::default()
-            .fg(palette::WARN)
+            .fg(th.warn())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Error / regression value (hot pink, bold).
-    pub fn value_err() -> Style {
+    /// Error / regression value (danger, bold).
+    pub fn value_err(th: Theme) -> Style {
         Style::default()
-            .fg(palette::ERR)
+            .fg(th.danger())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// MTP / speculative-decoding / callout value (magenta/pink, bold).
-    pub fn highlight() -> Style {
+    /// Callout / highlight value (accent, bold).
+    pub fn highlight(th: Theme) -> Style {
         Style::default()
-            .fg(palette::HIGHLIGHT)
+            .fg(th.highlight())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Top status bar (endpoint / model / mode) — cyan.
-    pub fn status_bar() -> Style {
-        Style::default().fg(palette::ACCENT)
+    /// Top status bar (endpoint / model / mode).
+    pub fn status_bar(th: Theme) -> Style {
+        Style::default().fg(th.primary())
     }
 
-    /// Bottom key-hint footer — dim blue-gray.
-    pub fn footer() -> Style {
-        Style::default().fg(palette::MUTED)
+    /// Bottom key-hint footer — dim.
+    pub fn footer(th: Theme) -> Style {
+        Style::default().fg(th.dim())
     }
 
-    /// Informational text (the `ℹ` notes) — deep blue, dimmed, so it reads
-    /// as "help" and never competes with the bright primary data.
-    pub fn info() -> Style {
+    /// Informational text (the `ℹ` notes) — info color, dimmed.
+    pub fn info(th: Theme) -> Style {
         Style::default()
-            .fg(palette::INFO)
+            .fg(th.info())
             .add_modifier(Modifier::DIM)
     }
 
-    /// Active tab in the tab bar — bright cyan, bold (the current view).
-    pub fn tab_active() -> Style {
+    /// Active tab in the tab bar — primary, bold.
+    pub fn tab_active(th: Theme) -> Style {
         Style::default()
-            .fg(palette::ACCENT)
+            .fg(th.primary())
             .add_modifier(Modifier::BOLD)
     }
 
-    /// Inactive tab in the tab bar — dim blue-gray.
-    pub fn tab_inactive() -> Style {
-        Style::default().fg(palette::MUTED)
+    /// Inactive tab in the tab bar — dim.
+    pub fn tab_inactive(th: Theme) -> Style {
+        Style::default().fg(th.dim())
     }
 
-    /// Separator between tabs / status-bar fields — dim cyan.
-    pub fn tab_separator() -> Style {
-        Style::default().fg(palette::BORDER_DEFAULT)
+    /// Separator between tabs / status-bar fields.
+    pub fn tab_separator(th: Theme) -> Style {
+        Style::default().fg(th.border())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_id_parses_all_three_themes() {
+        assert_eq!(Theme::from_id("cyberpunk"), Some(Theme::Cyberpunk));
+        assert_eq!(Theme::from_id("vampire"), Some(Theme::Vampire));
+        assert_eq!(Theme::from_id("monochrome"), Some(Theme::Monochrome));
+        // Case-insensitive.
+        assert_eq!(Theme::from_id("VAMPIRE"), Some(Theme::Vampire));
+        assert_eq!(Theme::from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn id_and_name_round_trip() {
+        for t in Theme::ALL {
+            assert_eq!(Theme::from_id(t.id()), Some(t));
+            assert!(!t.name().is_empty());
+            assert!(!t.tagline().is_empty());
+        }
+    }
+
+    #[test]
+    fn cyberpunk_preserves_the_original_palette() {
+        let c = Theme::Cyberpunk;
+        assert_eq!(c.primary(), Color::Rgb(0, 255, 255));
+        assert_eq!(c.secondary(), Color::Rgb(191, 0, 255));
+        assert_eq!(c.accent(), Color::Rgb(255, 0, 102));
+        assert_eq!(c.success(), Color::Rgb(0, 255, 170));
+        assert_eq!(c.danger(), Color::Rgb(255, 0, 68));
+        assert_eq!(c.dim(), Color::Rgb(68, 136, 170));
+        assert_eq!(c.bright(), Color::Rgb(204, 255, 255));
+        assert_eq!(c.border(), Color::Rgb(0, 68, 85));
+        assert_eq!(c.border_active(), Color::Rgb(0, 204, 204));
+    }
+
+    #[test]
+    fn each_theme_is_a_complete_distinct_palette() {
+        for t in Theme::ALL {
+            // Every role returns a valid (non-Reset) color.
+            assert_ne!(t.primary(), Color::Reset);
+            assert_ne!(t.secondary(), Color::Reset);
+            assert_ne!(t.tertiary(), Color::Reset);
+            assert_ne!(t.accent(), Color::Reset);
+            assert_ne!(t.success(), Color::Reset);
+            assert_ne!(t.danger(), Color::Reset);
+            assert_ne!(t.dim(), Color::Reset);
+            assert_ne!(t.bright(), Color::Reset);
+            assert_ne!(t.border(), Color::Reset);
+            assert_ne!(t.border_active(), Color::Reset);
+            assert_ne!(t.floor(), Color::Reset);
+            assert_ne!(t.bg(), Color::Reset);
+        }
+        // The three themes differ in their primary color.
+        assert_ne!(Theme::Cyberpunk.primary(), Theme::Vampire.primary());
+        assert_ne!(Theme::Vampire.primary(), Theme::Monochrome.primary());
+        assert_ne!(Theme::Cyberpunk.primary(), Theme::Monochrome.primary());
+    }
+
+    #[test]
+    fn vampire_uses_crimson_and_gold() {
+        let v = Theme::Vampire;
+        assert_eq!(v.primary(), Color::Rgb(220, 20, 60));
+        assert_eq!(v.accent(), Color::Rgb(255, 215, 0));
+        assert_eq!(v.danger(), Color::Rgb(255, 0, 0));
+        assert_eq!(v.border_active(), Color::Rgb(220, 20, 60));
+    }
+
+    #[test]
+    fn monochrome_uses_pastel_colors() {
+        let m = Theme::Monochrome;
+        assert_eq!(m.primary(), Color::Rgb(126, 182, 232));
+        assert_eq!(m.secondary(), Color::Rgb(200, 162, 200));
+        assert_eq!(m.bright(), Color::Rgb(255, 255, 255));
+        assert_eq!(m.dim(), Color::Rgb(153, 153, 153));
+    }
+
+    #[test]
+    fn default_theme_is_cyberpunk() {
+        assert_eq!(Theme::default(), Theme::Cyberpunk);
     }
 }

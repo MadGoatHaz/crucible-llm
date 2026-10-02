@@ -37,7 +37,7 @@ use ratatui::Frame;
 use crate::storage::db::{Database, StorageError};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, style, Theme};
 
 // ── mode ─────────────────────────────────────────────────────────────────
 
@@ -380,42 +380,43 @@ impl HistoryState {
 
 /// Render the History view into `area`. Dispatches on the current mode.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let Some(h) = app.history.as_ref() else {
         // No DB loaded yet — show the empty placeholder.
-        render_empty(area, f);
+        render_empty(area, th, f);
         return;
     };
     if h.sessions.is_empty() {
-        render_empty(area, f);
+        render_empty(area, th, f);
         return;
     }
     match &h.mode {
-        HistoryMode::List => render_list(area, h, f),
-        HistoryMode::Detail(idx) => render_detail(area, h, *idx, f),
+        HistoryMode::List => render_list(area, h, th, f),
+        HistoryMode::Detail(idx) => render_detail(area, h, *idx, th, f),
         HistoryMode::Compare { first, second } => {
             if second.is_some() {
-                render_compare(area, h, *first, second.unwrap(), f);
+                render_compare(area, h, *first, second.unwrap(), th, f);
             } else {
-                render_compare_select(area, h, *first, f);
+                render_compare_select(area, h, *first, th, f);
             }
         }
-        HistoryMode::DeleteConfirm(idx) => render_delete_confirm(area, h, *idx, f),
+        HistoryMode::DeleteConfirm(idx) => render_delete_confirm(area, h, *idx, th, f),
     }
 }
 
 /// The empty-state placeholder.
-fn render_empty(area: Rect, f: &mut Frame) {
-    let block = theme::block(theme::panel_title("HISTORY"), style::border());
+fn render_empty(area: Rect, th: Theme, f: &mut Frame) {
+    let block = theme::block(theme::panel_title(th, "HISTORY"), style::border(th));
     let lines = vec![
         Line::raw(""),
-        Line::from(Span::styled("No benchmark runs saved yet.", style::value())),
+        Line::from(Span::styled("No benchmark runs saved yet.", style::value(th))),
         Line::from(Span::styled(
             "Complete a run and results will appear here.",
-            style::info(),
+            style::info(th),
         )),
         Line::from(Span::styled(
             "You can then compare runs over time to track improvements.",
-            style::info(),
+            style::info(th),
         )),
     ];
     f.render_widget(
@@ -428,19 +429,19 @@ fn render_empty(area: Rect, f: &mut Frame) {
 }
 
 /// The session list with cursor highlighting and key-hint subtitle.
-fn render_list(area: Rect, h: &HistoryState, f: &mut Frame) {
+fn render_list(area: Rect, h: &HistoryState, th: Theme, f: &mut Frame) {
     let title_line = Line::from(vec![Span::styled(
         format!(
             "HISTORY — Past Benchmark Runs  ({} total)",
             h.sessions.len()
         ),
-        style::title(),
+        style::title(th),
     )]);
     let hints_line = Line::from(Span::styled(
         "  ↑↓/jk scroll │ Enter details │ C compare │ D delete │ 1-5 views │ q quit",
-        style::footer(),
+        style::footer(th),
     ));
-    let block = theme::block(title_line, style::border());
+    let block = theme::block(title_line, style::border(th));
 
     let rows: Vec<Row> = h
         .sessions
@@ -455,7 +456,7 @@ fn render_list(area: Rect, h: &HistoryState, f: &mut Frame) {
                 .unwrap_or_else(|| "--".to_string());
             let is_cursor = i == h.cursor;
             let row_style = if is_cursor {
-                Style::default().fg(palette::ACCENT)
+                Style::default().fg(th.primary())
             } else {
                 Style::default()
             };
@@ -494,7 +495,7 @@ fn render_list(area: Rect, h: &HistoryState, f: &mut Frame) {
                 Cell::from("Endpoint"),
                 Cell::from("Duration"),
             ])
-            .style(style::muted_title()),
+            .style(style::muted_title(th)),
         )
         .block(block),
         sub[0],
@@ -503,9 +504,9 @@ fn render_list(area: Rect, h: &HistoryState, f: &mut Frame) {
 }
 
 /// Detail view for one run.
-fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
+fn render_detail(area: Rect, h: &HistoryState, idx: usize, th: Theme, f: &mut Frame) {
     let Some(s) = h.sessions.get(idx) else {
-        render_list(area, h, f);
+        render_list(area, h, th, f);
         return;
     };
     let ts = s.timestamp.as_deref().unwrap_or("--");
@@ -515,8 +516,8 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
         fmt::truncate(&s.model_name, 24)
     );
     let block = theme::block(
-        Line::from(Span::styled(title, style::title())),
-        style::active_border(),
+        Line::from(Span::styled(title, style::title(th))),
+        style::active_border(th),
     );
 
     let mut lines: Vec<Line> = Vec::new();
@@ -528,17 +529,17 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
         .map(fmt::format_duration)
         .unwrap_or_else(|| "--".to_string());
     lines.push(Line::from(vec![
-        Span::styled("  Endpoint:  ", style::label()),
-        Span::styled(fmt::truncate(&s.target_url, 50), style::value()),
+        Span::styled("  Endpoint:  ", style::label(th)),
+        Span::styled(fmt::truncate(&s.target_url, 50), style::value(th)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("  Duration:  ", style::label()),
-        Span::styled(dur, style::value()),
+        Span::styled("  Duration:  ", style::label(th)),
+        Span::styled(dur, style::value(th)),
     ]));
     if let Some(gpu) = &s.system_gpu {
         lines.push(Line::from(vec![
-            Span::styled("  GPU:       ", style::label()),
-            Span::styled(gpu.clone(), style::value()),
+            Span::styled("  GPU:       ", style::label(th)),
+            Span::styled(gpu.clone(), style::value(th)),
         ]));
     }
     lines.push(Line::raw(""));
@@ -546,51 +547,51 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
     // Speed metrics (Engine A).
     lines.push(Line::from(Span::styled(
         "  Engine A: Speed",
-        style::value_ok(),
+        style::value_ok(th),
     )));
     match &h.detail_summary {
         Some(sum) => {
             if let Some(ttft) = sum.ttft_ms {
                 lines.push(Line::from(vec![
-                    Span::styled("    TTFT:        ", style::label()),
-                    Span::styled(format!("{ttft:.1} ms"), style::value()),
+                    Span::styled("    TTFT:        ", style::label(th)),
+                    Span::styled(format!("{ttft:.1} ms"), style::value(th)),
                 ]));
             }
             if let Some(tps) = sum.tokens_per_sec {
                 lines.push(Line::from(vec![
-                    Span::styled("    Gen speed:   ", style::label()),
-                    Span::styled(fmt::format_rate(tps), style::value()),
+                    Span::styled("    Gen speed:   ", style::label(th)),
+                    Span::styled(fmt::format_rate(tps), style::value(th)),
                 ]));
             }
             if let Some(pps) = sum.prompt_tps {
                 lines.push(Line::from(vec![
-                    Span::styled("    Prompt t/s:  ", style::label()),
-                    Span::styled(fmt::format_rate(pps), style::value()),
+                    Span::styled("    Prompt t/s:  ", style::label(th)),
+                    Span::styled(fmt::format_rate(pps), style::value(th)),
                 ]));
             }
             if let Some(mtp) = sum.mtp {
                 lines.push(Line::from(vec![
-                    Span::styled("    MTP rate:    ", style::label()),
-                    Span::styled(format!("{mtp:.2} x"), style::highlight()),
+                    Span::styled("    MTP rate:    ", style::label(th)),
+                    Span::styled(format!("{mtp:.2} x"), style::highlight(th)),
                 ]));
             }
             if let Some(jpt) = sum.joules_per_token {
                 lines.push(Line::from(vec![
-                    Span::styled("    J/token:     ", style::label()),
-                    Span::styled(format!("{jpt:.3}"), style::value()),
+                    Span::styled("    J/token:     ", style::label(th)),
+                    Span::styled(format!("{jpt:.3}"), style::value(th)),
                 ]));
             }
             if sum.ttft_ms.is_none() && sum.tokens_per_sec.is_none() {
                 lines.push(Line::from(Span::styled(
                     "    (no stream metrics stored)",
-                    style::footer(),
+                    style::footer(th),
                 )));
             }
         }
         None => {
             lines.push(Line::from(Span::styled(
                 "    (no metrics available)",
-                style::footer(),
+                style::footer(th),
             )));
         }
     }
@@ -599,23 +600,23 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
     // NIAH metrics (Engine C1).
     lines.push(Line::from(Span::styled(
         "  Engine C1: NIAH",
-        style::value_ok(),
+        style::value_ok(th),
     )));
     match &h.detail_needle {
         Some((retrieved, total)) if *total > 0 => {
             let pct = *retrieved as f64 / *total as f64 * 100.0;
             lines.push(Line::from(vec![
-                Span::styled("    Overall:     ", style::label()),
+                Span::styled("    Overall:     ", style::label(th)),
                 Span::styled(
                     format!("{pct:.1}%  ({retrieved}/{total} retrieved)"),
-                    style::value(),
+                    style::value(th),
                 ),
             ]));
         }
         _ => {
             lines.push(Line::from(Span::styled(
                 "    (no NIAH evaluations stored)",
-                style::footer(),
+                style::footer(th),
             )));
         }
     }
@@ -624,24 +625,24 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
     // Reasoning / Structured (not yet in the DB schema).
     lines.push(Line::from(Span::styled(
         "  Engine C2: Reasoning",
-        style::value_ok(),
+        style::value_ok(th),
     )));
     lines.push(Line::from(Span::styled(
         "    (not stored in this version)",
-        style::footer(),
+        style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
         "  Engine C3: Structured",
-        style::value_ok(),
+        style::value_ok(th),
     )));
     lines.push(Line::from(Span::styled(
         "    (not stored in this version)",
-        style::footer(),
+        style::footer(th),
     )));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         "  [Esc] Back to list",
-        style::footer(),
+        style::footer(th),
     )));
 
     f.render_widget(
@@ -651,11 +652,11 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
 }
 
 /// Compare mode, selecting the second run.
-fn render_compare_select(area: Rect, h: &HistoryState, first: usize, f: &mut Frame) {
+fn render_compare_select(area: Rect, h: &HistoryState, first: usize, th: Theme, f: &mut Frame) {
     let title = format!("COMPARE — Run [{}] selected, pick a second run", first + 1);
     let block = theme::block(
-        Line::from(Span::styled(title, style::title())),
-        style::active_border(),
+        Line::from(Span::styled(title, style::title(th))),
+        style::active_border(th),
     );
 
     let rows: Vec<Row> = h
@@ -675,9 +676,9 @@ fn render_compare_select(area: Rect, h: &HistoryState, first: usize, f: &mut Fra
             let is_cursor = i == h.cursor && i != first;
             let is_first = i == first;
             let row_style = if is_cursor {
-                Style::default().fg(palette::ACCENT)
+                Style::default().fg(th.primary())
             } else if is_first {
-                Style::default().fg(palette::OK)
+                Style::default().fg(th.success())
             } else {
                 Style::default()
             };
@@ -693,7 +694,7 @@ fn render_compare_select(area: Rect, h: &HistoryState, first: usize, f: &mut Fra
 
     let hints = Line::from(Span::styled(
         "  ↑↓/jk navigate │ Enter select │ Esc cancel",
-        style::footer(),
+        style::footer(th),
     ));
 
     let sub = Layout::default()
@@ -718,7 +719,7 @@ fn render_compare_select(area: Rect, h: &HistoryState, first: usize, f: &mut Fra
                 Cell::from("Model"),
                 Cell::from("Endpoint"),
             ])
-            .style(style::muted_title()),
+            .style(style::muted_title(th)),
         )
         .block(block),
         sub[0],
@@ -727,7 +728,7 @@ fn render_compare_select(area: Rect, h: &HistoryState, first: usize, f: &mut Fra
 }
 
 /// Compare mode, both runs selected — show the diff table.
-fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, f: &mut Frame) {
+fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, th: Theme, f: &mut Frame) {
     let sa = h.sessions.get(first);
     let sb = h.sessions.get(second);
     let title = match (sa, sb) {
@@ -745,15 +746,15 @@ fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, f: 
         _ => "COMPARING RUNS".to_string(),
     };
     let block = theme::block(
-        Line::from(Span::styled(title, style::title())),
-        style::active_border(),
+        Line::from(Span::styled(title, style::title(th))),
+        style::active_border(th),
     );
 
     let Some(diff) = &h.compare_diff else {
         // No diff data (shouldn't happen if second is Some).
         let lines = vec![Line::from(Span::styled(
             "No comparison data available.",
-            style::footer(),
+            style::footer(th),
         ))];
         f.render_widget(
             Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
@@ -768,13 +769,13 @@ fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, f: 
         Cell::from(format!("Run [{}] (B)", second + 1)),
         Cell::from("Change"),
     ])
-    .style(style::muted_title())];
+    .style(style::muted_title(th))];
 
     for r in &diff.rows {
         let delta_style = match r.improved {
-            Some(true) => style::value_ok(),
-            Some(false) => style::value_err(),
-            None => style::footer(),
+            Some(true) => style::value_ok(th),
+            Some(false) => style::value_err(th),
+            None => style::footer(th),
         };
         let delta_text = match r.improved {
             Some(true) => format!("▲ {}", format_delta(r.delta_pct)),
@@ -782,18 +783,18 @@ fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, f: 
             None => format!("— {}", format_delta(r.delta_pct)),
         };
         rows.push(Row::new(vec![
-            Cell::from(r.label).style(style::label()),
-            Cell::from(format_metric(r.label, r.a)).style(style::value()),
-            Cell::from(format_metric(r.label, r.b)).style(style::value()),
+            Cell::from(r.label).style(style::label(th)),
+            Cell::from(format_metric(r.label, r.a)).style(style::value(th)),
+            Cell::from(format_metric(r.label, r.b)).style(style::value(th)),
             Cell::from(delta_text).style(delta_style),
         ]));
     }
 
     let info_note = Line::from(Span::styled(
         "  ℹ Green = improvement, Red = regression, — = no change. TTFT & J/token improve when lower.",
-        style::info(),
+        style::info(th),
     ));
-    let back_hint = Line::from(Span::styled("  [Esc] Back to list", style::footer()));
+    let back_hint = Line::from(Span::styled("  [Esc] Back to list", style::footer(th)));
 
     let sub = Layout::default()
         .direction(Direction::Vertical)
@@ -822,11 +823,11 @@ fn render_compare(area: Rect, h: &HistoryState, first: usize, second: usize, f: 
 }
 
 /// Delete confirmation overlay.
-fn render_delete_confirm(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame) {
+fn render_delete_confirm(area: Rect, h: &HistoryState, idx: usize, th: Theme, f: &mut Frame) {
     let block = theme::block(
-        theme::panel_title("DELETE RUN?"),
+        theme::panel_title(th, "DELETE RUN?"),
         Style::default()
-            .fg(palette::CALLOUT)
+            .fg(th.accent())
             .add_modifier(ratatui::style::Modifier::BOLD),
     );
     let s = h.sessions.get(idx);
@@ -844,11 +845,11 @@ fn render_delete_confirm(area: Rect, h: &HistoryState, idx: usize, f: &mut Frame
     };
     let lines = vec![
         Line::raw(""),
-        Line::from(Span::styled(desc, Style::default().fg(palette::CALLOUT))),
+        Line::from(Span::styled(desc, Style::default().fg(th.accent()))),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  [y] Delete", style::value_err()),
-            Span::styled("   [n/Esc] Cancel", style::value()),
+            Span::styled("  [y] Delete", style::value_err(th)),
+            Span::styled("   [n/Esc] Cancel", style::value(th)),
         ]),
     ];
     // Center the confirmation box.

@@ -79,6 +79,8 @@ pub mod env_vars {
     /// Comma-separated context sizes for the v0.1.1 2D matrix
     /// (e.g. `0,8k,32k`).
     pub const MATRIX_CONTEXT: &str = "CRUCIBLE_MATRIX_CONTEXT";
+    /// The TUI color theme (`cyberpunk` | `vampire` | `monochrome`).
+    pub const THEME: &str = "CRUCIBLE_THEME";
 }
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
@@ -436,6 +438,15 @@ pub struct Config {
     /// prompt as-is. More than one value makes Engine B run the full
     /// concurrency × context matrix.
     pub matrix_contexts: Vec<u32>,
+    /// The TUI color theme (`"cyberpunk"` | `"vampire"` |
+    /// `"monochrome"`). Default `"cyberpunk"`.
+    pub theme: String,
+    /// `true` when the theme was provided explicitly (CLI / env / config
+    /// file) rather than falling back to the built-in default. The TUI
+    /// entry point shows the first-run theme picker only when this is
+    /// `false` (no theme has ever been chosen).
+    #[serde(skip)]
+    pub theme_explicit: bool,
 }
 
 impl Default for Config {
@@ -464,6 +475,8 @@ impl Default for Config {
             target_explicit: false,
             log_dir: None,
             matrix_contexts: DEFAULT_MATRIX_CONTEXTS.to_vec(),
+            theme: "cyberpunk".to_string(),
+            theme_explicit: false,
         }
     }
 }
@@ -539,6 +552,8 @@ pub struct ConfigFile {
     pub log_dir: Option<PathBuf>,
     /// The v0.1.1 2D matrix context axis (target prompt tokens).
     pub matrix_contexts: Option<Vec<u32>>,
+    /// The TUI color theme (`"cyberpunk"` | `"vampire"` | `"monochrome"`).
+    pub theme: Option<String>,
 }
 
 impl ConfigFile {
@@ -608,6 +623,10 @@ impl ConfigFile {
         }
         if let Some(v) = &self.matrix_contexts {
             c.matrix_contexts = v.clone();
+        }
+        if let Some(v) = &self.theme {
+            c.theme = v.clone();
+            c.theme_explicit = true;
         }
         c.target_explicit = self.url.is_some();
         c
@@ -848,6 +867,20 @@ pub fn layer(
             .unwrap_or_else(|| DEFAULT_MATRIX_CONTEXTS.to_vec())
     };
 
+    // ── TUI theme ──
+    // CLI has no `--theme` flag; layer env > file > the built-in default.
+    // `theme_explicit` is set only when an explicit source named a theme
+    // (a missing theme = first run → the TUI shows the theme picker).
+    let (theme, theme_explicit) = match env_get(env_vars::THEME)
+        .or_else(|| file.and_then(|f| f.theme.clone()))
+    {
+        Some(raw) => (
+            raw.to_ascii_lowercase(),
+            true,
+        ),
+        None => ("cyberpunk".to_string(), false),
+    };
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -922,6 +955,8 @@ pub fn layer(
         target_explicit,
         log_dir,
         matrix_contexts,
+        theme,
+        theme_explicit,
     })
 }
 
@@ -1071,6 +1106,57 @@ mod tests {
         let cli = cli_from(cli_args);
         let matches = matches_from(cli_args);
         layer(&cli, &matches, &[], None).unwrap()
+    }
+
+    // ── TUI theme ────────────────────────────────────────────────────────
+
+    #[test]
+    fn theme_defaults_to_cyberpunk_and_is_not_explicit() {
+        let cfg = Config::default();
+        assert_eq!(cfg.theme, "cyberpunk");
+        assert!(!cfg.theme_explicit, "a bare default is a first run");
+    }
+
+    #[test]
+    fn a_config_file_theme_is_explicit() {
+        let file = ConfigFile {
+            theme: Some("vampire".to_string()),
+            ..Default::default()
+        };
+        let cfg = file.to_config();
+        assert_eq!(cfg.theme, "vampire");
+        assert!(cfg.theme_explicit, "a file theme is an explicit choice");
+    }
+
+    #[test]
+    fn a_missing_file_theme_is_a_first_run() {
+        let file = ConfigFile {
+            theme: None,
+            ..Default::default()
+        };
+        let cfg = file.to_config();
+        assert_eq!(cfg.theme, "cyberpunk");
+        assert!(!cfg.theme_explicit);
+    }
+
+    #[test]
+    fn env_theme_layer_wins_and_is_explicit() {
+        let env = [(env_vars::THEME.to_string(), "monochrome".to_string())];
+        let cfg = layer(&cli_from(&["crucible-llm"]), &matches_from(&["crucible-llm"]), &env, None).expect("layer");
+        assert_eq!(cfg.theme, "monochrome");
+        assert!(cfg.theme_explicit);
+    }
+
+    #[test]
+    fn config_file_round_trips_the_theme() {
+        let file = ConfigFile {
+            theme: Some("vampire".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&file).expect("serialize");
+        assert!(json.contains("\"theme\""), "theme persisted: {json}");
+        let back: ConfigFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.theme, Some("vampire".to_string()));
     }
 
     #[test]

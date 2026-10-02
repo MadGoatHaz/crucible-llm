@@ -39,7 +39,7 @@ use ratatui::Frame;
 use crate::client::models::ModelInfo;
 use crate::config::EngineSelection;
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, style, Theme};
 use crate::ui::views::config::ConfigState;
 
 /// The four stages of the setup flow (stage 2 has two sub-states: the
@@ -659,6 +659,7 @@ const SPINNER: [&str; 4] = ["|", "/", "−", "\\"];
 
 /// Render the full-screen setup takeover into `area`.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let s = &app.setup;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -669,7 +670,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         ])
         .split(area);
 
-    render_top_bar(chunks[0], s, f);
+    render_top_bar(chunks[0], s, th, f);
 
     // Center the body panel (50% width) so long URLs don't stretch the box.
     let mid = Layout::default()
@@ -682,47 +683,47 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .split(chunks[1]);
     let body = mid[1];
     match s.phase {
-        SetupPhase::Url => render_url(body, s, f),
+        SetupPhase::Url => render_url(body, s, th, f),
         SetupPhase::Discover => render_discover(body, s, app, f),
-        SetupPhase::Model => render_model(body, s, f),
+        SetupPhase::Model => render_model(body, s, th, f),
         SetupPhase::Config => render_config(body, s, app, f),
         SetupPhase::Confirm => render_confirm(body, s, app, f),
     }
 
-    render_footer(chunks[2], s, f);
+    render_footer(chunks[2], th, s, f);
 }
 
 /// Top bar: brand + the four-step progress indicator.
-fn render_top_bar(area: Rect, s: &SetupState, f: &mut Frame) {
+fn render_top_bar(area: Rect, s: &SetupState, th: Theme, f: &mut Frame) {
     let step = s.phase.step_index();
     let mut spans = vec![
-        Span::styled(" CRUCIBLE", style::title()),
+        Span::styled(" CRUCIBLE", style::title(th)),
         Span::styled(
             "·LLM",
             Style::default()
-                .fg(palette::SECONDARY)
+                .fg(th.secondary())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" — SETUP ", style::title()),
+        Span::styled(" — SETUP ", style::title(th)),
         // The explicit phase indicator: "Step 1 of 4: Server URL".
-        Span::styled(" │ ", style::tab_separator()),
+        Span::styled(" │ ", style::tab_separator(th)),
         Span::styled(
             format!(" Step {} of 4: {} ", step + 1, s.phase.name()),
-            style::title(),
+            style::title(th),
         ),
-        Span::styled(" │ ", style::tab_separator()),
+        Span::styled(" │ ", style::tab_separator(th)),
     ];
     for (i, label) in STEP_LABELS.iter().enumerate() {
         let st = if i == step {
-            style::tab_active()
+            style::tab_active(th)
         } else if i < step {
-            style::value_ok()
+            style::value_ok(th)
         } else {
-            style::tab_inactive()
+            style::tab_inactive(th)
         };
         spans.push(Span::styled(format!("{label}  "), st));
         if i + 1 < STEP_LABELS.len() {
-            spans.push(Span::styled("▸", style::tab_separator()));
+            spans.push(Span::styled("▸", style::tab_separator(th)));
         }
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -730,76 +731,77 @@ fn render_top_bar(area: Rect, s: &SetupState, f: &mut Frame) {
 
 /// The panel border used by every stage (rounded, accent — the active
 /// takeover panel).
-fn panel(title: impl Into<Line<'static>>) -> ratatui::widgets::Block<'static> {
-    theme::block(title, style::active_border())
+fn panel(th: Theme, title: impl Into<Line<'static>>) -> ratatui::widgets::Block<'static> {
+    theme::block(title, style::active_border(th))
 }
 
 /// Stage 1: the URL prompt with a visible text cursor.
-fn render_url(area: Rect, s: &SetupState, f: &mut Frame) {
+fn render_url(area: Rect, s: &SetupState, th: Theme, f: &mut Frame) {
     let before: String = s.url.chars().take(s.url_cursor).collect();
     let after: String = s.url.chars().skip(s.url_cursor).collect();
     let mut lines = vec![
-        Line::from(Span::styled("Enter server URL", style::title())),
+        Line::from(Span::styled("Enter server URL", style::title(th))),
         Line::from(Span::styled(
             "(e.g. http://localhost:8000/v1)",
-            style::footer(),
+            style::footer(th),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("> ", style::highlight()),
-            Span::styled(before, style::value()),
-            Span::styled("█", Style::default().fg(palette::ACCENT)),
-            Span::styled(after, style::value()),
+            Span::styled("> ", style::highlight(th)),
+            Span::styled(before, style::value(th)),
+            Span::styled("█", Style::default().fg(th.primary())),
+            Span::styled(after, style::value(th)),
         ]),
         Line::raw(""),
     ];
     if let Some(e) = &s.error {
-        lines.push(Line::from(Span::styled(e, style::value_err())));
+        lines.push(Line::from(Span::styled(e, style::value_err(th))));
         lines.push(Line::raw(""));
     }
     lines.push(Line::from(Span::styled(
         "Press Enter to discover the models served here.",
-        style::footer(),
+        style::footer(th),
     )));
     f.render_widget(
-        Paragraph::new(Text::from(lines)).block(panel(theme::panel_title("SETUP — CONNECTION"))),
+        Paragraph::new(Text::from(lines)).block(panel(th, theme::panel_title(th, "SETUP — CONNECTION"))),
         area,
     );
 }
 
 /// Stage 2a: the discovery spinner.
 fn render_discover(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let frame = (app.tick / 6) as usize % SPINNER.len();
     let lines = vec![
         Line::from(Span::styled(
             format!("{} Discovering models…", SPINNER[frame]),
-            style::highlight(),
+            style::highlight(th),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("Target:  ", style::label()),
-            Span::styled(s.url.clone(), style::value()),
+            Span::styled("Target:  ", style::label(th)),
+            Span::styled(s.url.clone(), style::value(th)),
         ]),
         Line::from(Span::styled(
             "GET {base}/models (OpenAI-compatible)",
-            style::footer(),
+            style::footer(th),
         )),
         Line::raw(""),
         Line::from(Span::styled(
             "[d] retry now   ·   [Esc] back to URL",
-            style::footer(),
+            style::footer(th),
         )),
     ];
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel(theme::panel_title("SETUP — MODEL DISCOVERY"))),
+            .block(panel(th, theme::panel_title(th, "SETUP — MODEL DISCOVERY"))),
         area,
     );
 }
 
 /// Stage 2b: the model picker (scrollable + filterable) — or the free-text
 /// model entry when discovery produced nothing.
-fn render_model(area: Rect, s: &SetupState, f: &mut Frame) {
+fn render_model(area: Rect, s: &SetupState, th: Theme, f: &mut Frame) {
     let filtered = s.filtered_models();
     let has_list = !s.models.is_empty();
 
@@ -808,33 +810,33 @@ fn render_model(area: Rect, s: &SetupState, f: &mut Frame) {
     } else {
         "SETUP — ENTER MODEL NAME".to_string()
     };
-    let title: Line<'static> = Line::from(Span::styled(title, style::title()));
+    let title: Line<'static> = Line::from(Span::styled(title, style::title(th)));
 
     let mut lines: Vec<Line> = Vec::new();
     if !has_list {
         if let Some(e) = &s.error {
             lines.push(Line::from(Span::styled(
                 format!("Discovery failed: {e}"),
-                style::value_err(),
+                style::value_err(th),
             )));
             lines.push(Line::from(Span::styled(
                 "Type the model name to use, or press [d] to retry.",
-                style::footer(),
+                style::footer(th),
             )));
             lines.push(Line::raw(""));
         }
         let before: String = s.model_query.chars().take(s.model_query_cursor).collect();
         let after: String = s.model_query.chars().skip(s.model_query_cursor).collect();
         lines.push(Line::from(vec![
-            Span::styled("Model: ", style::label()),
-            Span::styled(before, style::value()),
-            Span::styled("█", Style::default().fg(palette::ACCENT)),
-            Span::styled(after, style::value()),
+            Span::styled("Model: ", style::label(th)),
+            Span::styled(before, style::value(th)),
+            Span::styled("█", Style::default().fg(th.primary())),
+            Span::styled(after, style::value(th)),
         ]));
     } else {
         lines.push(Line::from(Span::styled(
             "Available models:",
-            style::muted_title(),
+            style::muted_title(th),
         )));
         // Scroll window keeping the cursor in view.
         let height = area.height.saturating_sub(2) as usize;
@@ -845,9 +847,9 @@ fn render_model(area: Rect, s: &SetupState, f: &mut Frame) {
         for (i, m) in filtered.iter().enumerate().skip(start).take(visible) {
             let selected = i == s.model_cursor;
             let st = if selected {
-                style::tab_active()
+                style::tab_active(th)
             } else {
-                style::value()
+                style::value(th)
             };
             lines.push(Line::from(vec![
                 Span::styled(if selected { "> " } else { "  " }, st),
@@ -858,46 +860,47 @@ fn render_model(area: Rect, s: &SetupState, f: &mut Frame) {
         if filtered.is_empty() {
             lines.push(Line::from(Span::styled(
                 "(no match — Enter uses the typed name)",
-                style::value_warn(),
+                style::value_warn(th),
             )));
         }
         if !s.model_query.is_empty() {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
-                Span::styled("filter: ", style::footer()),
-                Span::styled(s.model_query.clone(), style::value_warn()),
+                Span::styled("filter: ", style::footer(th)),
+                Span::styled(s.model_query.clone(), style::value_warn(th)),
             ]));
         }
     }
-    f.render_widget(Paragraph::new(Text::from(lines)).block(panel(title)), area);
+    f.render_widget(Paragraph::new(Text::from(lines)).block(panel(th, title)), area);
 }
 
 /// Stage 3: the benchmark configuration form (write-through to
 /// `ConfigState`; the target URL/model are shown as read-only context).
 fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let c = &app.config;
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled("Target   ", style::footer()),
-            Span::styled(c.url.clone(), style::value()),
+            Span::styled("Target   ", style::footer(th)),
+            Span::styled(c.url.clone(), style::value(th)),
         ]),
         Line::from(vec![
-            Span::styled("Model    ", style::footer()),
-            Span::styled(c.model.clone(), style::value_ok()),
+            Span::styled("Model    ", style::footer(th)),
+            Span::styled(c.model.clone(), style::value_ok(th)),
         ]),
         Line::raw(""),
     ];
     for &field in &SetupField::ALL {
         let is_cursor = field == s.current_field();
-        let (value, vstyle) = form_value(field, c);
+        let (value, vstyle) = form_value(field, c, th);
         let prefix = if is_cursor {
-            Span::styled("> ", style::highlight())
+            Span::styled("> ", style::highlight(th))
         } else {
             Span::raw("  ")
         };
         lines.push(Line::from(vec![
             prefix,
-            Span::styled(format!("{:<11}", field.label()), style::label()),
+            Span::styled(format!("{:<11}", field.label()), style::label(th)),
             Span::styled(value, vstyle),
         ]));
     }
@@ -908,53 +911,53 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     let field = s.current_field();
     if let Some(engine) = field.engine() {
         lines.push(Line::raw(""));
-        lines.extend(crate::ui::views::engine_info_lines(engine));
+        lines.extend(crate::ui::views::engine_info_lines(th, engine));
     } else if let Some(text) = field.explanation() {
         lines.push(Line::raw(""));
-        lines.extend(crate::ui::views::info_lines(text));
+        lines.extend(crate::ui::views::info_lines(th, text));
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel(theme::panel_title("SETUP — BENCHMARK CONFIGURATION")))
+            .block(panel(th, theme::panel_title(th, "SETUP — BENCHMARK CONFIGURATION")))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
 /// `(value, value_style)` for one stage-3 form field.
-fn form_value(field: SetupField, c: &ConfigState) -> (String, Style) {
+fn form_value(field: SetupField, c: &ConfigState, th: Theme) -> (String, Style) {
     match field {
-        SetupField::Mode => (c.mode.label().to_string(), style::value()),
-        SetupField::Tokens => (c.tokens.to_string(), style::value()),
-        SetupField::Iterations => (c.iterations.to_string(), style::value()),
-        SetupField::Ladder => (c.ladder.clone(), style::value()),
+        SetupField::Mode => (c.mode.label().to_string(), style::value(th)),
+        SetupField::Tokens => (c.tokens.to_string(), style::value(th)),
+        SetupField::Iterations => (c.iterations.to_string(), style::value(th)),
+        SetupField::Ladder => (c.ladder.clone(), style::value(th)),
         SetupField::EngineSpeed => (
             format!("[{}] Speed", tick(c.engine_speed)),
-            bool_style(c.engine_speed),
+            bool_style(th, c.engine_speed),
         ),
         SetupField::EngineConcurrency => (
             format!("[{}] Concurrency", tick(c.engine_concurrency)),
-            bool_style(c.engine_concurrency),
+            bool_style(th, c.engine_concurrency),
         ),
         SetupField::EngineNiah => (
             format!("[{}] NIAH", tick(c.engine_niah)),
-            bool_style(c.engine_niah),
+            bool_style(th, c.engine_niah),
         ),
         SetupField::EngineReasoning => (
             format!("[{}] Reasoning", tick(c.engine_reasoning)),
-            bool_style(c.engine_reasoning),
+            bool_style(th, c.engine_reasoning),
         ),
         SetupField::EngineStructured => (
             format!("[{}] Structured", tick(c.engine_structured)),
-            bool_style(c.engine_structured),
+            bool_style(th, c.engine_structured),
         ),
         SetupField::EngineHardware => (
             format!("[{}] Hardware / Energy", tick(c.hardware)),
-            bool_style(c.hardware),
+            bool_style(th, c.hardware),
         ),
         SetupField::EngineFlatOut => (
             format!("[{}] Flat Out", tick(c.engine_flatout)),
-            bool_style(c.engine_flatout),
+            bool_style(th, c.engine_flatout),
         ),
     }
 }
@@ -968,16 +971,17 @@ fn tick(b: bool) -> &'static str {
     }
 }
 
-fn bool_style(b: bool) -> Style {
+fn bool_style(th: Theme, b: bool) -> Style {
     if b {
-        style::value_ok()
+        style::value_ok(th)
     } else {
-        Style::default().fg(palette::MUTED)
+        Style::default().fg(th.dim())
     }
 }
 
 /// Stage 4: the launch summary.
 fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let c = &app.config;
     let engines = EngineSelection {
         speed: c.engine_speed,
@@ -994,42 +998,42 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         .collect::<Vec<_>>()
         .join(" · ");
     let lines = vec![
-        Line::from(Span::styled("Benchmark summary", style::title())),
+        Line::from(Span::styled("Benchmark summary", style::title(th))),
         Line::raw(""),
-        summary_line("Target URL", &fmt::truncate(&s.url, 40), style::value()),
-        summary_line("Model", &fmt::truncate(&c.model, 40), style::value_ok()),
-        summary_line("Mode", c.mode.label(), style::value()),
-        summary_line("Tokens", &c.tokens.to_string(), style::value()),
-        summary_line("Iterations", &c.iterations.to_string(), style::value()),
-        summary_line("Ladder", &c.ladder, style::value()),
-        summary_line("Engines", &engine_labels, style::highlight()),
+        summary_line(th, "Target URL", &fmt::truncate(&s.url, 40), style::value(th)),
+        summary_line(th, "Model", &fmt::truncate(&c.model, 40), style::value_ok(th)),
+        summary_line(th, "Mode", c.mode.label(), style::value(th)),
+        summary_line(th, "Tokens", &c.tokens.to_string(), style::value(th)),
+        summary_line(th, "Iterations", &c.iterations.to_string(), style::value(th)),
+        summary_line(th, "Ladder", &c.ladder, style::value(th)),
+        summary_line(th, "Engines", &engine_labels, style::highlight(th)),
         Line::raw(""),
         Line::from(Span::styled(
             "Press Enter to start the benchmark.",
-            style::value_ok(),
+            style::value_ok(th),
         )),
         Line::from(Span::styled(
             "Press Esc to go back and modify.",
-            style::footer(),
+            style::footer(th),
         )),
     ];
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(panel(theme::panel_title("SETUP — CONFIRM & LAUNCH")))
+            .block(panel(th, theme::panel_title(th, "SETUP — CONFIRM & LAUNCH")))
             .wrap(Wrap { trim: true }),
         area,
     );
 }
 
-fn summary_line(label: &str, value: &str, value_style: Style) -> Line<'static> {
+fn summary_line(th: Theme, label: &str, value: &str, value_style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{:<12}", label), style::label()),
+        Span::styled(format!("{:<12}", label), style::label(th)),
         Span::styled(value.to_string(), value_style),
     ])
 }
 
 /// Bottom key-hint footer (per stage).
-fn render_footer(area: Rect, s: &SetupState, f: &mut Frame) {
+fn render_footer(area: Rect, th: Theme, s: &SetupState, f: &mut Frame) {
     let hint = match s.phase {
         SetupPhase::Url => {
             "[type] URL  ·  [←→/Home/End] cursor  ·  [⌫/Del] delete  ·  [Enter] discover models  ·  [Esc] quit (y/n)"
@@ -1044,7 +1048,7 @@ fn render_footer(area: Rect, s: &SetupState, f: &mut Frame) {
         SetupPhase::Confirm => "[Enter] start benchmark  ·  [Esc] modify",
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, style::footer()))),
+        Paragraph::new(Line::from(Span::styled(hint, style::footer(th)))),
         area,
     );
 }

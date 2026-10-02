@@ -52,7 +52,7 @@ use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{BenchmarkSession, StreamMetricRow};
-use crate::ui::theme::{self, glyph, palette, style};
+use crate::ui::theme::{self, glyph, style, Theme};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::{HistoryMode, HistoryState};
@@ -130,6 +130,9 @@ impl View {
 /// (except View 5, where `c` is a typeable character).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
+    /// The first-run theme picker (full-screen takeover, shown before
+    /// Setup when no theme has ever been chosen).
+    ThemePicker,
     /// The interactive setup flow (full-screen takeover).
     Setup,
     /// The five-view dashboard (Live / Concurrency / Needle / History /
@@ -179,6 +182,10 @@ pub struct App {
     pub running: bool,
     pub paused: bool,
     pub view: View,
+    /// The active color theme. Every view reads its colors from this —
+    /// switching it re-skins the whole TUI (first-run picker or the
+    /// Config view's Theme field).
+    pub active_theme: Theme,
     /// Concurrency target the `+` key steps up (plumbed to the worker pool
     /// in later chunks).
     pub concurrency_target: usize,
@@ -239,6 +246,14 @@ pub struct App {
     /// The interactive setup flow state (the four-stage URL → model →
     /// config → launch sequence). Mutated only in the key/tick path.
     pub setup: SetupState,
+    /// The first-run theme picker state (full-screen takeover shown before
+    /// Setup when no theme has ever been chosen).
+    pub theme_picker: crate::ui::views::theme_picker::ThemePickerState,
+    /// `true` when the target URL was provided explicitly (CLI / env /
+    /// config file) — captured at startup so the theme picker knows
+    /// whether to fall through to Setup (fresh target) or the Dashboard
+    /// (target already given) after a theme is chosen.
+    pub target_explicit: bool,
     /// The last model-discovery error message (lock-free; `None` on
     /// success). The setup flow surfaces it in the manual-entry stage
     /// (N/A-never-fail: a failed discovery degrades to free text).
@@ -306,6 +321,7 @@ impl App {
             running: true,
             paused: false,
             view: View::Live,
+            active_theme: Theme::default(),
             concurrency_target: 1,
             tick: 0,
             metrics,
@@ -327,6 +343,8 @@ impl App {
             // target was not fully pre-configured.
             phase: Phase::Dashboard,
             setup: SetupState::new(),
+            theme_picker: crate::ui::views::theme_picker::ThemePickerState::default(),
+            target_explicit: false,
             discovery_error: Arc::new(ArcSwapOption::empty()),
             seq: Arc::new(SeqStateSlot::new()),
             seq_bus: Arc::new(ProgressBus::new()),
@@ -384,28 +402,76 @@ impl App {
         self
     }
 
+    /// Set the active color theme (the entry point calls this with the
+    /// theme resolved from `--theme` / env / config file / default).
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.active_theme = theme;
+        self
+    }
+
+    /// Enter the first-run **theme picker** (the full-screen takeover shown
+    /// before Setup when no theme has ever been chosen). `needs_setup`
+    /// records whether, once a theme is confirmed, the flow should fall
+    /// through to the Setup takeover (fresh target) or straight to the
+    /// Dashboard (the target URL + model were already given).
+    pub fn with_theme_picker(mut self, needs_setup: bool) -> Self {
+        self.phase = Phase::ThemePicker;
+        self.theme_picker = crate::ui::views::theme_picker::ThemePickerState {
+            cursor: 0,
+            needs_setup,
+        };
+        self
+    }
+
+    /// Seed the Setup flow from the current Configuration form: an
+    /// *explicitly* provided URL is pre-filled in stage 1 (a built-in
+    /// default is not — the setup flow starts with an empty prompt, per the
+    /// "no leaked LAN IP" rule), and a non-placeholder model name is
+    /// pre-filled as the stage-2 manual-entry text.
+    fn enter_setup(&mut self) {
+        self.phase = Phase::Setup;
+        if self.target_explicit {
+            self.setup.url = self.config.url.clone();
+            self.setup.url_cursor = self.setup.url.chars().count();
+        }
+        if self.config.model != crate::config::DEFAULT_MODEL {
+            self.setup.model_query = self.config.model.clone();
+            self.setup.model_query_cursor = self.setup.model_query.chars().count();
+        }
+    }
+
     /// Enter the interactive **Setup** phase (the full-screen
-    /// pre-dashboard takeover), pre-filling from the resolved [`Config`]:
-    ///
-    /// * an *explicitly* provided URL is pre-filled in stage 1 (a
-    ///   built-in default is not — the setup flow starts with an empty
-    ///   prompt, per the recon's "no leaked LAN IP" rule);
-    /// * a non-placeholder model name is pre-filled as the stage-2
-    ///   manual-entry text.
+    /// pre-dashboard takeover), pre-filling from the resolved [`Config`].
     ///
     /// The entry point calls this only when the target (URL + model) was
     /// not fully given on the command line / env / config file.
     pub fn with_setup(mut self, cfg: &Config) -> Self {
-        self.phase = Phase::Setup;
-        if cfg.target_explicit {
-            self.setup.url = cfg.url.clone();
-            self.setup.url_cursor = self.setup.url.chars().count();
-        }
-        if cfg.model != crate::config::DEFAULT_MODEL {
-            self.setup.model_query = cfg.model.clone();
-            self.setup.model_query_cursor = self.setup.model_query.chars().count();
-        }
+        self.target_explicit = cfg.target_explicit;
+        // Seed the config form from the resolved config so the setup
+        // prefill reads the right URL/model (the entry point also calls
+        // `with_config`, but this keeps `with_setup` self-sufficient).
+        self.config = ConfigState::from_config(cfg);
+        self.enter_setup();
         self
+    }
+
+    /// Confirm a theme in the first-run picker (the `Enter` key path):
+    /// apply it to the active theme, persist it to the config file, and
+    /// fall through to Setup (fresh target) or the Dashboard (target
+    /// already given).
+    pub fn confirm_theme(&mut self) {
+        let chosen = Theme::ALL[self.theme_picker.cursor.min(Theme::ALL.len() - 1)];
+        self.active_theme = chosen;
+        self.config.theme = chosen.id().to_string();
+        // Persist so subsequent runs skip the picker (`theme_explicit` is
+        // now satisfied by the saved file).
+        let _ = self.config.save();
+        if self.theme_picker.needs_setup {
+            self.enter_setup();
+        } else {
+            self.phase = Phase::Dashboard;
+            self.view = View::Live;
+        }
     }
 
     /// Re-open the Setup phase from the dashboard (the `c` key):
@@ -432,6 +498,7 @@ impl App {
     /// and start the benchmark (the selected engines run against the
     /// shared Configuration form the setup flow just filled in).
     pub fn launch(&mut self) {
+        let th = self.active_theme;
         self.phase = Phase::Dashboard;
         self.view = View::Live;
         self.paused = false;
@@ -451,7 +518,7 @@ impl App {
         });
         self.push_log(
             format!("[setup] launching: {} / {}", cfg.url, cfg.model),
-            style::value_ok(),
+            style::value_ok(th),
         );
         // The setup summary the run log is reviewed for: the exact target
         // and parameters the run was launched with.
@@ -542,19 +609,20 @@ impl App {
     /// * the runner shares the `Space`-key [`RunPause`] gate, so a
     ///   confirmed standalone run pauses/resumes like the sequence.
     pub fn start_niah(&mut self) {
+        let th = self.active_theme;
         if self.seq.is_running() {
             self.push_log(
                 "[niah] locked while a benchmark sequence is running — \
                   it runs as Engine C1 in the queue"
                     .to_string(),
-                style::value_warn(),
+                style::value_warn(th),
             );
             return;
         }
         if self.niah.is_running() {
             self.push_log(
                 "[niah] already running — one size × depth cell at a time".to_string(),
-                style::value_warn(),
+                style::value_warn(th),
             );
             return;
         }
@@ -570,7 +638,7 @@ impl App {
             Err(e) => {
                 self.push_log(
                     format!("[niah] engine init failed: {e}"),
-                    style::value_err(),
+                    style::value_err(th),
                 );
                 return;
             }
@@ -587,7 +655,7 @@ impl App {
                 depths.len(),
                 config.url
             ),
-            style::value_ok(),
+            style::value_ok(th),
         );
         // The runner owns the slot handle; on completion it clears the
         // running flag and publishes the scored grid.
@@ -626,10 +694,11 @@ impl App {
     /// discovery leaves the previous list (if any) in place — the model
     /// field degrades to free text (N/A-never-fail rule).
     pub fn start_discovery(&mut self) {
+        let th = self.active_theme;
         if self.models.is_running() {
             self.push_log(
                 "[discovery] already in progress — one request at a time".to_string(),
-                style::value_warn(),
+                style::value_warn(th),
             );
             return;
         }
@@ -644,7 +713,7 @@ impl App {
         slot.set_running(true);
         self.push_log(
             format!("[discovery] listing models at {url}/models"),
-            style::value_ok(),
+            style::value_ok(th),
         );
         logger.info(Context::Discovery, format!("→ GET {url}/models"));
         tokio::spawn(async move {
@@ -713,10 +782,11 @@ impl App {
     /// sampling window that folds the power trace into Joules/Token.
     /// Re-pressing `r` while a sequence is in progress is a no-op (logged).
     pub fn start_run(&mut self) {
+        let th = self.active_theme;
         if self.seq.is_running() {
             self.push_log(
                 "[seq] already running — engines execute one at a time".to_string(),
-                style::value_warn(),
+                style::value_warn(th),
             );
             return;
         }
@@ -729,7 +799,7 @@ impl App {
         if cfg.engines.is_empty() {
             self.push_log(
                 "[seq] no engines selected — enable some in the Config view (View 5)".to_string(),
-                style::value_warn(),
+                style::value_warn(th),
             );
             return;
         }
@@ -756,7 +826,7 @@ impl App {
                 cfg.engines.count(),
                 cfg.engines.iter_labels().collect::<Vec<_>>().join(" → ")
             ),
-            style::value_ok(),
+            style::value_ok(th),
         );
         let (tx, rx) = std::sync::mpsc::channel();
         self.log_rx = Some(rx);
@@ -793,12 +863,42 @@ impl App {
 
     /// Handle one terminal key event (blueprint §6 footer key map).
     pub fn handle_key(&mut self, key: &KeyEvent) -> KeyAction {
+        let th = self.active_theme;
         // Ctrl-C is **inert**: the terminal's copy selection (mouse-select
         // + Ctrl-C) owns it, so it must never quit the app — and the same
         // swallow covers every other Ctrl combo, so none of them can fire
         // a key action (the old global `Ctrl-C quits` path is gone).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return KeyAction::Continue;
+        }
+
+        // The first-run theme picker is a **modal** full-screen takeover:
+        // `↑`/`↓` move the cursor, `Enter` confirms (applies + persists the
+        // theme, then falls through to Setup or the Dashboard), and `q`
+        // opens the usual quit confirmation. Every other key is swallowed
+        // (the picker owns the screen until a theme is chosen).
+        if self.phase == Phase::ThemePicker {
+            return match key.code {
+                KeyCode::Up => {
+                    self.theme_picker.cursor =
+                        (self.theme_picker.cursor + Theme::ALL.len() - 1) % Theme::ALL.len();
+                    KeyAction::Continue
+                }
+                KeyCode::Down => {
+                    self.theme_picker.cursor =
+                        (self.theme_picker.cursor + 1) % Theme::ALL.len();
+                    KeyAction::Continue
+                }
+                KeyCode::Enter => {
+                    self.confirm_theme();
+                    KeyAction::Continue
+                }
+                KeyCode::Char('q') => {
+                    self.pending_quit = true;
+                    KeyAction::Continue
+                }
+                _ => KeyAction::Continue,
+            }
         }
 
         // The quit confirmation is a **modal overlay** (dashboard *and*
@@ -818,7 +918,7 @@ impl App {
                     self.pending_quit = false;
                     self.push_log(
                         "[quit] cancelled — the app keeps running".to_string(),
-                        style::value_warn(),
+                        style::value_warn(th),
                     );
                     KeyAction::Continue
                 }
@@ -883,7 +983,7 @@ impl App {
                     self.pending_niah = false;
                     self.push_log(
                         "[niah] cancelled — no requests sent".to_string(),
-                        style::value_warn(),
+                        style::value_warn(th),
                     );
                     return KeyAction::Continue;
                 }
@@ -914,7 +1014,7 @@ impl App {
                 self.push_log(
                     "[setup] locked while a benchmark is running — press Space to pause, Q to quit"
                         .to_string(),
-                    style::value_warn(),
+                    style::value_warn(th),
                 );
                 return KeyAction::Continue;
             }
@@ -980,7 +1080,7 @@ impl App {
                         if self.config.save().is_ok() {
                             self.push_log(
                                 format!("[config] saved → {}", self.config.config_path.display()),
-                                style::value_ok(),
+                                style::value_ok(th),
                             );
                         }
                         return KeyAction::Continue;
@@ -997,7 +1097,7 @@ impl App {
                         self.config.reset_to_defaults();
                         self.push_log(
                             "[config] reset to defaults".to_string(),
-                            style::value_warn(),
+                            style::value_warn(th),
                         );
                         return KeyAction::Continue;
                     }
@@ -1010,15 +1110,22 @@ impl App {
                     if key.code == KeyCode::Esc {
                         let _ = self.config.save();
                         self.config.edit_mode = ConfigMode::Viewing;
+                        self.active_theme =
+                            Theme::from_id(&self.config.theme).unwrap_or_default();
                         return KeyAction::Continue;
                     }
                     // Everything else (including `1`–`9`, `0`, letters, Tab,
                     // arrows, F2, F5) delegates to the field editor.
-                    match self.config.handle_key(key) {
+                    let result = self.config.handle_key(key);
+                    // Live preview: a theme change in the form re-skins the
+                    // whole TUI immediately (the render reads `active_theme`).
+                    self.active_theme =
+                        Theme::from_id(&self.config.theme).unwrap_or_default();
+                    match result {
                         ConfigKeyResult::Saved => {
                             self.push_log(
                                 format!("[config] saved → {}", self.config.config_path.display()),
-                                style::value_ok(),
+                                style::value_ok(th),
                             );
                             self.logger.info(
                                 Context::Setup,
@@ -1144,7 +1251,7 @@ impl App {
                 } else {
                     "[pause] run resumed".to_string()
                 };
-                self.push_log(msg, style::value_warn());
+                self.push_log(msg, style::value_warn(th));
                 KeyAction::PauseResume
             }
             // `+` — step the concurrency target. Locked while a sequence
@@ -1155,7 +1262,7 @@ impl App {
                     self.push_log(
                         "[concurrency] locked while a benchmark is running — the sweep owns the ladder"
                             .to_string(),
-                        style::value_warn(),
+                        style::value_warn(th),
                     );
                     return KeyAction::Continue;
                 }
@@ -1174,14 +1281,14 @@ impl App {
                     self.push_log(
                         "[niah] locked while a benchmark is running — it runs as Engine C1 in the queue"
                             .to_string(),
-                        style::value_warn(),
+                        style::value_warn(th),
                     );
                     return KeyAction::Continue;
                 }
                 if self.niah.is_running() {
                     self.push_log(
                         "[niah] already running — one size × depth cell at a time".to_string(),
-                        style::value_warn(),
+                        style::value_warn(th),
                     );
                     return KeyAction::Continue;
                 }
@@ -1209,6 +1316,7 @@ impl App {
     /// headless path, where the raw stream events are captured; a TUI CSV
     /// export carries the metrics rows only.
     pub fn export(&mut self) -> Result<std::path::PathBuf, String> {
+        let th = self.active_theme;
         let snap = self.metrics.load();
         // Chunk 17: with the hardware poller attached, the export rows
         // carry the live silicon-efficiency reading (cumulative joules ÷
@@ -1278,7 +1386,7 @@ impl App {
                 self.export_format.label(),
                 path.display()
             ),
-            style::value_ok(),
+            style::value_ok(th),
         );
         Ok(path)
     }
@@ -1307,6 +1415,7 @@ impl App {
     /// a 5-point drop. Reading the snapshot here is a plain lock-free
     /// load; no timing path is touched.
     pub fn on_tick(&mut self) {
+        let th = self.active_theme;
         // Drain the executor's log pipe first (even while paused, so the
         // bounded log catches up instead of growing unbounded in the
         // channel): the sequence task sends *real* events as they happen,
@@ -1319,7 +1428,7 @@ impl App {
             }
         }
         for line in pending {
-            self.push_log(line, style::value());
+            self.push_log(line, style::value(th));
         }
 
         // The render clock freezes on `Space` only in the dashboard; the
@@ -1363,7 +1472,7 @@ impl App {
                 (m.vram_used_gb * 1e9) as u64,
                 (m.vram_total_gb * 1e9) as u64,
             ) {
-                self.push_log(format!("Warning: {w}"), style::value_warn());
+                self.push_log(format!("Warning: {w}"), style::value_warn(th));
             }
         } else if ratio < VRAM_FRAGMENTATION_THRESHOLD * 0.95 {
             self.vram_warned = false;
@@ -1383,7 +1492,9 @@ impl App {
             self.render_too_narrow(f.area(), f);
             return;
         }
-        if self.phase == Phase::Setup {
+        if self.phase == Phase::ThemePicker {
+            views::theme_picker::render(f.area(), self, f);
+        } else if self.phase == Phase::Setup {
             views::setup::render(f.area(), self, f);
         } else {
             let area = f.area();
@@ -1412,11 +1523,12 @@ impl App {
     /// The "terminal too narrow" full-frame message (shown when the width is
     /// under the 80-column minimum the layout needs).
     fn render_too_narrow(&self, area: Rect, f: &mut Frame) {
-        let block = theme::block(theme::panel_title("CRUCIBLE-LLM"), style::value_err());
+        let th = self.active_theme;
+        let block = theme::block(theme::panel_title(th, "CRUCIBLE-LLM"), style::value_err(th));
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "Terminal too narrow (minimum 80 columns)",
-                style::value_err(),
+                style::value_err(th),
             )))
             .block(block)
             .alignment(Alignment::Center),
@@ -1428,6 +1540,7 @@ impl App {
     /// of the current frame. `q` (dashboard) / `Esc` (Setup stage 1) opens
     /// it; `y` confirms (the only quit path), anything else cancels.
     fn render_quit_overlay(&self, f: &mut Frame) {
+        let th = self.active_theme;
         let area = f.area();
         const W: u16 = 34;
         const H: u16 = 5;
@@ -1441,7 +1554,7 @@ impl App {
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(
                 Style::default()
-                    .fg(palette::CALLOUT)
+                    .fg(th.accent())
                     .add_modifier(Modifier::BOLD),
             )
             .title(" QUIT? ");
@@ -1450,12 +1563,12 @@ impl App {
             Line::from(Span::styled(
                 "Quit crucible-llm?",
                 Style::default()
-                    .fg(palette::CALLOUT)
+                    .fg(th.accent())
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
-                Span::styled("  [y] Yes", style::value()),
-                Span::styled("   [n] No", style::value()),
+                Span::styled("  [y] Yes", style::value(th)),
+                Span::styled("   [n] No", style::value(th)),
             ]),
         ]);
         f.render_widget(Paragraph::new(text).block(block), overlay);
@@ -1466,22 +1579,23 @@ impl App {
     /// Reads the shared snapshot lock-free; a fresh `Arc` is taken each frame
     /// so the bar always reflects the latest published metrics.
     fn render_status_bar(&self, area: Rect, f: &mut Frame) {
+        let th = self.active_theme;
         let m = self.metrics.load();
         let mut spans = vec![
-            Span::styled(" ▐ ", style::tab_separator()),
-            Span::styled("CRUCIBLE", style::title()),
+            Span::styled(" ▐ ", style::tab_separator(th)),
+            Span::styled("CRUCIBLE", style::title(th)),
             Span::styled(
                 "·LLM",
                 Style::default()
-                    .fg(palette::SECONDARY)
+                    .fg(th.secondary())
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), style::footer()),
-            Span::styled(format!("  ▐ [{}]", m.backend), style::value()),
-            Span::styled(" ▐ ", style::tab_separator()),
-            Span::styled(format!("Target: {}", m.model), style::label()),
-            Span::styled(" ▐ ", style::tab_separator()),
-            Span::styled(format!("Mode: {}", m.mode), style::label()),
+            Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), style::footer(th)),
+            Span::styled(format!("  ▐ [{}]", m.backend), style::value(th)),
+            Span::styled(" ▐ ", style::tab_separator(th)),
+            Span::styled(format!("Target: {}", m.model), style::label(th)),
+            Span::styled(" ▐ ", style::tab_separator(th)),
+            Span::styled(format!("Mode: {}", m.mode), style::label(th)),
         ];
         // State indicators: `◉ RUNNING` while any benchmark load is in
         // flight (sequence running, or a standalone NIAH run), `‖ PAUSED`
@@ -1490,21 +1604,22 @@ impl App {
             spans.push(Span::styled(
                 format!("  {} RUNNING", glyph::RUN),
                 Style::default()
-                    .fg(palette::ACCENT)
+                    .fg(th.primary())
                     .add_modifier(Modifier::BOLD),
             ));
         }
         if self.paused {
-            spans.push(Span::styled(" ‖ PAUSED ", style::value_warn()));
+            spans.push(Span::styled(" ‖ PAUSED ", style::value_warn(th)));
         }
         f.render_widget(
-            Paragraph::new(Line::from(spans)).style(style::status_bar()),
+            Paragraph::new(Line::from(spans)).style(style::status_bar(th)),
             area,
         );
     }
 
     /// Tab bar: `[1] Live Monitor | [2] Concurrency Matrix | ...`.
     fn render_tab_bar(&self, area: Rect, f: &mut Frame) {
+        let th = self.active_theme;
         let mut spans = vec![Span::raw(" ")];
         for (i, view) in View::ALL.iter().enumerate() {
             let active = *view == self.view;
@@ -1514,13 +1629,13 @@ impl App {
                 format!("[{}] {}", i + 1, view.label())
             };
             let st = if active {
-                style::tab_active()
+                style::tab_active(th)
             } else {
-                style::tab_inactive()
+                style::tab_inactive(th)
             };
             spans.push(Span::styled(label, st));
             if i + 1 < View::ALL.len() {
-                spans.push(Span::styled(" │ ", style::tab_separator()));
+                spans.push(Span::styled(" │ ", style::tab_separator(th)));
             }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1551,18 +1666,19 @@ impl App {
     ///
     /// The `[Y/N]` NIAH confirmation is a modal footer (its own shape).
     pub fn footer_line(&self) -> Line<'static> {
+        let th = self.active_theme;
         if self.pending_niah {
             return self.niah_confirm_footer();
         }
         let mut spans: Vec<Span> = Vec::new();
         spans.extend(self.footer_view_tabs());
-        spans.push(footer_sep());
+        spans.push(footer_sep(th));
         spans.push(self.footer_connection());
         if let Some(st) = self.footer_engine_status() {
-            spans.push(footer_sep());
+            spans.push(footer_sep(th));
             spans.push(st);
         }
-        spans.push(footer_sep());
+        spans.push(footer_sep(th));
         spans.extend(self.footer_action_keys());
         Line::from(spans)
     }
@@ -1570,8 +1686,9 @@ impl App {
     /// The `[Y/N]` NIAH-confirmation modal footer: the request count and
     /// the two live keys.
     fn niah_confirm_footer(&self) -> Line<'static> {
-        let sep = footer_sep();
-        let live = |t: &str| Span::styled(t.to_string(), style::footer());
+        let th = self.active_theme;
+        let sep = footer_sep(th);
+        let live = |t: &str| Span::styled(t.to_string(), style::footer(th));
         let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
         Line::from(vec![
             live(&format!(
@@ -1589,6 +1706,7 @@ impl App {
     /// The five view tabs: `[1]Live [2]Conc [3]NIAH [4]Hist [5]Cfg` — the
     /// current view in **accent** (bold), the rest dim.
     fn footer_view_tabs(&self) -> Vec<Span<'static>> {
+        let th = self.active_theme;
         View::ALL
             .iter()
             .enumerate()
@@ -1596,9 +1714,9 @@ impl App {
                 let active = *v == self.view;
                 let label = format!("[{}]{}", i + 1, footer_view_label(*v));
                 let st = if active {
-                    style::tab_active()
+                    style::tab_active(th)
                 } else {
-                    style::footer()
+                    style::footer(th)
                 };
                 let mut out: Vec<Span<'static>> = Vec::new();
                 if active {
@@ -1614,16 +1732,18 @@ impl App {
     /// The connection-status dot: green `● Connected` when a target URL is
     /// set, red `● Disconnected` otherwise.
     fn footer_connection(&self) -> Span<'static> {
+        let th = self.active_theme;
         if self.config.url.trim().is_empty() {
-            Span::styled("● Disconnected", style::value_err())
+            Span::styled("● Disconnected", style::value_err(th))
         } else {
-            Span::styled("● Connected", style::value_ok())
+            Span::styled("● Connected", style::value_ok(th))
         }
     }
 
     /// The running-engine status segment (`Engine B: Step 5/9`) — present
     /// only while a sequence with live progress is in flight.
     fn footer_engine_status(&self) -> Option<Span<'static>> {
+        let th = self.active_theme;
         let state = self.seq.load()?;
         if state.phase != SeqPhase::Running {
             return None;
@@ -1633,7 +1753,7 @@ impl App {
         Some(Span::styled(
             format!("Engine {letter}: {step}"),
             Style::default()
-                .fg(palette::ACCENT)
+                .fg(th.primary())
                 .add_modifier(Modifier::BOLD),
         ))
     }
@@ -1641,6 +1761,7 @@ impl App {
     /// The action keys: `[Space]Pause` / `[Space]Resume` while running,
     /// `[R]Run` when idle, and `[q]Quit` always.
     fn footer_action_keys(&self) -> Vec<Span<'static>> {
+        let th = self.active_theme;
         let running = self.seq.is_running() || self.niah.is_running();
         let primary = if running {
             if self.paused {
@@ -1654,7 +1775,7 @@ impl App {
         // Action keys: electric purple (the "do something" keys); the
         // navigation tabs above stay dim blue.
         let key_style = Style::default()
-            .fg(palette::SECONDARY)
+            .fg(th.secondary())
             .add_modifier(Modifier::BOLD);
         vec![
             Span::styled(primary.to_string(), key_style),
@@ -1665,8 +1786,8 @@ impl App {
 }
 
 /// The footer's `│` separator span.
-fn footer_sep() -> Span<'static> {
-    Span::styled(" │ ", style::tab_separator())
+fn footer_sep(th: Theme) -> Span<'static> {
+    Span::styled(" │ ", style::tab_separator(th))
 }
 
 /// The compact tab label for a view (the footer's `[n]Label` tabs).
@@ -1829,6 +1950,92 @@ mod tests {
         }; // model == "default" (placeholder)
         let app = App::new().with_setup(&cfg);
         assert!(app.setup.model_query.is_empty());
+    }
+
+    // ── first-run theme picker: confirm path ─────────────────────────────
+
+    #[test]
+    fn confirm_theme_applies_and_persists_vampire() {
+        let mut app = App::new().with_theme_picker(true);
+        app.config.config_path =
+            std::path::PathBuf::from("/tmp/crucible-test-theme-pick.json");
+        assert_eq!(app.phase, Phase::ThemePicker);
+        app.theme_picker.cursor = 1; // Vampire
+        app.confirm_theme();
+        assert_eq!(app.active_theme, Theme::Vampire);
+        assert_eq!(app.config.theme, "vampire");
+        // needs_setup == true → fall through to the Setup takeover.
+        assert_eq!(app.phase, Phase::Setup);
+    }
+
+    #[test]
+    fn confirm_theme_goes_to_dashboard_when_target_given() {
+        let mut app = App::new().with_theme_picker(false);
+        app.config.config_path =
+            std::path::PathBuf::from("/tmp/crucible-test-theme-pick2.json");
+        app.theme_picker.cursor = 2; // Monochrome
+        app.confirm_theme();
+        assert_eq!(app.active_theme, Theme::Monochrome);
+        assert_eq!(app.config.theme, "monochrome");
+        // needs_setup == false → straight to the Dashboard (Live).
+        assert_eq!(app.phase, Phase::Dashboard);
+        assert_eq!(app.view, View::Live);
+    }
+
+    #[test]
+    fn confirm_theme_defaults_to_cyberpunk() {
+        let mut app = App::new().with_theme_picker(true);
+        app.config.config_path =
+            std::path::PathBuf::from("/tmp/crucible-test-theme-pick3.json");
+        // Cursor 0 = Cyberpunk (the default).
+        app.confirm_theme();
+        assert_eq!(app.active_theme, Theme::Cyberpunk);
+        assert_eq!(app.config.theme, "cyberpunk");
+    }
+
+    #[test]
+    fn with_theme_sets_the_active_theme() {
+        let app = App::new().with_theme(Theme::Vampire);
+        assert_eq!(app.active_theme, Theme::Vampire);
+    }
+
+    /// End-to-end: switching the active theme re-colors the rendered frame.
+    /// A Vampire-themed dashboard shows crimson (the Vampire primary) where
+    /// a Cyberpunk one shows neon cyan — proving the whole TUI re-skins.
+    #[test]
+    fn active_theme_reskins_the_rendered_frame() {
+        use ratatui::style::Color;
+
+        fn buffer_colors(app: &App) -> Vec<Color> {
+            let backend = ratatui::backend::TestBackend::new(120, 40);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| app.render(f)).expect("frame");
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.fg)
+                .collect()
+        }
+
+        let cyber = App::new().with_theme(Theme::Cyberpunk);
+        let vampire = App::new().with_theme(Theme::Vampire);
+
+        // Cyberpunk's neon cyan primary is present in its frame…
+        assert!(
+            buffer_colors(&cyber).contains(&Color::Rgb(0, 255, 255)),
+            "cyberpunk frame has neon cyan"
+        );
+        // …and is absent from the Vampire frame, which carries crimson instead.
+        assert!(
+            !buffer_colors(&vampire).contains(&Color::Rgb(0, 255, 255)),
+            "vampire frame has no neon cyan"
+        );
+        assert!(
+            buffer_colors(&vampire).contains(&Color::Rgb(220, 20, 60)),
+            "vampire frame has crimson"
+        );
     }
 
     // ── `c` re-opens setup from the dashboard ───────────────────────────
@@ -2475,7 +2682,7 @@ mod tests {
             .expect("the Concurrency tab span");
         assert_eq!(
             span.style.fg,
-            Some(palette::ACCENT),
+            Some(Theme::Cyberpunk.primary()),
             "current view is accent"
         );
     }

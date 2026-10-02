@@ -40,7 +40,7 @@ use crate::engines::capability::CaseVerdict;
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, glyph, palette, style};
+use crate::ui::theme::{self, glyph, style, Theme};
 use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
 
 /// Render the Live view into `area`.
@@ -51,6 +51,7 @@ use crate::ui::views::concurrency::{build_curve_lines, curve_notes};
 /// complete). The throughput hero + key metrics row always takes the largest
 /// share, so it stays the visual centerpiece.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     // Lock-free read of the latest published snapshot (the `Arc` is bound
     // first so the `&MetricsSnapshot` borrow outlives the frame).
     let snap = app.metrics.load();
@@ -93,11 +94,11 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 
     for (i, (id, _)) in plan.iter().enumerate() {
         match *id {
-            0 => render_sequence_header(rects[i], app, f),
-            1 => render_throughput_row(rects[i], m, frozen, f),
-            2 => render_concurrency_curve(rects[i], app, f),
-            3 => render_capability_scores(rects[i], app, m, f),
-            4 => render_log(rects[i], app, f),
+            0 => render_sequence_header(rects[i], app, th, f),
+            1 => render_throughput_row(rects[i], m, frozen, th, f),
+            2 => render_concurrency_curve(rects[i], app, th, f),
+            3 => render_capability_scores(rects[i], app, m, th, f),
+            4 => render_log(rects[i], app, th, f),
             _ => {}
         }
     }
@@ -213,15 +214,15 @@ fn should_show_capabilities(seq: &Option<Arc<SeqState>>, app: &App) -> bool {
 /// The top row: the throughput hero chart (left, the *live* rolling
 /// window) + the overall-metrics readout (right, *cumulative* across all
 /// engines — FIX 1).
-fn render_throughput_row(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut Frame) {
+fn render_throughput_row(area: Rect, m: &MetricsSnapshot, frozen: bool, th: Theme, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         // 50/50 so the overall panel's `avg │ max │ p5` rows (the widest
         // content) fit without wrapping and clipping the footer (FIX 1).
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    render_throughput_hero(cols[0], m, frozen, f);
-    render_overall_metrics(cols[1], m, f);
+    render_throughput_hero(cols[0], m, frozen, th, f);
+    render_overall_metrics(cols[1], m, th, f);
 }
 
 /// The hero: a large **real-time** aggregate tokens/sec block chart
@@ -233,7 +234,7 @@ fn render_throughput_row(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut 
 /// y-axis auto-scales to the data (never a fixed axis); the x-axis spans
 /// the *actual* data window. An empty series shows
 /// "Awaiting first tokens…" (never a blank panel).
-fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut Frame) {
+fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, th: Theme, f: &mut Frame) {
     // While the run is live the hero is a real-time chart ("now"); once the
     // sequence completes the metrics pipeline freezes and the hero shows its
     // final, static state ("final" + a ✓ COMPLETE badge, green border).
@@ -243,11 +244,11 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
         "LIVE THROUGHPUT — real-time generation speed (tokens/sec)"
     };
     let block = theme::block(
-        theme::panel_title(title),
+        theme::panel_title(th, title),
         if frozen {
-            style::value_ok()
+            style::value_ok(th)
         } else {
-            style::active_border()
+            style::active_border(th)
         },
     );
     if area.width < 8 || area.height < 5 {
@@ -276,19 +277,19 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
     // `peak` the warning, `avg` the dimmed secondary.
     let value_line = if frozen {
         Line::from(vec![
-            Span::styled("final ", style::label()),
-            Span::styled(fmt::format_rate(avg), style::value_ok()),
-            Span::styled("  │  peak ", style::footer()),
-            Span::styled(fmt::format_rate(peak), style::value_warn()),
+            Span::styled("final ", style::label(th)),
+            Span::styled(fmt::format_rate(avg), style::value_ok(th)),
+            Span::styled("  │  peak ", style::footer(th)),
+            Span::styled(fmt::format_rate(peak), style::value_warn(th)),
         ])
     } else {
         Line::from(vec![
-            Span::styled("now ", style::label()),
-            Span::styled(fmt::format_rate(current), style::value()),
-            Span::styled("  │  peak ", style::footer()),
-            Span::styled(fmt::format_rate(peak), style::value_warn()),
-            Span::styled("  │  avg ", style::footer()),
-            Span::styled(fmt::format_rate(avg), style::value_secondary()),
+            Span::styled("now ", style::label(th)),
+            Span::styled(fmt::format_rate(current), style::value(th)),
+            Span::styled("  │  peak ", style::footer(th)),
+            Span::styled(fmt::format_rate(peak), style::value_warn(th)),
+            Span::styled("  │  avg ", style::footer(th)),
+            Span::styled(fmt::format_rate(avg), style::value_secondary(th)),
         ])
     };
 
@@ -313,6 +314,7 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
         &markers,
         window_start,
         frozen,
+        th,
     );
     let mut lines = vec![value_line];
     lines.extend(chart);
@@ -330,6 +332,7 @@ fn render_throughput_hero(area: Rect, m: &MetricsSnapshot, frozen: bool, f: &mut
 /// When `frozen` (the run is complete), a **`✓ COMPLETE` overlay** is
 /// drawn at the top of the plot — the final line is the final line.
 /// Pure over its inputs (unit-testable, no terminal).
+#[allow(clippy::too_many_arguments)]
 fn build_throughput_chart(
     series: &[f64],
     w: u16,
@@ -338,6 +341,7 @@ fn build_throughput_chart(
     markers: &[(f64, String)],
     window_start_sec: f64,
     frozen: bool,
+    th: Theme,
 ) -> Vec<Line<'static>> {
     const Y_AXIS_W: usize = 5;
     let w = w as usize;
@@ -349,7 +353,7 @@ fn build_throughput_chart(
     if series.is_empty() {
         return vec![Line::from(Span::styled(
             "Awaiting first tokens…",
-            style::info(),
+            style::info(th),
         ))];
     }
 
@@ -386,7 +390,7 @@ fn build_throughput_chart(
             let grid_row = plot_h.saturating_sub(1).saturating_sub(r);
             if grid_row < h && grid_col < w {
                 let frac = (r as f64 + 0.5) / height as f64;
-                let (ch, color) = gradient_layer(frac, is_now);
+                let (ch, color) = gradient_layer(frac, is_now, th);
                 grid[grid_row][grid_col] = (ch, Some(color));
             }
         }
@@ -398,7 +402,7 @@ fn build_throughput_chart(
     if now_col < w {
         for row in grid.iter_mut().take(plot_h) {
             if row[now_col].0 == ' ' {
-                row[now_col] = ('│', Some(palette::TEXT));
+                row[now_col] = ('│', Some(th.bright()));
             }
         }
     }
@@ -413,13 +417,13 @@ fn build_throughput_chart(
         let c = Y_AXIS_W + col as usize;
         if c < w {
             for cell in grid.iter_mut().take(plot_h) {
-                cell[c] = ('┊', Some(palette::ACCENT));
+                cell[c] = ('┊', Some(th.primary()));
             }
         }
         for (i, ch) in label.chars().take(4).enumerate() {
             let cc = c + 1 + i;
             if cc < w {
-                grid[0][cc] = (ch, Some(palette::ACCENT));
+                grid[0][cc] = (ch, Some(th.primary()));
             }
         }
     }
@@ -433,13 +437,13 @@ fn build_throughput_chart(
             .min(plot_h.saturating_sub(1));
         for (i, cell) in grid[row][Y_AXIS_W..].iter_mut().enumerate() {
             if cell.0 == ' ' && i % 2 == 1 {
-                *cell = ('┄', Some(palette::DATA));
+                *cell = ('┄', Some(th.tertiary()));
             }
         }
         for (i, ch) in "avg".chars().enumerate() {
             let cc = Y_AXIS_W.saturating_sub(3) + i;
             if cc < Y_AXIS_W {
-                grid[row][cc] = (ch, Some(palette::DATA));
+                grid[row][cc] = (ch, Some(th.tertiary()));
             }
         }
     }
@@ -454,30 +458,30 @@ fn build_throughput_chart(
             .min(plot_h.saturating_sub(1));
         for (i, cell) in grid[row][Y_AXIS_W..].iter_mut().enumerate() {
             if cell.0 == ' ' && i % 2 == 0 {
-                *cell = ('═', Some(palette::CALLOUT));
+                *cell = ('═', Some(th.accent()));
             }
         }
         for (i, ch) in "peak".chars().enumerate() {
             let cc = Y_AXIS_W.saturating_sub(4) + i;
             if cc < Y_AXIS_W {
-                grid[row][cc] = (ch, Some(palette::CALLOUT));
+                grid[row][cc] = (ch, Some(th.accent()));
             }
         }
     }
 
     // The y-axis numbers, drawn last so they win over the avg/peak gutter
     // tags (top = max, middle = max/2, bottom = 0).
-    write_y_label(&mut grid, 0, max, w, h);
-    write_y_label(&mut grid, plot_h / 2, max / 2.0, w, h);
-    write_y_label(&mut grid, plot_h.saturating_sub(1), 0.0, w, h);
+    write_y_label(&mut grid, 0, max, w, h, th);
+    write_y_label(&mut grid, plot_h / 2, max / 2.0, w, h, th);
+    write_y_label(&mut grid, plot_h.saturating_sub(1), 0.0, w, h, th);
 
     // x-axis: a baseline + time labels spanning the *actual* window
     // (0 … N−1 s, where N = series.len()), skipping overlaps.
     let span = (series.len() - 1).max(1);
     for cell in &mut grid[h - 1][Y_AXIS_W..] {
-        *cell = ('─', Some(palette::MUTED));
+        *cell = ('─', Some(th.dim()));
     }
-    grid[h - 1][Y_AXIS_W] = ('├', Some(palette::MUTED));
+    grid[h - 1][Y_AXIS_W] = ('├', Some(th.dim()));
     let mut label_end: i64 = -1;
     for frac in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let text = format!("{}s", (frac * span as f64).round() as i64);
@@ -488,7 +492,7 @@ fn build_throughput_chart(
             for (i, ch) in text.chars().enumerate() {
                 let col = (start + i as i64) as usize;
                 if col < w {
-                    grid[h - 1][col] = (ch, Some(palette::MUTED));
+                    grid[h - 1][col] = (ch, Some(th.dim()));
                 }
             }
             label_end = start + text.len() as i64;
@@ -503,7 +507,7 @@ fn build_throughput_chart(
         for (i, ch) in text.chars().enumerate() {
             let col = start + i;
             if col < w {
-                grid[0][col] = (ch, Some(palette::OK));
+                grid[0][col] = (ch, Some(th.success()));
             }
         }
     }
@@ -534,11 +538,11 @@ fn build_throughput_chart(
 /// **Label spacing** (user feedback 6): every row is `Label: value` — the
 /// label (colon included) is padded to a fixed width so all values start in
 /// the same column. No more `Total Tokens33,108` or `Streamavg` collisions.
-fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
+fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, th: Theme, f: &mut Frame) {
     let o = &m.overall;
     let block = theme::block(
-        theme::panel_title("OVERALL METRICS (all engines)"),
-        style::border(),
+        theme::panel_title(th, "OVERALL METRICS (all engines)"),
+        style::border(th),
     );
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -558,19 +562,21 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
     let itl50 = stat_triple(o.itl_p50.avg, o.itl_p50.max, o.itl_p50.p5, fmt_latency);
     let itl99 = stat_triple(o.itl_p99.avg, o.itl_p99.max, o.itl_p99.p5, fmt_latency);
     let lines = vec![
-        stat_row("Gen Throughput", &gen.0, &gen.1, &gen.2, Some("t/s")),
+        stat_row(th, "Gen Throughput", &gen.0, &gen.1, &gen.2, Some("t/s")),
         stat_row(
+            th,
             "Prompt Throughput",
             &prompt.0,
             &prompt.1,
             &prompt.2,
             Some("t/s"),
         ),
-        stat_row("TTFT", &ttft.0, &ttft.1, &ttft.2, None),
-        stat_row("ITL p50", &itl50.0, &itl50.1, &itl50.2, None),
-        stat_row("ITL p99", &itl99.0, &itl99.1, &itl99.2, None),
-        simple_row("Total Tokens", &fmt::format_tokens(o.total_tokens)),
+        stat_row(th, "TTFT", &ttft.0, &ttft.1, &ttft.2, None),
+        stat_row(th, "ITL p50", &itl50.0, &itl50.1, &itl50.2, None),
+        stat_row(th, "ITL p99", &itl99.0, &itl99.1, &itl99.2, None),
+        simple_row(th, "Total Tokens", &fmt::format_tokens(o.total_tokens)),
         simple_row(
+            th,
             "Streams",
             &format!(
                 "avg {a:<5} │ max {b}",
@@ -578,10 +584,10 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
                 b = o.active_max
             ),
         ),
-        simple_row("Total Duration", &fmt::format_duration(o.duration_sec)),
+        simple_row(th, "Total Duration", &fmt::format_duration(o.duration_sec)),
         Line::from(Span::styled(
             "ℹ All engines. p5 = 5th percentile (worst 5%).",
-            style::info(),
+            style::info(th),
         )),
     ];
     f.render_widget(
@@ -596,29 +602,29 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, f: &mut Frame) {
 /// `Prompt Throughput:`, is 18) so every value in the panel starts in the
 /// same column — the user-reported `Total Tokens33,108` / `Streamavg`
 /// collisions are gone.
-fn label_cell(label: &str) -> Span<'static> {
-    Span::styled(format!("{:<20}", format!("{label}:")), style::label())
+fn label_cell(th: Theme, label: &str) -> Span<'static> {
+    Span::styled(format!("{:<20}", format!("{label}:")), style::label(th))
 }
 
 /// One `Label:   avg X │ max Y │ p5 Z [unit]` row for the overall panel
 /// (the pre-formatted value strings come from [`stat_triple`], which
 /// yields `--` across the board when the metric has no samples yet).
-fn stat_row(label: &str, a: &str, m: &str, p: &str, unit: Option<&str>) -> Line<'static> {
+fn stat_row(th: Theme, label: &str, a: &str, m: &str, p: &str, unit: Option<&str>) -> Line<'static> {
     let mut spans = vec![
-        label_cell(label),
-        Span::styled(format!("avg {a:<5} │ max {m:<5} │ p5 {p}"), style::value()),
+        label_cell(th, label),
+        Span::styled(format!("avg {a:<5} │ max {m:<5} │ p5 {p}"), style::value(th)),
     ];
     if let Some(u) = unit {
-        spans.push(Span::styled(format!("  {u}"), style::footer()));
+        spans.push(Span::styled(format!("  {u}"), style::footer(th)));
     }
     Line::from(spans)
 }
 
 /// One `Label:   value` row (total tokens, streams, duration).
-fn simple_row(label: &str, value: &str) -> Line<'static> {
+fn simple_row(th: Theme, label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        label_cell(label),
-        Span::styled(value.to_string(), style::value()),
+        label_cell(th, label),
+        Span::styled(value.to_string(), style::value(th)),
     ])
 }
 
@@ -663,10 +669,10 @@ fn fmt_stat(v: f64) -> String {
 /// "what to do with this" note. While Engine B is mid-sweep (no result
 /// published yet) it shows an in-progress note; with no sweep at all it
 /// shows the run-a-sweep hint.
-fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
+fn render_concurrency_curve(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let block = theme::block(
-        theme::panel_title("CONCURRENCY CURVE — t/s vs parallel users"),
-        style::border(),
+        theme::panel_title(th, "CONCURRENCY CURVE — t/s vs parallel users"),
+        style::border(th),
     );
     if area.width < 8 || area.height < 4 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -684,11 +690,11 @@ fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
         .filter(|r| !r.levels.is_empty())
         .map(|r| {
             let env = r.envelope();
-            let notes = curve_notes(&r.levels);
+            let notes = curve_notes(th, &r.levels);
             // The plot gets whatever height the notes leave (it
             // self-degrades to a compact form in the small Live panel).
             let plot_h = (inner.height as i64 - notes.len() as i64).max(4) as u16;
-            let mut ls = build_curve_lines(&r.levels, inner.width, plot_h, &env);
+            let mut ls = build_curve_lines(th, &r.levels, inner.width, plot_h, &env);
             ls.extend(notes);
             ls
         })
@@ -704,7 +710,7 @@ fn render_concurrency_curve(area: Rect, app: &App, f: &mut Frame) {
                     "Run a sweep (Engine B) to plot the curve."
                 }
                 .to_string(),
-                style::footer(),
+                style::footer(th),
             ))]
         });
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
@@ -730,12 +736,12 @@ struct CapScore {
 
 /// Score → color: green (>80%), yellow (50–80%), red (<50%), gray (N/A /
 /// non-percentage).
-fn score_color(pct: Option<f64>) -> Color {
+fn score_color(th: Theme, pct: Option<f64>) -> Color {
     match pct {
-        Some(p) if p >= 80.0 => palette::OK,
-        Some(p) if p >= 50.0 => palette::WARN,
-        Some(_) => palette::ERR,
-        None => palette::MUTED,
+        Some(p) if p >= 80.0 => th.success(),
+        Some(p) if p >= 50.0 => th.warn(),
+        Some(_) => th.danger(),
+        None => th.dim(),
     }
 }
 
@@ -744,15 +750,15 @@ fn score_color(pct: Option<f64>) -> Color {
 /// Structured C3, Energy D), each with a `ℹ` explanation, a `⚠` warning
 /// when the score is poor, and an **OVERALL** practical summary line at
 /// the bottom. Engines that haven't run are omitted (never shown empty).
-fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut Frame) {
-    let block = theme::block(theme::panel_title("CAPABILITY ASSESSMENT"), style::border());
+fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, th: Theme, f: &mut Frame) {
+    let block = theme::block(theme::panel_title(th, "CAPABILITY ASSESSMENT"), style::border(th));
     if area.width < 10 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
     let sel = selected(app);
-    let scores = build_capability_scores(app, m, &sel);
-    let overall = Line::from(Span::styled(capability_overall(&scores), style::value()));
+    let scores = build_capability_scores(app, m, &sel, th);
+    let overall = Line::from(Span::styled(capability_overall(&scores), style::value(th)));
     let mut lines: Vec<Line> = Vec::new();
     // The OVERALL summary sits at the bottom (the verdict after the
     // evidence) — except in a squeezed panel, where it moves up front so
@@ -763,20 +769,20 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
         lines.push(Line::raw(""));
     }
     for s in &scores {
-        lines.extend(build_cap_lines(s));
+        lines.extend(build_cap_lines(s, th));
     }
     // The structured-output detail sub-section (per-case checks, the
     // truncated actual output for failures, speed impact, and the
     // practical verdict) — appended only when C3 has run *and was
     // selected* (FIX 1).
-    let detail = build_structured_detail_lines(app, &sel);
+    let detail = build_structured_detail_lines(app, &sel, th);
     if !detail.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(detail);
     }
     if tall {
         let divider = "─".repeat(area.width.saturating_sub(4) as usize);
-        lines.push(Line::from(Span::styled(divider, style::border())));
+        lines.push(Line::from(Span::styled(divider, style::border(th))));
         lines.push(overall);
     }
     f.render_widget(
@@ -791,7 +797,7 @@ fn render_capability_scores(area: Rect, app: &App, m: &MetricsSnapshot, f: &mut 
 /// the engines that were **selected and have actually run** (FIX 1: an
 /// unselected engine never appears, even if a stale result is in its
 /// slot). Pure over its inputs, unit-testable.
-fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection) -> Vec<CapScore> {
+fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection, th: Theme) -> Vec<CapScore> {
     let mut v: Vec<CapScore> = Vec::with_capacity(4);
 
     // Reasoning (C2) — N/M solved as a percentage.
@@ -813,8 +819,8 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
                     r.score.solved,
                     r.score.total
                 ),
-                detail_style: style::value(),
-                color: score_color(Some(pct)),
+                detail_style: style::value(th),
+                color: score_color(th, Some(pct)),
                 info: "Math, logic, code problems. Measures analytical ability.",
                 warn: (pct < 50.0).then_some("LOW: weak analytical problem-solving."),
             });
@@ -834,8 +840,8 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
                 label: "Long Context",
                 pct: Some(pct),
                 detail: format!("{}  ({retrieved}/{total})", fmt::format_pct(pct)),
-                detail_style: style::value(),
-                color: score_color(Some(pct)),
+                detail_style: style::value(th),
+                color: score_color(th, Some(pct)),
                 info: "Retrieval from large documents. Critical for RAG / chat history.",
                 warn: (pct < 50.0).then_some("LOW: the model loses information in long contexts."),
             });
@@ -859,13 +865,13 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
                 pct: Some(pct),
                 detail: r.score_label(),
                 detail_style: if c == total {
-                    style::value_ok()
+                    style::value_ok(th)
                 } else if c == 0 {
-                    style::value_err()
+                    style::value_err(th)
                 } else {
-                    style::value_warn()
+                    style::value_warn(th)
                 },
-                color: score_color(Some(pct)),
+                color: score_color(th, Some(pct)),
                 info: "JSON schema adherence (3 cases). Required for API / agent tool-calling.",
                 warn: (c < total).then_some("See the detail below for which cases fail."),
             });
@@ -880,8 +886,8 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
             label: "Energy Efficiency",
             pct: None,
             detail: line,
-            detail_style: if na { style::footer() } else { style::value() },
-            color: palette::MUTED,
+            detail_style: if na { style::footer(th) } else { style::value(th) },
+            color: th.dim(),
             info: "Joules per token. Requires a local GPU with driver support.",
             warn: None,
         });
@@ -894,8 +900,8 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
                 label: "Flat Out",
                 pct: None,
                 detail: format!("BEST: {:.1} t/s", r.best_tps),
-                detail_style: style::value_ok(),
-                color: palette::OK,
+                detail_style: style::value_ok(th),
+                color: th.success(),
                 info: "Sustained max-speed test. 60s, decreasing targets (10k→1k).",
                 warn: None,
             });
@@ -909,7 +915,7 @@ fn build_capability_scores(app: &App, m: &MetricsSnapshot, sel: &EngineSelection
 /// `Label   [▰▰▰▰▰▰▰▰│▱▱▱▱▱▱▱▱]  detail  ⚡ warning`
 /// `        ℹ what it measures`
 /// (the segmented `▰`/`▱` bar with a bright needle at the exact fill.)
-fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
+fn build_cap_lines(s: &CapScore, th: Theme) -> Vec<Line<'static>> {
     const BAR_W: usize = 20;
     let filled = s
         .pct
@@ -921,15 +927,15 @@ fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
         Span::styled(
             "│".to_string(),
             Style::default()
-                .fg(palette::TEXT)
+                .fg(th.bright())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::raw(String::new())
     };
     let mut line1: Vec<Span> = vec![
-        Span::styled(format!("{:<16}", s.label), style::label()),
-        Span::styled("[".to_string(), Style::default().fg(palette::MUTED)),
+        Span::styled(format!("{:<16}", s.label), style::label(th)),
+        Span::styled("[".to_string(), Style::default().fg(th.dim())),
         Span::styled(
             glyph::SEG_ON.to_string().repeat(filled),
             Style::default().fg(s.color),
@@ -939,33 +945,33 @@ fn build_cap_lines(s: &CapScore) -> Vec<Line<'static>> {
             glyph::SEG_OFF
                 .to_string()
                 .repeat(BAR_W.saturating_sub(filled)),
-            Style::default().fg(palette::MUTED),
+            Style::default().fg(th.dim()),
         ),
-        Span::styled("] ".to_string(), Style::default().fg(palette::MUTED)),
+        Span::styled("] ".to_string(), Style::default().fg(th.dim())),
         Span::styled(s.detail.clone(), s.detail_style),
     ];
     if let Some(w) = s.warn {
         line1.push(Span::styled(
             format!("  {} {w}", glyph::WARN),
-            style::value_warn(),
+            style::value_warn(th),
         ));
     }
     vec![
         Line::from(line1),
         Line::from(Span::styled(
             format!("                ℹ {}", s.info),
-            style::info(),
+            style::info(th),
         )),
     ]
 }
 
 /// The `✓ label  ✗ label  …` check spans for one structured case.
-fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult) -> Vec<Span<'static>> {
+fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult, th: Theme) -> Vec<Span<'static>> {
     case.checks
         .iter()
         .map(|c| {
             let glyph = if c.passed { '✓' } else { '✗' };
-            let color = if c.passed { palette::OK } else { palette::ERR };
+            let color = if c.passed { th.success() } else { th.danger() };
             Span::styled(format!(" {glyph} {} ", c.label), Style::default().fg(color))
         })
         .collect()
@@ -977,7 +983,7 @@ fn case_check_spans(case: &crate::engines::capability::StructuredCaseResult) -> 
 /// line, and the auto-generated practical verdict. `empty` when C3 has not
 /// run **or was not selected** (FIX 1: the render path never shows an
 /// empty box, and never shows an unselected engine's detail).
-fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'static>> {
+fn build_structured_detail_lines(app: &App, sel: &EngineSelection, th: Theme) -> Vec<Line<'static>> {
     if !sel.structured {
         return Vec::new();
     }
@@ -988,29 +994,29 @@ fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         "STRUCTURED DETAIL (C3) — schema adherence",
-        style::muted_title(),
+        style::muted_title(th),
     )));
     for (i, case) in r.cases.iter().enumerate() {
         let (glyph, color) = match case.verdict {
-            CaseVerdict::Compliant => (glyph::DONE, palette::OK),
-            CaseVerdict::Partial => (glyph::WARN, palette::WARN),
-            CaseVerdict::Failed => (glyph::ERR, palette::ERR),
+            CaseVerdict::Compliant => (glyph::DONE, th.success()),
+            CaseVerdict::Partial => (glyph::WARN, th.warn()),
+            CaseVerdict::Failed => (glyph::ERR, th.danger()),
         };
         let mut spans = vec![
             Span::styled(
                 format!("  Case {} ({}):  ", i + 1, case.name),
-                style::label(),
+                style::label(th),
             ),
             Span::styled(glyph.to_string(), Style::default().fg(color)),
         ];
-        spans.extend(case_check_spans(case));
+        spans.extend(case_check_spans(case, th));
         lines.push(Line::from(spans));
         // Show the actual output (truncated to 3 lines) for any case that is
         // not fully compliant, so the user sees *what* went wrong.
         if !case.is_compliant() && !case.output.trim().is_empty() {
             lines.push(Line::from(Span::styled(
                 "    actual output:",
-                style::info(),
+                style::info(th),
             )));
             for ol in case.output.split('\n').take(3) {
                 let trimmed = ol.trim();
@@ -1019,35 +1025,35 @@ fn build_structured_detail_lines(app: &App, sel: &EngineSelection) -> Vec<Line<'
                 }
                 lines.push(Line::from(Span::styled(
                     format!("    │ {trimmed}"),
-                    style::info(),
+                    style::info(th),
                 )));
             }
         }
     }
     // Speed impact: free-form vs constrained decode.
     lines.push(Line::from(vec![
-        Span::styled("  Speed: ", style::label()),
+        Span::styled("  Speed: ", style::label(th)),
         Span::styled(
             format!(
                 "free-form {:.1} → constrained {:.1} t/s",
                 r.free_tps, r.constrained_tps
             ),
-            style::value(),
+            style::value(th),
         ),
-        Span::styled(format!(" ({:+.1}%)", r.penalty_pct), style::footer()),
+        Span::styled(format!(" ({:+.1}%)", r.penalty_pct), style::footer(th)),
     ]));
     lines.push(Line::from(Span::styled(
         "  ℹ JSON mode adds slight overhead due to format constraints.",
-        style::info(),
+        style::info(th),
     )));
     // The auto-generated practical verdict.
     let verdict = r.verdict_line();
     let vcolor = if verdict.starts_with('✓') {
-        palette::OK
+        th.success()
     } else if verdict.starts_with('✗') {
-        palette::ERR
+        th.danger()
     } else {
-        palette::WARN
+        th.warn()
     };
     lines.push(Line::from(Span::styled(
         format!("  VERDICT: {verdict}"),
@@ -1158,7 +1164,7 @@ const SPINNERS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 /// with a visual progress bar. The border pulses (accent) while an
 /// engine runs, turns green on completion, and magenta when the whole
 /// sequence is done.
-fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
+fn render_sequence_header(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // The panel is a bordered block whose title sits **on** the top border
     // row, so the inner area is `area.height - 2` rows. The content is
     // clamped to that inner height (below), so it can *never* overflow the
@@ -1174,13 +1180,13 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
     let (marker, marker_style, text, text_style, ratio, border_style) = match app.seq.load() {
         None => (
             "○".to_string(),
-            style::footer(),
+            style::footer(th),
             "No benchmark running — launch from Setup or press r".to_string(),
-            style::footer(),
+            style::footer(th),
             0.0,
-            style::border(),
+            style::border(th),
         ),
-        Some(state) => seq_header_parts(&state, app.tick),
+        Some(state) => seq_header_parts(&state, app.tick, th),
     };
 
     // Line 1: the status (marker + text).
@@ -1201,27 +1207,27 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         spans.push(Span::styled(
             "[".to_string(),
-            Style::default().fg(palette::MUTED),
+            Style::default().fg(th.dim()),
         ));
         for i in 0..bar_width {
             if i < filled {
                 let frac = i as f64 / bar_width as f64;
-                let (ch, color) = progress_layer(frac);
+                let (ch, color) = progress_layer(frac, th);
                 spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
             } else {
                 spans.push(Span::styled(
                     glyph::SEG_OFF.to_string(),
-                    Style::default().fg(palette::FLOOR),
+                    Style::default().fg(th.floor()),
                 ));
             }
         }
         spans.push(Span::styled(
             "]".to_string(),
-            Style::default().fg(palette::MUTED),
+            Style::default().fg(th.dim()),
         ));
         spans.push(Span::styled(
             format!(" {:4.0}%", ratio * 100.0),
-            style::value(),
+            style::value(th),
         ));
         Line::from(spans)
     } else {
@@ -1243,26 +1249,26 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
     // structural guarantee that the content can never overwrite the
     // border characters (the root cause of the BENCHMARK SEQUENCE /
     // LIVE THROUGHPUT bottom-border collision).
-    let block = theme::block(theme::panel_title("BENCHMARK SEQUENCE"), border_style);
+    let block = theme::block(theme::panel_title(th, "BENCHMARK SEQUENCE"), border_style);
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().bg(palette::BG)),
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(th.bg())),
         inner,
     );
 }
 
 /// The header's (marker, marker style, text, text style, bar ratio,
 /// border style) for a [`SeqState`].
-fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Style, f64, Style) {
+fn seq_header_parts(state: &SeqState, tick: u64, th: Theme) -> (String, Style, String, Style, f64, Style) {
     match state.phase {
         SeqPhase::Idle => (
             "○".to_string(),
-            style::footer(),
+            style::footer(th),
             "Idle — press r to run the selected engines".to_string(),
-            style::footer(),
+            style::footer(th),
             0.0,
-            style::border(),
+            style::border(th),
         ),
         SeqPhase::Running => {
             let spinner = SPINNERS[(tick as usize / 6) % SPINNERS.len()].to_string();
@@ -1275,38 +1281,38 @@ fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Styl
             (
                 spinner,
                 Style::default()
-                    .fg(palette::ACCENT)
+                    .fg(th.primary())
                     .add_modifier(ratatui::style::Modifier::BOLD),
                 format!(
                     "{} — {} — {progress_text}",
                     state.engine.title(),
                     SeqPhase::Running.label()
                 ),
-                style::value(),
+                style::value(th),
                 ratio,
-                theme::pulsing_border(tick),
+                theme::pulsing_border(th, tick),
             )
         }
         SeqPhase::Complete => (
             "✓".to_string(),
-            style::value_ok(),
+            style::value_ok(th),
             format!(
                 "{} — {} — {}",
                 state.engine.title(),
                 SeqPhase::Complete.label(),
                 state.summary
             ),
-            style::value(),
+            style::value(th),
             1.0,
-            style::value_ok(),
+            style::value_ok(th),
         ),
         SeqPhase::AllComplete => (
             "✓".to_string(),
-            style::highlight(),
+            style::highlight(th),
             format!("ALL BENCHMARKS COMPLETE — {}", state.summary),
-            style::value(),
+            style::value(th),
             1.0,
-            style::highlight(),
+            style::highlight(th),
         ),
     }
 }
@@ -1316,12 +1322,12 @@ fn seq_header_parts(state: &SeqState, tick: u64) -> (String, Style, String, Styl
 /// Bottom: the scrolling log / event stream — the executor's *real* events
 /// (engine starts, completions, summaries), drained from the mpsc pipe on
 /// the tick path (never pre-generated). Kept compact (a few lines).
-fn render_log(area: Rect, app: &App, f: &mut Frame) {
+fn render_log(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     f.render_widget(
         Paragraph::new(Text::from(app.log.clone()))
             .block(theme::block(
-                theme::panel_title("EVENT LOG"),
-                style::border(),
+                theme::panel_title(th, "EVENT LOG"),
+                style::border(th),
             ))
             .wrap(Wrap { trim: true }),
         area,
@@ -1340,6 +1346,7 @@ fn write_y_label(
     val: f64,
     w: usize,
     h: usize,
+    th: Theme,
 ) {
     const Y_AXIS_W: usize = 5;
     let text = format!("{}", val.round());
@@ -1347,7 +1354,7 @@ fn write_y_label(
     for (i, ch) in text.chars().enumerate() {
         let col = start + i;
         if col < w && row < h {
-            grid[row][col] = (ch, Some(palette::MUTED));
+            grid[row][col] = (ch, Some(th.dim()));
         }
     }
 }
@@ -1357,31 +1364,31 @@ fn write_y_label(
 /// (dim-blue floor → blue → cyan → bright → a hot white cap) is what gives
 /// each bar its "glowing from within" depth. The live `now` sample gets a
 /// hotter (taller) white cap.
-fn gradient_layer(frac: f64, now: bool) -> (char, Color) {
+fn gradient_layer(frac: f64, now: bool, th: Theme) -> (char, Color) {
     let top = if now { 0.85 } else { 0.95 };
     if frac < 0.18 {
-        (glyph::FLOOR, palette::FLOOR)
+        (glyph::FLOOR, th.floor())
     } else if frac < 0.42 {
-        (glyph::LOW, palette::DATA)
+        (glyph::LOW, th.tertiary())
     } else if frac < 0.72 {
-        (glyph::MID, palette::ACCENT)
+        (glyph::MID, th.primary())
     } else if frac < top {
-        (glyph::HIGH, palette::BRIGHT)
+        (glyph::HIGH, th.bright_gradient())
     } else {
-        (glyph::HIGH, palette::TEXT)
+        (glyph::HIGH, th.bright())
     }
 }
 
 /// The (char, color) for one position of a segmented progress bar:
 /// `frac` runs 0 (left) → 1 (right) across the filled region — a left-to-
 /// right cyan ramp that reads as the bar "charging up".
-fn progress_layer(frac: f64) -> (char, Color) {
+fn progress_layer(frac: f64, th: Theme) -> (char, Color) {
     if frac < 0.4 {
-        (glyph::SEG_ON, palette::ACCENT)
+        (glyph::SEG_ON, th.primary())
     } else if frac < 0.8 {
-        (glyph::SEG_ON, palette::BRIGHT)
+        (glyph::SEG_ON, th.bright_gradient())
     } else {
-        (glyph::SEG_ON, palette::TEXT)
+        (glyph::SEG_ON, th.bright())
     }
 }
 
@@ -1394,7 +1401,7 @@ mod tests {
 
     #[test]
     fn throughput_chart_guard_degenerate_areas() {
-        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0, false);
+        let lines = build_throughput_chart(&[1.0, 2.0], 3, 2, 1.0, &[], 0.0, false, Theme::default());
         assert_eq!(lines[0].to_string(), "chart too small");
     }
 
@@ -1405,7 +1412,7 @@ mod tests {
         let series: Vec<f64> = (0..60)
             .map(|i| 100.0 + 200.0 * ((i as f64) * 0.3).sin())
             .collect();
-        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0, false);
+        let lines = build_throughput_chart(&series, 40, 10, 150.0, &[], 0.0, false, Theme::default());
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1422,7 +1429,7 @@ mod tests {
     #[test]
     fn throughput_chart_empty_series_shows_awaiting() {
         // No samples yet → "Awaiting first tokens…", never a blank chart.
-        let lines = build_throughput_chart(&[], 30, 8, 0.0, &[], 0.0, false);
+        let lines = build_throughput_chart(&[], 30, 8, 0.0, &[], 0.0, false, Theme::default());
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1474,7 +1481,7 @@ mod tests {
             "Streams",
             "Total Duration",
         ] {
-            let text = label_cell(label).content.as_ref().to_string();
+            let text = label_cell(Theme::default(), label).content.as_ref().to_string();
             assert_eq!(text.len(), 20, "{label}: {text:?}");
             let colon = text.find(':').expect("the label cell carries a colon");
             assert_eq!(&text[..colon], label, "{label}: {text:?}");
@@ -1498,7 +1505,7 @@ mod tests {
     fn throughput_chart_right_aligns_newest_sample() {
         // A single sample must plot at the rightmost plot column, not the
         // left.
-        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0, false);
+        let lines = build_throughput_chart(&[100.0], 20, 5, 100.0, &[], 0.0, false, Theme::default());
         let rows: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
         // Find a row containing a bar; its rightmost █ should be near the
         // right edge.
@@ -1514,7 +1521,7 @@ mod tests {
     fn throughput_chart_frozen_shows_the_complete_overlay() {
         // FIX 2: once the run completes (frozen), the chart carries a
         // `✓ COMPLETE` overlay and stays the final state.
-        let lines = build_throughput_chart(&[100.0, 120.0, 90.0], 40, 8, 100.0, &[], 0.0, true);
+        let lines = build_throughput_chart(&[100.0, 120.0, 90.0], 40, 8, 100.0, &[], 0.0, true, Theme::default());
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -1708,7 +1715,7 @@ mod tests {
                 free_body: "hi".into(),
             });
         let m = crate::metrics::state::MetricsSnapshot::default();
-        let scores = build_capability_scores(&app, &m, &selected(&app));
+        let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
         // Only the two engines that ran appear (no empty/zero bars).
         assert_eq!(scores.len(), 2, "one bar per *run* capability");
         let details: String = scores
@@ -1734,7 +1741,7 @@ mod tests {
         let app = App::new();
         let m = crate::metrics::state::MetricsSnapshot::default();
         // Nothing ran, no hw poller → no bars at all.
-        assert!(build_capability_scores(&app, &m, &selected(&app)).is_empty());
+        assert!(build_capability_scores(&app, &m, &selected(&app), Theme::default()).is_empty());
     }
 
     #[test]
@@ -1748,7 +1755,7 @@ mod tests {
         let m = crate::metrics::state::MetricsSnapshot::default();
         let sel = selected(&app);
         assert!(sel.hardware);
-        let scores = build_capability_scores(&app, &m, &sel);
+        let scores = build_capability_scores(&app, &m, &sel, Theme::default());
         assert!(
             scores.iter().any(|s| s.label == "Energy Efficiency"),
             "selected + poller live → the Energy line shows"
@@ -1758,7 +1765,7 @@ mod tests {
         app.config.hardware = false;
         let sel = selected(&app);
         assert!(!sel.hardware);
-        let scores = build_capability_scores(&app, &m, &sel);
+        let scores = build_capability_scores(&app, &m, &sel, Theme::default());
         assert!(
             scores.iter().all(|s| s.label != "Energy Efficiency"),
             "unselected D never appears"
@@ -1767,16 +1774,17 @@ mod tests {
 
     #[test]
     fn capability_bar_fills_proportionally() {
+        let th = Theme::default();
         let s = CapScore {
             label: "Reasoning",
             pct: Some(50.0),
             detail: "50%".into(),
-            detail_style: style::value(),
-            color: palette::OK,
+            detail_style: style::value(th),
+            color: th.success(),
             info: "note",
             warn: None,
         };
-        let lines = build_cap_lines(&s);
+        let lines = build_cap_lines(&s, Theme::default());
         assert_eq!(lines.len(), 2, "value line + ℹ line");
         let text: String = lines[0]
             .spans
@@ -1799,14 +1807,15 @@ mod tests {
 
     #[test]
     fn capability_overall_composes_the_practical_summary() {
+        let th = Theme::default();
         // Strong reasoning, weak long-context, non-compliant JSON.
         let scores = vec![
             CapScore {
                 label: "Reasoning",
                 pct: Some(92.0),
                 detail: "92% (12/13)".into(),
-                detail_style: style::value(),
-                color: palette::OK,
+                detail_style: style::value(th),
+                color: th.success(),
                 info: "",
                 warn: None,
             },
@@ -1814,8 +1823,8 @@ mod tests {
                 label: "Long Context",
                 pct: Some(29.9),
                 detail: "29.9% (23/77)".into(),
-                detail_style: style::value(),
-                color: palette::ERR,
+                detail_style: style::value(th),
+                color: th.danger(),
                 info: "",
                 warn: Some("LOW"),
             },
@@ -1823,8 +1832,8 @@ mod tests {
                 label: "Structured Out",
                 pct: Some(0.0),
                 detail: "FAIL".into(),
-                detail_style: style::value_err(),
-                color: palette::ERR,
+                detail_style: style::value_err(th),
+                color: th.danger(),
                 info: "",
                 warn: Some("non-compliant"),
             },
@@ -1923,7 +1932,7 @@ mod tests {
             completed: Vec::new(),
             engine_started_ms: 0,
         };
-        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0, Theme::default());
         assert!(text.contains("ENGINE A: SPEED"), "{text}");
         assert!(text.contains("Running"), "{text}");
         assert!(text.contains("Iteration 2/5 · 248 tok"), "{text}");
@@ -1941,7 +1950,7 @@ mod tests {
             completed: vec![(Engine::Speed, "100.0 t/s decode".to_string())],
             engine_started_ms: 0,
         };
-        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0, Theme::default());
         assert!(text.contains("ENGINE A: SPEED"), "{text}");
         assert!(text.contains("Complete"), "{text}");
         assert!(text.contains("100.0 t/s decode"), "{text}");
@@ -1959,7 +1968,7 @@ mod tests {
             completed: Vec::new(),
             engine_started_ms: 0,
         };
-        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0);
+        let (_, _, text, _, ratio, _) = seq_header_parts(&state, 0, Theme::default());
         assert!(text.contains("ALL BENCHMARKS COMPLETE"), "{text}");
         assert_eq!(ratio, 1.0);
     }
@@ -2011,7 +2020,7 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(w, h);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal
-                .draw(|f| render_sequence_header(f.area(), &app, f))
+                .draw(|f| render_sequence_header(f.area(), &app, Theme::default(), f))
                 .unwrap();
             let buf = terminal.backend().buffer();
             // Row 0 is the top border + title. If the panel rendered at all,

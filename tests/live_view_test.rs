@@ -29,7 +29,7 @@ use crucible_llm::engines::{
 };
 use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
-use crucible_llm::ui::theme::palette;
+use crucible_llm::ui::theme::Theme;
 use crucible_llm::ui::views::live;
 
 mod common;
@@ -251,11 +251,11 @@ fn throughput_hero_renders_block_chart_with_axes() {
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "█" && c.fg == palette::TEXT),
+            .any(|c| c.symbol() == "█" && c.fg == Theme::Cyberpunk.bright()),
         "the hot cap is bright white/cyan"
     );
     assert!(
-        buf.content().iter().any(|c| c.fg == palette::FLOOR),
+        buf.content().iter().any(|c| c.fg == Theme::Cyberpunk.floor()),
         "the dim blue floor is present"
     );
 }

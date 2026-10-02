@@ -30,7 +30,7 @@ use crucible_llm::client::pool::WorkerPool;
 use crucible_llm::engines::concurrency::{Sweep, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crucible_llm::metrics::state::{StreamMetric, StreamStatus};
 use crucible_llm::ui::app::{App, View};
-use crucible_llm::ui::theme::palette;
+use crucible_llm::ui::theme::Theme;
 use crucible_llm::ui::views::concurrency;
 
 mod common;
@@ -495,20 +495,20 @@ fn view2_curve_marks_sweet_spot_and_knee() {
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "◆" && c.fg == palette::ACCENT),
+            .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.primary()),
         "sweet spot is a bright-cyan ◆"
     );
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "▲" && c.fg == palette::CALLOUT),
+            .any(|c| c.symbol() == "▲" && c.fg == Theme::Cyberpunk.accent()),
         "knee is a hot-pink ▲"
     );
     // The level below the sweet spot (1): a mint ◆ marker.
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "◆" && c.fg == palette::OK),
+            .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.success()),
         "levels below the sweet spot are mint ◆"
     );
     // Stems, the knee annotation, and the value labels on every point.
@@ -546,13 +546,13 @@ fn view2_curve_renders_the_full_ladder() {
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "◆" && c.fg == palette::ACCENT),
+            .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.primary()),
         "sweet spot (8) is a bright-cyan ◆"
     );
     assert!(
         buf.content()
             .iter()
-            .any(|c| c.symbol() == "▲" && c.fg == palette::CALLOUT),
+            .any(|c| c.symbol() == "▲" && c.fg == Theme::Cyberpunk.accent()),
         "knee (16) is a hot-pink ▲"
     );
     assert!(

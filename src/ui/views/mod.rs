@@ -11,7 +11,7 @@ use ratatui::Frame;
 
 use crate::engines::sequence::Engine;
 use crate::ui::app::{App, View};
-use crate::ui::theme::style;
+use crate::ui::theme::{style, Theme};
 
 pub mod concurrency;
 pub mod config;
@@ -19,6 +19,7 @@ pub mod history;
 pub mod live;
 pub mod needle;
 pub mod setup;
+pub mod theme_picker;
 
 /// Dispatch the current view into `area`.
 pub fn render_current(area: Rect, app: &App, f: &mut Frame) {
@@ -33,8 +34,8 @@ pub fn render_current(area: Rect, app: &App, f: &mut Frame) {
 
 /// The dimmed `ℹ` info lines for a multi-line help / description text
 /// (the first line carries the `ℹ` marker, continuation lines are
-/// indented two spaces).
-pub fn info_lines(text: &str) -> Vec<Line<'static>> {
+/// indented two spaces). Colored by the active theme.
+pub fn info_lines(th: Theme, text: &str) -> Vec<Line<'static>> {
     text.lines()
         .enumerate()
         .map(|(i, l)| {
@@ -44,7 +45,7 @@ pub fn info_lines(text: &str) -> Vec<Line<'static>> {
                 } else {
                     format!("  {l}")
                 },
-                style::info(),
+                style::info(th),
             ))
         })
         .collect()
@@ -53,7 +54,8 @@ pub fn info_lines(text: &str) -> Vec<Line<'static>> {
 /// The dimmed `ℹ` info lines for one engine's
 /// [`description`](Engine::description) (the setup / config engine
 /// selection shows the focused engine's note; the first line carries the
-/// `ℹ` marker, continuation lines are indented).
-pub fn engine_info_lines(engine: Engine) -> Vec<Line<'static>> {
-    info_lines(engine.description())
+/// `ℹ` marker, continuation lines are indented). Colored by the active
+/// theme.
+pub fn engine_info_lines(th: Theme, engine: Engine) -> Vec<Line<'static>> {
+    info_lines(th, engine.description())
 }

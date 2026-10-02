@@ -17,7 +17,7 @@ use ratatui::Frame;
 
 use crate::engines::capability::{NiahCellState, NIAH_DEPTHS, NIAH_SIZES};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, palette, style};
+use crate::ui::theme::{self, style, Theme};
 
 /// Context token sizes, 2k…128k (blueprint §5, Engine C1) — labels for the
 /// grid rows (the engine's `NIAH_SIZES` are the values).
@@ -27,18 +27,19 @@ const DEPTHS: [u8; 11] = NIAH_DEPTHS;
 
 /// Render the NIAH view into `area`.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(area);
-    render_grid(chunks[0], app, f);
-    render_legend(chunks[1], app, f);
+    render_grid(chunks[0], app, th, f);
+    render_legend(chunks[1], app, th, f);
 }
 
 /// N×M grid; each cell shows its state glyph (green `●` = nominal,
 /// yellow `●` = throttled, red `✗` = failed) or `···` (dimmed) until the
 /// matrix has been run.
-fn render_grid(area: Rect, app: &App, f: &mut Frame) {
+fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // Lock-free read of the published result (the runner's write seam is
     // the `n` key, never this path).
     let result = &*app.niah.load();
@@ -48,22 +49,22 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
         header.push(Cell::from(format!("{d:>3}%")));
     }
     header.push(Cell::from("PASS %"));
-    let mut rows: Vec<Row> = vec![Row::new(header).style(style::muted_title())];
+    let mut rows: Vec<Row> = vec![Row::new(header).style(style::muted_title(th))];
 
     let mut widths = vec![Constraint::Percentage(9)];
     widths.extend(std::iter::repeat_n(Constraint::Percentage(6), DEPTHS.len()));
     widths.push(Constraint::Percentage(11));
 
     for (i, label) in SIZE_LABELS.iter().enumerate() {
-        let mut cells = vec![Cell::from(*label).style(style::value())];
+        let mut cells = vec![Cell::from(*label).style(style::value(th))];
         for &depth in &DEPTHS {
             let (glyph, st) = match result.as_ref().and_then(|r| r.cell(NIAH_SIZES[i], depth)) {
                 Some(cell) => match cell.state {
-                    NiahCellState::Nominal => ("●", Style::default().fg(palette::OK)),
-                    NiahCellState::Throttled => ("●", Style::default().fg(palette::WARN)),
-                    NiahCellState::Failed => ("✗", Style::default().fg(palette::ERR)),
+                    NiahCellState::Nominal => ("●", Style::default().fg(th.success())),
+                    NiahCellState::Throttled => ("●", Style::default().fg(th.warn())),
+                    NiahCellState::Failed => ("✗", Style::default().fg(th.danger())),
                 },
-                None => ("···", Style::default().fg(palette::MUTED)),
+                None => ("···", Style::default().fg(th.dim())),
             };
             cells.push(Cell::from(glyph).style(st));
         }
@@ -73,8 +74,8 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
             .as_ref()
             .and_then(|r| r.size_pass_rate(NIAH_SIZES[i]))
         {
-            Some(p) => (fmt::format_pct(p), Style::default().fg(pass_rate_color(p))),
-            None => ("--".to_string(), Style::default().fg(palette::MUTED)),
+            Some(p) => (fmt::format_pct(p), Style::default().fg(pass_rate_color(th, p))),
+            None => ("--".to_string(), Style::default().fg(th.dim())),
         };
         cells.push(Cell::from(pr_text).style(pr_style));
         rows.push(Row::new(cells));
@@ -82,21 +83,21 @@ fn render_grid(area: Rect, app: &App, f: &mut Frame) {
 
     f.render_widget(
         Table::new(rows, widths).block(theme::block(
-            theme::panel_title("NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
-            style::border(),
+            theme::panel_title(th, "NEEDLE-IN-A-HAYSTACK MATRIX (context size × depth)"),
+            style::border(th),
         )),
         area,
     );
 }
 
 /// Pass-rate color: green (≥80%), yellow (50–79%), red (<50%).
-fn pass_rate_color(p: f64) -> Color {
+fn pass_rate_color(th: Theme, p: f64) -> Color {
     if p >= 80.0 {
-        palette::OK
+        th.success()
     } else if p >= 50.0 {
-        palette::WARN
+        th.warn()
     } else {
-        palette::ERR
+        th.danger()
     }
 }
 
@@ -104,7 +105,7 @@ fn pass_rate_color(p: f64) -> Color {
 /// benchmark sequence runs (NIAH is Engine C1 in that queue), the live
 /// request count while a standalone run is in flight, and the `[N]`
 /// confirmation hint when idle.
-fn render_legend(area: Rect, app: &App, f: &mut Frame) {
+fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let slot = &app.niah;
     let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
     let status = if app.seq.is_running() {
@@ -136,27 +137,27 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
          RAG and document QA.";
     let mut lines: Vec<Line> = vec![
         Line::from(vec![
-            Span::styled("● ", Style::default().fg(palette::OK)),
-            Span::styled("accurate + nominal prefill    ", style::label()),
-            Span::styled("● ", Style::default().fg(palette::WARN)),
-            Span::styled("accurate + throttled prefill    ", style::label()),
-            Span::styled("✗ ", Style::default().fg(palette::ERR)),
-            Span::styled("retrieval failed / hallucinated", style::label()),
+            Span::styled("● ", Style::default().fg(th.success())),
+            Span::styled("accurate + nominal prefill    ", style::label(th)),
+            Span::styled("● ", Style::default().fg(th.warn())),
+            Span::styled("accurate + throttled prefill    ", style::label(th)),
+            Span::styled("✗ ", Style::default().fg(th.danger())),
+            Span::styled("retrieval failed / hallucinated", style::label(th)),
         ]),
-        Line::from(Span::styled(status, style::footer())),
+        Line::from(Span::styled(status, style::footer(th))),
     ];
     // Empty state: no result yet and nothing in flight → say what will
     // appear and when.
     if slot.load().is_none() && !slot.is_running() && !app.seq.is_running() {
         lines.push(Line::from(Span::styled(
             "NIAH results will appear here after Engine C1 completes.",
-            style::info(),
+            style::info(th),
         )));
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("ℹ {NIAH_INFO}"),
-        style::info(),
+        style::info(th),
     )));
     // The practical interpretation: the "reliable up to ~Xk" threshold
     // computed from the actual grid (shown once a result exists).
@@ -164,12 +165,12 @@ fn render_legend(area: Rect, app: &App, f: &mut Frame) {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("ℹ {}", r.interpretation()),
-            style::info(),
+            style::info(th),
         )));
     }
     f.render_widget(
         Paragraph::new(Text::from(lines))
-            .block(theme::block(theme::panel_title("LEGEND"), style::border()))
+            .block(theme::block(theme::panel_title(th, "LEGEND"), style::border(th)))
             .wrap(Wrap { trim: true }),
         area,
     );

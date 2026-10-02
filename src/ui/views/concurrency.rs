@@ -27,7 +27,7 @@ use ratatui::Frame;
 
 use crate::engines::concurrency::{Envelope, SweepLevel, SweepResult, DEFAULT_LADDER};
 use crate::ui::app::{fmt, App};
-use crate::ui::theme::{self, glyph, palette, style};
+use crate::ui::theme::{self, glyph, style, Theme};
 
 /// Render the Concurrency view into `area`.
 ///
@@ -36,6 +36,7 @@ use crate::ui::theme::{self, glyph, palette, style};
 /// Reading `app.sweep` is a pure `&` read — no locks, no timing path
 /// (measurement isolation, blueprint §4).
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
+    let th = app.active_theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -52,9 +53,9 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .as_ref()
         .as_ref()
         .and_then(|r| r.envelope());
-    render_curve(chunks[0], app, f, &envelope);
-    render_matrix(chunks[1], app, f, &envelope);
-    render_recommendation(chunks[2], app, f);
+    render_curve(chunks[0], app, th, f, &envelope);
+    render_matrix(chunks[1], app, th, f, &envelope);
+    render_recommendation(chunks[2], app, th, f);
 }
 
 /// Top panel: aggregate throughput vs concurrent users — one point per
@@ -63,15 +64,15 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// (yellow) and the **saturation knee** (red `▲`) marked, the
 /// diminishing-returns zone past the knee drawn dim/red, and a
 /// plain-language "what to do with this" note underneath.
-fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
+fn render_curve(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Option<Envelope>) {
     // The primary title is uppercase + accent; the descriptive subtitle keeps
     // its natural casing (the "… vs Parallel Users" phrasing).
     let title = Line::from(vec![
-        Span::styled(format!("{} ", glyph::PREFIX), style::title()),
-        Span::styled("CONCURRENCY SWEEP — ", style::title()),
-        Span::styled("Aggregate Throughput vs Parallel Users", style::title()),
+        Span::styled(format!("{} ", glyph::PREFIX), style::title(th)),
+        Span::styled("CONCURRENCY SWEEP — ", style::title(th)),
+        Span::styled("Aggregate Throughput vs Parallel Users", style::title(th)),
     ]);
-    let block = theme::block(title, style::border());
+    let block = theme::block(title, style::border(th));
 
     let sweep = app.sweep.load();
     let Some(result) = sweep.as_ref().as_ref().filter(|r| !r.levels.is_empty()) else {
@@ -80,11 +81,11 @@ fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope
             Paragraph::new(Text::from(vec![
                 Line::from(Span::styled(
                     "Concurrency sweep will populate this view.",
-                    style::info(),
+                    style::info(th),
                 )),
                 Line::from(Span::styled(
                     "Run a sweep (Engine B in the Config view, or [r]) to plot the curve.",
-                    style::footer(),
+                    style::footer(th),
                 )),
             ]))
             .block(block),
@@ -95,11 +96,11 @@ fn render_curve(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let notes = curve_notes(&result.levels);
+    let notes = curve_notes(th, &result.levels);
     // Give the plot the space left over for the notes (it self-degrades
     // to a compact form when squeezed by a small terminal).
     let plot_h = (inner_h as i64 - notes.len() as i64).max(4) as u16;
-    let lines = build_curve_lines(&result.levels, inner_w as u16, plot_h, envelope);
+    let lines = build_curve_lines(th, &result.levels, inner_w as u16, plot_h, envelope);
     let mut all = lines;
     all.extend(notes);
     f.render_widget(Paragraph::new(Text::from(all)).block(block), area);
@@ -139,6 +140,7 @@ struct CurvePoint {
 ///
 /// Below 8 rows the axis title / legend drop out (compact form).
 pub(crate) fn build_curve_lines(
+    th: Theme,
     levels: &[SweepLevel],
     w: u16,
     h: u16,
@@ -184,25 +186,25 @@ pub(crate) fn build_curve_lines(
         match (sweet, knee) {
             (Some(s), Some(k)) => {
                 if c > k {
-                    palette::ERR
+                    th.danger()
                 } else if c == s {
-                    palette::ACCENT
+                    th.primary()
                 } else if c > s {
-                    palette::CALLOUT
+                    th.accent()
                 } else {
-                    palette::OK
+                    th.success()
                 }
             }
             (Some(s), None) => {
                 if c == s {
-                    palette::ACCENT
+                    th.primary()
                 } else if c > s {
-                    palette::ERR
+                    th.danger()
                 } else {
-                    palette::OK
+                    th.success()
                 }
             }
-            _ => palette::OK,
+            _ => th.success(),
         }
     };
 
@@ -245,7 +247,7 @@ pub(crate) fn build_curve_lines(
         let text = "t/s";
         for (i, ch) in text.chars().enumerate() {
             if i < w {
-                grid[r][i] = (ch, Some(palette::MUTED));
+                grid[r][i] = (ch, Some(th.dim()));
             }
         }
     }
@@ -256,7 +258,7 @@ pub(crate) fn build_curve_lines(
         for (i, ch) in text.chars().enumerate() {
             let col = start + i;
             if col < w && row < h {
-                grid[row][col] = (ch, Some(palette::MUTED));
+                grid[row][col] = (ch, Some(th.dim()));
             }
         }
     };
@@ -273,11 +275,11 @@ pub(crate) fn build_curve_lines(
         if i > 0 {
             let prev = &pts[i - 1];
             let fill_top = (p.y as usize).min(prev.y as usize);
-            let degraded = p.color == palette::ERR || p.color == palette::CALLOUT;
+            let degraded = p.color == th.danger() || p.color == th.accent();
             let fill = if degraded {
-                palette::SECONDARY
+                th.secondary()
             } else {
-                palette::FLOOR
+                th.floor()
             };
             for row in grid.iter_mut().take(base_row + 1).skip(fill_top) {
                 for cell in row.iter_mut().take(p.x as usize).skip(prev.x as usize + 1) {
@@ -289,7 +291,7 @@ pub(crate) fn build_curve_lines(
         }
         // Vertical stem (dim cyan).
         for row in grid.iter_mut().take(base_row + 1).skip(p.y as usize) {
-            row[p.x as usize] = ('│', Some(palette::BORDER_ACTIVE));
+            row[p.x as usize] = ('│', Some(th.border_active()));
         }
         // The marker at the top of the stem.
         grid[p.y as usize][p.x as usize] = (p.marker, Some(p.color));
@@ -297,7 +299,7 @@ pub(crate) fn build_curve_lines(
         if i > 0 {
             let prev = &pts[i - 1];
             for cell in &mut grid[p.y as usize][(prev.x as usize + 1)..(p.x as usize).min(w)] {
-                *cell = ('─', Some(palette::BORDER_ACTIVE));
+                *cell = ('─', Some(th.border_active()));
             }
         }
     }
@@ -353,11 +355,11 @@ pub(crate) fn build_curve_lines(
 
     // x-axis row: `├──┬──` with a `┬` under each point.
     for cell in &mut grid[axis_row][Y_AXIS_W..] {
-        *cell = ('─', Some(palette::MUTED));
+        *cell = ('─', Some(th.dim()));
     }
-    grid[axis_row][Y_AXIS_W] = ('├', Some(palette::MUTED));
+    grid[axis_row][Y_AXIS_W] = ('├', Some(th.dim()));
     for p in &pts {
-        grid[axis_row][p.x as usize] = ('┬', Some(palette::MUTED));
+        grid[axis_row][p.x as usize] = ('┬', Some(th.dim()));
     }
 
     // x labels (the concurrency values), skipping overlaps.
@@ -368,7 +370,7 @@ pub(crate) fn build_curve_lines(
             for (i, ch) in p.label.chars().enumerate() {
                 let col = (start + i as i64) as usize;
                 if col < w {
-                    grid[labels_row][col] = (ch, Some(palette::MUTED));
+                    grid[labels_row][col] = (ch, Some(th.dim()));
                 }
             }
             x_end = start + p.label.len() as i64;
@@ -382,15 +384,15 @@ pub(crate) fn build_curve_lines(
             r,
             Y_AXIS_W,
             "concurrent users",
-            palette::MUTED,
+            th.dim(),
             w,
         );
     }
     if let Some(r) = legend_row {
         let legend: [(&str, Color); 3] = [
-            ("◆ measured", palette::OK),
-            ("▲ knee", palette::CALLOUT),
-            ("── diminishing returns", palette::SECONDARY),
+            ("◆ measured", th.success()),
+            ("▲ knee", th.accent()),
+            ("── diminishing returns", th.secondary()),
         ];
         let mut col = Y_AXIS_W;
         for (text, color) in legend {
@@ -485,7 +487,7 @@ fn write_text(
 /// **unusable beyond** boundary (<15 t/s each), and the **pure
 /// throughput knee** as reference only. Pure over the sweep result
 /// (unit-testable, no terminal).
-fn recommendation_lines(result: &SweepResult) -> Vec<Line<'static>> {
+fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
     let us = result.usability();
     // The reference knee: the detected saturation knee, else the peak-
     // throughput level (where total t/s tops out).
@@ -502,59 +504,59 @@ fn recommendation_lines(result: &SweepResult) -> Vec<Line<'static>> {
                 Span::styled(
                     "  Practical Sweet Spot: ",
                     Style::default()
-                        .fg(palette::OK)
+                        .fg(th.success())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{n} concurrent users"),
                     Style::default()
-                        .fg(palette::OK)
+                        .fg(th.success())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" — each gets ~{:.0} t/s", us.practical_per_stream),
-                    style::value_ok(),
+                    style::value_ok(th),
                 ),
             ]));
         }
         None => ls.push(Line::from(Span::styled(
             "  Practical Sweet Spot: — (even 1 user is below 40 t/s)",
-            style::value_warn(),
+            style::value_warn(th),
         ))),
     }
     // Maximum usable.
     match us.max_usable {
         Some(n) => ls.push(Line::from(vec![
-            Span::styled("  Maximum Usable:      ", style::label()),
-            Span::styled(format!("{n} concurrent users"), style::value()),
+            Span::styled("  Maximum Usable:      ", style::label(th)),
+            Span::styled(format!("{n} concurrent users"), style::value(th)),
             Span::styled(
                 format!(" — each gets ~{:.0} t/s (slower)", us.max_usable_per_stream),
-                style::footer(),
+                style::footer(th),
             ),
         ])),
         None => ls.push(Line::from(Span::styled(
             "  Maximum Usable:      — (below 15 t/s per user throughout)",
-            style::value_err(),
+            style::value_err(th),
         ))),
     }
     // Unusable beyond.
     match us.unusable_from {
         Some(n) => ls.push(Line::from(vec![
-            Span::styled("  Unusable Beyond:     ", style::label()),
-            Span::styled(format!("{n}+ concurrent users"), style::value_err()),
-            Span::styled(" — each drops below 15 t/s", style::footer()),
+            Span::styled("  Unusable Beyond:     ", style::label(th)),
+            Span::styled(format!("{n}+ concurrent users"), style::value_err(th)),
+            Span::styled(" — each drops below 15 t/s", style::footer(th)),
         ])),
         None => ls.push(Line::from(Span::styled(
             "  Unusable Beyond:     not reached in this sweep",
-            style::footer(),
+            style::footer(th),
         ))),
     }
     // Pure throughput knee — reference only.
     if let Some(k) = knee {
         ls.push(Line::from(vec![
-            Span::styled("  Pure Throughput Knee: ", style::label()),
-            Span::styled(format!("{k}"), style::footer()),
-            Span::styled(" (reference only — total t/s peaks here)", style::footer()),
+            Span::styled("  Pure Throughput Knee: ", style::label(th)),
+            Span::styled(format!("{k}"), style::footer(th)),
+            Span::styled(" (reference only — total t/s peaks here)", style::footer(th)),
         ]));
     }
     ls
@@ -563,19 +565,19 @@ fn recommendation_lines(result: &SweepResult) -> Vec<Line<'static>> {
 /// The plain-language note under the plot (shared with the Live view's
 /// concurrency panel, FIX 3): what the recommendation means, the
 /// practical-sweet-spot lines, and the aggregate-throughput caveat.
-pub(crate) fn curve_notes(levels: &[SweepLevel]) -> Vec<Line<'static>> {
+pub(crate) fn curve_notes(th: Theme, levels: &[SweepLevel]) -> Vec<Line<'static>> {
     let result = SweepResult {
         levels: levels.to_vec(),
         matrix: None,
     };
     let mut ls: Vec<Line> = vec![Line::from(Span::styled(
         "ℹ Sweet spot = most users where EACH still gets ≥40 t/s (comfortable).",
-        style::info(),
+        style::info(th),
     ))];
-    ls.extend(recommendation_lines(&result));
+    ls.extend(recommendation_lines(th, &result));
     ls.push(Line::from(Span::styled(
         "ℹ Aggregate t/s alone misleads: many slow users is not fast service.",
-        style::info(),
+        style::info(th),
     )));
     ls
 }
@@ -583,7 +585,7 @@ pub(crate) fn curve_notes(levels: &[SweepLevel]) -> Vec<Line<'static>> {
 /// Sweep matrix: one row per ladder step — real aggregate t/s + p90 TPOT
 /// once a sweep has run, `--` until then. The knee row is flagged red
 /// (`KNEE`) and the sweet-spot row green (`SWEET`).
-fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelope>) {
+fn render_matrix(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Option<Envelope>) {
     let mut rows: Vec<Row> = vec![Row::new(vec![
         Cell::from("USERS"),
         Cell::from("AGG T/S"),
@@ -591,7 +593,7 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
         Cell::from("P90 TPOT"),
         Cell::from("STATUS"),
     ])
-    .style(style::muted_title())];
+    .style(style::muted_title(th))];
 
     let sweep = app.sweep.load();
     match sweep.as_ref().as_ref() {
@@ -606,7 +608,7 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
                 .map(|l| l.aggregate_tps / l.concurrency.max(1) as f64)
                 .unwrap_or(0.0);
             for level in &result.levels {
-                rows.push(sweep_row(level, envelope, app.concurrency_target, baseline));
+                rows.push(sweep_row(th, level, envelope, app.concurrency_target, baseline));
             }
         }
         _ => {
@@ -614,9 +616,9 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
                 let is_target = level == app.concurrency_target;
                 rows.push(Row::new(vec![
                     Cell::from(level.to_string()).style(if is_target {
-                        style::value_ok()
+                        style::value_ok(th)
                     } else {
-                        style::label()
+                        style::label(th)
                     }),
                     Cell::from("--"),
                     Cell::from("--"),
@@ -627,9 +629,9 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
                         "not run"
                     })
                     .style(if is_target {
-                        style::value_ok()
+                        style::value_ok(th)
                     } else {
-                        style::footer()
+                        style::footer(th)
                     }),
                 ]));
             }
@@ -648,8 +650,8 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
             ],
         )
         .block(theme::block(
-            theme::panel_title("CONCURRENCY SWEEP — Aggregate vs Per-Stream t/s"),
-            style::border(),
+            theme::panel_title(th, "CONCURRENCY SWEEP — Aggregate vs Per-Stream t/s"),
+            style::border(th),
         )),
         area,
     );
@@ -660,6 +662,7 @@ fn render_matrix(area: Rect, app: &App, f: &mut Frame, envelope: &Option<Envelop
 /// the **Per-Stream t/s** column (FIX 3: aggregate ÷ users) plus a
 /// color-coded per-stream status.
 fn sweep_row<'a>(
+    th: Theme,
     level: &'a SweepLevel,
     envelope: &'a Option<Envelope>,
     target: usize,
@@ -692,23 +695,23 @@ fn sweep_row<'a>(
 
     // FIX 3: per-stream t/s = aggregate ÷ users — what EACH user gets.
     let per = level.aggregate_tps / level.concurrency.max(1) as f64;
-    let (ps_label, ps_style) = per_stream_status(per, baseline);
+    let (ps_label, ps_style) = per_stream_status(th, per, baseline);
 
     let value_style = if is_knee {
-        style::value_err()
+        style::value_err(th)
     } else if is_sweet {
-        style::value_ok()
+        style::value_ok(th)
     } else if level.concurrency == target {
-        style::highlight()
+        style::highlight(th)
     } else {
-        style::label()
+        style::label(th)
     };
     let state_style = if is_knee {
-        style::value_err()
+        style::value_err(th)
     } else if is_sweet {
-        style::value_ok()
+        style::value_ok(th)
     } else {
-        style::footer()
+        style::footer(th)
     };
     Row::new(vec![
         Cell::from(level.concurrency.to_string()).style(value_style),
@@ -727,21 +730,21 @@ fn sweep_row<'a>(
 /// baseline (per-stream = aggregate ÷ users). The "degraded" threshold is
 /// when per-stream falls below 50% of the baseline — the point where adding
 /// more users starts hurting everyone's individual experience.
-fn per_stream_status(per: f64, baseline: f64) -> (String, Style) {
+fn per_stream_status(th: Theme, per: f64, baseline: f64) -> (String, Style) {
     let ratio = if baseline > 0.0 { per / baseline } else { 1.0 };
     if ratio >= 0.85 {
-        ("◆ optimal".to_string(), style::value_ok())
+        ("◆ optimal".to_string(), style::value_ok(th))
     } else if ratio >= 0.50 {
-        ("◆ good".to_string(), style::value_warn())
+        ("◆ good".to_string(), style::value_warn(th))
     } else if ratio >= 0.25 {
         (
             "▲ knee".to_string(),
             Style::default()
-                .fg(palette::CALLOUT)
+                .fg(th.accent())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("✕ saturated".to_string(), style::value_err())
+        ("✕ saturated".to_string(), style::value_err(th))
     }
 }
 
@@ -758,14 +761,14 @@ const RECOMMENDATION_INFO: [&str; 4] = [
 /// the recommendation), the maximum usable level, the unusable boundary,
 /// and the pure-throughput knee as reference only — plus the dimmed `ℹ`
 /// notes explaining why per-stream beats aggregate.
-fn render_recommendation(area: Rect, app: &App, f: &mut Frame) {
+fn render_recommendation(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let sweep = app.sweep.load();
     let lines: Vec<Line> = sweep
         .as_ref()
         .as_ref()
         .filter(|r| !r.levels.is_empty())
         .map(|r| {
-            let mut ls = recommendation_lines(r);
+            let mut ls = recommendation_lines(th, r);
             ls.push(Line::raw(""));
             for (i, note) in RECOMMENDATION_INFO.iter().enumerate() {
                 // The last line continues the previous sentence (no `ℹ`).
@@ -774,40 +777,40 @@ fn render_recommendation(area: Rect, app: &App, f: &mut Frame) {
                 } else {
                     format!("ℹ {note}")
                 };
-                ls.push(Line::from(Span::styled(prefixed, style::info())));
+                ls.push(Line::from(Span::styled(prefixed, style::info(th))));
             }
             ls
         })
         .unwrap_or_else(|| {
             vec![
                 Line::from(vec![
-                    Span::styled("Practical Sweet Spot: ", style::label()),
+                    Span::styled("Practical Sweet Spot: ", style::label(th)),
                     Span::styled(
                         format!("{} streams", app.concurrency_target),
-                        style::highlight(),
+                        style::highlight(th),
                     ),
-                    Span::styled("  (current target — step with [+])", style::footer()),
+                    Span::styled("  (current target — step with [+])", style::footer(th)),
                 ]),
                 Line::from(Span::styled(
                     "Run a sweep (Engine B) to find how many users you can serve while each stays fast.",
-                    style::footer(),
+                    style::footer(th),
                 )),
                 Line::raw(""),
                 Line::from(Span::styled(
                     "ℹ \"Practical sweet spot\" = most users where each still gets ≥40 t/s.",
-                    style::info(),
+                    style::info(th),
                 )),
                 Line::from(Span::styled(
                     "ℹ This is what matters for real use: coding agents, chat, RAG pipelines.",
-                    style::info(),
+                    style::info(th),
                 )),
             ]
         });
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(theme::block(
-                theme::panel_title("CONCURRENCY RECOMMENDATION"),
-                style::active_border(),
+                theme::panel_title(th, "CONCURRENCY RECOMMENDATION"),
+                style::active_border(th),
             ))
             .wrap(Wrap { trim: true }),
         area,
@@ -844,7 +847,7 @@ mod tests {
 
     #[test]
     fn curve_lines_guard_degenerate_areas() {
-        let lines = build_curve_lines(&[lvl(1, 100.0, 5.0)], 3, 3, &None);
+        let lines = build_curve_lines(Theme::default(), &[lvl(1, 100.0, 5.0)], 3, 3, &None);
         assert_eq!(lines[0].to_string(), "plot area too small");
     }
 
@@ -858,7 +861,7 @@ mod tests {
             matrix: None,
         }
         .envelope();
-        let lines = build_curve_lines(&levels, 80, 12, &env);
+        let lines = build_curve_lines(Theme::default(), &levels, 80, 12, &env);
         let text: String = lines
             .iter()
             .map(|l| l.to_string())
@@ -891,7 +894,7 @@ mod tests {
         // Per-stream: 100, 175, 20 → practical 2, max usable 4, no
         // unusable boundary; the knee (reference) is at 4.
         let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 80.0, 20.0)];
-        let notes = curve_notes(&levels);
+        let notes = curve_notes(Theme::default(), &levels);
         let text: String = notes
             .iter()
             .map(|l| l.to_string())
@@ -926,7 +929,7 @@ mod tests {
             lvl(4, 300.0, 8.0),
             lvl(8, 117.6, 20.0),
         ];
-        let notes = curve_notes(&levels);
+        let notes = curve_notes(Theme::default(), &levels);
         let text: String = notes
             .iter()
             .map(|l| l.to_string())
@@ -943,7 +946,7 @@ mod tests {
         // Per-stream: 30, 10 → no practical spot (nothing ≥40), one usable
         // level (30 ≥ 15), unusable from 2.
         let levels = vec![lvl(1, 30.0, 5.0), lvl(2, 20.0, 8.0)];
-        let notes = curve_notes(&levels);
+        let notes = curve_notes(Theme::default(), &levels);
         let text: String = notes
             .iter()
             .map(|l| l.to_string())
@@ -1037,7 +1040,7 @@ mod tests {
         // (h=12 → full layout: grid rows 1..=7; the legend row below is
         // excluded so its `●` is not counted as a data point.)
         let levels = vec![lvl(1, 50.0, 5.0), lvl(2, 400.0, 6.0)];
-        let lines = build_curve_lines(&levels, 40, 12, &None);
+        let lines = build_curve_lines(Theme::default(), &levels, 40, 12, &None);
         let rows: Vec<Vec<char>> = lines
             .iter()
             .map(|l| l.to_string().chars().collect())
@@ -1059,13 +1062,13 @@ mod tests {
     #[test]
     fn per_stream_status_tracks_the_baseline() {
         // Baseline 100 t/s (the single-user rate).
-        assert_eq!(per_stream_status(100.0, 100.0).0, "◆ optimal");
-        assert_eq!(per_stream_status(90.0, 100.0).0, "◆ optimal"); // 0.90
-        assert_eq!(per_stream_status(60.0, 100.0).0, "◆ good"); // 0.60
-        assert_eq!(per_stream_status(40.0, 100.0).0, "▲ knee"); // 0.40
-        assert_eq!(per_stream_status(20.0, 100.0).0, "✕ saturated"); // 0.20
+        assert_eq!(per_stream_status(Theme::default(), 100.0, 100.0).0, "◆ optimal");
+        assert_eq!(per_stream_status(Theme::default(), 90.0, 100.0).0, "◆ optimal"); // 0.90
+        assert_eq!(per_stream_status(Theme::default(), 60.0, 100.0).0, "◆ good"); // 0.60
+        assert_eq!(per_stream_status(Theme::default(), 40.0, 100.0).0, "▲ knee"); // 0.40
+        assert_eq!(per_stream_status(Theme::default(), 20.0, 100.0).0, "✕ saturated"); // 0.20
                                                                      // No baseline → treated as optimal (ratio 1.0).
-        assert_eq!(per_stream_status(50.0, 0.0).0, "◆ optimal");
+        assert_eq!(per_stream_status(Theme::default(), 50.0, 0.0).0, "◆ optimal");
     }
 
     #[test]
