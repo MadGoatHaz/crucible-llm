@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::client::{run_worker, StreamEvent, StreamWorker};
+use crate::client::{join_worker, spawn_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
@@ -392,8 +392,9 @@ impl ReasoningEngine {
         }
 
         let start = MonotonicInstant::now();
-        // A worker-task panic becomes a failed outcome, never a crash.
-        let outcome = run_worker(worker, tx).await;
+        // Spawn without awaiting: drain the channel concurrently to avoid
+        // the >capacity deadlock (server-agnostic fix).
+        let handle = spawn_worker(worker, tx);
         let mut response = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
@@ -440,6 +441,9 @@ impl ReasoningEngine {
                 REASONING_MAX_GEN_TOKENS,
             ));
         }
+
+        // Channel closed: collect the outcome.
+        let outcome = join_worker(handle).await;
 
         // §7 timing deltas (the worker owns the quanta stamps).
         let ts: StreamTimestamps = outcome.timestamps;

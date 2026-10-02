@@ -863,8 +863,49 @@ impl StreamWorker {
 /// into a [`StreamError::Read`] failure outcome instead of unwinding the
 /// benchmark — the N/A-never-fail rule: one bad stream is recorded, the
 /// run continues, and the process never crashes mid-measurement.
+///
+/// **Deadlock warning:** this function awaits the worker to completion
+/// before the caller can drain the `tx` channel. If the worker produces
+/// more frames than the channel capacity, `tx.send()` blocks and the
+/// worker never finishes → deadlock. Engines that drain the channel
+/// concurrently should use [`spawn_worker`] instead.
 pub async fn run_worker(worker: StreamWorker, tx: mpsc::Sender<StreamEvent>) -> StreamOutcome {
     match tokio::spawn(worker.run(tx)).await {
+        Ok(outcome) => outcome,
+        Err(join) => StreamOutcome {
+            timestamps: StreamTimestamps::default(),
+            usage: None,
+            premature: false,
+            malformed_frames: 0,
+            error: Some(StreamError::Read(format!("worker task failed: {join}"))),
+            looping: false,
+            loop_excluded_tokens: 0,
+        },
+    }
+}
+
+/// Spawn a [`StreamWorker`] on its own task and return the
+/// [`tokio::task::JoinHandle`] immediately (non-blocking).
+///
+/// The caller must drain the `tx` channel concurrently with the worker
+/// running, then await the handle for the final [`StreamOutcome`]. This
+/// avoids the deadlock that `run_worker` causes when the worker produces
+/// more frames than the bounded channel capacity.
+///
+/// A task panic (an internal bug, not an endpoint fault) is converted
+/// into a [`StreamError::Read`] failure outcome when the handle is
+/// awaited — the N/A-never-fail rule.
+pub fn spawn_worker(
+    worker: StreamWorker,
+    tx: mpsc::Sender<StreamEvent>,
+) -> tokio::task::JoinHandle<StreamOutcome> {
+    tokio::spawn(worker.run(tx))
+}
+
+/// Await a [`spawn_worker`] handle, converting a task panic into a
+/// [`StreamError::Read`] failure outcome (N/A-never-fail).
+pub async fn join_worker(handle: tokio::task::JoinHandle<StreamOutcome>) -> StreamOutcome {
+    match handle.await {
         Ok(outcome) => outcome,
         Err(join) => StreamOutcome {
             timestamps: StreamTimestamps::default(),
