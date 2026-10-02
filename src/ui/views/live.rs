@@ -72,7 +72,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     // key-metrics panel carries a two-line-per-metric description, so it
     // gets the wider share of the row.
     let mut plan: Vec<(u8, Constraint)> = Vec::new();
-    plan.push((0, Constraint::Length(3))); // sequence header + progress bar
+    plan.push((0, Constraint::Length(4))); // sequence header + progress bar
     plan.push((1, Constraint::Percentage(38))); // throughput hero | key metrics
     if show_concurrency {
         plan.push((2, Constraint::Percentage(23))); // concurrency curve
@@ -1132,7 +1132,7 @@ const SPINNERS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '
 /// engine runs, turns green on completion, and magenta when the whole
 /// sequence is done.
 fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
-    if area.width < 12 || area.height < 3 {
+    if area.width < 12 || area.height < 4 {
         return;
     }
 
@@ -1149,33 +1149,29 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
         Some(state) => seq_header_parts(&state, app.tick),
     };
 
-    // The progress bar: `[████████░░░░]  40%` — sized to the remaining
-    // width after the text (never negative; small terminals drop it).
-    let inner_width = (area.width - 2) as usize;
-    let bar_width = inner_width
-        .saturating_sub(text.chars().count() + marker.len() + 8)
-        .clamp(0, 40);
-
-    let mut spans: Vec<Span> = vec![
+    // Line 1: the status (marker + text).
+    let status_line = Line::from(vec![
         Span::raw(" "),
         Span::styled(marker, marker_style),
         Span::raw(" "),
         Span::styled(text, text_style),
-    ];
-    if bar_width > 0 {
+    ]);
+
+    // Line 2: the progress bar `[████████░░░░]  40%` — sized to the full
+    // inner width (never negative; small terminals drop it).
+    let inner_width = (area.width - 2) as usize;
+    let bar_width = inner_width.saturating_sub(8).clamp(0, 40);
+
+    let bar_line = if bar_width > 0 {
         let filled = (ratio.clamp(0.0, 1.0) * bar_width as f64).round() as usize;
-        spans.push(Span::raw("  "));
+        let mut spans: Vec<Span> = vec![Span::raw(" ")];
         spans.push(Span::styled(
             "[".to_string(),
             Style::default().fg(palette::MUTED),
         ));
         for i in 0..bar_width {
             if i < filled {
-                let frac = if bar_width > 0 {
-                    i as f64 / bar_width as f64
-                } else {
-                    0.0
-                };
+                let frac = i as f64 / bar_width as f64;
                 let (ch, color) = progress_layer(frac);
                 spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
             } else {
@@ -1193,10 +1189,13 @@ fn render_sequence_header(area: Rect, app: &App, f: &mut Frame) {
             format!(" {:4.0}%", ratio * 100.0),
             style::value(),
         ));
-    }
+        Line::from(spans)
+    } else {
+        Line::raw("")
+    };
 
     f.render_widget(
-        Paragraph::new(Line::from(spans))
+        Paragraph::new(Text::from(vec![status_line, bar_line]))
             .block(theme::block(
                 theme::panel_title("BENCHMARK SEQUENCE"),
                 border_style,
