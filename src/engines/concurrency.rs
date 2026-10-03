@@ -213,15 +213,36 @@ pub struct ConcurrencyMatrix {
 
 /// The full sweep curve: one [`SweepLevel`] per ladder step, plus (when
 /// the sweep ran with the v0.1.1 multi-context matrix axis) the full
-/// `context × concurrency` grid.
+/// `context × concurrency` grid, and the recommended **sweet spot**
+/// (the stream count Engine F / Flat Out uses for its real-world
+/// full-load run).
 #[derive(Debug, Clone, Default)]
 pub struct SweepResult {
     pub levels: Vec<SweepLevel>,
     /// The 2D matrix (v0.1.1) — `None` for a single-context sweep.
     pub matrix: Option<ConcurrencyMatrix>,
+    /// The recommended number of concurrent streams for a real-world
+    /// full-load run: the **practical sweet spot** (the highest level
+    /// where every stream still gets ≥ [`PRACTICAL_PER_STREAM_TPS`] —
+    /// 30 t/s ideal with a 2% margin, 29.4 t/s effective), falling back
+    /// to the **maximum usable** level (≥ [`USABLE_PER_STREAM_TPS`]),
+    /// then to a single stream. Computed by [`Self::from_levels`]; `0`
+    /// for an empty / default result.
+    pub sweet_spot: usize,
 }
 
 impl SweepResult {
+    /// Build a complete result from its levels (and optional matrix):
+    /// `sweet_spot` is derived from the curve
+    /// ([`recommended_streams_for`]).
+    pub fn from_levels(levels: Vec<SweepLevel>, matrix: Option<ConcurrencyMatrix>) -> Self {
+        Self {
+            sweet_spot: recommended_streams_for(&levels),
+            levels,
+            matrix,
+        }
+    }
+
     /// `true` when no level ran.
     pub fn is_empty(&self) -> bool {
         self.levels.is_empty()
@@ -302,7 +323,8 @@ impl SweepResult {
     ///
     /// * [`UsabilityProfile::practical_sweet_spot`] — the highest
     ///   concurrency where every stream still gets at least
-    ///   [`PRACTICAL_PER_STREAM_TPS`] (40 t/s: comfortable);
+    ///   [`PRACTICAL_PER_STREAM_TPS`] (30 t/s ideal with a 2% margin:
+    ///   29.4 t/s effective — comfortable for all tasks);
     /// * [`UsabilityProfile::max_usable`] — the highest concurrency
     ///   where every stream still gets at least
     ///   [`USABLE_PER_STREAM_TPS`] (15 t/s: usable, noticeably slower);
@@ -316,45 +338,85 @@ impl SweepResult {
     /// Pure function over the curve: no timing, no locks (measurement
     /// isolation, blueprint §4).
     pub fn usability(&self) -> UsabilityProfile {
-        let mut sorted: Vec<&SweepLevel> = self.levels.iter().collect();
-        sorted.sort_by_key(|l| l.concurrency);
-        let mut p = UsabilityProfile::default();
-        for l in &sorted {
-            let per = l.aggregate_tps / l.concurrency.max(1) as f64;
-            if per >= PRACTICAL_PER_STREAM_TPS {
-                p.practical_sweet_spot = Some(l.concurrency);
-                p.practical_per_stream = per;
-            }
-            if per >= USABLE_PER_STREAM_TPS {
-                p.max_usable = Some(l.concurrency);
-                p.max_usable_per_stream = per;
-            }
-            if p.unusable_from.is_none() && per < USABLE_PER_STREAM_TPS {
-                p.unusable_from = Some(l.concurrency);
-            }
-        }
-        p
+        usability_of(&self.levels)
     }
 }
 
-/// Per-stream throughput (aggregate ÷ users) at or above which each user
-/// gets a **comfortable** experience — chat, coding agents, RAG pipelines.
-/// The practical sweet spot is the highest level that clears this bar.
-pub const PRACTICAL_PER_STREAM_TPS: f64 = 40.0;
+/// The ideal minimum per-user throughput (t/s) for a **comfortable**
+/// experience — chat, coding agents, RAG pipelines.
+pub const IDEAL_PER_STREAM_TPS: f64 = 30.0;
+
+/// The margin of error applied to the ideal minimum: the practical sweet
+/// spot is the highest level where every stream still gets at least
+/// `IDEAL_PER_STREAM_TPS × (1 − SWEET_SPOT_MARGIN)` (30 × 0.98 =
+/// 29.4 t/s).
+pub const SWEET_SPOT_MARGIN: f64 = 0.02;
+
+/// The effective practical threshold: the ideal minimum with the margin
+/// applied (30 t/s × 0.98 = 29.4 t/s). The practical sweet spot is the
+/// highest level that clears this bar.
+pub const PRACTICAL_PER_STREAM_TPS: f64 = IDEAL_PER_STREAM_TPS * (1.0 - SWEET_SPOT_MARGIN);
 
 /// Per-stream throughput (aggregate ÷ users) at or above which the
 /// experience is **usable** (noticeably slower, but workable). Below it,
 /// interactive use becomes impractical.
 pub const USABLE_PER_STREAM_TPS: f64 = 15.0;
 
+/// The **per-stream usability profile** for a set of levels (see
+/// [`SweepResult::usability`]).
+///
+/// * [`UsabilityProfile::practical_sweet_spot`] — the highest
+///   concurrency where every stream still gets ≥
+///   [`PRACTICAL_PER_STREAM_TPS`] (29.4 t/s effective) — the
+///   **practical sweet spot**: the most users you can serve while each
+///   still gets an acceptable speed. `None` when no level clears the
+///   bar;
+/// * [`UsabilityProfile::max_usable`] — the highest concurrency where
+///   every stream still gets ≥ [`USABLE_PER_STREAM_TPS`] (15 t/s) —
+///   **maximum usable**;
+/// * [`UsabilityProfile::unusable_from`] — the first concurrency where
+///   every stream drops below 15 t/s — **unusable beyond** this level.
+pub fn usability_of(levels: &[SweepLevel]) -> UsabilityProfile {
+    let mut sorted: Vec<&SweepLevel> = levels.iter().collect();
+    sorted.sort_by_key(|l| l.concurrency);
+    let mut p = UsabilityProfile::default();
+    for l in &sorted {
+        let per = l.aggregate_tps / l.concurrency.max(1) as f64;
+        if per >= PRACTICAL_PER_STREAM_TPS {
+            p.practical_sweet_spot = Some(l.concurrency);
+            p.practical_per_stream = per;
+        }
+        if per >= USABLE_PER_STREAM_TPS {
+            p.max_usable = Some(l.concurrency);
+            p.max_usable_per_stream = per;
+        }
+        if p.unusable_from.is_none() && per < USABLE_PER_STREAM_TPS {
+            p.unusable_from = Some(l.concurrency);
+        }
+    }
+    p
+}
+
+/// The recommended number of concurrent streams for a sweep: the
+/// **practical sweet spot** (the highest level where every stream still
+/// gets ≥ 29.4 t/s — 30 t/s ideal with a 2% margin), falling back to the
+/// **maximum usable** level (≥ 15 t/s), then to a single stream — so the
+/// count is always valid for a real-world full-load run (Engine F /
+/// Flat Out).
+pub fn recommended_streams_for(levels: &[SweepLevel]) -> usize {
+    let us = usability_of(levels);
+    us.practical_sweet_spot.or(us.max_usable).unwrap_or(1)
+}
+
 /// The per-stream usability profile for a sweep curve (see
 /// [`SweepResult::usability`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UsabilityProfile {
     /// The highest concurrency where every stream still gets ≥
-    /// [`PRACTICAL_PER_STREAM_TPS`] (40 t/s) — the **practical sweet
-    /// spot**: the most users you can serve while each still gets an
-    /// acceptable speed. `None` when no level clears the bar.
+    /// [`PRACTICAL_PER_STREAM_TPS`] (29.4 t/s effective — 30 t/s ideal
+    /// with a 2% margin) — the **practical sweet spot**: the most users
+    /// you can serve while each still gets an acceptable speed. `None`
+    /// when no level clears the bar.
     pub practical_sweet_spot: Option<usize>,
     /// The per-stream t/s at the practical sweet spot (for display).
     pub practical_per_stream: f64,
@@ -612,10 +674,7 @@ impl Sweep {
                 levels.iter().filter(|l| l.degraded()).count()
             ),
         );
-        SweepResult {
-            levels,
-            matrix: None,
-        }
+        SweepResult::from_levels(levels, None)
     }
 
     /// The single-context ladder: one level at a time, in ladder order.
@@ -728,14 +787,14 @@ impl Sweep {
                 self.ladder.len()
             ),
         );
-        SweepResult {
-            levels: primary_levels,
-            matrix: Some(ConcurrencyMatrix {
+        SweepResult::from_levels(
+            primary_levels,
+            Some(ConcurrencyMatrix {
                 contexts,
                 concurrency: self.ladder.clone(),
                 cells: matrix_cells,
             }),
-        }
+        )
     }
 
     /// The pool for one matrix context: `0` reuses the configured prompt
@@ -1894,10 +1953,10 @@ mod tests {
             loop_excluded_tokens: 0,
             streams: Vec::new(),
         };
-        let result = SweepResult {
-            levels: vec![mk(1, 100.0), mk(2, 350.0), mk(4, 340.0), mk(8, 200.0)],
-            matrix: None,
-        };
+        let result = SweepResult::from_levels(
+            vec![mk(1, 100.0), mk(2, 350.0), mk(4, 340.0), mk(8, 200.0)],
+            None,
+        );
         assert_eq!(result.peak_throughput().unwrap().concurrency, 2);
         assert!(SweepResult::default().is_empty());
     }
@@ -1932,8 +1991,8 @@ mod tests {
         // Throughput climbs 100→340, plateaus at 16 (+1.5%, ≤ 5%), then
         // decays. p90 TPOT stays sub-2× until 16, where it spikes 3×
         // (10→30 ms) and keeps climbing — a clear saturation knee at 16.
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 190.0, 6.0),
                 level(4, 280.0, 7.0),
@@ -1942,8 +2001,8 @@ mod tests {
                 level(32, 342.0, 60.0),
                 level(64, 338.0, 90.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         let knee = result.detect_knee().expect("knee detected");
         assert_eq!(knee.concurrency, 16, "knee at the injected inflection");
         assert_eq!(knee.sweet_spot, 8, "sweet spot is the last healthy level");
@@ -1955,25 +2014,22 @@ mod tests {
     fn detect_knee_none_when_the_curve_is_healthy() {
         // Throughput keeps growing (every gain > 5%) and p90 TPOT never
         // doubles — no saturation transition, so no knee.
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 180.0, 5.0),
                 level(4, 300.0, 6.0),
                 level(8, 420.0, 6.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         assert!(result.detect_knee().is_none());
     }
 
     #[test]
     fn detect_knee_none_with_fewer_than_two_levels() {
         assert!(SweepResult::default().detect_knee().is_none());
-        let single = SweepResult {
-            levels: vec![level(1, 100.0, 5.0)],
-            matrix: None,
-        };
+        let single = SweepResult::from_levels(vec![level(1, 100.0, 5.0)], None);
         assert!(single.detect_knee().is_none());
     }
 
@@ -1982,15 +2038,15 @@ mod tests {
         // Throughput decays monotonically (every gain is negative, hence ≤
         // the threshold); the knee is the first level where p90 spikes 2×
         // (6→12 ms).
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 400.0, 5.0),
                 level(2, 380.0, 6.0),
                 level(4, 350.0, 12.0),
                 level(8, 300.0, 30.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         let knee = result.detect_knee().expect("knee detected");
         assert_eq!(knee.concurrency, 4);
         assert_eq!(knee.sweet_spot, 2);
@@ -2000,29 +2056,29 @@ mod tests {
     fn detect_knee_ignores_a_plateau_without_a_latency_spike() {
         // Throughput plateaus (even dips) at 4, but p90 TPOT never doubles
         // (7/6 ≈ 1.17×) — a plateau alone is not a saturation knee.
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 350.0, 6.0),
                 level(4, 300.0, 7.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         assert!(result.detect_knee().is_none());
     }
 
     #[test]
     fn envelope_reports_knee_and_sweet_spot() {
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 190.0, 6.0),
                 level(4, 280.0, 7.0),
                 level(8, 340.0, 10.0),
                 level(16, 345.0, 30.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         let env = result.envelope().expect("envelope");
         assert_eq!(env.sweet_spot, 8);
         assert!((env.aggregate_tps - 340.0).abs() < 1e-9);
@@ -2032,14 +2088,14 @@ mod tests {
 
     #[test]
     fn envelope_falls_back_to_peak_throughput_when_no_knee() {
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 350.0, 6.0),
                 level(4, 300.0, 7.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         // No knee (plateau without a 2× latency spike) → the envelope is
         // the peak-throughput level (350 t/s @ 2).
         let env = result.envelope().expect("envelope");
@@ -2069,11 +2125,11 @@ mod tests {
     fn usability_finds_the_per_stream_thresholds() {
         // The user's real run (qwen3.8-27b): aggregate 55 / 92.7 / 94.5 /
         // 117.3 / 118.2 / 120.5 → per-stream 55.0 / 46.4 / 23.6 / 14.7 /
-        // 7.4 / 3.8. Practical (≥40 each): up to 2. Usable (≥15 each): up
-        // to 4. Unusable (<15 each): from 8. (The old throughput knee
+        // 7.4 / 3.8. Practical (≥29.4 each): up to 2. Usable (≥15 each):
+        // up to 4. Unusable (<15 each): from 8. (The old throughput knee
         // called 32 the "sweet spot" — 32 users at 3.8 t/s each.)
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 55.0, 5.0),
                 level(2, 92.7, 8.0),
                 level(4, 94.5, 20.0),
@@ -2081,8 +2137,8 @@ mod tests {
                 level(16, 118.2, 80.0),
                 level(32, 120.5, 120.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         let p = result.usability();
         assert_eq!(p.practical_sweet_spot, Some(2), "practical: ~46 t/s each");
         assert!((p.practical_per_stream - 92.7 / 2.0).abs() < 0.01);
@@ -2093,31 +2149,31 @@ mod tests {
 
     #[test]
     fn usability_reports_partial_usability() {
-        // Level 1: 30 t/s/user — usable (≥15) but not comfortable (<40);
-        // level 2: 10 t/s/user — unusable.
-        let result = SweepResult {
-            levels: vec![level(1, 30.0, 5.0), level(2, 20.0, 8.0)],
-            matrix: None,
-        };
+        // Level 1: 29 t/s/user — usable (≥15) but below the practical bar
+        // (29.4 = 30 × 0.98); level 2: 10 t/s/user — unusable.
+        let result = SweepResult::from_levels(vec![level(1, 29.0, 5.0), level(2, 20.0, 8.0)], None);
         let p = result.usability();
-        assert_eq!(p.practical_sweet_spot, None, "no level clears 40 t/s each");
+        assert_eq!(
+            p.practical_sweet_spot, None,
+            "no level clears 29.4 t/s each"
+        );
         assert_eq!(p.max_usable, Some(1), "one user is still usable");
         assert_eq!(p.unusable_from, Some(2), "two users drop below 15 t/s each");
     }
 
     #[test]
     fn usability_all_levels_comfortable() {
-        // Per-stream stays ≥ 40 across the whole curve (and never drops
+        // Per-stream stays ≥ 29.4 across the whole curve (and never drops
         // below 15): the practical sweet spot is the top level, and there
         // is no unusable boundary within the sweep.
-        let result = SweepResult {
-            levels: vec![
+        let result = SweepResult::from_levels(
+            vec![
                 level(1, 100.0, 5.0),
                 level(2, 220.0, 6.0),
                 level(4, 480.0, 8.0),
             ],
-            matrix: None,
-        };
+            None,
+        );
         let p = result.usability();
         assert_eq!(p.practical_sweet_spot, Some(4));
         assert_eq!(p.max_usable, Some(4));
@@ -2130,6 +2186,49 @@ mod tests {
         assert_eq!(p.practical_sweet_spot, None);
         assert_eq!(p.max_usable, None);
         assert_eq!(p.unusable_from, None);
+    }
+
+    // ── the sweet spot (Engine F's stream count) ───────────────────────
+
+    #[test]
+    fn sweet_spot_is_the_highest_comfortable_level() {
+        // Per-stream: 55.0 / 46.4 / 23.6 / 14.7 / 7.4 / 3.8 — the
+        // practical sweet spot (≥29.4 each) is 2; the max usable (≥15) is
+        // 4. The stored field carries the practical value.
+        let levels = vec![
+            level(1, 55.0, 5.0),
+            level(2, 92.7, 8.0),
+            level(4, 94.5, 20.0),
+            level(8, 117.3, 40.0),
+            level(16, 118.2, 80.0),
+            level(32, 120.5, 120.0),
+        ];
+        let result = SweepResult::from_levels(levels, None);
+        assert_eq!(result.sweet_spot, 2);
+    }
+
+    #[test]
+    fn sweet_spot_falls_back_to_max_usable_then_one() {
+        // Nothing clears the practical bar (29.4) but level 1 is usable
+        // (29.0 ≥ 15): the fallback is the maximum usable level.
+        let levels = vec![level(1, 29.0, 5.0), level(2, 20.0, 8.0)];
+        assert_eq!(recommended_streams_for(&levels), 1);
+        // Everything below the usable floor: a single stream.
+        let levels = vec![level(1, 10.0, 5.0), level(2, 8.0, 8.0)];
+        assert_eq!(recommended_streams_for(&levels), 1);
+        // Empty sweep: a single stream.
+        assert_eq!(recommended_streams_for(&[]), 1);
+    }
+
+    #[test]
+    fn practical_threshold_is_30_with_a_2_percent_margin() {
+        assert!((PRACTICAL_PER_STREAM_TPS - 30.0 * 0.98).abs() < 1e-9);
+        assert!((PRACTICAL_PER_STREAM_TPS - 29.4).abs() < 1e-9);
+        // 29.5 t/s/user clears the bar; 29.3 does not.
+        let levels = vec![level(1, 29.5, 5.0)];
+        assert_eq!(usability_of(&levels).practical_sweet_spot, Some(1));
+        let levels = vec![level(1, 29.3, 5.0)];
+        assert_eq!(usability_of(&levels).practical_sweet_spot, None);
     }
 
     #[tokio::test]

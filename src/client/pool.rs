@@ -181,6 +181,11 @@ pub struct WorkerPool {
     /// that has not finished within this window is killed and recorded
     /// as a timeout failure. `None` (the default) means no cap.
     worker_timeout: Option<Duration>,
+    /// Disallow the model's own end-token from stopping generation on
+    /// every worker (`ignore_eos`; honored by llama.cpp servers, ignored
+    /// by other backends). Engine F sets this so the 60-second window —
+    /// not the model — is the only stop.
+    ignore_eos: bool,
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -194,6 +199,7 @@ impl std::fmt::Debug for WorkerPool {
             .field("capacity", &self.capacity)
             .field("logger", &self.logger.is_some())
             .field("worker_timeout", &self.worker_timeout)
+            .field("ignore_eos", &self.ignore_eos)
             .finish()
     }
 }
@@ -222,6 +228,7 @@ impl WorkerPool {
             capacity: DEFAULT_AGGREGATE_CAPACITY,
             logger: None,
             worker_timeout: None,
+            ignore_eos: false,
         }
     }
 
@@ -271,6 +278,15 @@ impl WorkerPool {
         self.worker_timeout
     }
 
+    /// Disallow the model's own end-token from stopping generation on
+    /// every worker (`"ignore_eos": true`; honored by llama.cpp servers,
+    /// unknown to — and ignored by — other backends). Engine F sets this
+    /// so the 60-second window, not the model, is the only stop.
+    pub fn ignore_eos(mut self, v: bool) -> Self {
+        self.ignore_eos = v;
+        self
+    }
+
     /// The pool's target endpoint.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -312,6 +328,9 @@ impl WorkerPool {
         .read_timeout(self.read_timeout)
         .retries(self.retries)
         .tag(tag);
+        if self.ignore_eos {
+            worker = worker.ignore_eos(true);
+        }
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key.clone());
         }

@@ -12,7 +12,8 @@
 //! The bottom panel is the **Concurrency Recommendation** (the practical
 //! sweet spot, FIX 3): the knee is *reference only* — the recommendation
 //! is per-stream usability, i.e. how many users you can serve while each
-//! still gets an acceptable speed (≥40 t/s comfortable, ≥15 t/s usable).
+//! still gets an acceptable speed (≥30 t/s comfortable — 29.4 t/s
+//! effective with the 2% margin — ≥15 t/s usable).
 //!
 //! The top panel renders the sweep as a block-based throughput-vs-
 //! concurrency curve: one vertical bar per ladder level (x on a
@@ -471,11 +472,12 @@ fn write_text(
 }
 
 /// The recommendation data lines (FIX 3): the **practical sweet spot**
-/// (the highest concurrency where every user still gets ≥40 t/s — the
-/// recommendation), the **maximum usable** level (≥15 t/s each), the
-/// **unusable beyond** boundary (<15 t/s each), and the **pure
-/// throughput knee** as reference only. Pure over the sweep result
-/// (unit-testable, no terminal).
+/// (the highest concurrency where every user still gets ≥30 t/s — 29.4
+/// t/s effective with the 2% margin — the recommendation), the
+/// **maximum usable** level (≥15 t/s each), the **unusable beyond**
+/// boundary (<15 t/s each), and the **pure throughput knee** as
+/// reference only. Pure over the sweep result (unit-testable, no
+/// terminal).
 fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
     let us = result.usability();
     // The reference knee: the detected saturation knee, else the peak-
@@ -509,7 +511,7 @@ fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
             ]));
         }
         None => ls.push(Line::from(Span::styled(
-            "  Practical Sweet Spot: — (even 1 user is below 40 t/s)",
+            "  Practical Sweet Spot: — (even 1 user is below 30 t/s)",
             style::value_warn(th),
         ))),
     }
@@ -558,12 +560,9 @@ fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
 /// concurrency panel, FIX 3): what the recommendation means, the
 /// practical-sweet-spot lines, and the aggregate-throughput caveat.
 pub(crate) fn curve_notes(th: Theme, levels: &[SweepLevel]) -> Vec<Line<'static>> {
-    let result = SweepResult {
-        levels: levels.to_vec(),
-        matrix: None,
-    };
+    let result = SweepResult::from_levels(levels.to_vec(), None);
     let mut ls: Vec<Line> = vec![Line::from(Span::styled(
-        "ℹ Sweet spot = most users where EACH still gets ≥40 t/s (comfortable).",
+        "ℹ Sweet spot = most users where EACH still gets ≥30 t/s (comfortable).",
         style::info(th),
     ))];
     ls.extend(recommendation_lines(th, &result));
@@ -748,7 +747,7 @@ fn per_stream_status(th: Theme, per: f64, baseline: f64) -> (String, Style) {
 
 /// The dimmed `ℹ` notes explaining what the recommendation means (FIX 3).
 const RECOMMENDATION_INFO: [&str; 4] = [
-    "\"Practical sweet spot\" = most users where each still gets ≥40 t/s.",
+    "\"Practical sweet spot\" = most users where each still gets ≥30 t/s.",
     "This is what matters for real use: coding agents, chat, RAG pipelines.",
     "Pure aggregate throughput is misleading — 32 users at 3.8 t/s each",
     "is not \"fast\", it's \"slow for everyone\".",
@@ -795,7 +794,7 @@ fn render_recommendation(area: Rect, app: &App, th: Theme, f: &mut Frame) {
                 )),
                 Line::raw(""),
                 Line::from(Span::styled(
-                    "ℹ \"Practical sweet spot\" = most users where each still gets ≥40 t/s.",
+                    "ℹ \"Practical sweet spot\" = most users where each still gets ≥30 t/s.",
                     style::info(th),
                 )),
                 Line::from(Span::styled(
@@ -854,11 +853,7 @@ mod tests {
         // Throughput plateaus (350→340) while p90 spikes 8→20 ms: the
         // knee is 4, the sweet spot 2.
         let levels = vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)];
-        let env = SweepResult {
-            levels: levels.clone(),
-            matrix: None,
-        }
-        .envelope();
+        let env = SweepResult::from_levels(levels.clone(), None).envelope();
         let lines = build_curve_lines(Theme::default(), &levels, 80, 12, &env);
         let text: String = lines
             .iter()
@@ -941,9 +936,9 @@ mod tests {
 
     #[test]
     fn curve_notes_handle_a_slow_curve() {
-        // Per-stream: 30, 10 → no practical spot (nothing ≥40), one usable
-        // level (30 ≥ 15), unusable from 2.
-        let levels = vec![lvl(1, 30.0, 5.0), lvl(2, 20.0, 8.0)];
+        // Per-stream: 29, 10 → no practical spot (nothing clears 29.4),
+        // one usable level (29 ≥ 15), unusable from 2.
+        let levels = vec![lvl(1, 29.0, 5.0), lvl(2, 20.0, 8.0)];
         let notes = curve_notes(Theme::default(), &levels);
         let text: String = notes
             .iter()
@@ -951,7 +946,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("even 1 user is below 40 t/s"),
+            text.contains("even 1 user is below 30 t/s"),
             "no-practical-spot wording: {text}"
         );
         assert!(
@@ -992,8 +987,8 @@ mod tests {
         let app = crate::ui::app::App::new();
         // Per-stream: 100, 95, 70, 42.5, 21.6, 10.7, 5.3 → practical 8,
         // max usable 16, unusable from 32, knee at 16.
-        app.sweep.store(SweepResult {
-            levels: vec![
+        app.sweep.store(SweepResult::from_levels(
+            vec![
                 lvl(1, 100.0, 5.0),
                 lvl(2, 190.0, 6.0),
                 lvl(4, 280.0, 7.0),
@@ -1002,8 +997,8 @@ mod tests {
                 lvl(32, 342.0, 60.0),
                 lvl(64, 338.0, 90.0),
             ],
-            matrix: None,
-        });
+            None,
+        ));
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
         terminal
@@ -1085,10 +1080,10 @@ mod tests {
     fn matrix_shows_the_per_stream_column() {
         // A two-level sweep: the per-stream column is aggregate ÷ users.
         let app = crate::ui::app::App::new();
-        app.sweep.store(SweepResult {
-            levels: vec![lvl(1, 100.0, 5.0), lvl(4, 340.0, 20.0)],
-            matrix: None,
-        });
+        app.sweep.store(SweepResult::from_levels(
+            vec![lvl(1, 100.0, 5.0), lvl(4, 340.0, 20.0)],
+            None,
+        ));
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
         terminal

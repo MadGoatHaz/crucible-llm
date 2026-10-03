@@ -1,57 +1,64 @@
-//! Engine F — Flat Out: sustained maximum decode speed.
+//! Engine F — Flat Out: real-world maximum throughput at the optimal
+//! user count.
 //!
-//! The goal is to measure the server's **true maximum sustained decode
-//! speed** with zero prefill interference. One minimal (~15-token)
-//! open-ended prompt, ONE continuous stream, let it run for exactly
-//! **60 seconds**, count every token frame observed on the wire, and
-//! divide: `tps = total_tokens / 60.0`. That single number is the
-//! server's peak sustained tokens-per-second.
+//! The goal is to measure what a production deployment actually serves:
+//! the server's **total** tokens/sec when it is loaded at its
+//! **sweet-spot concurrency** — the number of users Engine B's sweep
+//! recommends (the highest level where every user still gets ≥ 29.4
+//! t/s: 30 t/s ideal with a 2% margin). That aggregate number, with the
+//! per-stream number confirming each user stays comfortable, is the
+//! figure to quote when comparing servers or configurations.
 //!
-//! Best practice for measuring peak throughput:
+//! Method:
 //!
-//! * **one stream** — no concurrency cross-talk, the classic single-user
-//!   decode path;
-//! * **minimal prompt** (~15 tokens) — prefill takes <100 ms, negligible
-//!   against the 60-second decode window;
+//! * **`n` concurrent streams** (the sweet spot, or
+//!   [`DEFAULT_STREAM_COUNT`] when Engine B did not run) — all spawned
+//!   together via the shared [`WorkerPool`];
+//! * **one minimal (~15-token) open-ended prompt per stream** — prefill
+//!   takes <100 ms, negligible against the 60-second decode window;
 //! * **`max_tokens = 100,000` + `ignore_eos`** — effectively unlimited,
-//!   so the *only* stop condition is the 60-second window (aborted by
-//!   dropping the worker task, which closes the HTTP connection so the
-//!   server stops generating). `ignore_eos` keeps llama.cpp servers from
-//!   letting the model end the stream on its own end-token (a model that
-//!   "finishes" the 15-token story in 300 tokens would otherwise end the
-//!   60-second test in 5 seconds); other backends ignore the field;
-//! * **count what arrives** — tokens are the frame count observed on the
-//!   wire (not the server's self-reported `usage.completion_tokens`,
-//!   which some servers — e.g. Unsloth / llama.cpp GGUF — inflate to the
-//!   requested `max_tokens` target, overstating the rate).
+//!   so the *only* stop condition is the 60-second window
+//!   ([`WINDOW_SECS`]); `ignore_eos` keeps llama.cpp servers from letting
+//!   the model end a stream on its own end-token (other backends ignore
+//!   the field);
+//! * **all streams start together and are all aborted at the 60 s mark**
+//!   (aborting the supervisor drops every worker task, closing its
+//!   socket so the server stops generating);
+//! * **authoritative token counting** — each stream's count is the
+//!   server's `usage.completion_tokens` when it arrives, else the
+//!   re-tokenized text ([`authoritative_tokens`]) — never the raw frame
+//!   tally, which undercounts batched servers (vLLM MTP) by 30–40 %.
 //!
-//! The result also records TTFT and the ITL p50/p99 of the run, so the
-//! one headline number is backed by latency evidence.
+//! The result records the **aggregate t/s** (the headline), the
+//! **per-stream t/s** (aggregate ÷ streams — ≈ 30 confirms the sweet
+//! spot), the total tokens, and the pooled TTFT / ITL evidence.
 //!
-//! Measurement-isolation note: all timing is captured in the worker
+//! Measurement-isolation note: all timing is captured in the workers
 //! (quanta, `T0..Tn`); this module only takes deltas of those records and
-//! counts the frames that arrive. Nothing here touches the TUI render path.
+//! counts the tokens that arrive. Nothing here touches the TUI render
+//! path.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc;
 
-use crate::client::{authoritative_tokens, spawn_worker, StreamEvent, StreamWorker};
+use crate::client::pool::{PoolEvent, WorkerPool};
+use crate::client::{authoritative_tokens, StreamEvent};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
-use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamStatus};
+use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::tokenizer::count_tokens;
 use crate::prompt::{GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
 use crate::sse::{Chunk, Usage};
 use crate::timing::MonotonicInstant;
 
-/// The continuous run window (seconds). The stream is aborted when it
-/// elapses — the only real stop condition of the test.
+/// The continuous run window (seconds). All streams start together and
+/// are all aborted when it elapses — the only real stop condition of the
+/// test.
 pub const WINDOW_SECS: f64 = 60.0;
 
 /// The run window in nanoseconds (the same domain as
@@ -59,132 +66,148 @@ pub const WINDOW_SECS: f64 = 60.0;
 /// Kept in sync with [`WINDOW_SECS`].
 const WINDOW_NS: u64 = 60 * 1_000_000_000;
 
-/// The `max_tokens` requested for the single stream: 100,000 —
-/// effectively unlimited. The 60-second window, not this cap, ends the
-/// test.
+/// The `max_tokens` requested per stream: 100,000 — effectively
+/// unlimited. The 60-second window, not this cap, ends the test.
 pub const MAX_TOKENS: u32 = 100_000;
 
-/// Bounded worker→engine channel capacity.
-const CHANNEL_CAPACITY: usize = 256;
+/// The stream count when Engine B did not run (there is no sweet spot to
+/// read): a small, always-valid load.
+pub const DEFAULT_STREAM_COUNT: usize = 3;
 
-/// The minimal open-ended prompt (~15 tokens).
+/// The minimal open-ended prompt (~15 tokens) every stream runs.
 ///
-/// Short enough that prefill takes <100 ms (negligible against the 60s
+/// Short enough that prefill takes <100 ms (negligible against the 60 s
 /// window), open-ended enough that the model keeps generating without
 /// stopping, and not a question (questions get short answers).
 pub const MINIMAL_PROMPT: &str =
     "Continue this story: The old lighthouse keeper walked down the spiral stairs and";
 
-/// The complete Flat Out result: one continuous 60-second stream.
+/// Where the run's stream count came from (the JSON export's
+/// `stream_count_source` field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamCountSource {
+    /// The practical sweet spot from Engine B's sweep (the recommended
+    /// production concurrency).
+    ConcurrencySweetSpot,
+    /// The built-in default ([`DEFAULT_STREAM_COUNT`]) — Engine B did not
+    /// run, so there was no sweet spot to read.
+    Default,
+}
+
+impl StreamCountSource {
+    /// The JSON label (`"concurrency_sweet_spot"` / `"default"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConcurrencySweetSpot => "concurrency_sweet_spot",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// The complete Flat Out result: `n` concurrent streams (the sweet spot)
+/// running for one [`WINDOW_SECS`]-second window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatOutResult {
-    /// All token frames **observed on the wire** during the window (what
-    /// the server actually produced).
+    /// The number of concurrent streams (the sweet spot, or the default).
+    pub stream_count: usize,
+    /// Where the stream count came from.
+    pub stream_count_source: StreamCountSource,
+    /// Total tokens generated across **all** streams in the window.
     pub total_tokens: u64,
-    /// How long the run took (seconds; ~[`WINDOW_SECS`], or less when the
-    /// stream ended on its own).
+    /// How long the run took (seconds; ~[`WINDOW_SECS`], or less when
+    /// every stream ended on its own).
     pub duration_secs: f64,
-    /// The headline number: `total_tokens / duration_secs` — the server's
-    /// sustained maximum decode speed.
-    pub tps: f64,
-    /// Time to first token (milliseconds).
-    pub ttft_ms: f64,
-    /// Inter-token latency p50 for the run (milliseconds).
+    /// The headline number: `total_tokens / duration_secs` — the
+    /// server's real-world maximum throughput at full sweet-spot load.
+    pub aggregate_tps: f64,
+    /// `aggregate_tps / stream_count` — what each user gets at the
+    /// recommended load (≈ 30 t/s confirms the sweet spot).
+    pub per_stream_tps: f64,
+    /// Mean time to first token across the streams (milliseconds).
+    pub ttft_avg_ms: f64,
+    /// Inter-token latency p50, pooled across all streams (milliseconds).
     pub itl_p50_ms: f64,
-    /// Inter-token latency p99 for the run (milliseconds).
+    /// Inter-token latency p99, pooled across all streams (milliseconds).
     pub itl_p99_ms: f64,
 }
 
 impl FlatOutResult {
-    /// Build the result from the events observed during the window.
+    /// Build the result from the events observed per stream.
     ///
-    /// The token count follows the research's **Authoritative Counting
-    /// Rule** ([`authoritative_tokens`]):
+    /// Each stream's token count follows the **Authoritative Counting
+    /// Rule** ([`authoritative_tokens`]): the server's
+    /// `usage.completion_tokens` when it arrived (the rare path — the
+    /// 60 s window normally aborts the streams first), else the
+    /// re-tokenized reasoning + content text (the exact tokenizer when
+    /// one is supplied, else `chars/4`). Counting SSE frames is never
+    /// used: batched servers (vLLM MTP) pack multiple tokens into one
+    /// frame, which is the 30–40 % undercount this engine used to show.
     ///
-    /// 1. **PRIMARY** — the server's `usage.completion_tokens`, present only
-    ///    when the stream ended *naturally* before the 60 s window (Engine F
-    ///    normally aborts it, so this is the rare path);
-    /// 2. **FALLBACK** — re-tokenize the full reasoning + content text: the
-    ///    model's exact tokenizer when one is supplied, else the `chars/4`
-    ///    estimate. This is the normal path for an aborted stream — counting
-    ///    SSE frames is fundamentally inaccurate when speculative batching
-    ///    (vLLM MTP) packs multiple tokens into one frame, which is exactly
-    ///    the 30–40 % undercount the user observed.
-    ///
-    /// The t/s is that count over the **decode window** — the first
-    /// content/reasoning token to the last (`T_first` → `T_last`), which
-    /// excludes prefill/TTFT and the trailing gap to abort — the research's
-    /// **Timing Boundary Rule** and exactly how each backend measures its own
-    /// decode rate. The ITL percentiles are the gaps between consecutive
-    /// token frames.
+    /// The **aggregate t/s** is the total over the *wall* window
+    /// (`total_tokens / duration_secs`) — prefill and any trailing gap
+    /// included, exactly what a full-load deployment sustains. The ITL
+    /// percentiles are the gaps between consecutive token frames, pooled
+    /// across all streams.
     #[must_use]
     pub fn from_events(
-        events: &[StreamEvent],
+        per_stream: &[Vec<StreamEvent>],
         duration_secs: f64,
         tokenizer: Option<&Tokenizer>,
+        source: StreamCountSource,
     ) -> Self {
-        let mut deltas_ns: Vec<u64> = Vec::new();
-        let mut ttft_ms = 0.0f64;
-        let mut first_token_at: Option<MonotonicInstant> = None;
-        let mut last_token_at: Option<MonotonicInstant> = None;
-        let mut usage: Option<Usage> = None;
-        for event in events {
-            match event {
-                StreamEvent::Frame {
-                    frame,
-                    at,
-                    timestamps,
-                } => {
-                    // The usage chunk carries the server's authoritative
-                    // count (the frame where it physically appears in the
-                    // stream); a `Complete` event mirrors it too.
-                    if let Chunk::Usage(u) = &frame.chunk {
-                        usage = Some(*u);
-                    }
+        let stream_count = per_stream.len().max(1);
+        let mut total_tokens = 0u64;
+        let mut ttfts_ms: Vec<f64> = Vec::new();
+        let mut itl = LatencyHistogram::default();
+        for events in per_stream {
+            // The stream's authoritative count (usage → text estimate).
+            let (tokens, _) = authoritative_tokens(events, stream_usage(events), tokenizer);
+            total_tokens += tokens;
+            // Pooled ITL: the gaps between this stream's consecutive
+            // token frames.
+            let mut prev: Option<MonotonicInstant> = None;
+            for e in events {
+                if let StreamEvent::Frame { frame, at, .. } = e {
                     if frame.chunk.is_token() {
-                        if let Some(prev) = last_token_at {
-                            deltas_ns.push(prev.delta_nanos(at));
+                        if let Some(p) = prev {
+                            itl.record(p.delta_nanos(at));
                         }
-                        if ttft_ms == 0.0 {
-                            ttft_ms = timestamps
-                                .ttft_nanos()
-                                .map(|ns| ns as f64 / 1e6)
-                                .unwrap_or(0.0);
-                        }
-                        if first_token_at.is_none() {
-                            first_token_at = Some(*at);
-                        }
-                        last_token_at = Some(*at);
+                        prev = Some(*at);
                     }
                 }
-                StreamEvent::Complete { usage: u, .. } => {
-                    usage = *u;
+            }
+            // TTFT of the stream's first token frame.
+            if let Some(ts) = events.iter().find_map(|e| match e {
+                StreamEvent::Frame {
+                    frame, timestamps, ..
+                } if frame.chunk.is_token() => Some(*timestamps),
+                _ => None,
+            }) {
+                if let Some(ns) = ts.ttft_nanos() {
+                    ttfts_ms.push(ns as f64 / 1e6);
                 }
-                StreamEvent::Failed { .. } => {}
             }
         }
-        let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&deltas_ns);
-
-        // Authoritative count (usage → re-tokenize the full text).
-        let (total_tokens, _estimated) = authoritative_tokens(events, usage, tokenizer);
-
-        // Decode window: first → last content/reasoning token.
-        let tps = match (first_token_at, last_token_at) {
-            (Some(f), Some(l)) => {
-                let span_s = f.delta_nanos(&l) as f64 / 1e9;
-                if span_s > 0.0 {
-                    total_tokens as f64 / span_s
-                } else {
-                    0.0
-                }
-            }
-            _ => 0.0,
+        let aggregate_tps = if duration_secs > 0.0 {
+            total_tokens as f64 / duration_secs
+        } else {
+            0.0
+        };
+        let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&itl);
+        let ttft_avg_ms = if ttfts_ms.is_empty() {
+            0.0
+        } else {
+            ttfts_ms.iter().sum::<f64>() / ttfts_ms.len() as f64
         };
         Self {
+            stream_count,
+            stream_count_source: source,
             total_tokens,
             duration_secs,
-            tps,
-            ttft_ms,
+            aggregate_tps,
+            per_stream_tps: aggregate_tps / stream_count as f64,
+            ttft_avg_ms,
             itl_p50_ms,
             itl_p99_ms,
         }
@@ -194,35 +217,100 @@ impl FlatOutResult {
     #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
-            "{:.1} t/s sustained · {} tok in {:.0}s · TTFT {:.0} ms",
-            self.tps, self.total_tokens, self.duration_secs, self.ttft_ms
+            "{agg:.1} t/s aggregate ({n} streams) · {ps:.1} t/s per stream · {tok} tok in {d:.0}s",
+            agg = self.aggregate_tps,
+            n = self.stream_count,
+            ps = self.per_stream_tps,
+            tok = self.total_tokens,
+            d = self.duration_secs
         )
     }
 
-    /// The `--json` object for this result (a single object — there are
-    /// no segments).
+    /// The `--json` object for this result.
     #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
         serde_json::json!({
+            "stream_count": self.stream_count,
+            "stream_count_source": self.stream_count_source,
             "total_tokens": self.total_tokens,
             "duration_secs": self.duration_secs,
-            "tps": self.tps,
-            "ttft_ms": self.ttft_ms,
+            "aggregate_tps": self.aggregate_tps,
+            "per_stream_tps": self.per_stream_tps,
+            "ttft_avg_ms": self.ttft_avg_ms,
             "itl_p50_ms": self.itl_p50_ms,
             "itl_p99_ms": self.itl_p99_ms,
         })
     }
 }
 
-/// `(p50 ms, p99 ms)` of inter-token deltas recorded into a
-/// [`LatencyHistogram`] (the same histogram Engine A uses for its ITL
-/// distribution). `(0.0, 0.0)` for an empty list.
-fn itl_percentiles_ms(deltas_ns: &[u64]) -> (f64, f64) {
-    let mut h = LatencyHistogram::default();
-    for d in deltas_ns {
-        h.record(*d);
-    }
+/// `(p50 ms, p99 ms)` of a pooled inter-token-latency histogram (the
+/// same histogram Engine A uses for its ITL distribution).
+fn itl_percentiles_ms(h: &LatencyHistogram) -> (f64, f64) {
     (h.p50() / 1e6, h.p99() / 1e6)
+}
+
+/// A stream's authoritative `usage` (the last usage frame, or the
+/// terminal `Complete` event's usage — they mirror each other).
+fn stream_usage(events: &[StreamEvent]) -> Option<Usage> {
+    let mut usage = None;
+    for e in events {
+        match e {
+            StreamEvent::Frame { frame, .. } => {
+                if let Chunk::Usage(u) = &frame.chunk {
+                    usage = Some(*u);
+                }
+            }
+            StreamEvent::Complete { usage: u, .. } => usage = *u,
+            StreamEvent::Failed { .. } => {}
+        }
+    }
+    usage
+}
+
+/// Convert one pooled (stream-tagged) event back to the untagged
+/// [`StreamEvent`] of the stream it came from (the per-stream event
+/// lists the result / snapshot builders consume).
+fn to_stream_event(e: &PoolEvent) -> StreamEvent {
+    match e {
+        PoolEvent::Frame {
+            frame,
+            at,
+            timestamps,
+            ..
+        } => StreamEvent::Frame {
+            frame: frame.clone(),
+            at: *at,
+            timestamps: *timestamps,
+        },
+        PoolEvent::Complete {
+            timestamps,
+            usage,
+            premature,
+            malformed_frames,
+            looping,
+            loop_excluded_tokens,
+            ..
+        } => StreamEvent::Complete {
+            timestamps: *timestamps,
+            usage: *usage,
+            premature: *premature,
+            malformed_frames: *malformed_frames,
+            looping: *looping,
+            loop_excluded_tokens: *loop_excluded_tokens,
+        },
+        PoolEvent::Failed {
+            timestamps,
+            error,
+            looping,
+            loop_excluded_tokens,
+            ..
+        } => StreamEvent::Failed {
+            timestamps: *timestamps,
+            error: error.clone(),
+            looping: *looping,
+            loop_excluded_tokens: *loop_excluded_tokens,
+        },
+    }
 }
 
 /// Engine construction errors.
@@ -236,13 +324,19 @@ pub enum FlatOutError {
     Tokenizer(#[from] TokenizerError),
 }
 
-/// The Flat Out engine: one continuous [`WINDOW_SECS`]-second stream with
-/// a minimal prompt and an effectively-unlimited `max_tokens` cap.
+/// The Flat Out engine: `n` concurrent streams (the sweet spot) with the
+/// minimal prompt, an effectively-unlimited `max_tokens` cap, and one
+/// [`WINDOW_SECS`]-second window that ends the test.
 #[derive(Debug)]
 pub struct FlatOutEngine {
     cfg: Config,
     client: reqwest::Client,
     generator: PromptGenerator,
+    /// The number of concurrent streams (the sweet spot, or the default).
+    stream_count: usize,
+    /// Where the stream count came from (the result's
+    /// `stream_count_source`).
+    stream_count_source: StreamCountSource,
     /// Optional TUI seam: publish live [`MetricsSnapshot`]s.
     metrics: Option<Arc<MetricsState>>,
     /// Optional sequence seam: publish [`EngineProgress`].
@@ -254,7 +348,10 @@ pub struct FlatOutEngine {
 }
 
 impl FlatOutEngine {
-    /// Build the engine from the resolved config.
+    /// Build the engine from the resolved config (the stream count
+    /// defaults to [`DEFAULT_STREAM_COUNT`] — use
+    /// [`stream_count`](Self::stream_count) to drive it from Engine B's
+    /// sweet spot).
     pub fn new(cfg: &Config) -> Result<Self, FlatOutError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(cfg.timeout.max(1)))
@@ -267,11 +364,20 @@ impl FlatOutEngine {
             cfg: cfg.clone(),
             client,
             generator,
+            stream_count: DEFAULT_STREAM_COUNT,
+            stream_count_source: StreamCountSource::Default,
             metrics: None,
             progress: None,
             pause: None,
             logger: None,
         })
+    }
+
+    /// Set the stream count (e.g. Engine B's sweet spot) and its source.
+    pub fn stream_count(mut self, n: usize, source: StreamCountSource) -> Self {
+        self.stream_count = n.max(1);
+        self.stream_count_source = source;
+        self
     }
 
     /// Attach a [`MetricsState`] publisher.
@@ -298,11 +404,18 @@ impl FlatOutEngine {
         self
     }
 
-    /// Run the single 60-second stream and return the result.
+    /// Run the `n`-stream window and return the result.
+    ///
+    /// All streams are spawned together (one [`WorkerPool`] level),
+    /// drained until the [`WINDOW_SECS`] window elapses (or every stream
+    /// ends on its own, whichever comes first), then aborted: the
+    /// supervisor's task tree is dropped, every socket closes, and the
+    /// server stops generating.
     pub async fn run(&self) -> FlatOutResult {
         let prompt = self.generate_prompt();
+        let n = self.stream_count;
 
-        // The `Space`-key pause: hold before the stream goes out.
+        // The `Space`-key pause: hold before the streams go out.
         if let Some(gate) = &self.pause {
             gate.wait_while_paused().await;
         }
@@ -310,20 +423,31 @@ impl FlatOutEngine {
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::FlatOut {
                 elapsed_secs: 0.0,
+                streams: n,
                 tokens: 0,
                 tps: 0.0,
             });
         }
 
-        if let Some(l) = &self.logger {
-            l.info(
-                Context::EngineF,
-                format!("Flat Out: one {WINDOW_SECS:.0}s stream, max_tokens {MAX_TOKENS}"),
-            );
+        if self.stream_count_source == StreamCountSource::Default {
+            if let Some(l) = &self.logger {
+                l.info(
+                    Context::EngineF,
+                    format!("No concurrency data — using default {n} streams"),
+                );
+            }
+        } else {
+            if let Some(l) = &self.logger {
+                l.info(
+                    Context::EngineF,
+                    format!(
+                        "Real-world max throughput: {n} streams (concurrency sweet spot) for {WINDOW_SECS:.0}s, max_tokens {MAX_TOKENS}"
+                    ),
+                );
+            }
         }
 
-        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let mut worker = StreamWorker::new(
+        let pool = WorkerPool::new(
             self.client.clone(),
             &self.cfg.url,
             &self.cfg.model,
@@ -331,29 +455,28 @@ impl FlatOutEngine {
             MAX_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.cfg.timeout.max(1)))
-        // The 60s window — not the model's own end-token — is the only
+        // The 60 s window — not the model's own end-token — is the only
         // stop: llama.cpp servers honor `ignore_eos`, other backends
         // ignore the field (graceful degradation).
-        .ignore_eos(true)
-        .tag("F");
-        if let Some(key) = &self.cfg.api_key {
-            worker = worker.api_key(key);
-        }
-        if let Some(logger) = &self.logger {
-            worker = worker.logger(logger.clone());
-        }
+        .ignore_eos(true);
+        let pool = match &self.cfg.api_key {
+            Some(key) => pool.api_key(key.clone()),
+            None => pool,
+        };
+        let pool = match &self.logger {
+            Some(l) => pool.logger(l.clone()),
+            None => pool,
+        };
 
-        // Spawn the worker without awaiting it: the channel must be drained
-        // concurrently (the same pattern as Engine A's server-agnostic fix).
-        let handle = spawn_worker(worker, tx);
+        // Spawn all `n` streams together; drain the aggregate channel
+        // until the window elapses (then abort) or every stream ends on
+        // its own. `tokio::time::timeout` bounds each `recv` to the time
+        // remaining in the window, so a slow server is cut at 60 s.
+        let (mut rx, supervisor) = pool.spawn_tagged(n, "F");
         let start = MonotonicInstant::now();
-
-        let mut events = Vec::new();
+        let mut per_stream: Vec<Vec<StreamEvent>> = vec![Vec::new(); n];
+        let mut terminals = 0usize;
         let mut batch = 0u32;
-
-        // Drain until the 60s window elapses (then abort) or the stream
-        // ends on its own. `tokio::time::timeout` bounds each `recv` to the
-        // time remaining in the window, so a slow server is cut at 60s.
         loop {
             let elapsed_ns = start.delta_nanos(&MonotonicInstant::now());
             if elapsed_ns >= WINDOW_NS {
@@ -362,73 +485,83 @@ impl FlatOutEngine {
             let remaining = Duration::from_nanos(WINDOW_NS - elapsed_ns);
             match tokio::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(event)) => {
-                    let is_terminal = matches!(
-                        event,
-                        StreamEvent::Complete { .. } | StreamEvent::Failed { .. }
-                    );
-                    events.push(event);
+                    if let Some(bucket) = per_stream.get_mut(event.stream() as usize) {
+                        bucket.push(to_stream_event(&event));
+                    }
+                    if event.is_terminal() {
+                        terminals += 1;
+                    }
                     batch += 1;
-                    if batch >= 8 || is_terminal {
+                    if batch >= 16 || terminals == n {
                         // Live TUI snapshot + sequence progress bus (the
-                        // 10 Hz ticker mirrors the bus into the state slot).
-                        // While the window is open the stream is live
+                        // 10 Hz ticker mirrors the bus into the state
+                        // slot). While the window is open the run is live
                         // (`finished = false`).
                         if let Some(state) = &self.metrics {
-                            state.update(self.live_snapshot(&events, &start, false));
+                            state.update(self.live_snapshot(&per_stream, &start, false));
                         }
                         if let Some(bus) = &self.progress {
                             let (tokens, tps) =
-                                Self::observed(&events, self.generator.tokenizer().as_deref());
+                                Self::observed(&per_stream, self.generator.tokenizer().as_deref());
                             bus.publish(EngineProgress::FlatOut {
                                 elapsed_secs: start.elapsed().as_secs_f64(),
+                                streams: n,
                                 tokens,
                                 tps,
                             });
                         }
                         batch = 0;
                     }
-                    if is_terminal {
-                        break;
+                    if terminals == n {
+                        break; // every stream ended before the window
                     }
                 }
-                Ok(None) => break, // channel closed (worker done)
-                Err(_) => break,   // 60s window elapsed
+                Ok(None) => break, // channel closed (all workers done)
+                Err(_) => break,   // 60 s window elapsed
             }
         }
 
-        // Stop the stream: abort the worker task (drops the HTTP response →
-        // the connection closes → the server stops generating). A no-op if
-        // the stream already ended on its own before the window.
-        handle.abort();
+        // Stop the run: abort the supervisor task — it owns every worker
+        // task (and its forwarder), so they are aborted with it and their
+        // sockets close (the server stops generating). A no-op when all
+        // streams already ended on their own.
+        supervisor.abort();
         drop(rx);
 
         let elapsed = start.elapsed().as_secs_f64();
-        let result =
-            FlatOutResult::from_events(&events, elapsed, self.generator.tokenizer().as_deref());
+        let result = FlatOutResult::from_events(
+            &per_stream,
+            elapsed,
+            self.generator.tokenizer().as_deref(),
+            self.stream_count_source,
+        );
 
         // Final publish (the last batch may not have flushed). The 60 s
-        // window is over and the worker is aborted: this is a *completed*
-        // stream, so it is reported `Done` (the accumulator counts its
-        // decode rate — the last engine must appear in OVERALL METRICS).
+        // window is over and the workers are aborted: every stream is a
+        // *completed* benchmark stream, reported `Done` (the
+        // accumulator counts each one's decode rate — the last engine
+        // must appear in OVERALL METRICS).
         if let Some(state) = &self.metrics {
-            state.update(self.live_snapshot(&events, &start, true));
+            state.update(self.live_snapshot(&per_stream, &start, true));
         }
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::FlatOut {
                 elapsed_secs: elapsed,
+                streams: n,
                 tokens: result.total_tokens,
-                tps: result.tps,
+                tps: result.aggregate_tps,
             });
         }
         if let Some(l) = &self.logger {
             l.info(
                 Context::EngineF,
                 format!(
-                    "Flat Out: {} tok in {:.1}s ({:.1} t/s, TTFT {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms)",
+                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms)",
                     result.total_tokens,
                     result.duration_secs,
-                    result.tps,
-                    result.ttft_ms,
+                    result.aggregate_tps,
+                    result.per_stream_tps,
+                    result.ttft_avg_ms,
                     result.itl_p50_ms,
                     result.itl_p99_ms
                 ),
@@ -451,24 +584,18 @@ impl FlatOutEngine {
         }
     }
 
-    /// The authoritative token count so far + its decode rate over the
-    /// first→last token window (the live progress figures; prefill/TTFT
-    /// excluded, the research's Timing Boundary Rule).
-    ///
-    /// The count is the authoritative one ([`authoritative_tokens`]): the
-    /// server's `usage.completion_tokens` once it arrives, else the
-    /// re-tokenized text — never the raw frame tally (which undercounts
-    /// batched vLLM frames by 30–40 %).
-    fn observed(events: &[StreamEvent], tokenizer: Option<&Tokenizer>) -> (u64, f64) {
+    /// The live progress figures: the authoritative token count so far
+    /// (summed across all streams) + its decode rate over the global
+    /// first→last token window (prefill/TTFT excluded — the research's
+    /// Timing Boundary Rule).
+    fn observed(per_stream: &[Vec<StreamEvent>], tokenizer: Option<&Tokenizer>) -> (u64, f64) {
+        let mut total = 0u64;
         let mut first: Option<MonotonicInstant> = None;
         let mut last: Option<MonotonicInstant> = None;
-        let mut usage: Option<Usage> = None;
-        for e in events {
-            match e {
-                StreamEvent::Frame { frame, at, .. } => {
-                    if let Chunk::Usage(u) = &frame.chunk {
-                        usage = Some(*u);
-                    }
+        for events in per_stream {
+            total += authoritative_tokens(events, stream_usage(events), tokenizer).0;
+            for e in events {
+                if let StreamEvent::Frame { frame, at, .. } = e {
                     if frame.chunk.is_token() {
                         if first.is_none() {
                             first = Some(*at);
@@ -476,98 +603,115 @@ impl FlatOutEngine {
                         last = Some(*at);
                     }
                 }
-                StreamEvent::Complete { usage: u, .. } => {
-                    usage = *u;
-                }
-                StreamEvent::Failed { .. } => {}
             }
         }
-        let (tokens, _est) = authoritative_tokens(events, usage, tokenizer);
         let tps = match (first, last) {
             (Some(f), Some(l)) => {
                 let span_s = f.delta_nanos(&l) as f64 / 1e9;
                 if span_s > 0.0 {
-                    tokens as f64 / span_s
+                    total as f64 / span_s
                 } else {
                     0.0
                 }
             }
             _ => 0.0,
         };
-        (tokens, tps)
+        (total, tps)
     }
 
-    /// Build a live [`MetricsSnapshot`] from the events collected so far
-    /// in the run.
+    /// Build a live [`MetricsSnapshot`] from the per-stream events
+    /// collected so far in the run.
     ///
-    /// The decode rate uses the same single formula as Engine A and the
-    /// Overall Metrics panel: `tokens_received / (T_last − T_first)`.
+    /// The decode rate uses the same formula as Engine A and the Overall
+    /// Metrics panel: `tokens_received / (T_last − T_first)` — over all
+    /// streams combined (the live aggregate).
     ///
-    /// `finished` marks the **final** publish (the 60 s window elapsed and
-    /// the worker was aborted): the stream is a *completed* benchmark
-    /// stream and is reported `Done`. The abort means no terminal
-    /// `Complete` event ever arrives and every captured frame carries
-    /// `t_end = None`, so without this flag the stream would stay
-    /// `Streaming` forever and the `OverallAccumulator`'s non-terminal →
-    /// terminal detector would never count this stream's decode rate —
-    /// the last engine would silently vanish from the OVERALL METRICS
-    /// panel (the user-reported Live-vs-Overall discrepancy).
+    /// `finished` marks the **final** publish (the 60 s window elapsed
+    /// and the workers were aborted): every stream is a *completed*
+    /// benchmark stream and is reported `Done`. The abort means no
+    /// terminal `Complete` event ever arrives for the in-flight streams,
+    /// so without this flag they would stay `Streaming` forever and the
+    /// `OverallAccumulator`'s non-terminal → terminal detector would
+    /// never count this engine's decode rate — the last engine would
+    /// silently vanish from the OVERALL METRICS panel.
     fn live_snapshot(
         &self,
-        events: &[StreamEvent],
+        per_stream: &[Vec<StreamEvent>],
         start: &MonotonicInstant,
         finished: bool,
     ) -> MetricsSnapshot {
+        let n = per_stream.len().max(1);
         let elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
-        let (frame_tokens, decode_rate) =
-            Self::observed(events, self.generator.tokenizer().as_deref());
-        let mut itl = LatencyHistogram::default();
-        let mut last_token_at: Option<MonotonicInstant> = None;
-        let mut usage: Option<Usage> = None;
-        let mut t_end: Option<MonotonicInstant> = None;
+        let (tokens_received, decode_rate) =
+            Self::observed(per_stream, self.generator.tokenizer().as_deref());
 
-        for event in events {
-            match event {
-                StreamEvent::Frame {
-                    frame,
-                    at,
-                    timestamps,
-                } => {
-                    if frame.chunk.is_token() {
-                        if let Some(prev) = last_token_at {
-                            itl.record(prev.delta_nanos(at));
+        // Pooled ITL + one stream row per stream.
+        let mut itl = LatencyHistogram::default();
+        let mut active = 0usize;
+        let mut streams: Vec<StreamMetric> = Vec::with_capacity(n);
+        for (id, events) in per_stream.iter().enumerate() {
+            let mut prev: Option<MonotonicInstant> = None;
+            let mut first_token: Option<MonotonicInstant> = None;
+            let mut last_token: Option<MonotonicInstant> = None;
+            let mut ttft_s: Option<f64> = None;
+            let mut complete = false;
+            let mut failed = false;
+            for e in events {
+                match e {
+                    StreamEvent::Frame {
+                        frame,
+                        at,
+                        timestamps,
+                    } => {
+                        if frame.chunk.is_token() {
+                            if let Some(p) = prev {
+                                itl.record(p.delta_nanos(at));
+                            }
+                            prev = Some(*at);
+                            if first_token.is_none() {
+                                first_token = Some(*at);
+                                if let Some(ns) = timestamps.ttft_nanos() {
+                                    ttft_s = Some(ns as f64 / 1e9);
+                                }
+                            }
+                            last_token = Some(*at);
                         }
-                        last_token_at = Some(*at);
                     }
-                    if t_end.is_none() {
-                        t_end = timestamps.t_end;
-                    }
-                }
-                StreamEvent::Complete {
-                    usage: u,
-                    timestamps,
-                    ..
-                } => {
-                    usage = *u;
-                    t_end = timestamps.t_end;
-                }
-                StreamEvent::Failed { timestamps, .. } => {
-                    t_end = timestamps.t_end;
+                    StreamEvent::Complete { .. } => complete = true,
+                    StreamEvent::Failed { .. } => failed = true,
                 }
             }
+            let (tokens, gen_tps) = Self::stream_rate(
+                events,
+                first_token,
+                last_token,
+                self.generator.tokenizer().as_deref(),
+            );
+            let state = if finished {
+                StreamStatus::Done
+            } else if failed {
+                StreamStatus::Error
+            } else if complete {
+                StreamStatus::Done
+            } else if tokens > 0 {
+                StreamStatus::Streaming
+            } else {
+                StreamStatus::Waiting
+            };
+            if state == StreamStatus::Streaming {
+                active += 1;
+            }
+            streams.push(StreamMetric {
+                id: id as u32,
+                kind: "Content".to_string(),
+                state,
+                tg_tokens: (tokens > 0).then_some(tokens),
+                gen_tps: (gen_tps > 0.0).then_some(gen_tps),
+                ttft_s,
+                progress: (elapsed_ns as f64 / 1e9 / WINDOW_SECS).min(1.0),
+                ..Default::default()
+            });
         }
-
-        // The authoritative token count: the server's
-        // `usage.completion_tokens` when it arrived, else the re-tokenized
-        // text (the normal case — we abort the 60 s stream before the
-        // terminal usage chunk). Never the raw frame tally, which
-        // undercounts batched vLLM frames by 30–40 %.
-        let tokens_received = frame_tokens;
-        let status = if t_end.is_some() || finished {
-            StreamStatus::Done
-        } else {
-            StreamStatus::Streaming
-        };
 
         MetricsSnapshot {
             endpoint: self.cfg.url.clone(),
@@ -575,29 +719,49 @@ impl FlatOutEngine {
             model: self.cfg.model.clone(),
             mode: "FlatOut".to_string(),
             aggregate_tps: decode_rate,
-            active_streams: (status == StreamStatus::Streaming) as usize,
-            total_streams: 1,
+            active_streams: active,
+            total_streams: n,
             itl_p50_ns: itl.p50() as u64,
             itl_p90_ns: itl.p90() as u64,
             itl_p99_ns: itl.p99() as u64,
             itl_p999_ns: itl.p999() as u64,
             completion_tokens: tokens_received,
             // The decode-rate numerator: the authoritative token count
-            // (usage → text estimate), matching `completion_tokens`.
-            observed_frames: frame_tokens,
-            prompt_tokens: usage.map(|u| u.prompt_tokens).unwrap_or(0),
-            status,
-            streams: vec![crate::metrics::state::StreamMetric {
-                id: 0,
-                kind: "Content".to_string(),
-                state: status,
-                tg_tokens: (tokens_received > 0).then_some(tokens_received),
-                gen_tps: (decode_rate > 0.0).then_some(decode_rate),
-                progress: (elapsed_ns as f64 / 1e9 / WINDOW_SECS).min(1.0),
-                ..Default::default()
-            }],
+            // (usage → text estimate), summed across all streams.
+            observed_frames: tokens_received,
+            prompt_tokens: 0,
+            status: if finished {
+                StreamStatus::Done
+            } else {
+                StreamStatus::Streaming
+            },
+            streams,
             ..Default::default()
         }
+    }
+
+    /// One stream's authoritative token count + its decode rate over its
+    /// own first→last token window (`tokens / span` — the same formula
+    /// the Overall Metrics panel records per stream).
+    fn stream_rate(
+        events: &[StreamEvent],
+        first_token: Option<MonotonicInstant>,
+        last_token: Option<MonotonicInstant>,
+        tokenizer: Option<&Tokenizer>,
+    ) -> (u64, f64) {
+        let (tokens, _) = authoritative_tokens(events, stream_usage(events), tokenizer);
+        let gen_tps = match (first_token, last_token) {
+            (Some(f), Some(l)) => {
+                let span_s = f.delta_nanos(&l) as f64 / 1e9;
+                if span_s > 0.0 && tokens > 0 {
+                    tokens as f64 / span_s
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
+        (tokens, gen_tps)
     }
 }
 
@@ -620,6 +784,19 @@ mod tests {
         }
     }
 
+    /// A content frame carrying `text` (for the text-estimate paths).
+    fn content_frame_text(text: &str, at: MonotonicInstant, ts: StreamTimestamps) -> StreamEvent {
+        StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk: Chunk::Content(text.into()),
+                t_nanos: 0,
+                done: false,
+            },
+            at,
+            timestamps: ts,
+        }
+    }
+
     fn ts_at(t: MonotonicInstant) -> StreamTimestamps {
         StreamTimestamps {
             t0: Some(t),
@@ -627,6 +804,19 @@ mod tests {
             t2: Some(t),
             t3: Some(t),
             t_end: Some(t),
+        }
+    }
+
+    /// A timestamp record with `t_end` unset — the shape of every frame
+    /// captured from an *aborted* stream (the worker is dropped before it
+    /// can send the terminal event, so `Tn` is never recorded).
+    fn ts_open(t: MonotonicInstant) -> StreamTimestamps {
+        StreamTimestamps {
+            t0: Some(t),
+            t1: Some(t),
+            t2: Some(t),
+            t3: Some(t),
+            t_end: None,
         }
     }
 
@@ -647,48 +837,55 @@ mod tests {
         assert!(c.tokens <= 30, "prompt should be ~15 tokens: {}", c.tokens);
     }
 
-    /// A timestamp record with `t_end` unset — the shape of every frame
-    /// captured from an *aborted* stream (the worker is dropped before it
-    /// can send the terminal event, so `Tn` is never recorded).
-    fn ts_open(t: MonotonicInstant) -> StreamTimestamps {
-        StreamTimestamps {
-            t0: Some(t),
-            t1: Some(t),
-            t2: Some(t),
-            t3: Some(t),
-            t_end: None,
-        }
+    #[test]
+    fn default_stream_count_is_three() {
+        assert_eq!(DEFAULT_STREAM_COUNT, 3);
     }
 
     #[test]
-    fn final_publish_reports_the_aborted_stream_done() {
-        // The 60 s window aborts the worker: no terminal `Complete` event
-        // arrives, so every captured frame has `t_end = None`. The final
-        // publish (`finished = true`) must still report the stream `Done` —
-        // otherwise the Overall Metrics accumulator never counts this
-        // stream's decode rate (the user-reported Live-vs-Overall
-        // discrepancy: the last engine missing from the overall panel).
+    fn stream_count_source_labels() {
+        assert_eq!(
+            StreamCountSource::ConcurrencySweetSpot.as_str(),
+            "concurrency_sweet_spot"
+        );
+        assert_eq!(StreamCountSource::Default.as_str(), "default");
+    }
+
+    #[test]
+    fn engine_defaults_to_three_streams() {
         let engine = FlatOutEngine::new(&Config {
             url: "http://127.0.0.1:9".to_string(),
             model: "m".to_string(),
             ..Config::default()
         })
         .unwrap();
-        let t0 = MonotonicInstant::now();
-        let events = vec![content_frame(t0, ts_open(t0))];
-        // Live publish (window still open): Streaming, one active stream.
-        let live = engine.live_snapshot(&events, &t0, false);
-        assert_eq!(live.streams[0].state, StreamStatus::Streaming);
-        assert_eq!(live.active_streams, 1);
-        // Final publish (window elapsed, worker aborted): Done, zero
-        // active streams.
-        let final_snap = engine.live_snapshot(&events, &t0, true);
-        assert_eq!(final_snap.streams[0].state, StreamStatus::Done);
-        assert_eq!(final_snap.active_streams, 0);
+        assert_eq!(engine.stream_count, DEFAULT_STREAM_COUNT);
+        assert_eq!(engine.stream_count_source, StreamCountSource::Default);
     }
 
     #[test]
-    fn from_events_prefers_server_usage_over_the_token_window() {
+    fn engine_stream_count_builder_sets_count_and_source() {
+        let engine = FlatOutEngine::new(&Config {
+            url: "http://127.0.0.1:9".to_string(),
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap();
+        let engine = engine.stream_count(8, StreamCountSource::ConcurrencySweetSpot);
+        assert_eq!(engine.stream_count, 8);
+        assert_eq!(
+            engine.stream_count_source,
+            StreamCountSource::ConcurrencySweetSpot
+        );
+        // The builder floors at one stream (never zero).
+        let engine = FlatOutEngine::new(&Config::default())
+            .unwrap()
+            .stream_count(0, StreamCountSource::Default);
+        assert_eq!(engine.stream_count, 1);
+    }
+
+    #[test]
+    fn from_events_prefers_server_usage_over_the_text_estimate() {
         let (clock, mock) = quanta::Clock::mock();
         quanta::with_clock(&clock, || {
             let t0 = MonotonicInstant::now(); // 0 ms
@@ -718,12 +915,61 @@ mod tests {
                     timestamps: ts,
                 },
             ];
-            // The server's usage is the authoritative count (primary method);
-            // the rate is over the first→last token window (100→300 ms).
-            let r = FlatOutResult::from_events(&events, 10.0, None);
+            // The server's usage is the authoritative count (primary
+            // method); the aggregate is total / wall window (10 s).
+            let r = FlatOutResult::from_events(&[events], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.stream_count, 1);
             assert_eq!(r.total_tokens, 100_000, "server usage is authoritative");
-            assert!((r.tps - 100_000.0 / 0.2).abs() < 1.0, "tps: {}", r.tps);
+            assert!(
+                (r.aggregate_tps - 10_000.0).abs() < 1.0,
+                "aggregate: {}",
+                r.aggregate_tps
+            );
+            assert!(
+                (r.per_stream_tps - 10_000.0).abs() < 1.0,
+                "per-stream: {}",
+                r.per_stream_tps
+            );
             assert!((r.duration_secs - 10.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn from_events_sums_streams_and_pools_itl() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now(); // 100 ms
+            mock.increment(100_000_000);
+            let t2 = MonotonicInstant::now(); // 200 ms
+            mock.increment(100_000_000);
+            let t3 = MonotonicInstant::now(); // 300 ms
+            let ts = ts_at(t0);
+            // Two streams: 4-char content frames (chars/4 → 1 token each).
+            // Stream 0: two tokens (100→200 ms, a 100 ms gap); stream 1:
+            // one token (300 ms). Total 3 tokens over the 10 s window.
+            let s0 = vec![
+                content_frame_text("abcd", t1, ts),
+                content_frame_text("efgh", t2, ts),
+            ];
+            let s1 = vec![content_frame_text("ijkl", t3, ts)];
+            let r = FlatOutResult::from_events(&[s0, s1], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.stream_count, 2);
+            assert_eq!(r.total_tokens, 3, "1 + 1 + 1 token per 4-char frame");
+            assert!(
+                (r.aggregate_tps - 0.3).abs() < 1e-9,
+                "aggregate: {}",
+                r.aggregate_tps
+            );
+            assert!(
+                (r.per_stream_tps - 0.15).abs() < 1e-9,
+                "per-stream: {}",
+                r.per_stream_tps
+            );
+            // The pooled ITL has one 100 ms sample.
+            assert!((r.itl_p50_ms - 100.0).abs() < 0.5, "p50: {}", r.itl_p50_ms);
+            assert!((r.itl_p99_ms - 100.0).abs() < 0.5, "p99: {}", r.itl_p99_ms);
         });
     }
 
@@ -738,24 +984,23 @@ mod tests {
             let t2 = MonotonicInstant::now(); // last token
             let ts = ts_at(t0);
             // No usage frame (the aborted-stream case), no tokenizer: the
-            // count is estimated from the full text (`chars/4`), NOT the raw
-            // frame tally — counting frames undercounts batched servers.
-            // Two frames of 4 chars each → 8 chars → 2 tokens.
-            let mut e1 = content_frame(t1, ts);
-            if let StreamEvent::Frame { frame, .. } = &mut e1 {
-                frame.chunk = Chunk::Content("abcd".into());
-            }
-            let mut e2 = content_frame(t2, ts);
-            if let StreamEvent::Frame { frame, .. } = &mut e2 {
-                frame.chunk = Chunk::Content("efgh".into());
-            }
-            let events = vec![e1, e2];
-            let r = FlatOutResult::from_events(&events, 10.0, None);
+            // count is estimated from the full text (`chars/4`), NOT the
+            // raw frame tally — counting frames undercounts batched
+            // servers. Two frames of 4 chars each → 8 chars → 2 tokens.
+            let events = vec![
+                content_frame_text("abcd", t1, ts),
+                content_frame_text("efgh", t2, ts),
+            ];
+            let r = FlatOutResult::from_events(&[events], 10.0, None, StreamCountSource::Default);
             assert_eq!(
                 r.total_tokens, 2,
                 "no usage + no tokenizer → chars/4 estimate"
             );
-            assert!((r.tps - 2.0 / 0.1).abs() < 1e-9, "tps: {}", r.tps); // 2 / 100 ms
+            assert!(
+                (r.aggregate_tps - 0.2).abs() < 1e-9,
+                "aggregate: {}",
+                r.aggregate_tps
+            );
         });
     }
 
@@ -772,33 +1017,26 @@ mod tests {
             let t2 = MonotonicInstant::now(); // last token
             let ts = ts_at(t0);
             // No usage frame; two content frames "apple " + "apple" → the
-            // word-level tokenizer counts "apple apple" as exactly 2 tokens.
-            let mut e1 = content_frame(t1, ts);
-            if let StreamEvent::Frame { frame, .. } = &mut e1 {
-                frame.chunk = Chunk::Content("apple ".into());
-            }
-            let mut e2 = content_frame(t2, ts);
-            if let StreamEvent::Frame { frame, .. } = &mut e2 {
-                frame.chunk = Chunk::Content("apple".into());
-            }
-            let events = vec![e1, e2];
-            let r = FlatOutResult::from_events(&events, 10.0, Some(&tok));
+            // word-level tokenizer counts "apple apple" as exactly 2
+            // tokens.
+            let events = vec![
+                content_frame_text("apple ", t1, ts),
+                content_frame_text("apple", t2, ts),
+            ];
+            let r =
+                FlatOutResult::from_events(&[events], 10.0, Some(&tok), StreamCountSource::Default);
             assert_eq!(r.total_tokens, 2, "re-tokenized count (apple apple)");
-            assert!((r.tps - 2.0 / 0.05).abs() < 1e-9, "tps: {}", r.tps); // 2 / 50 ms
         });
     }
 
     #[test]
     fn from_events_zero_duration_gives_zero_tps() {
         let t0 = MonotonicInstant::now();
-        let mut e = content_frame(t0, ts_at(t0));
-        if let StreamEvent::Frame { frame, .. } = &mut e {
-            frame.chunk = Chunk::Content("abcd".into());
-        }
-        let events = vec![e];
-        let r = FlatOutResult::from_events(&events, 0.0, None);
+        let events = vec![content_frame_text("abcd", t0, ts_at(t0))];
+        let r = FlatOutResult::from_events(&[events], 0.0, None, StreamCountSource::Default);
         assert_eq!(r.total_tokens, 1); // 4 chars → chars/4 = 1 token
-        assert_eq!(r.tps, 0.0); // a single frame → a zero decode window
+        assert_eq!(r.aggregate_tps, 0.0);
+        assert_eq!(r.per_stream_tps, 0.0);
     }
 
     #[test]
@@ -819,84 +1057,196 @@ mod tests {
             timestamps: ts,
         };
         let events = vec![reasoning, control];
-        let r = FlatOutResult::from_events(&events, 5.0, None);
+        let r = FlatOutResult::from_events(&[events], 5.0, None, StreamCountSource::Default);
         // One reasoning token frame; the `[DONE]` control frame is not a
-        // token. A single frame gives a zero decode window → 0 t/s.
+        // token.
         assert_eq!(r.total_tokens, 1);
-        assert_eq!(r.tps, 0.0);
     }
 
     #[test]
-    fn from_events_records_ttft_from_the_first_token() {
+    fn from_events_averages_ttft_across_streams() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            // Stream 0: request at t0, first token at 100 ms (TTFT 100 ms);
+            // stream 1: first token at 300 ms (TTFT 300 ms) → mean 200 ms.
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            mock.increment(200_000_000);
+            let t2 = MonotonicInstant::now();
+            // TTFT = T3 − T1: the request went out at t0, the first token
+            // frame decoded at its arrival instant.
+            let ts1 = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t0),
+                t2: Some(t1),
+                t3: Some(t1),
+                t_end: None,
+            };
+            let ts2 = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t0),
+                t2: Some(t2),
+                t3: Some(t2),
+                t_end: None,
+            };
+            let s0 = content_frame_text("abcd", t1, ts1);
+            let s1 = content_frame_text("efgh", t2, ts2);
+            let r = FlatOutResult::from_events(
+                &[vec![s0], vec![s1]],
+                5.0,
+                None,
+                StreamCountSource::Default,
+            );
+            assert!(
+                (r.ttft_avg_ms - 200.0).abs() < 1.0,
+                "ttft avg: {}",
+                r.ttft_avg_ms
+            );
+        });
+    }
+
+    #[test]
+    fn to_stream_event_round_trips_all_variants() {
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            let frame = PoolEvent::from_event(
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Content("tok".into()),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t0,
+                    timestamps: ts,
+                },
+                3,
+            );
+            assert!(matches!(to_stream_event(&frame), StreamEvent::Frame { .. }));
+            let complete = PoolEvent::from_event(
+                StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(Usage {
+                        prompt_tokens: 10,
+                        completion_tokens: 20,
+                    }),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+                1,
+            );
+            assert!(matches!(
+                to_stream_event(&complete),
+                StreamEvent::Complete {
+                    usage: Some(u),
+                    ..
+                } if u.completion_tokens == 20
+            ));
+            let failed = PoolEvent::from_event(
+                StreamEvent::Failed {
+                    timestamps: ts,
+                    error: crate::client::StreamError::Connection("refused".into()),
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+                2,
+            );
+            assert!(matches!(
+                to_stream_event(&failed),
+                StreamEvent::Failed { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn live_snapshot_reports_per_stream_states() {
+        let engine = FlatOutEngine::new(&Config {
+            url: "http://127.0.0.1:9".to_string(),
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap();
         let t0 = MonotonicInstant::now();
-        let ts = StreamTimestamps {
-            t0: Some(t0),
-            t1: Some(t0),
-            t2: Some(t0),
-            t3: Some(t0),
-            t_end: None,
-        };
-        let events = vec![content_frame(t0, ts)];
-        let r = FlatOutResult::from_events(&events, 60.0, None);
-        // All milestones equal → TTFT is 0 (recorded, not missing).
-        assert_eq!(r.ttft_ms, 0.0);
+        // Two streams: one streaming (tokens, no terminal), one failed.
+        let s0 = vec![content_frame_text("abcd", t0, ts_open(t0))];
+        let s1 = vec![StreamEvent::Failed {
+            timestamps: ts_at(t0),
+            error: crate::client::StreamError::Connection("refused".into()),
+            looping: false,
+            loop_excluded_tokens: 0,
+        }];
+        // Live publish: stream 0 Streaming, stream 1 Error.
+        let live = engine.live_snapshot(&[s0.clone(), s1.clone()], &t0, false);
+        assert_eq!(live.total_streams, 2);
+        assert_eq!(live.active_streams, 1);
+        assert_eq!(live.streams[0].state, StreamStatus::Streaming);
+        assert_eq!(live.streams[1].state, StreamStatus::Error);
+        // Final publish (window elapsed, workers aborted): every stream
+        // is a completed benchmark stream, reported Done (the accumulator
+        // counts each one's decode rate).
+        let final_snap = engine.live_snapshot(&[s0, s1], &t0, true);
+        assert_eq!(final_snap.status, StreamStatus::Done);
+        assert_eq!(final_snap.active_streams, 0);
+        assert_eq!(final_snap.streams[0].state, StreamStatus::Done);
+        assert_eq!(final_snap.streams[1].state, StreamStatus::Done);
     }
 
     #[test]
-    fn itl_percentiles_track_the_gap_distribution() {
-        // 1 ms and 2 ms gaps: p50 is the first value covering half the
-        // count (the 1 ms sample), p99 the 2 ms sample (hdrhistogram
-        // cumulative-count semantics; buckets carry a tiny rounding
-        // slack).
-        let (p50, p99) = itl_percentiles_ms(&[1_000_000, 2_000_000]);
-        assert!((p50 - 1.0).abs() < 0.01, "p50: {p50}");
-        assert!((p99 - 2.0).abs() < 0.05, "p99: {p99}");
-    }
-
-    #[test]
-    fn itl_percentiles_empty_is_zero() {
-        assert_eq!(itl_percentiles_ms(&[]), (0.0, 0.0));
-    }
-
-    #[test]
-    fn summary_line_is_the_single_number() {
+    fn summary_line_carries_the_headline_numbers() {
         let r = FlatOutResult {
-            total_tokens: 3462,
+            stream_count: 8,
+            stream_count_source: StreamCountSource::ConcurrencySweetSpot,
+            total_tokens: 17_124,
             duration_secs: 60.0,
-            tps: 57.7,
-            ttft_ms: 42.0,
-            itl_p50_ms: 17.0,
-            itl_p99_ms: 40.0,
+            aggregate_tps: 285.4,
+            per_stream_tps: 35.7,
+            ttft_avg_ms: 312.5,
+            itl_p50_ms: 28.3,
+            itl_p99_ms: 65.1,
         };
         let line = r.summary_line();
-        assert!(line.starts_with("57.7 t/s sustained"), "{line}");
-        assert!(line.contains("3462 tok in 60s"), "{line}");
+        assert!(line.contains("285.4 t/s aggregate (8 streams)"), "{line}");
+        assert!(line.contains("35.7 t/s per stream"), "{line}");
+        assert!(line.contains("17124 tok in 60s"), "{line}");
     }
 
     #[test]
-    fn to_dict_is_a_single_flat_object() {
+    fn to_dict_is_the_full_export_object() {
         let r = FlatOutResult {
-            total_tokens: 3462,
+            stream_count: 8,
+            stream_count_source: StreamCountSource::ConcurrencySweetSpot,
+            total_tokens: 17_124,
             duration_secs: 60.0,
-            tps: 57.7,
-            ttft_ms: 42.0,
-            itl_p50_ms: 17.0,
-            itl_p99_ms: 40.0,
+            aggregate_tps: 285.4,
+            per_stream_tps: 35.7,
+            ttft_avg_ms: 312.5,
+            itl_p50_ms: 28.3,
+            itl_p99_ms: 65.1,
         };
         let v = r.to_dict();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
         assert_eq!(
             keys,
             vec![
+                "stream_count",
+                "stream_count_source",
                 "total_tokens",
                 "duration_secs",
-                "tps",
-                "ttft_ms",
+                "aggregate_tps",
+                "per_stream_tps",
+                "ttft_avg_ms",
                 "itl_p50_ms",
                 "itl_p99_ms"
             ]
         );
-        assert_eq!(v["total_tokens"], 3462);
-        assert!((v["tps"].as_f64().unwrap() - 57.7).abs() < 1e-9);
+        assert_eq!(v["stream_count"], 8);
+        assert_eq!(v["stream_count_source"], "concurrency_sweet_spot");
+        assert_eq!(v["total_tokens"], 17_124);
+        assert!((v["aggregate_tps"].as_f64().unwrap() - 285.4).abs() < 1e-9);
+        assert!((v["per_stream_tps"].as_f64().unwrap() - 35.7).abs() < 1e-9);
     }
 }

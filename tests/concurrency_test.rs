@@ -351,14 +351,14 @@ fn view2_renders_sweep_curve_knee_and_envelope() {
     // Per-stream: 100 / 175 / 20 — the knee (c=4: throughput collapses
     // 350→80, p90 spikes 8→20 ms) is past the point where each user
     // still gets a comfortable rate.
-    app.sweep.store(SweepResult {
-        levels: vec![
+    app.sweep.store(SweepResult::from_levels(
+        vec![
             level(1, 100.0, 5.0),
             level(2, 350.0, 8.0),
             level(4, 80.0, 20.0),
         ],
-        matrix: None,
-    });
+        None,
+    ));
     let text = render_concurrency(&app);
 
     // Real curve rows: aggregate t/s + p90 TPOT per level.
@@ -391,8 +391,8 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
     // plateaus (340→345, +1.5%) while p90 TPOT spikes 3× (10→30 ms).
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep.store(SweepResult {
-        levels: vec![
+    app.sweep.store(SweepResult::from_levels(
+        vec![
             level(1, 100.0, 5.0),
             level(2, 190.0, 6.0),
             level(4, 280.0, 7.0),
@@ -401,8 +401,8 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
             level(32, 342.0, 60.0),
             level(64, 338.0, 90.0),
         ],
-        matrix: None,
-    });
+        None,
+    ));
     let text = render_concurrency(&app);
 
     // The detected knee matches the injected inflection (acceptance:
@@ -453,10 +453,7 @@ fn view2_survives_a_partial_failure_level() {
             m
         })
         .collect();
-    app.sweep.store(SweepResult {
-        levels: vec![lvl],
-        matrix: None,
-    });
+    app.sweep.store(SweepResult::from_levels(vec![lvl], None));
     let text = render_concurrency(&app);
     assert!(text.contains("6/8 ok"));
     assert!(text.contains("300.0 t/s"));
@@ -479,14 +476,14 @@ fn view2_curve_shows_placeholder_before_a_sweep() {
 fn view2_curve_marks_sweet_spot_and_knee() {
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep.store(SweepResult {
-        levels: vec![
+    app.sweep.store(SweepResult::from_levels(
+        vec![
             level(1, 100.0, 5.0),
             level(2, 350.0, 8.0),
             level(4, 340.0, 20.0),
         ],
-        matrix: None,
-    });
+        None,
+    ));
     let buf = render_concurrency_at(&app, 120, 40);
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
 
@@ -530,8 +527,8 @@ fn view2_curve_marks_sweet_spot_and_knee() {
 fn view2_curve_renders_the_full_ladder() {
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep.store(SweepResult {
-        levels: vec![
+    app.sweep.store(SweepResult::from_levels(
+        vec![
             level(1, 100.0, 5.0),
             level(2, 190.0, 6.0),
             level(4, 280.0, 7.0),
@@ -540,8 +537,8 @@ fn view2_curve_renders_the_full_ladder() {
             level(32, 342.0, 60.0),
             level(64, 338.0, 90.0),
         ],
-        matrix: None,
-    });
+        None,
+    ));
     let buf = render_concurrency_at(&app, 120, 40);
     assert!(
         buf.content()
@@ -565,10 +562,10 @@ fn view2_curve_renders_the_full_ladder() {
 fn view2_curve_survives_small_terminals() {
     let mut app = App::new();
     app.view = View::Concurrency;
-    app.sweep.store(SweepResult {
-        levels: vec![level(1, 100.0, 5.0), level(2, 350.0, 8.0)],
-        matrix: None,
-    });
+    app.sweep.store(SweepResult::from_levels(
+        vec![level(1, 100.0, 5.0), level(2, 350.0, 8.0)],
+        None,
+    ));
     for (w, h) in [(40, 10), (20, 6), (80, 24)] {
         let _ = render_concurrency_at(&app, w, h);
     }

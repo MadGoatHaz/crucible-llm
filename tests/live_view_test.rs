@@ -279,10 +279,10 @@ fn throughput_hero_degrades_gracefully_when_empty() {
 fn concurrency_curve_shows_while_engine_b_runs() {
     let app = app_with(test_snapshot());
     // A completed sweep on screen + Engine B running.
-    app.sweep.store(SweepResult {
-        levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)],
-        matrix: None,
-    });
+    app.sweep.store(SweepResult::from_levels(
+        vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0), lvl(4, 340.0, 20.0)],
+        None,
+    ));
     app.seq.store(seq_state(
         SeqPhase::Running,
         Engine::Concurrency,
@@ -308,10 +308,8 @@ fn concurrency_curve_hidden_during_engine_a() {
     let app = app_with(test_snapshot());
     // Sweep data exists, but Engine A is running → the curve is hidden
     // (never shown empty for the wrong engine).
-    app.sweep.store(SweepResult {
-        levels: vec![lvl(1, 100.0, 5.0)],
-        matrix: None,
-    });
+    app.sweep
+        .store(SweepResult::from_levels(vec![lvl(1, 100.0, 5.0)], None));
     app.seq.store(seq_state(
         SeqPhase::Running,
         Engine::Speed,
@@ -437,10 +435,10 @@ fn capability_scores_hidden_during_engine_a() {
 #[test]
 fn all_complete_shows_the_full_summary() {
     let app = app_with(test_snapshot());
-    app.sweep.store(SweepResult {
-        levels: vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0)],
-        matrix: None,
-    });
+    app.sweep.store(SweepResult::from_levels(
+        vec![lvl(1, 100.0, 5.0), lvl(2, 350.0, 8.0)],
+        None,
+    ));
     app.reasoning_slot.store(ReasoningResult {
         responses: vec![],
         ttfts: vec![],

@@ -50,8 +50,9 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
 | **C3 · Structured** | JSON compliance across 3 schema-complexity levels + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
 | **D · Energy** | GPU watts, joules/token (NVIDIA NVML built-in; AMD/Intel pending) | What's the **power cost**? |
+| **F · Flat Out** | real-world max throughput: aggregate + per-stream t/s at the sweet-spot concurrency for 60 s | What's the **headline number** to quote when comparing setups? |
 
-By default a run executes **A, B, C1, C2, C3** (Engine D is opt-in, since it must run on the machine with the GPU). Select any subset with `--engine`.
+By default a run executes **A, B, C1, C2, C3, F** (Engine D is opt-in, since it must run on the machine with the GPU). Select any subset with `--engine`.
 
 ### TUI Interface
 
@@ -59,7 +60,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 
 - **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker (first run only; a saved config skips straight to the dashboard).
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
-- **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 40 t/s), not just the aggregate throughput knee.
+- **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
 - **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
 - **View 4 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 5 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
@@ -227,7 +228,7 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 
 ### Concurrency (Engine B)
 
-- **Practical sweet spot** — the most users where **each** still gets ≥ **40 t/s** (comfortable for chat / agents / RAG).
+- **Practical sweet spot** — the most users where **each** still gets ≥ **30 t/s** (29.4 t/s effective with the 2% margin — comfortable for chat / agents / RAG).
 - **Maximum usable** — the most users where each gets ≥ **15 t/s** (workable, noticeably slower).
 - **Throughput knee** — where *aggregate* t/s stops increasing (a reference point, not the recommendation).
 - **Per-stream t/s** — `aggregate ÷ users`; what each individual user actually experiences.

@@ -84,7 +84,7 @@ Press Enter to start. The TUI switches to the Live Monitor.
 
 ### Reading the Concurrency View (View 2)
 - **Table**: One row per concurrency level. Shows aggregate AND per-stream speed.
-- **Recommendation**: "Practical Sweet Spot" = where each user still gets ≥40 t/s
+- **Recommendation**: "Practical Sweet Spot" = where each user still gets ≥30 t/s (29.4 t/s effective with the 2% margin)
 - **Graph**: Visual curve of throughput vs users
 
 ### Reading the NIAH View (View 3)
@@ -203,7 +203,7 @@ Press `e` during or after a run. Choose format: JSON, Markdown, or CSV.
 
 ### How many users can I serve?
 Look at the Concurrency view's "Practical Sweet Spot." That's your answer.
-- Sweet spot of 8 = 8 simultaneous users at comfortable speed (each ≥ 40 t/s)
+- Sweet spot of 8 = 8 simultaneous users at comfortable speed (each ≥ 30 t/s)
 - Each additional user beyond that makes everyone slower
 
 ### Can I trust this model?

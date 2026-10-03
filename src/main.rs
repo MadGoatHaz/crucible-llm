@@ -29,7 +29,8 @@ use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine, MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{
-    build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StructuredEngine,
+    build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StreamCountSource,
+    StructuredEngine,
 };
 use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::log::{Context, RunLogger};
@@ -251,11 +252,11 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
             .ok()
             .and_then(|g| g.gpu_name().map(str::to_string));
 
-        // The `--json` document: Engine A's results now, the `flatout`
-        // single-object result appended once Engine F has run (the
-        // document is printed *after* the additional-engine block below,
-        // so the flatout object is included in one JSON document on
-        // stdout). Non-JSON mode prints the result box(es) + summary.
+        // The `--json` document: Engine A's results now, the `flat_out`
+        // object appended once Engine F has run (the document is printed
+        // *after* the additional-engine block below, so the flat_out
+        // object is included in one JSON document on stdout). Non-JSON
+        // mode prints the result box(es) + summary.
         let mut json_doc = if cfg.json {
             Some(json_report(cfg, &results))
         } else {
@@ -389,6 +390,10 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                     extra.iter_labels().collect::<Vec<_>>().join(", ")
                 ));
             }
+            // Engine F (Flat Out) reads Engine B's sweet spot as its
+            // stream count (the real-world full-load number); captured
+            // here because the sweep result is scoped to the block.
+            let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
             if extra.concurrency {
                 if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
                     if !cfg.json {
@@ -402,6 +407,7 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
                         ));
                     }
                     let r = sweep.run().await;
+                    flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
                     // FIX 3: the headless summary leads with the
                     // practical (per-stream usability) sweet spot, with
                     // the pure-throughput knee as reference.
@@ -463,15 +469,21 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
             }
             if extra.flatout {
                 match FlatOutEngine::new(cfg) {
-                    Ok(engine) => {
+                    Ok(mut engine) => {
+                        // The stream count is Engine B's sweet spot when
+                        // the sweep ran (real-world full load), else the
+                        // built-in default.
+                        if let Some((n, source)) = flatout_streams {
+                            engine = engine.stream_count(n, source);
+                        }
                         if !cfg.json {
-                            term.dim("  [F] flat out (one 60s stream — peak sustained t/s)…");
+                            term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
                         }
                         let r = engine.logger(logger.clone()).run().await;
-                        // The `--json` document carries the single flatout
-                        // result object (no segments).
+                        // The `--json` document carries the flat_out
+                        // result object.
                         if let Some(v) = &mut json_doc {
-                            v["flatout"] = r.to_dict();
+                            v["flat_out"] = r.to_dict();
                         }
                         term.info(&format!("  [F] {}", r.summary_line()));
                     }
@@ -484,7 +496,7 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
         }
 
         // The `--json` document (printed after the additional engines so
-        // the `flatout` object is included): stdout stays pure JSON.
+        // the `flat_out` object is included): stdout stays pure JSON.
         if let Some(v) = json_doc {
             println!("{v}");
         }

@@ -930,17 +930,20 @@ fn build_capability_scores(
         });
     }
 
-    // Flat Out (F) — sustained maximum decode speed: one continuous
-    // 60-second stream.
+    // Flat Out (F) — real-world maximum throughput: the sweet-spot
+    // number of concurrent streams for one 60-second window.
     if sel.flatout {
         if let Some(r) = app.flatout_slot.load().as_ref() {
             v.push(CapScore {
                 label: "Flat Out",
                 pct: None,
-                detail: format!("{:.1} t/s", r.tps),
+                detail: format!(
+                    "{:.1} t/s agg · {:.1} t/s/user · {} streams",
+                    r.aggregate_tps, r.per_stream_tps, r.stream_count
+                ),
                 detail_style: style::value_ok(th),
                 color: th.success(),
-                info: "Sustained max decode. One continuous 60s stream.",
+                info: "Real-world max throughput at sweet-spot concurrency (60s).",
                 warn: None,
             });
         }
@@ -1641,8 +1644,8 @@ mod tests {
         let app = App::new();
         // A full run: everything selected, everything completed, and the
         // results are on screen (the sweep slot + a capability slot).
-        app.sweep.store(crate::engines::SweepResult {
-            levels: vec![crate::engines::SweepLevel {
+        app.sweep.store(crate::engines::SweepResult::from_levels(
+            vec![crate::engines::SweepLevel {
                 concurrency: 1,
                 aggregate_tps: 100.0,
                 p50_tpot_ns: 0,
@@ -1663,8 +1666,8 @@ mod tests {
                 loop_excluded_streams: 0,
                 loop_excluded_tokens: 0,
             }],
-            matrix: None,
-        });
+            None,
+        ));
         app.seq.store(SeqState {
             phase: SeqPhase::AllComplete,
             queue: Engine::ALL.to_vec(),

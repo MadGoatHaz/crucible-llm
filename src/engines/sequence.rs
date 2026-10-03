@@ -38,7 +38,8 @@ use crate::engines::capability::{
     NiahEngine, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
 };
 use crate::engines::concurrency::SweepResult;
-use crate::engines::flatout::{FlatOutEngine, FlatOutResult, WINDOW_SECS};
+use crate::engines::flatout::StreamCountSource;
+use crate::engines::flatout::{FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT, WINDOW_SECS};
 use crate::engines::hardware::profile;
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
@@ -176,7 +177,7 @@ impl Engine {
                 "Single-stream throughput. Measures tokens/sec and\nTTFT (time to first token) for one user — how fast\nthe model generates text in isolation."
             }
             Engine::Concurrency => {
-                "Multi-stream sweep. Gradually raises parallel requests\n(1→2→3→4→8→12→16→24→32) to find where per-user\nspeed degrades — how many users you can actually serve."
+                "Multi-stream sweep (1→2→3→4→8→12→16→24→32) finds\nwhere per-user speed degrades: the sweet spot keeps ≥30\nt/s per user (2% margin) — how many users you can serve."
             }
             Engine::Niah => {
                 "Long-context retrieval. Hides a fact in a 2k–128k\ndocument and asks the model to find it — measures\ncontext retention for RAG / document QA."
@@ -191,7 +192,7 @@ impl Engine {
                 "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
             }
             Engine::FlatOut => {
-                "Sustained maximum decode speed. One continuous\n60-second stream. Your server's peak tokens-per-second."
+                "Real-world maximum throughput. Runs at your server's\nsweet-spot concurrency for 60 seconds. The number to\nquote when comparing setups."
             }
         }
     }
@@ -230,10 +231,11 @@ pub enum EngineProgress {
     Structured { run: usize, total: usize },
     /// Engine D: `Sampling... {elapsed}s`.
     Sampling { elapsed: f64 },
-    /// Engine F: `{elapsed}s / 60s — {tokens} tokens ({tps} t/s)` (one
-    /// continuous stream).
+    /// Engine F: `{elapsed}s / 60s — {streams} streams — {tokens} tok
+    /// ({tps} t/s aggregate)` (the sweet-spot full-load run).
     FlatOut {
         elapsed_secs: f64,
+        streams: usize,
         tokens: u64,
         tps: f64,
     },
@@ -320,10 +322,11 @@ impl EngineProgress {
             EngineProgress::Sampling { elapsed } => format!("Sampling… {elapsed:.1}s"),
             EngineProgress::FlatOut {
                 elapsed_secs,
+                streams,
                 tokens,
                 tps,
             } => format!(
-                "{elapsed_secs:.0}s / {WINDOW_SECS:.0}s — {} tokens ({tps:.1} t/s)",
+                "{elapsed_secs:.0}s / {WINDOW_SECS:.0}s — {streams} streams — {} tok ({tps:.1} t/s)",
                 thousands(*tokens)
             ),
         }
@@ -1057,12 +1060,22 @@ impl BenchmarkSequence {
         summary
     }
 
-    /// Engine F — Flat Out: the sustained maximum decode speed finale.
-    /// One continuous 60-second stream with a minimal prompt and an
-    /// effectively-unlimited `max_tokens` cap. Returns the one-line
-    /// summary.
+    /// Engine F — Flat Out: the real-world maximum throughput finale.
+    /// Runs at the **concurrency sweet spot** (Engine B's recommendation —
+    /// the highest level where every user still gets ≥ 29.4 t/s) for 60
+    /// seconds: the server's full-load number to quote. Without a sweep,
+    /// it falls back to [`DEFAULT_STREAM_COUNT`] streams. Returns the
+    /// one-line summary.
     async fn run_flatout(&self) -> String {
         self.slots.flatout.set_running(true);
+        let (stream_count, source) = self
+            .slots
+            .concurrency
+            .load()
+            .as_ref()
+            .as_ref()
+            .map(|r| (r.sweet_spot, StreamCountSource::ConcurrencySweetSpot))
+            .unwrap_or((DEFAULT_STREAM_COUNT, StreamCountSource::Default));
         let engine = match FlatOutEngine::new(&self.cfg) {
             Ok(e) => e,
             Err(e) => {
@@ -1073,6 +1086,7 @@ impl BenchmarkSequence {
             }
         };
         let engine = engine
+            .stream_count(stream_count, source)
             .metrics(self.metrics.clone())
             .progress(self.bus.clone())
             .pause(self.pause.clone())
@@ -1122,10 +1136,10 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
 }
 
 /// Engine B's one-line summary: the **practical sweet spot** (the
-/// highest concurrency where every user still gets ≥ 40 t/s — what
-/// matters for real use), with the pure-throughput knee as reference,
-/// or a note when the curve was empty / nothing cleared the usability
-/// bar.
+/// highest concurrency where every user still gets ≥ 29.4 t/s — 30 t/s
+/// ideal with a 2% margin, what matters for real use), with the
+/// pure-throughput knee as reference, or a note when the curve was empty
+/// / nothing cleared the usability bar.
 pub fn summarize_sweep(result: &SweepResult) -> String {
     if result.is_empty() {
         return "no usable levels".to_string();
@@ -1142,11 +1156,11 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
             n, us.practical_per_stream, knee
         ),
         None => {
-            // Even the lightest load is below the 40 t/s/user comfort
-            // bar: report the usability edge instead.
+            // Even the lightest load is below the 30 t/s/user comfort bar
+            // (29.4 effective): report the usability edge instead.
             match us.max_usable {
                 Some(n) => format!(
-                    "no level reaches 40 t/s/user — usable up to {} users (~{:.0} t/s each){}",
+                    "no level reaches 30 t/s/user — usable up to {} users (~{:.0} t/s each){}",
                     n, us.max_usable_per_stream, knee
                 ),
                 None => format!("unusable for interactive use (below 15 t/s/user even at 1){knee}"),
@@ -1429,11 +1443,12 @@ mod tests {
         assert_eq!(
             EngineProgress::FlatOut {
                 elapsed_secs: 32.0,
+                streams: 8,
                 tokens: 1847,
                 tps: 57.7,
             }
             .label(),
-            "32s / 60s — 1,847 tokens (57.7 t/s)"
+            "32s / 60s — 8 streams — 1,847 tok (57.7 t/s)"
         );
     }
 
@@ -1442,6 +1457,7 @@ mod tests {
         assert_eq!(
             EngineProgress::FlatOut {
                 elapsed_secs: 0.0,
+                streams: 3,
                 tokens: 0,
                 tps: 0.0,
             }
@@ -1450,6 +1466,7 @@ mod tests {
         );
         let f = EngineProgress::FlatOut {
             elapsed_secs: 30.0,
+            streams: 8,
             tokens: 1000,
             tps: 33.3,
         }
@@ -1459,6 +1476,7 @@ mod tests {
         assert_eq!(
             EngineProgress::FlatOut {
                 elapsed_secs: 90.0,
+                streams: 8,
                 tokens: 1000,
                 tps: 11.1,
             }
@@ -1590,11 +1608,12 @@ mod tests {
             loop_excluded_tokens: 0,
         };
         // Per-stream: 100 @ 1 user, 175 @ 2 → the practical sweet spot
-        // (≥40 t/s each) is 2. No knee on a 2-level climb.
-        let result = SweepResult {
-            levels: vec![level(1, 100.0, 5_000_000), level(2, 350.0, 6_000_000)],
-            matrix: None,
-        };
+        // (≥29.4 t/s each — 30 with a 2% margin) is 2. No knee on a
+        // 2-level climb.
+        let result = SweepResult::from_levels(
+            vec![level(1, 100.0, 5_000_000), level(2, 350.0, 6_000_000)],
+            None,
+        );
         let line = summarize_sweep(&result);
         assert!(line.contains("practical sweet spot 2 users"), "{line}");
         assert!(line.contains("~175 t/s each"), "{line}");

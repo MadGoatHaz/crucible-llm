@@ -47,11 +47,15 @@ pub use capability::{
     REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
 };
 pub use concurrency::{
-    normalize_ladder, ConcurrencyMatrix, Envelope, KneePoint, MatrixCell, Sweep, SweepLevel,
-    SweepResult, UsabilityProfile, DEFAULT_LADDER, KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD,
-    PRACTICAL_PER_STREAM_TPS, USABLE_PER_STREAM_TPS,
+    normalize_ladder, recommended_streams_for, ConcurrencyMatrix, Envelope, KneePoint, MatrixCell,
+    Sweep, SweepLevel, SweepResult, UsabilityProfile, DEFAULT_LADDER, IDEAL_PER_STREAM_TPS,
+    KNEE_GAIN_THRESHOLD, KNEE_SPIKE_THRESHOLD, PRACTICAL_PER_STREAM_TPS, SWEET_SPOT_MARGIN,
+    USABLE_PER_STREAM_TPS,
 };
-pub use flatout::{FlatOutEngine, FlatOutResult, MAX_TOKENS, MINIMAL_PROMPT, WINDOW_SECS};
+pub use flatout::{
+    FlatOutEngine, FlatOutResult, StreamCountSource, DEFAULT_STREAM_COUNT, MAX_TOKENS,
+    MINIMAL_PROMPT, WINDOW_SECS,
+};
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
     VRAM_FRAGMENTATION_THRESHOLD,
@@ -145,8 +149,8 @@ pub struct RunReport {
     pub reasoning: Option<ReasoningResult>,
     /// Engine C3 — the structured-output penalty + compliance.
     pub structured: Option<StructuredResult>,
-    /// Engine F — Flat Out (sustained max-speed, one continuous 60s
-    /// stream).
+    /// Engine F — Flat Out (real-world max throughput at the
+    /// sweet-spot concurrency, one 60s window).
     pub flatout: Option<FlatOutResult>,
 }
 
@@ -225,7 +229,15 @@ pub async fn run_selected(cfg: &Config) -> RunReport {
     }
 
     if sel.flatout {
+        // Engine F runs at Engine B's sweet spot (the real-world
+        // full-load number); without a sweep it uses the default count.
+        let (stream_count, source) = report
+            .concurrency
+            .as_ref()
+            .map(|r| (r.sweet_spot, StreamCountSource::ConcurrencySweetSpot))
+            .unwrap_or((DEFAULT_STREAM_COUNT, StreamCountSource::Default));
         if let Ok(engine) = FlatOutEngine::new(cfg) {
+            let engine = engine.stream_count(stream_count, source);
             report.flatout = Some(engine.run().await);
         }
     }
