@@ -10,14 +10,14 @@ This document explains how each benchmark works, what it measures, and why. Unde
 │                                                                             │
 │  ┌──────────┐    ┌──────────┐    ┌────────────────────────────────────────┐  │
 │  │   User   │───▶│ TUI /    │───▶│         Benchmark Sequence             │  │
-│  │  (keys)  │    │   CLI    │    │  (A → B → C1 → C2 → C3 → D, one at   │  │
+│  │  (keys)  │    │   CLI    │    │  (A → B → C1 → C2 → C3 → D → F, one at │  │
 │  └──────────┘    └──────────┘    │   a time, tokio::spawned task)         │  │
 │                          │       └──────┬───────────────┬────────────────┘  │
 │                          ▼              ▼               ▼                     │
 │                   ┌────────────┐  ┌──────────┐  ┌──────────────┐            │
 │                   │  Config    │  │ Engines  │  │  ProgressBus │            │
 │                   │ (URL, model│  │ A,B,C1,  │  │ (10 Hz →     │            │
-│                   │  tokens,   │  │ C2,C3,D  │  │  SeqState)   │            │
+│                   │  tokens,   │  │ C2,C3,D,F│  │  SeqState)   │            │
 │                   │  ladder)   │  └────┬─────┘  └──────────────┘            │
 │                   └────────────┘       │                                    │
 │                                        ▼                                    │
@@ -132,13 +132,15 @@ From these, we derive:
 
 ### Token Counting
 
-We use two sources, with a clear priority:
+Every completion-token count flows through one canonical function, `authoritative_tokens()` (`client/stream.rs`), with a strict priority:
 
-1. **Server-reported** (authoritative): `usage.completion_tokens` and `usage.prompt_tokens` from the final SSE frame. When the server provides these, they are used for all calculations. This is the most accurate source because it reflects the server's actual tokenization.
+1. **Server-reported (primary, authoritative)** — `usage.completion_tokens` from the terminal `usage` frame (requested via `stream_options.include_usage: true`). When the server provides it, it is the count: it reflects the server's own tokenization, so it matches what the backend reports.
 
-2. **Frame count** (real-time estimation): The number of SSE `data:` frames carrying `Content` or `Reasoning` chunks. Used for live throughput estimates in the TUI while the stream is in progress (before the final `usage` frame arrives).
+2. **Re-tokenization (fallback)** — when no `usage` frame arrived (an aborted stream, or a non-compliant proxy), the full reasoning + content text is re-tokenized: the model's exact HuggingFace `tokenizer.json` when one is supplied, else a `chars/4` estimate (flagged `estimated`).
 
-For **prompt token counting** (to size the input), we support an optional HuggingFace `tokenizer.json` file. When provided, the prompt generator uses the tokenizer for exact counts. Without it, we estimate at `chars / 4` (the common heuristic for BPE tokenizers) and flag the result as `[ESTIMATED]`. This estimation is sufficient for Engine A's short/long modes but is less precise for Engine C1's haystack sizing (where we pad with a token-stable `" apple"` filler when a tokenizer is available).
+**The raw SSE frame tally is never used as a token count.** Batched servers (vLLM's multi-token prediction / speculative decoding) pack ~2.4 tokens into a single `data:` frame, so counting frames understates true output by 30–40 %. Frame counts survive only as decode-rate evidence on the wire, never as the token numerator.
+
+For **prompt token counting** (sizing the input), an optional HuggingFace `tokenizer.json` gives exact counts; without it we estimate at `chars/4` (the common BPE heuristic) and flag the result `[ESTIMATED]`. This is sufficient for Engine A's short/long modes and for Engine C1's haystack sizing (which pads with a token-stable `" apple"` filler when a tokenizer is available).
 
 ### SSE Parsing
 
@@ -162,7 +164,7 @@ The metrics pipeline has a **freeze-on-completion** behavior. While a run is act
 - the 100 ms hardware poller **goes idle** (it checks the freeze latch each tick and skips the sample/merge work while frozen), so it stops perturbing the system;
 - the frozen state persists until the **next run starts**, which calls `MetricsState::unfreeze()` to re-arm the pipeline.
 
-This applies to every run shape — the full `A → B → C1 → C2 → C3 (→ D)` sequence and a standalone `n`-key NIAH run. The freeze is a **read-side** concern (it only gates how often snapshots are refreshed); it never touches the `quanta` timing path, so the measurement-isolation invariant holds.
+This applies to every run shape — the full `A → B → C1 → C2 → C3 → D → F` sequence and a standalone `n`-key NIAH run. The freeze is a **read-side** concern (it only gates how often snapshots are refreshed); it never touches the `quanta` timing path, so the measurement-isolation invariant holds.
 
 ## Engine A: Speed
 
@@ -239,11 +241,11 @@ Each level is bounded three ways so the sweep can never hang on a single bad lev
 
 ### Sweet Spot Detection
 
-We calculate three thresholds from the sweep curve:
+We calculate four thresholds from the sweep curve:
 
 | Threshold | Definition | Meaning |
 |-----------|-----------|---------|
-| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 40 | Comfortable for chat, coding agents, RAG pipelines. **This is what we recommend.** |
+| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 30 (29.4 t/s effective, 2% margin) | Comfortable for chat, coding agents, RAG pipelines. **This is what we recommend — and the load Engine F runs at.** |
 | **Maximum Usable** | Highest level where per-stream t/s ≥ 15 | Minimal but functional. Noticeably slower, but workable. |
 | **Unusable From** | First level where per-stream t/s < 15 | Interactive use becomes impractical. |
 | **Throughput Knee** | First level where aggregate t/s gain ≤ 5% AND p90 TPOT grows ≥ 2× | Pure capacity limit: the GPU has transitioned from memory-bandwidth-bound to compute-bound. |
@@ -427,6 +429,28 @@ When no power telemetry is available (no GPU, no driver, feature off), all deriv
 - **VRAM usage**: the aggregate of model weights + KV cache. A fragmentation warning at 90% means the server may start OOM-killing requests.
 - **Comparison**: use J/token to compare quantization levels (Q4 vs. Q8), model sizes (7B vs. 70B), or hardware options (A5000 vs. 4090) on equal footing.
 
+## Engine F: Flat Out
+
+### What It Measures
+
+Real-world maximum throughput: the server's **total** tokens/sec when it is loaded at its **concurrency sweet spot** — the user count Engine B recommends. This is the "one number" to quote when comparing servers or configurations, because it measures the deployment at the load you would actually run it.
+
+### Methodology
+
+1. **Read the stream count** from Engine B's stored sweep result: the practical sweet spot (the highest level where every user still gets ≥ 29.4 t/s — 30 ideal with a 2% margin). When Engine B did not run, fall back to a small default load (3 streams, tagged `default`).
+2. **Spawn all `n` streams together** via the shared `WorkerPool`, each sending the same minimal (~15-token) open-ended prompt so prefill is <100 ms — negligible against the 60-second window.
+3. **`max_tokens = 100,000` + `ignore_eos`** — effectively unlimited, so the *only* stop condition is the **60-second window** (`WINDOW_SECS`). `ignore_eos` keeps llama.cpp servers from ending a stream on the model's own end-token; other backends ignore the field (graceful degradation).
+4. **Abort at 60 s** — the supervisor task is dropped, every worker task and its socket closes, and the server stops generating.
+5. **Authoritative token counting** per stream (`authoritative_tokens`): the server `usage` when it arrives, else re-tokenized text — never the raw frame tally.
+
+### What the Numbers Mean
+
+- **Aggregate t/s** = `total_tokens / duration` — the headline: what a full-load deployment sustains.
+- **Per-stream t/s** = `aggregate ÷ streams` — ≈ 30 t/s confirms the load is at the sweet spot.
+- **TTFT avg / ITL p50 / p99** — pooled across all streams, the latency evidence behind the throughput.
+
+The JSON export records the result under `flat_out` with `stream_count`, `stream_count_source` (`concurrency_sweet_spot` / `default`), `total_tokens`, `duration_secs`, `aggregate_tps`, `per_stream_tps`, and the latency percentiles.
+
 ## Data Flow Diagram
 
 ```
@@ -506,6 +530,22 @@ Every completed run is persisted to the SQLite store (`~/.local/share/crucible/b
 
 **Measurement isolation:** all DB I/O happens on the key path (user-driven, rare) and the results are cached in the view's state, so the 60 Hz render loop never touches the database — it renders a pure `&App` read.
 
+## Themes
+
+The TUI is skinned by a `Theme` enum with three complete palettes (`ui/theme.rs`). Every color a view draws comes from the active theme — no view hardcodes a `Color` — so switching re-colors the entire screen from a single source of truth.
+
+| Theme | Palette | Config id |
+|-------|---------|-----------|
+| **Cyberpunk** (default) | Neon cyan · electric purple · deep blue · digital glow | `cyberpunk` |
+| **Vampire** | Crimson · gold · dark purple · gothic | `vampire` |
+| **Monochrome Pastel** | Soft blue · lavender · clean whites · minimal | `monochrome` |
+
+Each theme supplies the full role set — `primary`, `secondary`, `tertiary`, `accent`, `success`, `danger`, `dim`, `bright`, `border`, `border_active`, plus the gradient-texture colors (`floor`, `bright_gradient`, `bg`) that give the charts their depth.
+
+**Selection & switching.** The theme resolves from `CRUCIBLE_THEME` / the config file's `theme` field / the built-in default (`cyberpunk`). On the **first run** (no theme ever chosen — `theme_explicit` is false) a full-screen **theme picker** takes over before Setup: `↑`/`↓` moves the cursor and the *entire* screen live-previews the hovered theme, while each option box shows its own palette; `Enter` applies it to `app.active_theme`, persists it to the config file, and falls through to Setup (fresh target) or the Dashboard (target given). **Subsequent runs** skip the picker. The theme is changeable any time from **Config (View 5)**'s Theme field — `←`/`→` cycles with a live preview, `1`/`2`/`3` select directly, and `Esc` saves.
+
+Rendering stays a pure `&App` read (the `active_theme` field), so the theme never touches the measurement path.
+
 ## Technology Stack
 
 | Component | Technology | Why |
@@ -540,7 +580,7 @@ The act of measuring must not perturb the system. This is enforced architectural
 
 We report **per-user experience**, not just aggregate numbers.
 
-- Engine B's headline recommendation is the **practical sweet spot** (per-stream t/s ≥ 40), not the peak aggregate throughput. 64 users at 2.6 t/s each is not "fast."
+- Engine B's headline recommendation is the **practical sweet spot** (the highest level where per-stream t/s ≥ 30 — 29.4 effective with the 2% margin), not the peak aggregate throughput. 64 users at 2.6 t/s each is not "fast."
 - ITL percentiles (p50, p90, p99, p99.9) show the *distribution*, not just the mean. A p99 of 500ms means 1% of tokens take a half-second — the user perceives stutter even if the average is 30ms.
 - NIAH reports pass rates per context size, not just an overall percentage. The degradation curve is the actionable data.
 - Structured output reports per-case checks (valid JSON, schema, fields, types) — not just a boolean. You see *exactly what failed*.

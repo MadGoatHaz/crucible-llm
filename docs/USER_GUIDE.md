@@ -6,7 +6,7 @@
 
 1. Build or download the binary
 2. Run `./crucible-llm`
-3. You'll see the **Setup** screen — the interactive walkthrough (below)
+3. You'll first see the **theme picker** (choose a color theme), then the **Setup** screen — the interactive walkthrough (below)
 
 ### Subsequent runs
 
@@ -15,7 +15,7 @@ If you saved a config with a **URL + model** on a previous run (via the Config v
 ## The Setup Flow (first run)
 
 ### Step 1: Server URL
-Enter the base URL of your OpenAI-compatible server.
+Enter the base URL of your OpenAI-compatible server. Crucible works with **any OpenAI-compatible server** — vLLM, llama.cpp, LM Studio, Unsloth Desktop, SGLang, Ollama, and TGI — anything exposing a `/v1/chat/completions` endpoint.
 Examples:
 - vLLM: `http://localhost:8000/v1`
 - Ollama: `http://localhost:11434/v1`
@@ -32,7 +32,7 @@ A list of models appears (fetched from `GET /v1/models`).
 - If discovery fails, you can type a model name manually
 
 ### Step 3: Configuration
-- **Engines**: Toggle which benchmarks to run. Defaults: **A, B, C1, C2, C3** (D / energy is opt-in)
+- **Engines**: Toggle which benchmarks to run. Defaults: **A, B, C1, C2, C3, F** (D / energy is opt-in)
 - **Mode**: short (quick TTFT test) or long (sustained throughput)
 - **Tokens**: Target prompt tokens for `long` mode (default **10000**)
 - **Iterations**: How many times to repeat (more = more reliable)
@@ -47,7 +47,7 @@ Press Enter to start. The TUI switches to the Live Monitor.
 |---------|---------|
 | Target tokens | `10000` |
 | Concurrency ladder | `1, 2, 3, 4, 8, 12, 16, 24, 32` |
-| Engines | A (Speed), B (Concurrency), C1 (NIAH), C2 (Reasoning), C3 (Structured) |
+| Engines | A (Speed), B (Concurrency), C1 (NIAH), C2 (Reasoning), C3 (Structured), F (Flat Out) |
 | Engine D (Energy) | **off** (opt-in — run it on the GPU machine) |
 | Mode | `short` |
 | Iterations | `1` |
@@ -75,6 +75,18 @@ Press Enter to start. The TUI switches to the Live Monitor.
 | Ctrl+C | **Does not quit** — the terminal owns it for copy selection |
 
 > `Ctrl+C` is intentionally inert so you can select text and copy it with the terminal. To quit, press `q` and confirm with `y`. `Esc` never quits outright.
+
+### Themes
+
+Crucible ships three complete color themes, and the whole TUI re-skins when you switch:
+
+- **Cyberpunk** (default) — neon cyan / electric purple / digital glow
+- **Vampire** — crimson / gold / dark purple, gothic
+- **Monochrome Pastel** — soft blue / lavender / clean, minimal
+
+**First run:** if you've never picked a theme, a full-screen picker appears before Setup. Move with `↑`/`↓` (the whole screen live-previews the hovered theme) and confirm with `Enter` — it's saved, so later runs skip the picker.
+
+**Change later:** open **Config (View 5)**, focus the **Theme** field, and cycle with `←`/`→` (live preview) or jump with `1`/`2`/`3`; `Esc` saves. You can also set it via the `theme` field in `~/.config/crucible/config.json` or the `CRUCIBLE_THEME` environment variable.
 
 ### Reading the Live Monitor (View 1)
 - **Throughput graph**: Real-time tokens/sec. Green=fast, red=slow. Vertical lines mark engine transitions.
@@ -126,8 +138,8 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 |-------|--------------|
 | Target URL | Base URL of your OpenAI-compatible server; must be reachable from this machine |
 | Model | The model to benchmark; usually auto-detected, must match exactly (case-sensitive) |
-| Mode | `short` = ~100-token prompt (tests TTFT); `long` = your token target (tests sustained throughput) |
-| Target tokens | `max_tokens` per request — 256 = quick, 10000 = standard, 8192+ = stress |
+| Mode | `short` = ~50-token prompt (tests TTFT); `long` = padded to your token target (tests sustained throughput) |
+| Target tokens | Target prompt tokens for `long` mode (default 10000) — how big the input document is |
 | Iterations | Repeats — 1 = quick, 3-5 = reliable, 10+ = publication-grade |
 | Timeout | Max seconds to wait; the stream is killed if silent this long (default 120s) |
 | API key | Bearer token for authenticated servers; local servers don't need it; not persisted |
@@ -135,7 +147,8 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Tokenizer | Path to a HuggingFace `tokenizer.json` for exact counts; without it, `chars/4` estimate |
 | Concurrency ladder | Engine B levels, comma-separated (default `1,2,3,4,8,12,16,24,32`) |
 | Hardware telemetry | Engine D energy poller (opt-in; reports N/A without a GPU driver) |
-| Engine A–C3 | Toggle each benchmark on/off |
+| Theme | TUI color theme — Cyberpunk / Vampire / Monochrome Pastel; `←`/`→` cycles, `1`/`2`/`3` selects |
+| Engine A–F | Toggle each benchmark on/off (D / energy is opt-in) |
 
 ## Headless / CLI Mode
 
@@ -206,11 +219,17 @@ Look at the Concurrency view's "Practical Sweet Spot." That's your answer.
 - Sweet spot of 8 = 8 simultaneous users at comfortable speed (each ≥ 30 t/s)
 - Each additional user beyond that makes everyone slower
 
+### What's the headline number?
+That's **Flat Out (Engine F)** — it uses your server's optimal user count (from the Concurrency sweet spot) for a **60-second full-load test**. The aggregate t/s it reports is the single number to quote when comparing servers or configurations. If you didn't run Concurrency first, it falls back to a small default load (3 streams).
+
 ### Can I trust this model?
 - **Reasoning ≥ 90%**: Yes, for most tasks
 - **NIAH reliable to 16k+**: Yes, for RAG with moderate context
 - **Structured 3/3**: Yes, for API integration
 - Any of these failing? The model has limitations for that use case.
+
+### Are the token counts accurate?
+Yes. Crucible uses the **server-reported `usage.completion_tokens`** as the authoritative count, with a re-tokenization fallback (your exact tokenizer, or a `chars/4` estimate) when a stream is cut off before a usage frame arrives. It never counts raw SSE frames — which matters because batched servers like vLLM pack ~2.4 tokens into one frame. The result is accurate across vLLM, llama.cpp, LM Studio, SGLang, Ollama, and TGI.
 
 ## Troubleshooting
 

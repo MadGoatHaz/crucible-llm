@@ -21,9 +21,10 @@ src/
 ├── log.rs            # File-based run logger (latest.log + run archives)
 ├── client/
 │   ├── mod.rs
-│   ├── stream.rs     # StreamWorker (HTTP + SSE + timing)
+│   ├── stream.rs     # StreamWorker (HTTP + SSE + timing + authoritative token count)
 │   ├── pool.rs       # WorkerPool (concurrent streams)
-│   └── models.rs     # Model discovery (GET /v1/models)
+│   ├── models.rs     # Model discovery (GET /v1/models)
+│   └── loop_guard.rs # Decode-loop guard (repeating-pattern detection)
 ├── sse/
 │   ├── mod.rs
 │   ├── parser.rs     # SSE stream parser
@@ -37,6 +38,7 @@ src/
 │   ├── sequence.rs   # Benchmark sequence executor
 │   ├── speed.rs      # Engine A
 │   ├── concurrency.rs # Engine B
+│   ├── flatout.rs    # Engine F
 │   ├── hardware.rs   # Engine D
 │   └── capability/
 │       ├── mod.rs
@@ -46,7 +48,8 @@ src/
 ├── metrics/
 │   ├── mod.rs
 │   ├── state.rs      # ArcSwap shared metrics
-│   └── histogram.rs  # HdrHistogram (ITL distribution)
+│   ├── histogram.rs  # HdrHistogram (ITL distribution)
+│   └── methodology.rs # Methodology block for JSON export
 ├── hw/
 │   ├── mod.rs        # HwPoller trait
 │   └── nvml.rs       # NVIDIA backend
@@ -64,6 +67,7 @@ src/
     └── views/
         ├── mod.rs
         ├── setup.rs      # Setup/connection phase
+        ├── theme_picker.rs # First-run theme picker
         ├── live.rs       # View 1: Live monitor
         ├── concurrency.rs # View 2: Concurrency
         ├── needle.rs     # View 3: NIAH

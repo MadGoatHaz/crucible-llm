@@ -7,11 +7,11 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-460%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-629%20green-brightgreen)](#)
 
 </div>
 
-Crucible LLM is a comprehensive benchmarking tool for **OpenAI-compatible inference servers** — vLLM, llama.cpp, SGLang, Ollama, and others. It measures generation speed, concurrency capacity, reasoning ability, long-context retrieval, structured-output compliance, and energy efficiency — all from a single interactive TUI or a headless CLI.
+Crucible LLM is a comprehensive benchmarking tool for **any OpenAI-compatible inference server** — vLLM, llama.cpp, LM Studio, Unsloth Desktop, SGLang, Ollama, and TGI. It measures generation speed, concurrency capacity, reasoning ability, long-context retrieval, structured-output compliance, and energy efficiency — all from a single interactive TUI or a headless CLI.
 
 Built in Rust for **zero-dependency deployment**. One static binary. No Python. No JVM. No runtime. SQLite is compiled in; GPU telemetry is feature-gated. Point it at any `/v1` endpoint and start measuring.
 
@@ -31,7 +31,7 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 
 - **TUI-first** — an interactive terminal dashboard with real-time throughput graphs, live model discovery, and per-engine metrics.
 - **Headless-ready** — a full CLI mode for CI/CD, scripting, and automated regression testing, with pure-JSON output and meaningful exit codes.
-- **Comprehensive** — six benchmark engines covering speed, scale, intelligence, structured-output fidelity, and silicon efficiency.
+- **Comprehensive** — seven benchmark engines covering speed, concurrency scale, reasoning intelligence, long-context retrieval, structured-output fidelity, real-world maximum throughput, and silicon energy efficiency.
 - **Portable** — a single static binary. Run it from any terminal on any Linux box. No install, no venv, no system libraries.
 - **Honest metrics** — measures what actually matters for a *user*: per-stream experience and practical capacity, not just aggregate throughput. A server that serves 64 users at 2.6 t/s each is not "fast" — it is slow for everyone. Crucible reports the difference.
 - **Rigorous timing** — all latency is captured on a hardware cycle clock (`quanta`) in isolated worker rings and is never perturbed by UI repaints, allocation churn, or database writes (the *measurement-isolation* invariant).
@@ -45,12 +45,12 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 | Engine | Measures | Use Case |
 | :--- | :--- | :--- |
 | **A · Speed** | tokens/sec (decode), prefill throughput, TTFT, ITL p50/p99, MTP/speculative ratio | How fast does the model respond to **one** user? |
-| **B · Concurrency** | sweep 1→32 parallel streams, per-stream t/s, saturation knee, practical sweet spot | How many users can your server **actually** serve? |
+| **B · Concurrency** | sweep 1→32 parallel streams, per-stream t/s, saturation knee, **practical sweet spot** (highest level where each user still gets ≥ 30 t/s) | How many users can your server **actually** serve? |
 | **C1 · NIAH** | needle-in-a-haystack retrieval across 2k→128k contexts × 11 depths | Can the model **find a fact** buried in a long document? |
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
 | **C3 · Structured** | JSON compliance across 3 schema-complexity levels + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
 | **D · Energy** | GPU watts, joules/token (NVIDIA NVML built-in; AMD/Intel pending) | What's the **power cost**? |
-| **F · Flat Out** | real-world max throughput: aggregate + per-stream t/s at the sweet-spot concurrency for 60 s | What's the **headline number** to quote when comparing setups? |
+| **F · Flat Out** | runs at the server's **sweet-spot concurrency** for 60 s — aggregate + per-stream t/s at real-world full load | What's the **headline number** to quote when comparing setups? |
 
 By default a run executes **A, B, C1, C2, C3, F** (Engine D is opt-in, since it must run on the machine with the GPU). Select any subset with `--engine`.
 
@@ -80,6 +80,18 @@ More views in action:
 ![Needle (NIAH)](<docs/img/Needle (NIAH).png>)
 
 </div>
+
+### Themes
+
+Three complete color palettes — the entire TUI re-skins from a single source of truth:
+
+| Theme | Palette | Character |
+| :--- | :--- | :--- |
+| **Cyberpunk** (default) | Neon cyan · electric purple · deep blue | The original digital-glow skin |
+| **Vampire** | Crimson · gold · dark purple | Dark, gothic |
+| **Monochrome Pastel** | Soft blue · lavender · clean whites | Calm, minimal |
+
+On your **first run** (no theme ever chosen) a full-screen **theme picker** appears before Setup — move with `↑`/`↓` and the whole screen live-previews the hovered theme; `Enter` applies and saves it. Change it any time from **Config (View 5)**'s Theme field (`←`/`→` to cycle, `1`/`2`/`3` to select).
 
 ### Headless / CLI Mode
 
@@ -125,7 +137,7 @@ On your **first run** (no saved config) the interactive Setup flow walks you thr
 1. Enter your server URL (e.g. `http://localhost:8000/v1`).
 2. Pick a model from the auto-discovered list (or type it).
 3. Configure the benchmark (or accept the defaults).
-4. Press **Enter** to launch — watch the live dashboard run A → B → C1 → C2 → C3.
+4. Press **Enter** to launch — watch the live dashboard run A → B → C1 → C2 → C3 → F.
 
 On **subsequent runs**, a saved config (`~/.config/crucible/config.json`) with a URL + model skips Setup and opens the dashboard directly. Re-open Setup any time with `c`.
 
@@ -175,17 +187,20 @@ CLI flag  >  environment variable  >  config file  >  built-in default
   "iterations": 3,
   "timeout": 120,
   "ladder": [1, 2, 3, 4, 8, 12, 16, 24, 32],
+  "matrix_contexts": [0, 8000, 32000],
   "hardware": true,
+  "theme": "cyberpunk",
   "engines": {
     "speed": true, "concurrency": true, "niah": true,
-    "reasoning": true, "structured": true, "hardware": false
+    "reasoning": true, "structured": true, "flatout": true,
+    "hardware": false
   }
 }
 ```
 
 ### Environment Variables
 
-Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`.
+Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`.
 
 ### CLI Reference
 
@@ -205,8 +220,9 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact token counts; without it, counts are `chars/4` estimates (flagged `estimated`). |
 | `--tui` | off | Force the interactive dashboard (default mode on a TTY). |
 | `--headless` | off | Run the classic headless benchmark instead of the TUI. |
-| `--engine <NAME>` | A,B,C1,C2,C3 | Select which engines a run orchestrates (repeatable): `speed`/`a`, `concurrency`/`b`, `niah`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`d`. |
+| `--engine <NAME>` | A,B,C1,C2,C3,F | Select which engines a run orchestrates (repeatable): `speed`/`a`, `concurrency`/`b`, `niah`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`d`, `flatout`/`f`. |
 | `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
+| `--matrix-context <CSV>` | `0,8k,32k` | Context sizes for Engine B's 2D concurrency × context matrix (`0` = the configured prompt). |
 | `--no-hardware` | off | Disable the hardware/energy telemetry poller. |
 | `--export <fmt>` | — | Export the run: `json`, `md`, or `csv`. |
 | `--export-path <PATH>` | `data_dir()/exports/…` | Destination file for `--export`. |
@@ -217,6 +233,10 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 ---
 
 ## Understanding the Results
+
+### Token Counting
+
+Token counts use the **server's reported `usage.completion_tokens`** as the authoritative source, with a **re-tokenization fallback** (the exact tokenizer when supplied, else a `chars/4` estimate) when a stream is aborted before a usage frame arrives. Crucible never counts raw SSE frames: batched servers (vLLM's multi-token prediction) pack ~2.4 tokens into one frame, and frame-counting understates true output by 30–40 %. This keeps the counts accurate across vLLM, llama.cpp, LM Studio, SGLang, Ollama, and TGI.
 
 ### Speed (Engine A)
 
@@ -257,6 +277,12 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 - **Joules/token** = `∫P(t)dt / total_tokens` — the silicon-efficiency metric for comparing quantizations and hardware.
 - **Requires a local GPU with driver support** — NVIDIA NVML is built-in (`--features nvml`); AMD/Intel are on the roadmap. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
 
+### Flat Out (Engine F)
+
+- **Real-world maximum throughput** — the server loaded at its **concurrency sweet spot** (Engine B's recommendation) for a full **60 seconds**.
+- **Aggregate t/s** is the headline number: `total_tokens / 60 s`. **Per-stream t/s** (= aggregate ÷ streams) confirms each user stays at the sweet spot (~30 t/s).
+- Without a prior sweep it falls back to a small default load (3 streams). This is the "one number" to quote when comparing setups.
+
 ---
 
 ## Data & Storage
@@ -278,7 +304,7 @@ Crucible is a single static binary organized around one core invariant: **measur
 
 - **Four decoupled execution rings** — a stream-worker pool (network I/O), the engine core (metric synthesis), a 100 ms hardware profiler, and the 60 Hz TUI render loop — connected by lock-free channels.
 - **Timing never touches the UI.** All latency is stamped by `quanta` (CPU cycle counters, no syscalls) inside the worker rings. The dashboard reads a lock-free, double-buffered (`ArcSwap`) snapshot; a dropped frame, a resize, or a SQLite flush can never perturb a measurement.
-- **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; `eventsource-stream` + `reqwest` (HTTP/2) drive low-allocation SSE parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
+- **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; a manual zero-allocation SSE line-buffer state machine + `reqwest` (HTTP/1.1 for local endpoints, HTTP/2 for TLS) drive the stream parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
 - **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); NVIDIA telemetry is feature-gated and absent by default; GPU/CPU telemetry degrades to N/A where a driver is missing.
 
 See [`docs/blueprint.md`](./docs/blueprint.md) for the full system specification, metric formulations, and database schema.
