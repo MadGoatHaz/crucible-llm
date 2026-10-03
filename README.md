@@ -180,8 +180,8 @@ CLI flag  >  environment variable  >  config file  >  built-in default
 
 ```json
 {
-  "url": "http://192.168.51.163:8000/v1",
-  "model": "qwen3.8-27b",
+  "url": "http://localhost:8000/v1",
+  "model": "my-model",
   "mode": "long",
   "tokens": 10000,
   "iterations": 3,

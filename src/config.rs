@@ -31,8 +31,8 @@ use thiserror::Error;
 
 use crate::engines::concurrency::DEFAULT_LADDER;
 
-/// Default endpoint (parity with `llmspeedtest.py`'s `DEFAULT_URL`).
-pub const DEFAULT_URL: &str = "http://192.168.51.163:8080/v1/chat/completions";
+/// Default endpoint.
+pub const DEFAULT_URL: &str = "http://localhost:8000/v1";
 /// Default model name (parity with `llmspeedtest.py`'s `DEFAULT_MODEL`).
 pub const DEFAULT_MODEL: &str = "default";
 /// Default connection/read timeout in seconds (parity with the prototype).

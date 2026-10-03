@@ -1907,7 +1907,7 @@ pub mod fmt {
     }
 
     /// The server address (`host:port`) of a URL —
-    /// `http://192.168.51.154:8888/v1` → `192.168.51.154:8888`. The status
+    /// `http://127.0.0.1:8888/v1` → `127.0.0.1:8888`. The status
     /// bar shows this (never a backend name: the server could be vLLM,
     /// llama.cpp, LM Studio, Unsloth, SGLang, … — we don't know). A bare
     /// host passes through; the empty string stays empty.
@@ -1948,8 +1948,8 @@ mod tests {
     #[test]
     fn url_host_extracts_host_and_port() {
         assert_eq!(
-            fmt::url_host("http://192.168.51.154:8888/v1"),
-            "192.168.51.154:8888"
+            fmt::url_host("http://127.0.0.1:8888/v1"),
+            "127.0.0.1:8888"
         );
         assert_eq!(
             fmt::url_host("https://example.com/v1/chat/completions"),
@@ -1967,7 +1967,7 @@ mod tests {
         // rendered status bar carries the endpoint host instead.
         let app = App::new();
         app.metrics.update(MetricsSnapshot {
-            endpoint: "http://192.168.51.154:8888/v1".to_string(),
+            endpoint: "http://127.0.0.1:8888/v1".to_string(),
             model: "swift-27b".to_string(),
             mode: "short".to_string(),
             backend: String::new(),
@@ -1975,7 +1975,7 @@ mod tests {
         });
         let text = rendered_text(&app, 120, 40);
         assert!(
-            text.contains("192.168.51.154:8888"),
+            text.contains("127.0.0.1:8888"),
             "status bar shows the server address: {text}"
         );
         assert!(
