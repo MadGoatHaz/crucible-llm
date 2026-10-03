@@ -1,0 +1,40 @@
+<h1>Crucible LLM v0.1.1 — Big Update</h1>
+
+<p><em>The one where the numbers finally mean what you think they mean.</em></p>
+
+<p>Since the initial release, we've been listening to feedback and pushing hard on the things that matter most. Here's what's new:</p>
+
+<h2>3 Visual Themes</h2>
+<p>Pick your vibe. <strong>Cyberpunk</strong> (cyan/purple/neon) is the default. <strong>Vampire</strong> (crimson/gold/gothic) for the dark aesthetic. <strong>Monochrome Pastel</strong> (soft/clean) for minimalists. First run asks you to pick — live preview as you arrow between them. Change anytime from Config.</p>
+
+<h2>Flat Out Engine</h2>
+<p>The number you want to quote. New <strong>"Flat Out"</strong> benchmark: 60 seconds at your server's optimal concurrency. Not 1 stream. Not max streams. The <strong>SWEET SPOT</strong> — where each user still gets great speed. This is your real-world maximum throughput. The number to compare servers by.</p>
+
+<h2>Accurate Token Counting</h2>
+<p>We were counting wrong. Now we're not. Turns out vLLM batches ~2.4 tokens per SSE frame. We were counting frames. That's a 3x undercount. Fixed. We now use the server's own token count (<code>usage.completion_tokens</code>) as the authoritative source. Our numbers match the server's numbers.</p>
+
+<h2>Works With Everything</h2>
+<p>Not just vLLM. Confirmed working with: vLLM, llama.cpp, LM Studio, Unsloth Desktop, SGLang, Ollama, TGI. Any OpenAI-compatible endpoint. If it speaks <code>/v1/chat/completions</code>, we benchmark it.</p>
+
+<h2>30 T/S Sweet Spot</h2>
+<p>The number that actually matters. Concurrency sweep now identifies your <strong>"Practical Sweet Spot"</strong> — the most users where each still gets ≥30 tokens/sec. Not the max-throughput knee (misleading). The real deployment number. <em>"You can serve 8 users comfortably. A 9th starts hurting everyone."</em></p>
+
+<h2>Methodology Transparency</h2>
+<p>Show your work. Every JSON export now includes a methodology block: exact formulas, timing resolution (nanoseconds), token counting method. Reproducible. Verifiable. No black box.</p>
+
+<h2>QoL Improvements</h2>
+<ul>
+<li>TUI is the default (just run the binary)</li>
+<li>Settings persist between runs (no re-setup)</li>
+<li>Ctrl+C copies (doesn't quit the app)</li>
+<li>Full run logs for debugging</li>
+<li>History view with side-by-side comparison</li>
+<li>Decode loop guard (catches repeating models)</li>
+</ul>
+
+<h2>Download</h2>
+<p><a href="https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1">https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1</a></p>
+<p>Single Linux x86_64 binary. 14MB. No dependencies. No Python. No pip. <code>chmod +x</code> and run.</p>
+
+<h2>Feedback</h2>
+<p>If you're running any of these backends, hit us up with your numbers. We want to know if the sweet spot and Flat Out results match what you're seeing. Issues, PRs, and war stories all welcome.</p>
