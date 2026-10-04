@@ -45,9 +45,9 @@ This document explains how each benchmark works, what it measures, and why. Unde
 │                    │                                         │              │
 │                    ▼                                         ▼              │
 │         ┌───────────────────┐                    ┌───────────────────┐     │
-│         │  Metrics State     │                    │  Hardware Poller  │     │
-│         │  (ArcSwap double-  │                    │  (100 ms NVML /   │     │
-│         │   buffered)        │                    │   sysinfo)        │     │
+ │         │  Metrics State     │                    │  Hardware Poller  │     │
+ │         │  (ArcSwap double-  │                    │  (100 ms GPU      │     │
+ │         │   buffered)        │                    │  backend + sysinfo)│     │
 │         └────────┬──────────┘                    └────────┬──────────┘     │
 │                  │                                         │               │
 │                  ▼                                         ▼               │
@@ -390,7 +390,7 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
 ### Methodology
 
 1. **Hardware poller** (100 ms cadence, runs continuously in the background):
-   - **NVIDIA GPU** (feature-gated `nvml`): VRAM used/total, SM clock, core temperature, instantaneous power (milliwatts), compute utilization %, memory-bus utilization %. All visible devices are read and aggregated (VRAM and power summed, clock/temperature/utilization take the max).
+   - **GPU** (auto-detected at startup — NVIDIA NVML / AMD sysfs / Intel Level Zero + sysfs fallback, all through one `GpuBackend` trait): utilization %, instantaneous power (watts), core temperature, VRAM used/total, core + memory clocks, throttle reasons. All visible devices are read and aggregated (VRAM and power summed, clock/temperature/utilization take the max).
    - **Cross-platform CPU/RAM** (`sysinfo`): global CPU usage %, RAM used/total. Available on every host.
    - Each sample is appended to a bounded rolling trace (3600 samples = 6 minutes of power history).
 
@@ -411,12 +411,12 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
 
 | Platform | Telemetry | Status |
 |----------|-----------|--------|
-| **NVIDIA** | NVML API (`nvml-wrapper` crate, feature-gated `nvml`) | Full support: power, VRAM, clock, temperature, utilization |
-| **AMD** | ROCm / sysfs | In development |
-| **Intel** | intel_gpu_top / sysfs | In development |
+| **NVIDIA** | NVML API (`nvml-wrapper` crate, `nvml` feature — **on by default**) | Full support: power, VRAM, clocks, temperature, utilization, throttle |
+| **AMD** | `amdgpu` sysfs + hwmon (zero-dep, no ROCm stack) | Full support: utilization, VRAM, temperature, power, core + memory clocks |
+| **Intel** | Level Zero Sysman (dlopen'd at runtime via `libloading` — no link dependency) with i915/xe sysfs fallback | Full support on Arc: utilization, power, VRAM, clocks, temperature, throttle; sysfs fallback: VRAM, temperature, power (utilization N/A) |
 | **Any** | `sysinfo` (CPU/RAM) | Always available |
 
-**Must run ON the machine with the GPU.** The NVML driver is a local shared library (`libnvidia-ml.so`) — it cannot be queried remotely. Remote users will see `N/A` for all GPU fields.
+**Must run ON the machine with the GPU.** Every telemetry source (NVML, sysfs/hwmon, Level Zero) is local — it cannot be queried remotely. Remote users will see `N/A` for all GPU fields.
 
 ### The N/A Rule
 
@@ -428,6 +428,49 @@ When no power telemetry is available (no GPU, no driver, feature off), all deriv
 - **Peak watts**: maximum power draw during the run. Important for cooling and power budget planning.
 - **VRAM usage**: the aggregate of model weights + KV cache. A fragmentation warning at 90% means the server may start OOM-killing requests.
 - **Comparison**: use J/token to compare quantization levels (Q4 vs. Q8), model sizes (7B vs. 70B), or hardware options (A5000 vs. 4090) on equal footing.
+
+## GPU Monitoring Architecture
+
+All GPU telemetry flows through one vendor-agnostic seam: the **`GpuBackend` trait** (`src/hw/mod.rs`) and a normalized **`GpuSample`** (all-`Option` fields — the N/A rule). NVIDIA, AMD, and Intel each implement the trait; nothing above the seam knows which vendor is present.
+
+### The `GpuBackend` Trait
+
+```
+trait GpuBackend: Send + Sync {
+    fn vendor(&self) -> &str;              // "NVIDIA" | "AMD" | "Intel"
+    fn model(&self) -> String;             // e.g. "GeForce RTX 4090"
+    fn poll(&self) -> GpuSample;           // one sample per 100 ms tick
+}
+```
+
+`GpuSample` carries utilization %, power (W), temperature (°C), VRAM used/total, core + memory clocks, and throttle reasons — every field `Option`, so a backend that can't read a metric emits `None` (rendered `N/A`), never a fake zero and never a panic.
+
+### Detection (NVIDIA → AMD → Intel)
+
+`detect_gpu()` runs at startup and tries the backends in priority order, stopping at the first that initializes:
+
+1. **NVIDIA** — NVML init (the `nvml` feature, on by default; requires the NVIDIA driver).
+2. **AMD** — `amdgpu` sysfs probe (`device/vendor == 0x1002`); zero-dependency, no ROCm stack.
+3. **Intel** — **Level Zero Sysman first** (`libze_loader.so.1` dlopen'd at runtime via `libloading` — a *runtime* load, never a link dependency, so the binary still runs on machines without the loader), **falling back to the i915/xe sysfs backend** when Level Zero is unavailable.
+
+The single detected backend is shared by the TUI panel, Engine D, and the Config/Setup views; the result is logged to the run log (`[HW] Detected: <name>`). No GPU / no driver → `None`: CPU/RAM-only telemetry, no GPU panel, Engine D auto-off.
+
+### Backends & Data Sources
+
+| Backend | Data source | Metrics |
+|---------|-------------|---------|
+| NVIDIA (`nvml.rs`) | NVML (`nvml-wrapper` crate) | power, utilization, temperature, VRAM, core clock, throttle |
+| AMD (`amd.rs`) | Linux sysfs + hwmon (`amdgpu` driver) | utilization (`gpu_busy_percent`), VRAM, temperature, power, core clock (hwmon, DPM-table fallback), memory clock |
+| Intel Arc (`intel_level_zero.rs`) | Level Zero Sysman (`libloading` dlopen, all 16 `zes*` symbols resolved at runtime) | utilization, power (µJ/µs counter deltas), temperature, VRAM, core + memory clocks, throttle reasons |
+| Intel fallback (`intel.rs`) | sysfs (i915 / xe drivers) | VRAM (discrete `lmem_*`), temperature, power; utilization N/A (not exposed by Intel sysfs) |
+
+### Integration
+
+- **Hardware poller (100 ms)** polls the detected backend and merges each `GpuSample` into the `MetricsState` snapshot via the same `load → clone → merge → update` path as CPU/RAM — measurement isolation is untouched.
+- **Engine D** integrates the power trace (trapezoidal `∫P(t)dt`) into J/token, peak/average power, and peak VRAM; its result now also carries **mean GPU utilization, GPU vendor, and GPU model**.
+- **TUI Live view** renders a full GPU telemetry panel — power, utilization, temperature, core/memory clocks, VRAM, throttle reasons, live J/token — **only when a backend is live and publishing**. With no GPU the panel is hidden entirely: no N/A box, no panic.
+- **Engine D default**: auto-enabled when a GPU is detected, auto-disabled when not. An explicit user selection (`--engine`, `CRUCIBLE_ENGINE`, or the config file) always wins over the auto-detection.
+- **Config / Setup views** show the detected GPU on the Engine D row (e.g. `[✓] Energy — RTX 4090`, or `no GPU`).
 
 ## Engine F: Flat Out
 
@@ -560,7 +603,9 @@ Rendering stays a pure `&App` read (the `active_theme` field), so the theme neve
 | Shared state | ArcSwap | Lock-free reads from the TUI render thread; atomic double-buffer swap |
 | Storage | SQLite (rusqlite) | Zero-config, single file, ACID, fast for read-heavy workloads |
 | Tokenization | HuggingFace `tokenizers` (optional) | Accurate token counts for prompt sizing and NIAH haystack padding |
-| GPU telemetry | NVML (`nvml-wrapper`, feature-gated) | Power, VRAM, clock, temperature, utilization for NVIDIA GPUs |
+| GPU telemetry (NVIDIA) | NVML (`nvml-wrapper`, `nvml` feature — on by default) | Power, VRAM, clocks, temperature, utilization, throttle |
+| GPU telemetry (AMD) | Linux sysfs + hwmon (`amdgpu` driver, zero-dep) | Utilization, VRAM, temperature, power, core + memory clocks |
+| GPU telemetry (Intel) | Level Zero Sysman via `libloading` (runtime dlopen, no link dep) + i915/xe sysfs fallback | Utilization, power, VRAM, clocks, temperature, throttle (Arc); VRAM/temp/power (fallback) |
 | System telemetry | `sysinfo` | Cross-platform CPU/RAM counters (always available) |
 | Serialization | Serde + `serde_json` | Config, API requests/responses, export formats |
 | Randomness | `rand` (thread RNG) | Cryptographically random needles for NIAH |
@@ -589,9 +634,10 @@ We report **per-user experience**, not just aggregate numbers.
 
 A single static Rust binary. No Python, no Node, no system packages (beyond optional GPU drivers). The binary is ~14 MB and runs on any Linux/macOS machine with a terminal.
 
-- The SSE parser is a manual state machine — no `eventsource-stream` crate.
+- The SSE parser is a manual state machine — no `eventsource-stream` crate (dependency removed in v0.1.2).
 - The reasoning checkers are pure `std` — no `regex` or parser crates.
-- NVML is feature-gated (`--features nvml`) — the default build has no NVIDIA dependency.
+- NVIDIA NVML is **on by default** (opt out with `--no-default-features`); Intel Level Zero is dlopen'd at runtime via `libloading` — a zero link dependency, so the binary still runs on machines without the loader.
+- The AMD backend is pure sysfs/hwmon — no ROCm stack, no extra crates.
 - The tokenizer is optional — without it, `chars/4` estimation keeps the binary self-contained.
 
 ### 4. Graceful Degradation
@@ -600,7 +646,7 @@ The tool always runs, even when optional features are missing:
 
 | Missing feature | Behavior |
 |----------------|----------|
-| No GPU / no NVML driver | Engine D reports `N/A` for all energy metrics. CPU/RAM telemetry still works. |
+| No GPU / no driver (any vendor) | GPU telemetry is `None`: the TUI GPU panel is hidden, Engine D auto-disables (or reports `N/A` if forced on). CPU/RAM telemetry still works. |
 | No tokenizer file | Prompt and completion counts use `chars/4` estimation, flagged `[ESTIMATED]`. NIAH haystack sizing uses the estimate. |
 | Server omits `usage` | Token counts fall back to SSE frame count (labeled as estimate in the log). |
 | Server ignores `stream: true` | Plain-JSON fallback: the whole body is parsed as one completion. |

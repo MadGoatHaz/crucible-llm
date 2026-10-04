@@ -41,6 +41,17 @@ A list of models appears (fetched from `GET /v1/models`).
 ### Step 4: Launch
 Press Enter to start. The TUI switches to the Live Monitor.
 
+## GPU Monitoring (Engine D)
+
+Crucible auto-detects your GPU at startup:
+- NVIDIA: uses NVML (full telemetry)
+- AMD: uses sysfs/hwmon (util, VRAM, temp, power)
+- Intel: uses Level Zero (Arc) or sysfs (integrated)
+
+When a GPU is detected, Engine D is enabled by default and a live telemetry panel appears in the TUI showing power, utilization, temperature, VRAM, and energy efficiency.
+
+No GPU? Engine D is disabled automatically. No N/A panels.
+
 ## Default Values
 
 | Setting | Default |
@@ -48,7 +59,7 @@ Press Enter to start. The TUI switches to the Live Monitor.
 | Target tokens | `10000` |
 | Concurrency ladder | `1, 2, 3, 4, 8, 12, 16, 24, 32` |
 | Engines | A (Speed), B (Concurrency), C1 (NIAH), C2 (Reasoning), C3 (Structured), F (Flat Out) |
-| Engine D (Energy) | **off** (opt-in — run it on the GPU machine) |
+| Engine D (Energy) | **auto** — on when a GPU is detected (NVIDIA/AMD/Intel), off when not; explicit engine selection always wins. Must run on the GPU machine. |
 | Mode | `short` |
 | Iterations | `1` |
 | Timeout | `120` s |
@@ -146,9 +157,9 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Cache bypass | ON = cold-start (real first-request perf); OFF = warm (steady-state) |
 | Tokenizer | Path to a HuggingFace `tokenizer.json` for exact counts; without it, `chars/4` estimate |
 | Concurrency ladder | Engine B levels, comma-separated (default `1,2,3,4,8,12,16,24,32`) |
-| Hardware telemetry | Engine D energy poller (opt-in; reports N/A without a GPU driver) |
+| Hardware telemetry | Engine D energy poller — auto on when a GPU is detected; shows the detected GPU (e.g. `[✓] Energy — RTX 4090`) |
 | Theme | TUI color theme — Cyberpunk / Vampire / Monochrome Pastel; `←`/`→` cycles, `1`/`2`/`3` selects |
-| Engine A–F | Toggle each benchmark on/off (D / energy is opt-in) |
+| Engine A–F | Toggle each benchmark on/off (D / energy auto-selects with GPU detection; your explicit choice always wins) |
 
 ## Headless / CLI Mode
 
@@ -246,9 +257,9 @@ Yes. Crucible uses the **server-reported `usage.completion_tokens`** as the auth
 - Type the model name manually in the setup screen
 
 ### Energy shows N/A
-- You're not on the GPU machine, OR
-- Built without `--features nvml`, OR
-- No supported GPU driver found
+- You're not on the GPU machine (all GPU telemetry — NVML, sysfs, Level Zero — is local), OR
+- No supported GPU driver found (NVIDIA / AMD / Intel), OR
+- There is no GPU at all — in that case the GPU panel is simply hidden (by design, not an error) and Engine D stays off
 
 ### Setup appears every time
 - You don't have a saved config with a URL + model yet. Save one from the Config view (View 5 → `Enter` → `F2`), and the next run opens straight to the dashboard.
@@ -262,6 +273,6 @@ Yes. Crucible uses the **server-reported `usage.completion_tokens`** as the auth
 ## System Requirements
 
 - **Minimum**: Any terminal (Linux, macOS, WSL2, Windows via WSL)
-- **For Energy monitoring**: Must run on the GPU machine with appropriate drivers
+- **For GPU monitoring (Engine D)**: Must run on the GPU machine — NVIDIA (NVML, on by default), AMD (amdgpu sysfs), or Intel (Level Zero / i915/xe) drivers. No GPU = Engine D auto-off, everything else works normally
 - **Binary size**: ~14 MB (static, no dependencies)
 - **Memory**: < 100 MB RAM for the tool itself

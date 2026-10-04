@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",

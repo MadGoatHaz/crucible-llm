@@ -2,6 +2,35 @@
 
 All notable changes to Crucible LLM.
 
+## [0.1.2] - 2026-10-04
+
+### Added
+- **AMD GPU monitoring** — sysfs/hwmon backend: utilization, VRAM, temperature, power, clocks
+- **Intel Arc GPU monitoring** — Level Zero Sysman via libloading (no link dependency, graceful fallback)
+- **Intel sysfs fallback** — for i915/xe drivers when Level Zero unavailable
+- **Vendor-agnostic GpuBackend trait** — unified interface for all GPU monitoring backends
+- **GPU auto-detection** — detects NVIDIA/AMD/Intel at startup, activates correct backend
+- **NVIDIA by default** — `nvml` feature now enabled by default (was opt-in in 0.1.1)
+- **Full GPU telemetry panel in TUI** — power, utilization, temp, clocks, VRAM, throttle, J/token (shown only when GPU active)
+- **Engine D auto-select** — enabled by default when GPU detected, disabled when not
+- **Config/Setup shows detected GPU** — "D: Energy — [✓] RTX 4090"
+
+### Fixed
+- NVIDIA telemetry was silently off in v0.1.1 default builds (feature not enabled)
+- Hardware panel was removed in v0.1.1 remote-user redesign; now conditionally shown when GPU data is live
+
+### Improved
+- Engine D results now include GPU vendor, model, and mean utilization
+- Flat Out added to capability scores display
+- Dead dependency removed (eventsource-stream)
+- Repo URL corrected in all docs
+- ~6 new hardware tests; suite at 652 total
+
+### Code Quality
+- `#[must_use]` annotations on pure functions
+- Module docs corrected (engine count, ladder defaults)
+- Zero clippy warnings, zero fmt issues
+
 ## [0.1.1] - 2026-10-03
 
 ### Added

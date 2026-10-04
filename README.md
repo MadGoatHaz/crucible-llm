@@ -7,13 +7,13 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-629%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-652%20green-brightgreen)](#)
 
 </div>
 
 Crucible LLM is a comprehensive benchmarking tool for **any OpenAI-compatible inference server** — vLLM, llama.cpp, LM Studio, Unsloth Desktop, SGLang, Ollama, and TGI. It measures generation speed, concurrency capacity, reasoning ability, long-context retrieval, structured-output compliance, and energy efficiency — all from a single interactive TUI or a headless CLI.
 
-Built in Rust for **zero-dependency deployment**. One static binary. No Python. No JVM. No runtime. SQLite is compiled in; GPU telemetry is feature-gated. Point it at any `/v1` endpoint and start measuring.
+Built in Rust for **zero-dependency deployment**. One static binary. No Python. No JVM. No runtime. SQLite is compiled in; GPU telemetry (NVIDIA, AMD, Intel) is built in. Point it at any `/v1` endpoint and start measuring.
 
 ### Live Monitor
 
@@ -49,10 +49,17 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 | **C1 · NIAH** | needle-in-a-haystack retrieval across 2k→128k contexts × 11 depths | Can the model **find a fact** buried in a long document? |
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
 | **C3 · Structured** | JSON compliance across 3 schema-complexity levels + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
-| **D · Energy** | GPU watts, joules/token (NVIDIA NVML built-in; AMD/Intel pending) | What's the **power cost**? |
+| **D · Energy** | GPU power + utilization monitoring. Auto-detects NVIDIA, AMD, or Intel. Measures watts, Joules/token, temperature, VRAM, clocks | What's the **power cost**? |
 | **F · Flat Out** | runs at the server's **sweet-spot concurrency** for 60 s — aggregate + per-stream t/s at real-world full load | What's the **headline number** to quote when comparing setups? |
 
-By default a run executes **A, B, C1, C2, C3, F** (Engine D is opt-in, since it must run on the machine with the GPU). Select any subset with `--engine`.
+By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enables when a GPU is detected** (it must run on the machine with the GPU; no GPU → off, no N/A panels). Select any subset with `--engine`; an explicit selection always wins over auto-detection.
+
+### GPU Monitoring (Multi-Vendor)
+- NVIDIA (NVML), AMD (sysfs/hwmon), Intel (Level Zero + sysfs)
+- Auto-detection at startup
+- Live telemetry: power, utilization, VRAM, temperature, clocks, throttle
+- Energy efficiency: Joules per token
+- Full TUI panel (shown only when GPU is active)
 
 ### TUI Interface
 
@@ -110,19 +117,20 @@ For CI/CD, scripting, and regression gating:
 
 - A Rust **stable** toolchain (to build from source) — **or** a pre-compiled binary from [Releases].
 - A running **OpenAI-compatible inference server** (vLLM, llama.cpp, SGLang, Ollama, …).
+- Optional: NVIDIA, AMD, or Intel GPU with drivers for Engine D telemetry (auto-detected; the rest of the suite runs fine without one).
 
 ### Build
 
 ```bash
 git clone https://github.com/MadGoatHaz/crucible-llm.git
 cd crucible-llm
-cargo build --release          # → target/release/crucible-llm  (static binary)
+cargo build --release          # → target/release/crucible-llm  (static binary, GPU telemetry on by default)
 
-# Optional: enable built-in NVIDIA GPU telemetry (Engine D)
-cargo build --release --features nvml
+# Build without the NVIDIA (NVML) telemetry dependency, if you prefer:
+cargo build --release --no-default-features
 ```
 
-The release binary is fully self-contained: SQLite is bundled (no system `libsqlite3`), and there are **no** runtime library dependencies.
+The release binary is fully self-contained: SQLite is bundled (no system `libsqlite3`), and there are **no** runtime library dependencies. NVIDIA GPU telemetry (`nvml`) is a default feature — a plain `cargo build` gives you full GPU monitoring on NVIDIA systems; AMD (sysfs) and Intel (Level Zero, loaded at runtime) need no extra features at all.
 
 ### Run (TUI)
 
@@ -275,7 +283,7 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 
 - GPU **power draw** (watts) sampled at 100 ms during inference.
 - **Joules/token** = `∫P(t)dt / total_tokens` — the silicon-efficiency metric for comparing quantizations and hardware.
-- **Requires a local GPU with driver support** — NVIDIA NVML is built-in (`--features nvml`); AMD/Intel are on the roadmap. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
+- **Requires a local GPU with driver support** — Crucible auto-detects **NVIDIA (NVML, on by default), AMD (sysfs/hwmon), or Intel (Level Zero, with a sysfs fallback)** at startup and activates the matching backend. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
 
 ### Flat Out (Engine F)
 
@@ -305,7 +313,7 @@ Crucible is a single static binary organized around one core invariant: **measur
 - **Four decoupled execution rings** — a stream-worker pool (network I/O), the engine core (metric synthesis), a 100 ms hardware profiler, and the 60 Hz TUI render loop — connected by lock-free channels.
 - **Timing never touches the UI.** All latency is stamped by `quanta` (CPU cycle counters, no syscalls) inside the worker rings. The dashboard reads a lock-free, double-buffered (`ArcSwap`) snapshot; a dropped frame, a resize, or a SQLite flush can never perturb a measurement.
 - **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; a manual zero-allocation SSE line-buffer state machine + `reqwest` (HTTP/1.1 for local endpoints, HTTP/2 for TLS) drive the stream parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
-- **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); NVIDIA telemetry is feature-gated and absent by default; GPU/CPU telemetry degrades to N/A where a driver is missing.
+- **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); GPU telemetry (NVIDIA NVML on by default, AMD sysfs, Intel Level Zero loaded at runtime — no link dependency) degrades to N/A where a driver is missing.
 
 See [`docs/blueprint.md`](./docs/blueprint.md) for the full system specification, metric formulations, and database schema.
 
@@ -341,8 +349,8 @@ Contributions are welcome. The bar for a merge is high — the measurement path 
 
 ## Roadmap
 
-- [ ] **AMD GPU telemetry** — watts / VRAM / clocks via in-tree `amdgpu` sysfs + hwmon (no ROCm stack required).
-- [ ] **Intel GPU telemetry** — Level Zero Sysman, with a sysfs/hwmon fallback for minimal hosts.
+- [x] **AMD GPU telemetry** — watts / VRAM / clocks via in-tree `amdgpu` sysfs + hwmon (no ROCm stack required). *Shipped in v0.1.2.*
+- [x] **Intel GPU telemetry** — Level Zero Sysman, with a sysfs/hwmon fallback for minimal hosts. *Shipped in v0.1.2.*
 - [ ] **WebSocket / streaming metrics** — a remote, real-time frontend for the dashboard.
 - [ ] **Model comparison mode** — A/B two models (or two quantizations) side-by-side with signed deltas.
 - [ ] **Docker image** — one-command deployment of the static binary.
