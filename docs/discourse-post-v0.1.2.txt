@@ -29,7 +29,7 @@ chmod +x crucible-llm-linux-x86_64 && ./crucible-llm-linux-x86_64
 ```
 
 **Feedback**
-Run it on your AMD or Intel box and tell us what you see — utilization, watts, J/token. If something shows N/A where it shouldn't, that's a bug — file it.
+Run it on your AMD or Intel box and tell me what you see — utilization, watts, J/token. If something shows N/A where it shouldn't, that's a bug — file it.
 
 ---
 Full changelog: https://github.com/MadGoatHaz/crucible-llm/blob/master/CHANGELOG.md

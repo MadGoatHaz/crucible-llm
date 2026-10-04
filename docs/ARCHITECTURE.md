@@ -69,7 +69,7 @@ The key architectural principle is **measurement isolation**: the render loop, t
 
 ## Core Measurement Pipeline
 
-### How We Talk to the Server
+### How I Talk to the Server
 
 All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stream: true`. The request body includes:
 
@@ -86,13 +86,13 @@ All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stre
 
 Requests are sent via `reqwest` (a connection-pooled HTTP client). For local endpoints (plain HTTP), this is HTTP/1.1 with chunked transfer encoding. For remote endpoints (TLS), this is HTTP/2. The server responds with Server-Sent Events (SSE) — one `data:` frame per token (or token group), terminated by `data: [DONE]`.
 
-The `include_usage: true` flag is critical: it asks the server to append a `usage` object (with `prompt_tokens` and `completion_tokens`) to the final SSE frame, giving us authoritative token counts without needing a client-side tokenizer.
+The `include_usage: true` flag is critical: it asks the server to append a `usage` object (with `prompt_tokens` and `completion_tokens`) to the final SSE frame, giving me authoritative token counts without needing a client-side tokenizer.
 
 If a server ignores `stream: true` and returns a plain JSON completion object instead, the worker detects this (the first bytes do not start with `data:`) and falls back to parsing the single-object response. The measurement is still valid, but there is only one "token frame" instead of a stream.
 
 ### Timing Methodology
 
-We use `quanta` for high-resolution monotonic clock timestamps. `quanta` reads the CPU's Time-Stamp Counter (TSC) directly via RDTSC on x86, falling back to the OS reference clock (`clock_gettime`) where the CPU lacks invariant counters. No syscalls on the fast path — deltas are computed from raw cycle counts converted to nanoseconds.
+I use `quanta` for high-resolution monotonic clock timestamps. `quanta` reads the CPU's Time-Stamp Counter (TSC) directly via RDTSC on x86, falling back to the OS reference clock (`clock_gettime`) where the CPU lacks invariant counters. No syscalls on the fast path — deltas are computed from raw cycle counts converted to nanoseconds.
 
 Each stream worker records five lifecycle milestones:
 
@@ -121,7 +121,7 @@ T0 ────────── T1 ──── T2 ──── T3 ───�
 | **T3** | First token decoded | First `Content` or `Reasoning` SSE frame parsed |
 | **Tn** | Stream close | `[DONE]` frame, clean EOF, or premature close |
 
-From these, we derive:
+From these, I derive:
 
 - **TTFT** = T3 − T1 — time from request dispatched to first token arrival. This is the perceived "responsiveness" of the server.
 - **TTFB** = T2 − T1 — time from request dispatched to first byte. This is the network + prefill hand-off window (used for logging, not the primary metric).
@@ -140,7 +140,7 @@ Every completion-token count flows through one canonical function, `authoritativ
 
 **The raw SSE frame tally is never used as a token count.** Batched servers (vLLM's multi-token prediction / speculative decoding) pack ~2.4 tokens into a single `data:` frame, so counting frames understates true output by 30–40 %. Frame counts survive only as decode-rate evidence on the wire, never as the token numerator.
 
-For **prompt token counting** (sizing the input), an optional HuggingFace `tokenizer.json` gives exact counts; without it we estimate at `chars/4` (the common BPE heuristic) and flag the result `[ESTIMATED]`. This is sufficient for Engine A's short/long modes and for Engine C1's haystack sizing (which pads with a token-stable `" apple"` filler when a tokenizer is available).
+For **prompt token counting** (sizing the input), an optional HuggingFace `tokenizer.json` gives exact counts; without it I estimate at `chars/4` (the common BPE heuristic) and flag the result `[ESTIMATED]`. This is sufficient for Engine A's short/long modes and for Engine C1's haystack sizing (which pads with a token-stable `" apple"` filler when a tokenizer is available).
 
 ### SSE Parsing
 
@@ -241,11 +241,11 @@ Each level is bounded three ways so the sweep can never hang on a single bad lev
 
 ### Sweet Spot Detection
 
-We calculate four thresholds from the sweep curve:
+I calculate four thresholds from the sweep curve:
 
 | Threshold | Definition | Meaning |
 |-----------|-----------|---------|
-| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 30 (29.4 t/s effective, 2% margin) | Comfortable for chat, coding agents, RAG pipelines. **This is what we recommend — and the load Engine F runs at.** |
+| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 30 (29.4 t/s effective, 2% margin) | Comfortable for chat, coding agents, RAG pipelines. **This is what I recommend — and the load Engine F runs at.** |
 | **Maximum Usable** | Highest level where per-stream t/s ≥ 15 | Minimal but functional. Noticeably slower, but workable. |
 | **Unusable From** | First level where per-stream t/s < 15 | Interactive use becomes impractical. |
 | **Throughput Knee** | First level where aggregate t/s gain ≤ 5% AND p90 TPOT grows ≥ 2× | Pure capacity limit: the GPU has transitioned from memory-bandwidth-bound to compute-bound. |
@@ -623,7 +623,7 @@ The act of measuring must not perturb the system. This is enforced architectural
 
 ### 2. Honest Metrics
 
-We report **per-user experience**, not just aggregate numbers.
+I report **per-user experience**, not just aggregate numbers.
 
 - Engine B's headline recommendation is the **practical sweet spot** (the highest level where per-stream t/s ≥ 30 — 29.4 effective with the 2% margin), not the peak aggregate throughput. 64 users at 2.6 t/s each is not "fast."
 - ITL percentiles (p50, p90, p99, p99.9) show the *distribution*, not just the mean. A p99 of 500ms means 1% of tokens take a half-second — the user perceives stutter even if the average is 30ms.

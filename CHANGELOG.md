@@ -36,7 +36,7 @@ All notable changes to Crucible LLM.
 ### Added
 - **3 Visual Themes**: Cyberpunk (cyan/purple/neon), Vampire (crimson/gold/gothic), Monochrome Pastel (soft/clean). First-run theme picker with live preview. Switchable from Config (tab 5).
 - **Flat Out Engine (F)**: 60-second real-world maximum throughput test. Runs at your server's concurrency sweet-spot for full-load measurement. The "one number" to quote when comparing setups.
-- **Authoritative Token Counting**: Uses server-reported `usage.completion_tokens` as primary source. Re-tokenization fallback. Accurate across all backends (vLLM batches ~2.4 tokens/frame — we count actual tokens, not frames).
+- **Authoritative Token Counting**: Uses server-reported `usage.completion_tokens` as primary source. Re-tokenization fallback. Accurate across all backends (vLLM batches ~2.4 tokens/frame — I count actual tokens, not frames).
 - **Multi-Backend Support**: Verified working with vLLM, llama.cpp, LM Studio, Unsloth Desktop, SGLang, Ollama, TGI. Any OpenAI-compatible `/v1/chat/completions` endpoint.
 - **Practical Sweet Spot (30 t/s)**: Concurrency engine now identifies the highest user count where each still gets ≥30 t/s (±2% margin). The recommended deployment number.
 - **Methodology Transparency**: Every JSON export includes a `methodology` block with exact formulas, timing resolution, and counting method.
@@ -59,7 +59,7 @@ All notable changes to Crucible LLM.
 - **Live throughput graph**: Now uses same calculation as Overall Metrics (converges to true rate)
 
 ### Fixed
-- **vLLM token undercount**: Server batches ~2.4 tokens/SSE frame. We now count actual tokens, not frames.
+- **vLLM token undercount**: Server batches ~2.4 tokens/SSE frame. I now count actual tokens, not frames.
 - **Non-vLLM compatibility**: Deadlock fixed for llama.cpp, LM Studio, Unsloth (channel buffer overflow with high-frame-count servers)
 - **Tokio IO**: Enabled for TUI runtime (model discovery HTTP)
 - **Layout collisions**: Panel border overlaps fixed

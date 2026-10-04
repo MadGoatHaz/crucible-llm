@@ -73,10 +73,10 @@ Pick your vibe. Cyberpunk (cyan/purple/neon) is the default. Vampire (crimson/go
 The number you want to quote. 60 seconds at your server's optimal concurrency (the sweet spot). Your real-world maximum throughput with all users loaded.
 
 **Accurate Token Counting**
-Turns out vLLM batches ~2.4 tokens per SSE frame. We were counting frames. That's a 3x undercount. Fixed. We now use the server's own token count (`usage.completion_tokens`) as the authoritative source.
+Turns out vLLM batches ~2.4 tokens per SSE frame. I was counting frames. That's a 3x undercount. Fixed. I now use the server's own token count (`usage.completion_tokens`) as the authoritative source.
 
 **Works With Everything**
-Confirmed: vLLM, llama.cpp, LM Studio, Unsloth Desktop. Any OpenAI-compatible endpoint. If it speaks `/v1/chat/completions`, we can benchmark it.
+Confirmed: vLLM, llama.cpp, LM Studio, Unsloth Desktop. Any OpenAI-compatible endpoint. If it speaks `/v1/chat/completions`, I can benchmark it.
 
 **30 T/S Sweet Spot**
 The number that actually matters. Concurrency sweep identifies your "Practical Sweet Spot" — the most users where each still gets ≥30 tokens/sec. Not the max-throughput knee. The real deployment number.
@@ -106,4 +106,4 @@ https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1
 
 👉 **[github.com/MadGoatHaz/crucible-llm](https://github.com/MadGoatHaz/crucible-llm)** — star the repo, open an issue, or fork and contribute.
 
-**Feedback:** If you're running any of these backends, hit me up with your numbers. We want to know if the sweet spot and Flat Out results match what you're seeing. Issues, PRs, and war stories all welcome.
+**Feedback:** If you're running any of these backends, hit me up with your numbers. I want to know if the sweet spot and Flat Out results match what you're seeing. Issues, PRs, and war stories all welcome.
