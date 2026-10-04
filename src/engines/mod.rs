@@ -1,20 +1,24 @@
-//! The four benchmark engines: A (speed), B (concurrency), C (capability),
-//! and D (hardware).
+//! The seven benchmark engines: A (speed), B (concurrency), C1/C2/C3
+//! (capability), D (hardware), and F (flat out).
 //!
 //! * [`speed`] — Engine A (Chunk 7): single-stream TTFT / PP / TG / MTP
 //!   orchestration; the headless result box / `--json` report / summary
 //!   (parity with `llmspeedtest.py`).
 //! * [`concurrency`] — Engine B (Chunk 10 + 11): the multi-stream ladder
-//!   sweep (`1→2→4→8→16→32→64`), collecting per-level aggregate tokens/sec
-//!   and client-perceived p90 TPOT across all concurrent streams, plus
-//!   saturation knee-point detection and the "Optimal Operational
-//!   Envelope" (the recommended sweet spot).
+//!   sweep (default `1→2→3→4→8→12→16→24→32`), collecting per-level
+//!   aggregate tokens/sec and client-perceived p90 TPOT across all
+//!   concurrent streams, plus saturation knee-point detection, the
+//!   per-stream usability profile, and the "Optimal Operational Envelope"
+//!   (the recommended sweet spot).
 //! * [`capability`] — Engine C (Chunk 15 + 16): C1 needle-in-a-haystack
 //!   context retention, C2 deterministic reasoning/code verification,
 //!   and C3 structured-output/JSON-grammar compliance.
 //! * [`hardware`] — Engine D (Chunk 17): the silicon-efficiency profiler —
 //!   `Joules/Token = ∫P(t)dt / Total_Generated_Tokens` over the 100 ms
 //!   hardware power trace, plus the VRAM fragmentation warning.
+//! * [`flatout`] — Engine F: real-world maximum throughput at the
+//!   sweet-spot concurrency — `n` concurrent streams (Engine B's
+//!   recommendation) for one 60-second window, all at once.
 //!
 //! **Chunk 18 — full integration:** [`run_selected`] orchestrates *any*
 //! combination of the four engines from a single [`Config`] (the

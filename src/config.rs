@@ -71,7 +71,8 @@ pub mod env_vars {
     /// (Chunk 18).
     pub const HARDWARE: &str = "CRUCIBLE_HARDWARE";
     /// Comma-separated engine selection (Chunk 18): `speed`,
-    /// `concurrency`, `niah`, `reasoning`, `structured`, `hardware`.
+    /// `concurrency`, `niah`, `reasoning`, `structured`, `hardware`,
+    /// `flatout`.
     pub const ENGINE: &str = "CRUCIBLE_ENGINE";
     /// Directory for the run log (`latest.log` + `run-<timestamp>.log`
     /// archives). Default: `data_dir()/crucible/logs`.
@@ -156,9 +157,9 @@ impl std::str::FromStr for ExportFormat {
     }
 }
 
-/// Which of the four benchmark engines (blueprint §5) a single run
+/// Which of the seven benchmark engines (blueprint §5) a single run
 /// orchestrates (plan Chunk 18: "a single command/run can trigger any
-/// subset of engines A–D").
+/// subset of the engines").
 ///
 /// * `speed` — Engine A (single-stream TTFT/PP/TG/MTP);
 /// * `concurrency` — Engine B (the ladder sweep);
@@ -370,7 +371,7 @@ pub struct Cli {
     pub ladder: Option<String>,
     /// Select which engines a run orchestrates (repeatable; Chunk 18):
     /// `speed` (A), `concurrency` (B), `niah` (C1), `reasoning` (C2),
-    /// `structured` (C3), `hardware` (D).
+    /// `structured` (C3), `hardware` (D), `flatout` (F).
     #[arg(long, value_name = "ENGINE")]
     pub engine: Vec<String>,
     /// Disable the hardware/energy telemetry poller (Engine D; on by

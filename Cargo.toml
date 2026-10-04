@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 description = "High-performance terminal LLM benchmark & inference profiler"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/YOURUSERNAME/crucible-llm"
+repository = "https://github.com/MadGoatHaz/crucible-llm"
 
 [dependencies]
 # TUI
@@ -14,7 +14,6 @@ crossterm = "0.29"
 tokio = { version = "1.53", features = ["full"] }
 # Networking / SSE
 reqwest = { version = "0.13", features = ["json", "stream", "http2"] }
-eventsource-stream = "0.2"
 futures-util = "0.3"
 # Tokenization (optional at runtime)
 tokenizers = "0.23"

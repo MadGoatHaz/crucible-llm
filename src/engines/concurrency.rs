@@ -71,6 +71,7 @@ const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Normalize a user-supplied ladder: drop non-positive entries, remove
 /// duplicates, sort ascending.
+#[must_use]
 pub fn normalize_ladder(ladder: impl IntoIterator<Item = usize>) -> Vec<usize> {
     let mut v: Vec<usize> = ladder.into_iter().filter(|&n| n > 0).collect();
     v.sort_unstable();
@@ -235,6 +236,7 @@ impl SweepResult {
     /// Build a complete result from its levels (and optional matrix):
     /// `sweet_spot` is derived from the curve
     /// ([`recommended_streams_for`]).
+    #[must_use]
     pub fn from_levels(levels: Vec<SweepLevel>, matrix: Option<ConcurrencyMatrix>) -> Self {
         Self {
             sweet_spot: recommended_streams_for(&levels),
@@ -244,6 +246,7 @@ impl SweepResult {
     }
 
     /// `true` when no level ran.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.levels.is_empty()
     }
@@ -251,6 +254,7 @@ impl SweepResult {
     /// The level with the highest aggregate throughput — the fallback
     /// sweet spot when [`Self::detect_knee`] finds no saturation
     /// transition on the curve.
+    #[must_use]
     pub fn peak_throughput(&self) -> Option<&SweepLevel> {
         self.levels
             .iter()
@@ -276,6 +280,7 @@ impl SweepResult {
     ///
     /// Pure function over the curve: no timing, no locks (measurement
     /// isolation, blueprint §4).
+    #[must_use]
     pub fn detect_knee(&self) -> Option<KneePoint> {
         let mut levels: Vec<&SweepLevel> = self.levels.iter().collect();
         levels.sort_by_key(|l| l.concurrency);
@@ -298,6 +303,7 @@ impl SweepResult {
     /// recommended sweet spot for hosting this model on the target
     /// hardware — the level just before the detected knee, or the
     /// peak-throughput level when the curve is healthy (no knee).
+    #[must_use]
     pub fn envelope(&self) -> Option<Envelope> {
         let knee = self.detect_knee();
         let sweet = match knee {
@@ -337,6 +343,7 @@ impl SweepResult {
     ///
     /// Pure function over the curve: no timing, no locks (measurement
     /// isolation, blueprint §4).
+    #[must_use]
     pub fn usability(&self) -> UsabilityProfile {
         usability_of(&self.levels)
     }
@@ -376,6 +383,7 @@ pub const USABLE_PER_STREAM_TPS: f64 = 15.0;
 ///   **maximum usable**;
 /// * [`UsabilityProfile::unusable_from`] — the first concurrency where
 ///   every stream drops below 15 t/s — **unusable beyond** this level.
+#[must_use]
 pub fn usability_of(levels: &[SweepLevel]) -> UsabilityProfile {
     let mut sorted: Vec<&SweepLevel> = levels.iter().collect();
     sorted.sort_by_key(|l| l.concurrency);
@@ -403,6 +411,7 @@ pub fn usability_of(levels: &[SweepLevel]) -> UsabilityProfile {
 /// **maximum usable** level (≥ 15 t/s), then to a single stream — so the
 /// count is always valid for a real-world full-load run (Engine F /
 /// Flat Out).
+#[must_use]
 pub fn recommended_streams_for(levels: &[SweepLevel]) -> usize {
     let us = usability_of(levels);
     us.practical_sweet_spot.or(us.max_usable).unwrap_or(1)

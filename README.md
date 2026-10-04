@@ -114,7 +114,7 @@ For CI/CD, scripting, and regression gating:
 ### Build
 
 ```bash
-git clone https://github.com/YOURUSERNAME/crucible-llm.git
+git clone https://github.com/MadGoatHaz/crucible-llm.git
 cd crucible-llm
 cargo build --release          # → target/release/crucible-llm  (static binary)
 

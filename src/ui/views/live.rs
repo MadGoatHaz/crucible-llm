@@ -1,20 +1,24 @@
 //! View 1 — Live Monitor & Telemetry (blueprint §6), redesigned for
 //! **remote** users.
 //!
-//! The remote operator does not sit on the GPU machine, so hardware panels
-//! that read `N/A` off-box (the VRAM gauge, GPU clock, power, the per-stream
-//! monitor matrix, the ITL braille histogram) are gone. Every pixel now shows
-//! what a remote user actually cares about:
+//! The remote operator does not sit on the GPU machine, so the hardware
+//! panels that would read `N/A` off-box are **hidden entirely, never
+//! rendered empty**: the full GPU telemetry panel (power, utilization,
+//! VRAM, clocks, temperature, throttle) appears only when a GPU backend is
+//! live and publishing to the snapshot (i.e. on the GPU box itself). Every
+//! pixel shows what the current user actually cares about:
 //!
 //! * **Throughput** (the hero) — a large real-time tokens/sec block chart,
 //!   top-left, with y/x axis labels and a `now | peak` value line;
 //! * **Key metrics** — aggregate t/s, TTFT, ITL p50/p99, tokens, active
 //!   streams, each with a one-line dimmed `ℹ` note;
+//! * **GPU telemetry** (any vendor) — shown only when GPU data is
+//!   available;
 //! * **Concurrency curve** (Engine B) — aggregate t/s vs parallel users,
-//!   reusing View 2's block rendering, with the sweet spot (`●`) and the
+//!   reusing View 2's block rendering, with the sweet spot (`◆`) and the
 //!   saturation knee (`▲`);
 //! * **Capability scores** — horizontal bars for Reasoning (C2), NIAH (C1),
-//!   Structured (C3), and Energy (D);
+//!   Structured (C3), Energy (D), and Flat Out (F);
 //! * **Event log** — a compact stream of the executor's real events.
 //!
 //! The layout adapts to the running engine: during Engine A only the hero +

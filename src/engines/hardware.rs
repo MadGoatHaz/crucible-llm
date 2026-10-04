@@ -83,6 +83,7 @@ fn within(t: &MonotonicInstant, start: &MonotonicInstant, end: &MonotonicInstant
 /// Returns `(joules, has_power)`: `has_power` is `false` when no sample
 /// in scope carried a reading, in which case `joules` is `0.0` and
 /// callers **must** report any derived metric as N/A (module N/A rule).
+#[must_use]
 pub fn integrate_joules(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
@@ -118,6 +119,7 @@ pub fn integrate_joules(
 ///
 /// `None` when no power telemetry is available or `tokens` is zero
 /// (N/A rule — never a spurious `0.0`).
+#[must_use]
 pub fn joules_per_token(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
@@ -133,6 +135,7 @@ pub fn joules_per_token(
 
 /// Full Engine D profile for a window: energy, power stats, peak VRAM,
 /// and the fragmentation warning.
+#[must_use]
 pub fn profile(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
@@ -224,6 +227,7 @@ pub fn profile(
 /// sleeps at the poll cadence) — the standalone / headless path. The TUI
 /// prefers the shared 100 ms background poller, which accumulates the
 /// same trace without a second poller.
+#[must_use]
 pub fn profile_backend(
     gpu: Option<&dyn GpuBackend>,
     duration: std::time::Duration,
@@ -252,6 +256,7 @@ pub fn profile_backend(
 ///
 /// `None` when the total is unknown (N/A rule) or the ratio is below the
 /// threshold.
+#[must_use]
 pub fn fragmentation_warning(used_bytes: u64, total_bytes: u64) -> Option<String> {
     if total_bytes == 0 {
         return None;

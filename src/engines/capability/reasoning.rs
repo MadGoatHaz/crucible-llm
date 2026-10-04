@@ -38,7 +38,7 @@ use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
 use crate::sse::Chunk;
-use crate::timing::{MonotonicInstant, StreamTimestamps};
+use crate::timing::StreamTimestamps;
 
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
@@ -396,7 +396,6 @@ impl ReasoningEngine {
             worker = worker.logger(logger.clone());
         }
 
-        let start = MonotonicInstant::now();
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
         let handle = spawn_worker(worker, tx);
@@ -428,7 +427,6 @@ impl ReasoningEngine {
                         &self.model,
                         "Reasoning",
                         &events,
-                        &start,
                         REASONING_MAX_GEN_TOKENS,
                         self.tokenizer.as_deref(),
                     ));
@@ -443,7 +441,6 @@ impl ReasoningEngine {
                 &self.model,
                 "Reasoning",
                 &events,
-                &start,
                 REASONING_MAX_GEN_TOKENS,
                 self.tokenizer.as_deref(),
             ));

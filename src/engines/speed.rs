@@ -260,7 +260,6 @@ impl SpeedEngine {
             worker = worker.logger(logger.clone());
         }
 
-        let start = MonotonicInstant::now();
         // Spawn the worker without awaiting it: the channel must be
         // drained concurrently, or a >capacity frame count deadlocks
         // the worker's `tx.send()` (server-agnostic fix: llama.cpp,
@@ -282,14 +281,14 @@ impl SpeedEngine {
                     Some(StreamEvent::Complete { .. }) | Some(StreamEvent::Failed { .. })
                 );
                 if batch >= 8 || is_terminal {
-                    state.update(self.live_snapshot(&events, &start));
+                    state.update(self.live_snapshot(&events));
                     batch = 0;
                 }
             }
         }
         // Final publish (the terminal event may have been batched out).
         if let Some(state) = &self.metrics {
-            state.update(self.live_snapshot(&events, &start));
+            state.update(self.live_snapshot(&events));
         }
         // Channel is closed (worker done): collect the outcome. A task
         // panic becomes a failed outcome, never a crash.
@@ -308,13 +307,12 @@ impl SpeedEngine {
 
     /// Build a live [`MetricsSnapshot`] from the events collected so far
     /// (single-stream Engine A → the TUI's Live Monitor).
-    fn live_snapshot(&self, events: &[StreamEvent], start: &MonotonicInstant) -> MetricsSnapshot {
+    fn live_snapshot(&self, events: &[StreamEvent]) -> MetricsSnapshot {
         Self::single_stream_snapshot(
             &self.cfg.url,
             &self.cfg.model,
             self.cfg.mode.label(),
             events,
-            start,
             MAX_GEN_TOKENS,
             self.generator.tokenizer().as_deref(),
         )
@@ -344,11 +342,9 @@ impl SpeedEngine {
         model: &str,
         mode: &str,
         events: &[StreamEvent],
-        start: &MonotonicInstant,
         max_tokens: u32,
         tokenizer: Option<&Tokenizer>,
     ) -> MetricsSnapshot {
-        let _elapsed_ns = start.delta_nanos(&MonotonicInstant::now()).max(1);
         let mut itl = LatencyHistogram::default();
         let mut reasoning_frames = 0u64;
         let mut content_frames = 0u64;
@@ -597,6 +593,7 @@ impl SpeedEngine {
 /// Synthesize one [`SpeedResult`] from a finished worker run plus its
 /// channel events (blueprint §7 formulas; prototype semantics for
 /// token-count fallbacks, chunk counting, and the error surface).
+#[must_use]
 pub fn aggregate(
     cfg: &Config,
     prompt: &GeneratedPrompt,
@@ -762,6 +759,7 @@ pub fn aggregate(
 /// resolution + measured overhead), a `methodology` block (the formula
 /// behind every number), and a `loop_guard` block when any run was
 /// excluded by the decode-loop guard.
+#[must_use]
 pub fn json_report(cfg: &Config, results: &[SpeedResult]) -> serde_json::Value {
     let mut output = json!({
         "url": cfg.url,
@@ -800,6 +798,7 @@ pub fn json_report(cfg: &Config, results: &[SpeedResult]) -> serde_json::Value {
 
 /// Exit-code rule (prototype `main`): `true` when **every** run failed
 /// → the process must exit 1.
+#[must_use]
 pub fn all_failed(results: &[SpeedResult]) -> bool {
     !results.is_empty() && results.iter().all(SpeedResult::is_failed)
 }
@@ -813,6 +812,7 @@ const BOLD: &str = "\u{1b}[1m";
 /// The result box (parity with the prototype's `print_result_box`),
 /// including its width quirk (52-char borders/title, 54-char label rows).
 /// `None` for a hard failure — the caller prints the `FAILED` line.
+#[must_use]
 pub fn format_result_box(
     result: &SpeedResult,
     iteration: usize,
@@ -910,6 +910,7 @@ fn row(lines: &mut Vec<String>, label: &str, value: &str) {
 
 /// The multi-iteration summary (parity with the prototype's
 /// `print_summary`): `None` when fewer than two runs are valid.
+#[must_use]
 pub fn format_summary(results: &[SpeedResult], color: bool) -> Option<String> {
     // Looping runs (v0.1.1) are excluded from the averaged summary — their
     // throughput is not a measurement of the server.
@@ -1346,9 +1347,8 @@ mod tests {
                     loop_excluded_tokens: 0,
                 }))
                 .collect();
-            let snap = SpeedEngine::single_stream_snapshot(
-                "http://x", "m", "short", &events, &t0, 256, None,
-            );
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, 256, None);
             // prefill = 60 prompt tokens / 20 ms TTFT = 3000 t/s.
             assert!(
                 (snap.prefill_throughput - 3000.0).abs() < 1e-6,
@@ -1413,9 +1413,8 @@ mod tests {
                     loop_excluded_tokens: 10,
                 },
             ];
-            let snap = SpeedEngine::single_stream_snapshot(
-                "http://x", "m", "short", &events, &t0, 256, None,
-            );
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, 256, None);
             assert_eq!(snap.prefill_throughput, 0.0);
             assert_eq!(snap.decode_throughput, 0.0);
             assert_eq!(snap.e2e_throughput, 0.0);

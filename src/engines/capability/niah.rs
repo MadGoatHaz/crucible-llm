@@ -45,7 +45,7 @@ use crate::metrics::state::MetricsState;
 use crate::prompt::{count_tokens, Tokenizer, BASE_SENTENCES, FILLER};
 use crate::sse::Chunk;
 use crate::storage::models::NeedleEvaluation;
-use crate::timing::{MonotonicInstant, StreamTimestamps};
+use crate::timing::StreamTimestamps;
 
 /// Bounded worker→engine channel capacity (same as Engine A / C2).
 const CHANNEL_CAPACITY: usize = 256;
@@ -673,7 +673,6 @@ impl NiahEngine {
             worker = worker.logger(logger.clone());
         }
 
-        let start = MonotonicInstant::now();
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
         let handle = spawn_worker(worker, tx);
@@ -705,7 +704,6 @@ impl NiahEngine {
                         &self.model,
                         "NIAH",
                         &events,
-                        &start,
                         NIAH_MAX_GEN_TOKENS,
                         self.tokenizer.as_deref(),
                     ));
@@ -720,7 +718,6 @@ impl NiahEngine {
                 &self.model,
                 "NIAH",
                 &events,
-                &start,
                 NIAH_MAX_GEN_TOKENS,
                 self.tokenizer.as_deref(),
             ));

@@ -4,7 +4,7 @@
 
 ```bash
 # Prerequisites: Rust stable, cargo
-git clone https://github.com/YOURUSERNAME/crucible-llm.git
+git clone https://github.com/MadGoatHaz/crucible-llm.git
 cd crucible-llm
 cargo build
 cargo test

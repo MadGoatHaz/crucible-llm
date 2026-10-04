@@ -1,6 +1,6 @@
 //! The **Benchmark Sequence** executor: runs the selected engines strictly
-//! **one at a time** (A → B → C1 → C2 → C3 → D) and publishes a lock-free
-//! progress state that the TUI reads every frame.
+//! **one at a time** (A → B → C1 → C2 → C3 → D → F) and publishes a
+//! lock-free progress state that the TUI reads every frame.
 //!
 //! This is the TUI-side orchestration (the headless path keeps its own
 //! sequential order via `run_selected` / `main::run_headless`). The
@@ -547,9 +547,9 @@ pub fn queue_for(sel: &crate::config::EngineSelection) -> Vec<Engine> {
 
 impl BenchmarkSequence {
     /// Build the executor for a run. The engine queue is the selected
-    /// engines in the canonical A → B → C1 → C2 → C3 → D order; an empty
-    /// selection yields an empty queue (the run is a no-op that logs a
-    /// warning).
+    /// engines in the canonical A → B → C1 → C2 → C3 → D → F order; an
+    /// empty selection yields an empty queue (the run is a no-op that logs
+    /// a warning).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: Config,
@@ -1157,6 +1157,7 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
 /// ideal with a 2% margin, what matters for real use), with the
 /// pure-throughput knee as reference, or a note when the curve was empty
 /// / nothing cleared the usability bar.
+#[must_use]
 pub fn summarize_sweep(result: &SweepResult) -> String {
     if result.is_empty() {
         return "no usable levels".to_string();
