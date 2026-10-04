@@ -2,13 +2,14 @@
 //!
 //! [`HwPoller`] samples the host once every 100 ms:
 //!
-//! * **NVIDIA GPU** — VRAM (used / total), SM clock, core temperature,
-//!   instantaneous power (mW), and compute/memory-bus utilization, via
-//!   `nvml-wrapper`. This is feature-gated (`nvml`, default-off) and
-//!   runtime-detected: when no GPU/driver is present every GPU field
-//!   degrades to `None` (rendered `N/A`) — never a panic, so the app runs
-//!   normally on driver-less machines (blueprint §5D / Chunk 17
-//!   acceptance).
+//! * **GPU (auto-detected)** — VRAM (used / total), core clock,
+//!   temperature, instantaneous power, and utilization, from whichever
+//!   vendor backend [`detect_gpu`] finds: NVIDIA (NVML — the default
+//!   feature, tried first), AMD (sysfs/hwmon), or Intel (Level Zero →
+//!   sysfs fallback). Runtime-detected: when no GPU/driver is present
+//!   every GPU field degrades to `None` (rendered `N/A`) — never a panic,
+//!   so the app runs normally on driver-less machines (blueprint §5D /
+//!   Chunk 17 acceptance).
 //! * **Cross-platform CPU / RAM** counters via `sysinfo` (not
 //!   feature-gated).
 //!
@@ -47,6 +48,8 @@ pub use intel::{detect_intel_backend, IntelSysfsBackend};
 #[cfg(target_os = "linux")]
 pub use intel_level_zero::IntelLevelZeroBackend;
 
+use std::sync::Arc;
+
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::timing::MonotonicInstant;
 
@@ -84,13 +87,77 @@ pub struct GpuSample {
 /// cheap (direct file reads / a single driver call — no subprocess
 /// spawning) and must never panic; a missing node degrades that field to
 /// `None` (the N/A rule).
-pub trait GpuBackend: Send + Sync {
+pub trait GpuBackend: Send + Sync + std::fmt::Debug {
     /// Vendor name (e.g. `"AMD"`, `"Intel"`, `"NVIDIA"`).
     fn vendor(&self) -> &str;
     /// The GPU's model / driver label, if known.
     fn model(&self) -> Option<&str>;
     /// One telemetry sample (all fields optional, N/A rule).
     fn poll(&self) -> GpuSample;
+}
+
+/// Auto-detect the best available GPU backend (NVIDIA → AMD → Intel).
+///
+/// NVIDIA (NVML) is tried **first** — it is the most common LLM-serving
+/// accelerator and the richest telemetry surface, and it is the default
+/// feature. When no NVIDIA driver is present (or the `nvml` feature is
+/// off) it falls through to the AMD sysfs backend, then the Intel chain
+/// (Level Zero first, sysfs fallback).
+///
+/// Returns `None` when no GPU telemetry is available at all (the
+/// graceful-degradation path, never a panic) — the caller runs with
+/// CPU/RAM telemetry only and every GPU field reports N/A.
+pub fn detect_gpu() -> Option<Box<dyn GpuBackend>> {
+    #[cfg(feature = "nvml")]
+    if let Some(be) = nvml::NvmlBackend::try_init() {
+        return Some(be);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(be) = amd::AmdSysfsBackend::try_init() {
+        return Some(be);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(be) = intel::detect_intel_backend() {
+        return Some(be);
+    }
+    None
+}
+
+/// The vendor + model display label, de-duplicating when the model name
+/// already carries the vendor prefix (NVIDIA and Intel marketing names do —
+/// e.g. `"NVIDIA GeForce RTX 3080 Ti"` stays as-is, not
+/// `"NVIDIA NVIDIA …"`). `None` model → the vendor alone.
+pub fn gpu_display_name(g: &dyn GpuBackend) -> String {
+    match g.model() {
+        Some(m)
+            if m.to_ascii_lowercase()
+                .starts_with(&g.vendor().to_ascii_lowercase()) =>
+        {
+            m.to_string()
+        }
+        Some(m) => format!("{} {}", g.vendor(), m),
+        None => g.vendor().to_string(),
+    }
+}
+
+/// Convert a vendor-agnostic [`GpuSample`] into the GPU fields of an
+/// [`HwSample`] (the `P(t)` trace point the energy math integrates).
+///
+/// Unit conversions: MB → bytes (VRAM), watts → milliwatts (power),
+/// °C clamped non-negative, % carried through. The CPU/RAM fields stay
+/// `None` (the poller fills them from `sysinfo`); `t` is the sample
+/// timestamp.
+pub fn hw_sample_from_gpu(t: MonotonicInstant, g: &GpuSample) -> HwSample {
+    HwSample {
+        t,
+        vram_used_bytes: g.memory_used_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+        vram_total_bytes: g.memory_total_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+        power_mw: g.power_watts.map(|w| (w * 1000.0).round().max(0.0) as u64),
+        gpu_clock_mhz: g.core_clock_mhz,
+        gpu_temp_c: g.temperature_c.map(|c| c.max(0) as u32),
+        gpu_util_pct: g.utilization_pct.map(|u| u as u32),
+        ..HwSample::default()
+    }
 }
 
 /// Shared, infallible sysfs read helpers for the AMD and Intel backends.
@@ -187,13 +254,15 @@ pub struct HwSample {
 /// The 100 ms hardware telemetry poller (blueprint §4.3 "Hardware
 /// Profiler").
 ///
-/// [`HwPoller::new`] probes the NVIDIA driver at startup (feature-gated);
-/// when no GPU/driver is present the poller keeps running with CPU/RAM
-/// telemetry only and every GPU field reports N/A.
-#[derive(Debug)]
+/// [`HwPoller::new`] auto-detects a GPU backend at startup (NVIDIA → AMD
+/// → Intel, via [`detect_gpu`]); when no GPU/driver is present the
+/// poller keeps running with CPU/RAM telemetry only and every GPU field
+/// reports N/A. [`HwPoller::with_backend`] injects an already-detected
+/// backend (the entry point detects once and shares the result with the
+/// App and Engine D).
 pub struct HwPoller {
-    #[cfg(feature = "nvml")]
-    gpu: Option<nvml::NvmlPoller>,
+    /// The detected GPU backend (any vendor), or `None` (no GPU).
+    gpu: Option<Arc<dyn GpuBackend>>,
     sys: sysinfo::System,
     /// The target GPU's marketing name (for `benchmark_sessions.system_gpu`).
     gpu_name: Option<String>,
@@ -205,26 +274,37 @@ pub struct HwPoller {
     capacity: usize,
 }
 
+impl std::fmt::Debug for HwPoller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HwPoller")
+            .field("gpu_name", &self.gpu_name)
+            .field("energy_joules", &self.energy_joules)
+            .field("trace_len", &self.trace.len())
+            .finish()
+    }
+}
+
 impl HwPoller {
-    /// Probe the hardware once and prime the CPU/RAM counters.
+    /// Auto-detect a GPU backend and prime the CPU/RAM counters.
     ///
-    /// Never fails: a missing driver (or the absent `nvml` feature) simply
-    /// means GPU fields stay `None` (graceful degradation, blueprint
-    /// §5D).
+    /// Never fails: no GPU/driver simply means the poller runs with
+    /// CPU/RAM telemetry only and every GPU field reports N/A (graceful
+    /// degradation, blueprint §5D).
     pub fn new() -> Self {
-        #[cfg(feature = "nvml")]
-        let gpu = nvml::NvmlPoller::init().ok();
-        #[cfg(feature = "nvml")]
-        let gpu_name = gpu.as_ref().map(|g| g.name().to_string());
-        #[cfg(not(feature = "nvml"))]
-        let gpu_name = None;
+        Self::with_backend(detect_gpu().map(Arc::from))
+    }
+
+    /// Build a poller around an already-detected backend (`None` = no
+    /// GPU) and prime the CPU/RAM counters. The entry point uses this to
+    /// share the single detection result with the App and Engine D.
+    pub fn with_backend(gpu: Option<Arc<dyn GpuBackend>>) -> Self {
+        let gpu_name = gpu.as_ref().map(|g| gpu_display_name(g.as_ref()));
         let mut sys = sysinfo::System::new();
         // Prime the counters: `global_cpu_usage()` is a delta-based
         // reading (inaccurate on the very first call — sysinfo docs).
         sys.refresh_memory();
         sys.refresh_cpu_usage();
         Self {
-            #[cfg(feature = "nvml")]
             gpu,
             sys,
             gpu_name,
@@ -241,17 +321,15 @@ impl HwPoller {
         self
     }
 
-    /// `true` when an NVIDIA GPU/driver is available (feature on **and**
-    /// NVML initialized).
+    /// `true` when a GPU backend is available (any vendor).
     pub fn has_gpu(&self) -> bool {
-        #[cfg(feature = "nvml")]
-        {
-            self.gpu.is_some()
-        }
-        #[cfg(not(feature = "nvml"))]
-        {
-            false
-        }
+        self.gpu.is_some()
+    }
+
+    /// The detected GPU backend, if any (for Engine D / the App to read
+    /// vendor + model, or to poll directly).
+    pub fn backend(&self) -> Option<&dyn GpuBackend> {
+        self.gpu.as_deref()
     }
 
     /// The target GPU's name (`benchmark_sessions.system_gpu`).
@@ -276,24 +354,29 @@ impl HwPoller {
         (total_tokens > 0).then(|| self.energy_joules / total_tokens as f64)
     }
 
-    /// One 100 ms poll: read the GPU (if any) + CPU/RAM, advance the
-    /// cumulative energy integral, and append to the bounded trace.
+    /// One 100 ms poll: read the GPU backend (if any) + CPU/RAM, advance
+    /// the cumulative energy integral, and append to the bounded trace.
     pub fn poll(&mut self) -> HwSample {
+        let gpu = self.gpu.as_ref().map(|g| g.poll());
+        self.advance(&gpu)
+    }
+
+    /// The shared sample-advance logic: fold the (optional) GPU sample
+    /// into a fresh [`HwSample`], add the CPU/RAM counters, advance the
+    /// trapezoidal `∫P(t)dt` integral, and append to the bounded trace.
+    fn advance(&mut self, gpu: &Option<GpuSample>) -> HwSample {
         let mut sample = HwSample {
             t: MonotonicInstant::now(),
             ..HwSample::default()
         };
-
-        #[cfg(feature = "nvml")]
-        if let Some(gpu) = &self.gpu {
-            let g = gpu.read();
-            sample.vram_used_bytes = g.vram_used_bytes;
-            sample.vram_total_bytes = g.vram_total_bytes;
-            sample.power_mw = g.power_mw;
-            sample.gpu_clock_mhz = g.gpu_clock_mhz;
-            sample.gpu_temp_c = g.gpu_temp_c;
-            sample.gpu_util_pct = g.gpu_util_pct;
-            sample.mem_util_pct = g.mem_util_pct;
+        if let Some(g) = gpu {
+            let g_sample = hw_sample_from_gpu(sample.t, g);
+            sample.vram_used_bytes = g_sample.vram_used_bytes;
+            sample.vram_total_bytes = g_sample.vram_total_bytes;
+            sample.power_mw = g_sample.power_mw;
+            sample.gpu_clock_mhz = g_sample.gpu_clock_mhz;
+            sample.gpu_temp_c = g_sample.gpu_temp_c;
+            sample.gpu_util_pct = g_sample.gpu_util_pct;
         }
 
         // Cross-platform CPU/RAM (sysinfo): a couple of /proc reads —
@@ -339,12 +422,14 @@ impl HwPoller {
     /// never touches the stream workers' quanta timing path
     /// (measurement-isolation invariant, blueprint §4).
     pub fn tick(&mut self, state: &MetricsState) {
-        let sample = self.poll();
+        let gpu = self.gpu.as_ref().map(|g| g.poll());
+        let sample = self.advance(&gpu);
         let snap = state.load();
         let merged = merge_hw(
             &snap,
             &sample,
             self.live_joules_per_token(snap.completion_tokens),
+            gpu.as_ref(),
         );
         state.update(merged);
     }
@@ -362,7 +447,12 @@ impl Default for HwPoller {
 ///
 /// Pure and side-effect free: `jpt` (the live joules/token) is passed in
 /// by the caller so this function stays trivially testable.
-pub fn merge_hw(snap: &MetricsSnapshot, sample: &HwSample, jpt: Option<f64>) -> MetricsSnapshot {
+pub fn merge_hw(
+    snap: &MetricsSnapshot,
+    sample: &HwSample,
+    jpt: Option<f64>,
+    gpu: Option<&GpuSample>,
+) -> MetricsSnapshot {
     let mut s = snap.clone();
     s.vram_used_gb = sample
         .vram_used_bytes
@@ -375,6 +465,10 @@ pub fn merge_hw(snap: &MetricsSnapshot, sample: &HwSample, jpt: Option<f64>) -> 
     s.power_w = sample.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0);
     s.gpu_clock_mhz = sample.gpu_clock_mhz.map(|m| m as f64).unwrap_or(0.0);
     s.joules_per_token = jpt.unwrap_or(0.0);
+    // The full vendor-agnostic GPU sample (temperature, utilization,
+    // throttle, …) the Live view's GPU panel renders. `None` (no GPU) →
+    // the panel is hidden entirely (never an N/A box).
+    s.gpu = gpu.cloned();
     s
 }
 
@@ -386,13 +480,14 @@ mod tests {
     fn merge_hw_maps_na_to_zero_sentinels() {
         let snap = MetricsSnapshot::default();
         let sample = HwSample::default(); // every field None
-        let merged = merge_hw(&snap, &sample, None);
+        let merged = merge_hw(&snap, &sample, None, None);
         assert_eq!(merged.vram_used_gb, 0.0);
         assert_eq!(merged.vram_total_gb, 0.0);
         assert_eq!(merged.power_w, 0.0);
         assert_eq!(merged.gpu_clock_mhz, 0.0);
         assert_eq!(merged.joules_per_token, 0.0);
-        // Non-hardware fields pass through untouched.
+        assert!(merged.gpu.is_none()); // no GPU → the panel is hidden
+                                       // Non-hardware fields pass through untouched.
         assert_eq!(merged.endpoint, snap.endpoint);
         assert_eq!(merged.model, snap.model);
     }
@@ -407,12 +502,52 @@ mod tests {
             gpu_clock_mhz: Some(1410),
             ..HwSample::default()
         };
-        let merged = merge_hw(&snap, &sample, Some(0.338));
+        let gpu = GpuSample {
+            power_watts: Some(285.0),
+            utilization_pct: Some(94),
+            temperature_c: Some(68),
+            ..GpuSample::default()
+        };
+        let merged = merge_hw(&snap, &sample, Some(0.338), Some(&gpu));
         assert!((merged.vram_used_gb - 21.4).abs() < 1e-9);
         assert!((merged.vram_total_gb - 24.0).abs() < 1e-9);
         assert!((merged.power_w - 285.0).abs() < 1e-9);
         assert_eq!(merged.gpu_clock_mhz, 1410.0);
         assert_eq!(merged.joules_per_token, 0.338);
+        assert!(merged.gpu.is_some()); // the full sample is carried for the panel
+    }
+
+    /// `hw_sample_from_gpu` normalizes vendor units (MB→bytes, W→mW,
+    /// °C clamped, % carried) into the trace-point shape the energy math
+    /// integrates.
+    #[test]
+    fn hw_sample_from_gpu_normalizes_units() {
+        let t = MonotonicInstant::now();
+        let g = GpuSample {
+            power_watts: Some(285.5),
+            utilization_pct: Some(94),
+            memory_used_mb: Some(7700),
+            memory_total_mb: Some(25000),
+            core_clock_mhz: Some(2520),
+            temperature_c: Some(68),
+            ..GpuSample::default()
+        };
+        let s = hw_sample_from_gpu(t, &g);
+        assert_eq!(s.power_mw, Some(285_500));
+        assert_eq!(s.gpu_util_pct, Some(94));
+        assert_eq!(s.vram_used_bytes, Some(7700 * 1024 * 1024));
+        assert_eq!(s.vram_total_bytes, Some(25000 * 1024 * 1024));
+        assert_eq!(s.gpu_clock_mhz, Some(2520));
+        assert_eq!(s.gpu_temp_c, Some(68));
+        // A negative temperature (a sensor glitch) clamps to 0.
+        let s2 = hw_sample_from_gpu(
+            t,
+            &GpuSample {
+                temperature_c: Some(-5),
+                ..g
+            },
+        );
+        assert_eq!(s2.gpu_temp_c, Some(0));
     }
 
     #[test]

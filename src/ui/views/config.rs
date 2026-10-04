@@ -667,10 +667,16 @@ impl Default for ConfigState {
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let th = app.active_theme;
     let c = &app.config;
+    // The detected GPU's display name (for the "Hardware telemetry" row) —
+    // `None` when no GPU is present (the row then reads "no GPU").
+    let gpu_label = app
+        .gpu
+        .as_ref()
+        .map(|g| crate::hw::gpu_display_name(g.as_ref()));
     if c.edit_mode == ConfigMode::Viewing {
-        render_gate(area, c, th, f);
+        render_gate(area, c, th, f, gpu_label.as_deref());
     } else {
-        render_form(area, c, th, f);
+        render_form(area, c, th, f, gpu_label.as_deref());
     }
 }
 
@@ -678,7 +684,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 /// edit" prompt, and the always-available exit keys. No field is focused,
 /// so no key can be swallowed by the editor and the user can never get
 /// stuck.
-fn render_gate(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
+fn render_gate(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame, gpu_label: Option<&str>) {
     let block = theme::block(
         theme::panel_title(th, "CONFIG (read-only — press Enter to edit)"),
         style::border(th),
@@ -698,7 +704,7 @@ fn render_gate(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
         style::label(th),
     )));
     for &field in &Field::ALL {
-        let (label, value, vstyle) = field_display(field, c, th);
+        let (label, value, vstyle) = field_display(field, c, th, gpu_label);
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(format!("{label:<22} "), style::label(th)),
@@ -726,11 +732,11 @@ fn render_gate(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
 /// with a cursor, the focused field's explanation (dimmed `ℹ` note in a
 /// reserved 4-line area), and the edit-mode key hints (`Esc` saves and
 /// returns to the gate; all other keys type into the focused field).
-fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
+fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame, gpu_label: Option<&str>) {
     let mut lines: Vec<Line> = Vec::with_capacity(Field::ALL.len() + 10);
     for &field in &Field::ALL {
         let is_cursor = field == c.current();
-        let (label, value, vstyle) = field_display(field, c, th);
+        let (label, value, vstyle) = field_display(field, c, th, gpu_label);
         let prefix = if is_cursor {
             Span::styled("> ", style::highlight(th))
         } else {
@@ -790,8 +796,15 @@ fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame) {
     );
 }
 
-/// `(label, value, value_style)` for one form field.
-fn field_display(field: Field, c: &ConfigState, th: Theme) -> (String, String, Style) {
+/// `(label, value, value_style)` for one form field. `gpu_label` is the
+/// detected GPU's model (or `None`) — the Hardware row shows it
+/// (`"[✓] Energy — RTX 4090"`) or `"no GPU"` when absent.
+fn field_display(
+    field: Field,
+    c: &ConfigState,
+    th: Theme,
+    gpu_label: Option<&str>,
+) -> (String, String, Style) {
     match field {
         Field::Url => (
             "Target URL".to_string(),
@@ -861,11 +874,15 @@ fn field_display(field: Field, c: &ConfigState, th: Theme) -> (String, String, S
             c.ladder.clone(),
             style::value(th),
         ),
-        Field::Hardware => (
-            "Hardware telemetry".to_string(),
-            bool_str(c.hardware),
-            bool_style(th, c.hardware),
-        ),
+        Field::Hardware => {
+            let glyph = if c.hardware { "✓" } else { "✗" };
+            let name = gpu_label.unwrap_or("no GPU");
+            (
+                "Hardware telemetry".to_string(),
+                format!("[{glyph}] Energy — {name}"),
+                bool_style(th, c.hardware),
+            )
+        }
         Field::EngineSpeed => (
             "Engine A — Speed".to_string(),
             bool_str(c.engine_speed),

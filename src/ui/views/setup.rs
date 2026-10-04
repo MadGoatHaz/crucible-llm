@@ -894,9 +894,15 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         ]),
         Line::raw(""),
     ];
+    // The detected GPU's display name (for the "D: Energy" label) —
+    // `None` when no GPU is present (the label then reads "no GPU").
+    let gpu_label = app
+        .gpu
+        .as_ref()
+        .map(|g| crate::hw::gpu_display_name(g.as_ref()));
     for &field in &SetupField::ALL {
         let is_cursor = field == s.current_field();
-        let (value, vstyle) = form_value(field, c, th);
+        let (value, vstyle) = form_value(field, c, th, gpu_label.as_deref());
         let prefix = if is_cursor {
             Span::styled("> ", style::highlight(th))
         } else {
@@ -931,8 +937,15 @@ fn render_config(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
     );
 }
 
-/// `(value, value_style)` for one stage-3 form field.
-fn form_value(field: SetupField, c: &ConfigState, th: Theme) -> (String, Style) {
+/// `(value, value_style)` for one stage-3 form field. `gpu_label` is the
+/// detected GPU's model (or `None`) — the Engine D row shows it
+/// (`"D: Energy [✓ RTX 4090]"`) or `"no GPU"` when absent.
+fn form_value(
+    field: SetupField,
+    c: &ConfigState,
+    th: Theme,
+    gpu_label: Option<&str>,
+) -> (String, Style) {
     match field {
         SetupField::Mode => (c.mode.label().to_string(), style::value(th)),
         SetupField::Tokens => (c.tokens.to_string(), style::value(th)),
@@ -958,10 +971,14 @@ fn form_value(field: SetupField, c: &ConfigState, th: Theme) -> (String, Style) 
             format!("[{}] Structured", tick(c.engine_structured)),
             bool_style(th, c.engine_structured),
         ),
-        SetupField::EngineHardware => (
-            format!("[{}] Hardware / Energy", tick(c.hardware)),
-            bool_style(th, c.hardware),
-        ),
+        SetupField::EngineHardware => {
+            let glyph = if c.hardware { "✓" } else { "✗" };
+            let name = gpu_label.unwrap_or("no GPU");
+            (
+                format!("[{glyph}] Energy — {name}"),
+                bool_style(th, c.hardware),
+            )
+        }
         SetupField::EngineFlatOut => (
             format!("[{}] Flat Out", tick(c.engine_flatout)),
             bool_style(th, c.engine_flatout),

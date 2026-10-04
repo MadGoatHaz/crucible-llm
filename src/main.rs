@@ -32,7 +32,7 @@ use crucible_llm::engines::{
     build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StreamCountSource,
     StructuredEngine,
 };
-use crucible_llm::hw::{HwPoller, HW_POLL_INTERVAL_MS};
+use crucible_llm::hw::{detect_gpu, gpu_display_name, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
@@ -42,7 +42,7 @@ use crucible_llm::ui::event::EventLoop;
 use crucible_llm::ui::theme::Theme;
 
 fn main() {
-    let cfg = match Config::from_cli() {
+    let mut cfg = match Config::from_cli() {
         Ok(cfg) => cfg,
         // `--help` / `--version` / bad flags: clap prints the right text to
         // the right stream and exits with its own code (0 for help).
@@ -63,10 +63,38 @@ fn main() {
     let logger = RunLogger::start(cfg.log_dir.as_deref());
 
     // `--banner` (hidden, Chunk 20): the old bare-invocation banner path,
-    // demoted to an explicit flag.
+    // demoted to an explicit flag. Checked before the (unnecessary for a
+    // banner) GPU probe.
     if cfg.banner {
         print_banner();
         return;
+    }
+
+    // GPU auto-detection (early): NVIDIA → AMD → Intel. The single result
+    // is shared with the App (the GPU panel + the "D: Energy" label) and
+    // Engine D (the telemetry). Logged once so the run record shows what
+    // hardware was found. `None` (no GPU) is the graceful path — the app
+    // runs with CPU/RAM telemetry only, never a panic.
+    let gpu: Option<Arc<dyn GpuBackend>> = detect_gpu().map(Arc::from);
+    match &gpu {
+        Some(g) => {
+            let name = gpu_display_name(g.as_ref());
+            eprintln!("[HW] Detected: {name}");
+            logger.info(Context::Setup, format!("[HW] Detected: {name}"));
+        }
+        None => {
+            eprintln!("[HW] No GPU telemetry available");
+            logger.info(
+                Context::Setup,
+                "[HW] No GPU telemetry available".to_string(),
+            );
+        }
+    }
+    // Detection-based Engine D default: on when a GPU is present, off
+    // when not — applied *only* when the user did not pick engines
+    // explicitly (CLI `--engine` / env / config file win over detection).
+    if !cfg.engines_explicit {
+        cfg.engines.hardware = gpu.is_some();
     }
 
     // Chunk 20 — the TUI is the default mode. The run goes headless when
@@ -92,7 +120,7 @@ fn main() {
                 cfg.timeout
             ),
         );
-        let code = run_headless(&cfg, logger.clone());
+        let code = run_headless(&cfg, logger.clone(), gpu.clone());
         logger.info(
             Context::Setup,
             format!("run ended — headless — exit code {code}"),
@@ -115,7 +143,7 @@ fn main() {
                 .unwrap_or_default()
         ),
     );
-    let ok = run_tui(&cfg, logger.clone());
+    let ok = run_tui(&cfg, logger.clone(), gpu);
     EventLoop::restore(); // best-effort terminal restore on all paths
     logger.info(Context::Tui, format!("run ended — TUI — ok={ok}"));
     logger.finish(); // flush before exit (drops are skipped by process::exit)
@@ -127,7 +155,7 @@ fn main() {
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
 /// and print the prototype's result box(es) / summary — or `--json` on
 /// stdout. Returns the process exit code (1 iff every run failed).
-fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
+fn run_headless(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>>) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io() // the stream worker does real network I/O
@@ -141,9 +169,10 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>) -> i32 {
     };
     // Chunk 17: the 100 ms hardware sampler (blueprint §4.3) runs for the
     // whole headless run; its power trace is sliced per-iteration into the
-    // Silicon Efficiency Metric (Joules/Token). Never fails — a driverless
-    // host simply yields N/A and the run proceeds normally.
-    let hw = Arc::new(Mutex::new(HwPoller::new()));
+    // Silicon Efficiency Metric (Joules/Token). The detected backend (any
+    // vendor) drives the GPU fields; a driverless host simply yields N/A
+    // and the run proceeds normally.
+    let hw = Arc::new(Mutex::new(HwPoller::with_backend(gpu)));
     rt.spawn({
         let hw = hw.clone();
         async move {
@@ -577,11 +606,12 @@ fn run_export(
 /// foreground terminal program, so a current-thread runtime is all it
 /// needs; the worker pool will run on its own multi-thread runtime in
 /// later chunks.
-fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
+fn run_tui(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>>) -> bool {
     let export_format = cfg.export.unwrap_or_default();
-    // Chunk 17: probe the hardware once (NVML feature-gated + sysinfo).
-    // Never fails — a driverless host simply runs with N/A GPU fields.
-    let hw = Arc::new(Mutex::new(HwPoller::new()));
+    // Chunk 17: the detected backend (any vendor) + sysinfo drive the
+    // 100 ms poller. Never fails — a driverless host simply runs with
+    // N/A GPU fields.
+    let hw = Arc::new(Mutex::new(HwPoller::with_backend(gpu.clone())));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -598,7 +628,8 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>) -> bool {
                 .with_export_format(export_format)
                 .with_config(cfg)
                 .with_theme(Theme::from_id(&cfg.theme).unwrap_or_default())
-                .with_logger(logger.clone());
+                .with_logger(logger.clone())
+                .with_gpu(gpu);
             // The target is "fully given" when an explicit URL + a
             // non-placeholder model are present; otherwise the Setup
             // takeover is needed to fill them in (the placeholder model

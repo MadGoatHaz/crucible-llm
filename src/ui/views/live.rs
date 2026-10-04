@@ -75,6 +75,12 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let mut plan: Vec<(u8, Constraint)> = Vec::new();
     plan.push((0, Constraint::Length(4))); // sequence header + progress bar
     plan.push((1, Constraint::Percentage(38))); // throughput hero | key metrics
+                                                // The full GPU telemetry panel — shown *only* when GPU data is
+                                                // available (a backend is live and publishing to the snapshot);
+                                                // hidden entirely when there is no GPU (never an N/A box).
+    if m.gpu.is_some() {
+        plan.push((5, Constraint::Length(5))); // GPU panel
+    }
     if show_concurrency {
         plan.push((2, Constraint::Percentage(23))); // concurrency curve
     }
@@ -99,6 +105,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
             2 => render_concurrency_curve(rects[i], app, th, f),
             3 => render_capability_scores(rects[i], app, m, th, f),
             4 => render_log(rects[i], app, th, f),
+            5 => render_gpu_panel(rects[i], app, m, th, f),
             _ => {}
         }
     }
@@ -739,6 +746,94 @@ fn render_concurrency_curve(area: Rect, app: &App, th: Theme, f: &mut Frame) {
             ))]
         });
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+// ── GPU telemetry panel (any vendor) ───────────────────────────────────────
+
+/// The full GPU telemetry panel (blueprint §5D): power, utilization,
+/// temperature, clock, VRAM, throttle reasons, and the live J/token.
+///
+/// Shown **only when GPU data is available** (a backend is live and
+/// publishing to the snapshot); hidden entirely when there is no GPU —
+/// never an N/A box. Reads the latest [`crate::hw::GpuSample`] lock-free
+/// from the snapshot (measurement-isolation invariant, blueprint §4) and
+/// the vendor + model from the App's backend for the title. Updates in
+/// real time during runs; after completion the pipeline freezes and the
+/// panel holds its final values.
+fn render_gpu_panel(area: Rect, app: &App, m: &MetricsSnapshot, th: Theme, f: &mut Frame) {
+    let Some(g) = &m.gpu else {
+        return; // no GPU → the panel is hidden entirely
+    };
+    let title = match &app.gpu {
+        Some(be) => format!("GPU — {}", crate::hw::gpu_display_name(be.as_ref())),
+        None => "GPU".to_string(),
+    };
+    let block = theme::block(theme::panel_title(th, title), style::active_border(th));
+    if area.width < 24 || area.height < 4 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+    let vram = match (g.memory_used_mb, g.memory_total_mb) {
+        (Some(used), Some(total)) if total > 0 => {
+            format!(
+                "{:.1} / {:.1} GB",
+                used as f64 / 1024.0,
+                total as f64 / 1024.0
+            )
+        }
+        (Some(used), None) => format!("{:.1} GB", used as f64 / 1024.0),
+        _ => "N/A".to_string(),
+    };
+    let power = g
+        .power_watts
+        .map(|w| format!("{w:.0}W"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let util = g
+        .utilization_pct
+        .map(|u| format!("{u}%"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let temp = g
+        .temperature_c
+        .map(|t| format!("{t}°C"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let clock = g
+        .core_clock_mhz
+        .map(|c| format!("{c} MHz"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let throttle = g.throttle_reasons.as_deref().unwrap_or("None");
+    let energy = if m.joules_per_token > 0.0 {
+        format!("{:.3} J/token (this run)", m.joules_per_token)
+    } else {
+        "N/A".to_string()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  Power: ", style::label(th)),
+            Span::styled(power, style::value(th)),
+            Span::styled("  │  Util: ", style::footer(th)),
+            Span::styled(util, style::value(th)),
+            Span::styled("  │  Temp: ", style::footer(th)),
+            Span::styled(temp, style::value(th)),
+            Span::styled("  │  Clock: ", style::footer(th)),
+            Span::styled(clock, style::value(th)),
+        ]),
+        Line::from(vec![
+            Span::styled("  VRAM: ", style::label(th)),
+            Span::styled(vram, style::value(th)),
+            Span::styled("  │  Throttle: ", style::footer(th)),
+            Span::styled(throttle.to_string(), style::value(th)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Energy: ", style::label(th)),
+            Span::styled(energy, style::value_ok(th)),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 // ── Capability scores (C1 / C2 / C3 / D) ───────────────────────────────────
@@ -2104,6 +2199,83 @@ mod tests {
         let app = App::new();
         for (w, h) in [(40, 10), (20, 6), (80, 24)] {
             let _ = render_live_text(&app, w, h);
+        }
+    }
+
+    // ── GPU telemetry panel ──────────────────────────────────────────────
+
+    #[test]
+    fn gpu_panel_shows_when_data_is_available() {
+        let app = App::new();
+        app.metrics.update(MetricsSnapshot {
+            gpu: Some(crate::hw::GpuSample {
+                power_watts: Some(285.0),
+                utilization_pct: Some(94),
+                temperature_c: Some(68),
+                memory_used_mb: Some(7700),
+                memory_total_mb: Some(25000),
+                core_clock_mhz: Some(2520),
+                ..Default::default()
+            }),
+            joules_per_token: 2.4,
+            ..Default::default()
+        });
+        let text = render_live_text(&app, 120, 40);
+        assert!(text.contains("GPU"), "GPU panel title: {text}");
+        assert!(text.contains("285W"), "power: {text}");
+        assert!(text.contains("94%"), "utilization: {text}");
+        assert!(text.contains("68°C"), "temperature: {text}");
+        assert!(text.contains("2520 MHz"), "clock: {text}");
+        assert!(text.contains("7.5 / 24.4 GB"), "VRAM: {text}");
+        assert!(text.contains("Throttle: None"), "throttle: {text}");
+        assert!(text.contains("2.400 J/token"), "energy: {text}");
+    }
+
+    #[test]
+    fn gpu_panel_title_uses_the_backend_vendor_and_model() {
+        let mut app = App::new();
+        app.gpu = Some(std::sync::Arc::new(MockGpuBackend));
+        app.metrics.update(MetricsSnapshot {
+            gpu: Some(crate::hw::GpuSample {
+                power_watts: Some(100.0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let text = render_live_text(&app, 120, 40);
+        assert!(
+            text.contains("GPU — NVIDIA GEFORCE RTX 4090"),
+            "title: {text}"
+        );
+    }
+
+    #[test]
+    fn gpu_panel_hidden_when_no_gpu() {
+        let app = App::new(); // no backend, no gpu sample in the snapshot
+        let text = render_live_text(&app, 120, 40);
+        assert!(
+            !text.contains("Throttle:"),
+            "no GPU panel without a GPU: {text}"
+        );
+        assert!(
+            !text.contains("GPU —"),
+            "no GPU title without a GPU: {text}"
+        );
+    }
+
+    /// A minimal [`crate::hw::GpuBackend`] for the GPU-panel title test
+    /// (no hardware).
+    #[derive(Debug)]
+    struct MockGpuBackend;
+    impl crate::hw::GpuBackend for MockGpuBackend {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("GeForce RTX 4090")
+        }
+        fn poll(&self) -> crate::hw::GpuSample {
+            crate::hw::GpuSample::default()
         }
     }
 

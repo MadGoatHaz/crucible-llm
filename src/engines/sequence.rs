@@ -1036,22 +1036,39 @@ impl BenchmarkSequence {
             });
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let (trace, _gpu) = match &self.hw {
-            Some(poller) => poller
-                .lock()
-                .ok()
-                .map(|g| (g.trace().to_vec(), g.gpu_name().map(str::to_string)))
-                .unwrap_or_default(),
-            None => (Vec::new(), None),
+        // Harvest the poller's accumulated power trace plus the backend's
+        // vendor + model (the 100 ms task filled the trace; we only read it
+        // here, never on the timing path).
+        let (trace, vendor, model) = match &self.hw {
+            Some(poller) => {
+                let g = poller.lock().ok();
+                match g {
+                    Some(p) => {
+                        let (vendor, model) = p
+                            .backend()
+                            .map(|b| (Some(b.vendor().to_string()), b.model().map(str::to_string)))
+                            .unwrap_or((None, None));
+                        (p.trace().to_vec(), vendor, model)
+                    }
+                    None => (Vec::new(), None, None),
+                }
+            }
+            None => (Vec::new(), None, None),
         };
-        let energy = profile(&trace, None, total_tokens);
+        let mut energy = profile(&trace, None, total_tokens);
+        energy.vendor = vendor;
+        energy.model = model;
         let summary = match energy.joules_per_token {
             Some(jpt) => {
                 let peak = energy
                     .peak_power_w
                     .map(|w| format!(" · peak {w:.0} W"))
                     .unwrap_or_default();
-                format!("{jpt:.3} J/token{peak}")
+                let util = energy
+                    .avg_utilization_pct
+                    .map(|u| format!(" · {u:.0}% util"))
+                    .unwrap_or_default();
+                format!("{jpt:.3} J/token{peak}{util}")
             }
             None => "N/A (no power telemetry)".to_string(),
         };

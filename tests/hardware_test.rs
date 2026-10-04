@@ -15,7 +15,7 @@
 //!   pipeline (blueprint §4.2) without touching the timing path.
 //!
 //! The NVML-dependent path is exercised (feature-gated) without
-//! requiring a GPU: `NvmlPoller::init()` must return a `Result` — never
+//! requiring a GPU: `NvmlBackend::try_init()` must return `None` — never
 //! panic — on a driver-less host.
 
 use std::time::Duration;
@@ -204,12 +204,13 @@ fn poller_tick_publishes_to_the_lock_free_snapshot() {
 fn merge_hw_is_a_pure_na_mapping() {
     let base = MetricsSnapshot::default();
     let na = HwSample::default(); // every field None
-    let merged = merge_hw(&base, &na, None);
+    let merged = merge_hw(&base, &na, None, None);
     assert_eq!(merged.vram_used_gb, 0.0);
     assert_eq!(merged.vram_total_gb, 0.0);
     assert_eq!(merged.power_w, 0.0);
     assert_eq!(merged.gpu_clock_mhz, 0.0);
     assert_eq!(merged.joules_per_token, 0.0);
+    assert!(merged.gpu.is_none()); // no GPU sample → the panel is hidden
 
     let full = HwSample {
         vram_used_bytes: Some(21_400_000_000),
@@ -218,12 +219,17 @@ fn merge_hw_is_a_pure_na_mapping() {
         gpu_clock_mhz: Some(1410),
         ..HwSample::default()
     };
-    let merged = merge_hw(&base, &full, Some(0.338));
+    let gpu = crucible_llm::hw::GpuSample {
+        power_watts: Some(285.0),
+        ..Default::default()
+    };
+    let merged = merge_hw(&base, &full, Some(0.338), Some(&gpu));
     assert!((merged.vram_used_gb - 21.4).abs() < 1e-9);
     assert!((merged.vram_total_gb - 24.0).abs() < 1e-9);
     assert!((merged.power_w - 285.0).abs() < 1e-9);
     assert_eq!(merged.gpu_clock_mhz, 1410.0);
     assert_eq!(merged.joules_per_token, 0.338);
+    assert!(merged.gpu.is_some()); // the full sample is carried for the panel
 }
 
 // ── NVML feature-gated path ────────────────────────────────────────────────
@@ -231,11 +237,12 @@ fn merge_hw_is_a_pure_na_mapping() {
 #[cfg(feature = "nvml")]
 #[test]
 fn nvml_init_degrades_gracefully_without_a_driver() {
-    // Chunk 17 acceptance: no panic on a driver-less host — the Err is
-    // the graceful path (and an Ok means a real GPU answered).
-    if let Ok(p) = crucible_llm::hw::nvml::NvmlPoller::init() {
-        let s = p.read();
-        assert!(s.vram_total_bytes.is_some());
-        assert!(!p.name().is_empty());
+    use crucible_llm::hw::GpuBackend;
+    // Chunk 17 acceptance: no panic on a driver-less host — the `None`
+    // is the graceful path (and a `Some` means a real GPU answered).
+    if let Some(b) = crucible_llm::hw::nvml::NvmlBackend::try_init() {
+        let s = b.poll();
+        assert!(s.memory_total_mb.is_some());
+        assert!(!b.name().is_empty());
     }
 }

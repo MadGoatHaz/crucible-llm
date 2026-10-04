@@ -20,6 +20,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use super::histogram::LatencyHistogram;
+use crate::hw::GpuSample;
 
 /// Per-stream / overall run status (blueprint §6 stream-matrix `STATE` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -194,6 +195,11 @@ pub struct MetricsSnapshot {
     pub joules_per_token: f64,
     /// GPU core clock in MHz (blueprint §6 View 1 top-left key metric).
     pub gpu_clock_mhz: f64,
+    /// The latest vendor-agnostic GPU sample — the full telemetry set the
+    /// Live view's GPU panel renders (power, utilization, temperature,
+    /// clocks, VRAM, throttle reasons). `None` when no GPU is present:
+    /// the panel is hidden entirely, never shown as an N/A box.
+    pub gpu: Option<GpuSample>,
 
     // ---- inter-token latency percentiles (nanoseconds) ----
     pub itl_p50_ns: u64,
@@ -268,6 +274,7 @@ impl Default for MetricsSnapshot {
             power_w: 0.0,
             joules_per_token: 0.0,
             gpu_clock_mhz: 0.0,
+            gpu: None,
             itl_p50_ns: 0,
             itl_p90_ns: 0,
             itl_p99_ns: 0,

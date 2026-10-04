@@ -25,7 +25,7 @@
 //! when VRAM usage approaches the fragmentation threshold
 //! ([`VRAM_FRAGMENTATION_THRESHOLD`]).
 
-use crate::hw::HwSample;
+use crate::hw::{hw_sample_from_gpu, GpuBackend, HwSample, HW_POLL_INTERVAL_MS};
 use crate::timing::MonotonicInstant;
 
 /// VRAM occupancy (used / total) at which the fragmentation warning fires
@@ -53,6 +53,14 @@ pub struct EnergyResult {
     /// `Some` when the peak VRAM ratio reached the fragmentation
     /// threshold (the blueprint §5D warning text).
     pub fragmentation_warning: Option<String>,
+    /// Mean GPU compute utilization over the window, % (0–100). `None`
+    /// without utilization telemetry (e.g. the Intel sysfs path).
+    pub avg_utilization_pct: Option<f64>,
+    /// The GPU vendor (`"NVIDIA"` / `"AMD"` / `"Intel"`), when a backend
+    /// produced the samples.
+    pub vendor: Option<String>,
+    /// The GPU's model / driver label, when known.
+    pub model: Option<String>,
 }
 
 /// True when `t` lies within the closed window `[start, end]`.
@@ -179,6 +187,16 @@ pub fn profile(
         .zip(in_scope.iter().filter_map(|s| s.vram_total_bytes).max())
         .and_then(|(used, total)| fragmentation_warning(used, total));
 
+    // Mean compute utilization over the in-scope samples that report it.
+    let avg_utilization_pct = {
+        let utils: Vec<f64> = in_scope
+            .iter()
+            .filter_map(|s| s.gpu_util_pct)
+            .map(|u| u as f64)
+            .collect();
+        (!utils.is_empty()).then(|| utils.iter().sum::<f64>() / utils.len() as f64)
+    };
+
     EnergyResult {
         joules,
         joules_per_token: (has_power && total_tokens > 0).then(|| joules / total_tokens as f64),
@@ -187,7 +205,46 @@ pub fn profile(
         peak_vram_bytes,
         peak_vram_ratio,
         fragmentation_warning,
+        avg_utilization_pct,
+        // Vendor / model are filled by the caller (the backend that
+        // produced the samples) — the pure trace math never knows them.
+        vendor: None,
+        model: None,
     }
+}
+
+/// The Engine D entry point that works **from a backend directly**: poll
+/// `gpu` at 100 ms for `duration`, collect [`HwSample`]s, and compute the
+/// full energy profile (avg/peak power, total joules, J/token, avg
+/// utilization) over `tokens` — with the backend's vendor + model
+/// attached to the result.
+///
+/// `None` backend → an all-N/A [`EnergyResult`] (the N/A rule: no power
+/// telemetry, no spurious `0.0` J/token). This is a blocking call (it
+/// sleeps at the poll cadence) — the standalone / headless path. The TUI
+/// prefers the shared 100 ms background poller, which accumulates the
+/// same trace without a second poller.
+pub fn profile_backend(
+    gpu: Option<&dyn GpuBackend>,
+    duration: std::time::Duration,
+    tokens: u64,
+) -> EnergyResult {
+    let (vendor, model) = gpu
+        .map(|g| (Some(g.vendor().to_string()), g.model().map(str::to_string)))
+        .unwrap_or((None, None));
+    let mut samples: Vec<HwSample> = Vec::new();
+    let interval = std::time::Duration::from_millis(HW_POLL_INTERVAL_MS);
+    let start = std::time::Instant::now();
+    while start.elapsed() < duration {
+        if let Some(g) = gpu {
+            samples.push(hw_sample_from_gpu(MonotonicInstant::now(), &g.poll()));
+        }
+        std::thread::sleep(interval);
+    }
+    let mut r = profile(&samples, None, tokens);
+    r.vendor = vendor;
+    r.model = model;
+    r
 }
 
 /// The blueprint §5D VRAM fragmentation warning: `Some` when occupancy
@@ -214,6 +271,7 @@ pub fn fragmentation_warning(used_bytes: u64, total_bytes: u64) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hw::GpuSample;
     use crate::timing::MonotonicInstant;
 
     #[test]
@@ -329,5 +387,64 @@ mod tests {
             vram_total_bytes: vram_total,
             ..HwSample::default()
         }
+    }
+
+    // ── profile_backend (the backend-driven Engine D path) ──────────────
+
+    /// A deterministic mock backend so `profile_backend` is testable
+    /// without any hardware (the N/A-never-panic contract holds here).
+    #[derive(Debug)]
+    struct MockBackend {
+        vendor: &'static str,
+        model: Option<&'static str>,
+        watts: f64,
+        util: u8,
+    }
+
+    impl GpuBackend for MockBackend {
+        fn vendor(&self) -> &str {
+            self.vendor
+        }
+        fn model(&self) -> Option<&str> {
+            self.model
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                power_watts: Some(self.watts),
+                utilization_pct: Some(self.util),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    #[test]
+    fn profile_backend_none_is_all_na() {
+        let r = profile_backend(None, std::time::Duration::from_millis(20), 100);
+        assert_eq!(r.joules_per_token, None);
+        assert_eq!(r.avg_utilization_pct, None);
+        assert_eq!(r.vendor, None);
+        assert_eq!(r.model, None);
+        assert_eq!(r.joules, 0.0);
+    }
+
+    #[test]
+    fn profile_backend_collects_and_computes() {
+        let be = MockBackend {
+            vendor: "NVIDIA",
+            model: Some("RTX 4090"),
+            watts: 285.0,
+            util: 94,
+        };
+        let r = profile_backend(
+            Some(&be as &dyn GpuBackend),
+            std::time::Duration::from_millis(300),
+            1000,
+        );
+        assert!(r.joules > 0.0, "energy integrated: {}", r.joules);
+        assert!(r.joules_per_token.is_some());
+        assert_eq!(r.avg_utilization_pct, Some(94.0));
+        assert_eq!(r.vendor.as_deref(), Some("NVIDIA"));
+        assert_eq!(r.model.as_deref(), Some("RTX 4090"));
+        assert!((r.peak_power_w.unwrap() - 285.0).abs() < 1.0);
     }
 }

@@ -46,7 +46,7 @@ use crate::engines::{
     SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
     VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
-use crate::hw::HwPoller;
+use crate::hw::{GpuBackend, HwPoller};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
@@ -231,6 +231,12 @@ pub struct App {
     /// `ArcSwap<MetricsSnapshot>`; the views read it lock-free. `None`
     /// until the entry point attaches one.
     pub hw: Option<Arc<Mutex<HwPoller>>>,
+    /// The detected GPU backend (any vendor), shared with the poller.
+    /// The views read its vendor + model for the GPU panel title and the
+    /// "D: Energy" label; the live telemetry itself lives in the
+    /// `MetricsSnapshot.gpu` field (updated by the 100 ms poller).
+    /// `None` when no GPU is present (the GPU panel is hidden).
+    pub gpu: Option<Arc<dyn GpuBackend>>,
     /// Lock-free model-discovery slot (Chunk 20): a background
     /// `tokio::spawn`ed `GET {base}/v1/models` (OpenAI-compatible)
     /// publishes the discovered [`ModelInfo`] list here; the setup flow
@@ -337,6 +343,7 @@ impl App {
             flatout_slot: Arc::new(ResultSlot::new()),
             config: ConfigState::default(),
             hw: None,
+            gpu: None,
             models: Arc::new(ResultSlot::new()),
             // `App::new()` keeps the classic behavior (dashboard first);
             // the entry point switches to Setup via `with_setup` when the
@@ -402,6 +409,15 @@ impl App {
     /// render path only ever reads the resulting snapshot.
     pub fn with_hw(mut self, hw: Arc<Mutex<HwPoller>>) -> Self {
         self.hw = Some(hw);
+        self
+    }
+
+    /// Attach the detected GPU backend (any vendor). The entry point
+    /// shares the single detection result here and in the poller; the
+    /// views read its vendor + model for the GPU panel title and the
+    /// "D: Energy" label.
+    pub fn with_gpu(mut self, gpu: Option<Arc<dyn GpuBackend>>) -> Self {
+        self.gpu = gpu;
         self
     }
 
@@ -1947,10 +1963,7 @@ mod tests {
 
     #[test]
     fn url_host_extracts_host_and_port() {
-        assert_eq!(
-            fmt::url_host("http://127.0.0.1:8888/v1"),
-            "127.0.0.1:8888"
-        );
+        assert_eq!(fmt::url_host("http://127.0.0.1:8888/v1"), "127.0.0.1:8888");
         assert_eq!(
             fmt::url_host("https://example.com/v1/chat/completions"),
             "example.com"

@@ -449,6 +449,13 @@ pub struct Config {
     /// `false` (no theme has ever been chosen).
     #[serde(skip)]
     pub theme_explicit: bool,
+    /// `true` when the engine selection was provided explicitly (CLI
+    /// `--engine` / env / config file) rather than the built-in default.
+    /// The entry point applies the detection-based Engine D default (on
+    /// when a GPU is present, off when not) *only* when the user did not
+    /// pick engines themselves.
+    #[serde(skip)]
+    pub engines_explicit: bool,
 }
 
 impl Default for Config {
@@ -479,6 +486,7 @@ impl Default for Config {
             matrix_contexts: DEFAULT_MATRIX_CONTEXTS.to_vec(),
             theme: "cyberpunk".to_string(),
             theme_explicit: false,
+            engines_explicit: false,
         }
     }
 }
@@ -620,6 +628,8 @@ impl ConfigFile {
         if let Some(v) = self.engines {
             c.engines = v;
         }
+        // A file-supplied engine selection is an explicit choice.
+        c.engines_explicit = self.engines.is_some();
         if let Some(v) = &self.log_dir {
             c.log_dir = Some(v.clone());
         }
@@ -912,8 +922,12 @@ pub fn layer(
     };
 
     // ── engine selection (Chunk 18) ──
-    let engines = if !cli.engine.is_empty() {
-        selection_from_names(&cli.engine)?
+    // `engines_explicit` records whether the selection came from an
+    // explicit source (CLI / env / file) rather than the built-in
+    // default — the entry point applies the detection-based Engine D
+    // default only when the user did not pick engines themselves.
+    let (engines, engines_explicit) = if !cli.engine.is_empty() {
+        (selection_from_names(&cli.engine)?, true)
     } else if let Some(raw) = env_get(env_vars::ENGINE) {
         let names: Vec<String> = raw
             .split(',')
@@ -921,12 +935,18 @@ pub fn layer(
             .filter(|p| !p.is_empty())
             .collect();
         if names.is_empty() {
-            file.and_then(|f| f.engines).unwrap_or_default()
+            (
+                file.and_then(|f| f.engines).unwrap_or_default(),
+                file.and_then(|f| f.engines).is_some(),
+            )
         } else {
-            selection_from_names(&names)?
+            (selection_from_names(&names)?, true)
         }
     } else {
-        file.and_then(|f| f.engines).unwrap_or_default()
+        (
+            file.and_then(|f| f.engines).unwrap_or_default(),
+            file.and_then(|f| f.engines).is_some(),
+        )
     };
 
     Ok(Config {
@@ -955,6 +975,7 @@ pub fn layer(
         matrix_contexts,
         theme,
         theme_explicit,
+        engines_explicit,
     })
 }
 
