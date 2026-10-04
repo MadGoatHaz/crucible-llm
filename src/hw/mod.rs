@@ -33,8 +33,111 @@
 #[cfg(feature = "nvml")]
 pub mod nvml;
 
+#[cfg(target_os = "linux")]
+mod amd;
+#[cfg(target_os = "linux")]
+mod intel;
+
+#[cfg(target_os = "linux")]
+pub use amd::AmdSysfsBackend;
+#[cfg(target_os = "linux")]
+pub use intel::IntelSysfsBackend;
+
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::timing::MonotonicInstant;
+
+/// A unified, vendor-agnostic GPU telemetry sample (blueprint §5D).
+///
+/// Every field is `Option` (the N/A rule): a metric the driver cannot
+/// provide is `None`, never a panic. Backends normalize raw sensor units
+/// (µW → W, m°C → °C, Hz → MHz, bytes → MB) before populating these, so
+/// downstream consumers receive consistent values regardless of vendor.
+#[derive(Debug, Clone, Default)]
+pub struct GpuSample {
+    /// Instantaneous power draw, watts.
+    pub power_watts: Option<f64>,
+    /// GPU compute engine utilization, % (0–100).
+    pub utilization_pct: Option<u8>,
+    /// VRAM in use (weights + KV cache), MB.
+    pub memory_used_mb: Option<u64>,
+    /// Total installed VRAM, MB.
+    pub memory_total_mb: Option<u64>,
+    /// Graphics core clock, MHz.
+    pub core_clock_mhz: Option<u32>,
+    /// Memory clock, MHz.
+    pub memory_clock_mhz: Option<u32>,
+    /// Core / hotspot temperature, °C.
+    pub temperature_c: Option<i32>,
+    /// Human-readable throttle reasons (e.g. "thermal", "power"), if any.
+    pub throttle_reasons: Option<String>,
+}
+
+/// A vendor-agnostic GPU telemetry backend.
+///
+/// Implementations read from the platform's native telemetry surface
+/// (NVML, AMD sysfs/hwmon, Intel sysfs/hwmon) and normalize into a
+/// [`GpuSample`]. [`GpuBackend::poll`] is the 100 ms hot path: it must be
+/// cheap (direct file reads / a single driver call — no subprocess
+/// spawning) and must never panic; a missing node degrades that field to
+/// `None` (the N/A rule).
+pub trait GpuBackend: Send + Sync {
+    /// Vendor name (e.g. `"AMD"`, `"Intel"`, `"NVIDIA"`).
+    fn vendor(&self) -> &str;
+    /// The GPU's model / driver label, if known.
+    fn model(&self) -> Option<&str>;
+    /// One telemetry sample (all fields optional, N/A rule).
+    fn poll(&self) -> GpuSample;
+}
+
+/// Shared, infallible sysfs read helpers for the AMD and Intel backends.
+///
+/// Every read returns `Option` — a missing node (ENOENT) or an
+/// unparseable value is `None`, never a panic (the N/A rule). Linux-only:
+/// the `/sys` tree does not exist on other platforms.
+#[cfg(target_os = "linux")]
+pub(crate) mod sysfs {
+    use std::path::{Path, PathBuf};
+
+    /// Read a file and return its trimmed contents, or `None` on any I/O
+    /// failure (missing file, permission, etc.).
+    pub(crate) fn read_trimmed(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// Read a file as a `u8` (0–255), or `None`.
+    pub(crate) fn read_u8(path: &Path) -> Option<u8> {
+        read_trimmed(path)?.parse().ok()
+    }
+
+    /// Read a file as a `u32`, or `None`.
+    pub(crate) fn read_u32(path: &Path) -> Option<u32> {
+        read_trimmed(path)?.parse().ok()
+    }
+
+    /// Read a file as a `u64`, or `None`.
+    pub(crate) fn read_u64(path: &Path) -> Option<u64> {
+        read_trimmed(path)?.parse().ok()
+    }
+
+    /// Read a file as an `i32` (hwmon temperatures are signed), or `None`.
+    pub(crate) fn read_i32(path: &Path) -> Option<i32> {
+        read_trimmed(path)?.parse().ok()
+    }
+
+    /// Locate the first `hwmon` subdirectory under a DRM `device` dir
+    /// (e.g. `/sys/class/drm/card0/device/hwmon/hwmon0`). `None` when the
+    /// hwmon dir is absent (integrated GPUs / older drivers).
+    pub(crate) fn find_hwmon(device_path: &Path) -> Option<PathBuf> {
+        let hwmon_dir = device_path.join("hwmon");
+        std::fs::read_dir(&hwmon_dir).ok().and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+        })
+    }
+}
 
 /// The hardware poll period (blueprint §4.3: "polls system sensors every
 /// 100 milliseconds").
