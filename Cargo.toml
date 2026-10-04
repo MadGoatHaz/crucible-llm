@@ -24,6 +24,10 @@ hdrhistogram = "7.6"
 # Hardware monitoring (feature-gated)
 sysinfo = "0.39"
 nvml-wrapper = { version = "0.13", optional = true }
+# Level Zero Sysman (Intel Arc): dlopen'd at runtime via libloading, never
+# link-dependent — the binary works on non-Intel machines without the
+# Level Zero loader (graceful None fallback to the sysfs backend).
+libloading = "0.8"
 # Persistence
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

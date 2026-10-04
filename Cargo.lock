@@ -523,6 +523,7 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "hdrhistogram",
+ "libloading",
  "nvml-wrapper",
  "quanta",
  "rand 0.9.5",

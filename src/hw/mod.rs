@@ -37,11 +37,15 @@ pub mod nvml;
 mod amd;
 #[cfg(target_os = "linux")]
 mod intel;
+#[cfg(target_os = "linux")]
+mod intel_level_zero;
 
 #[cfg(target_os = "linux")]
 pub use amd::AmdSysfsBackend;
 #[cfg(target_os = "linux")]
-pub use intel::IntelSysfsBackend;
+pub use intel::{detect_intel_backend, IntelSysfsBackend};
+#[cfg(target_os = "linux")]
+pub use intel_level_zero::IntelLevelZeroBackend;
 
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::timing::MonotonicInstant;

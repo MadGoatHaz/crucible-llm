@@ -28,6 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::intel_level_zero::IntelLevelZeroBackend;
 use super::sysfs::{find_hwmon, read_i32, read_trimmed, read_u32, read_u64};
 use super::{GpuBackend, GpuSample};
 
@@ -136,6 +137,26 @@ impl GpuBackend for IntelSysfsBackend {
     }
 }
 
+/// The Intel GPU detection chain: **Level Zero Sysman first**, then the
+/// sysfs/hwmon fallback.
+///
+/// 1. [`IntelLevelZeroBackend`] — preferred: full telemetry for discrete
+///    Arc GPUs (power, utilization, VRAM, core + memory clocks,
+///    temperature, throttle reasons) via `libze_loader.so.1`, loaded
+///    dynamically. `None` when the Level Zero loader / Intel Compute
+///    Runtime is not installed — never a panic.
+/// 2. [`IntelSysfsBackend`] — fallback: works on every Intel GPU
+///    (including integrated) with the documented per-field limitations.
+///
+/// Returns `None` only when *neither* surface is available (no Intel
+/// GPU at all) — the caller degrades to N/A.
+pub fn detect_intel_backend() -> Option<Box<dyn GpuBackend>> {
+    if let Some(level_zero) = IntelLevelZeroBackend::try_init() {
+        return Some(level_zero);
+    }
+    IntelSysfsBackend::try_init().map(|sysfs| sysfs as Box<dyn GpuBackend>)
+}
+
 /// hwmon power draw: `power1_average` on discrete Arc, `power1_input` on
 /// some designs. Microwatts → watts. `None` for integrated iGPUs (power
 /// lives in the CPU RAPL powercap node, not the DRM device).
@@ -161,6 +182,19 @@ mod tests {
     #[test]
     fn try_init_is_graceful() {
         let result = IntelSysfsBackend::try_init();
+        if let Some(backend) = &result {
+            assert_eq!(backend.vendor(), "Intel");
+            let _sample = backend.poll(); // must not panic
+        }
+    }
+
+    /// The detection chain (Level Zero → sysfs) must never panic: `None`
+    /// on a machine with no Intel GPU, or a working backend (Level Zero
+    /// when the loader is installed, sysfs otherwise) whose `poll` also
+    /// never panics.
+    #[test]
+    fn detect_intel_backend_is_graceful() {
+        let result = detect_intel_backend();
         if let Some(backend) = &result {
             assert_eq!(backend.vendor(), "Intel");
             let _sample = backend.poll(); // must not panic
