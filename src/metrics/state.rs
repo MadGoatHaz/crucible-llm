@@ -274,7 +274,8 @@ pub struct MetricsSnapshot {
     pub overall: OverallStats,
     /// Engine-transition markers (FIX 2: the hero chart's vertical lines).
     pub engine_markers: Vec<EngineMarker>,
-    /// Total elapsed benchmark time (seconds) since the first update.
+    /// Total elapsed benchmark time (seconds) since the run started
+    /// (the first engine began) — `0.0` while the app sits idle.
     pub elapsed_sec: f64,
 }
 
@@ -810,6 +811,12 @@ struct OverallAccumulator {
     first: Option<Instant>,
     last: Option<Instant>,
     last_agg: Option<Instant>,
+    /// The run clock is live: the sequence opened the load window (the
+    /// first engine began — [`MetricsState::mark_run_started`]). While
+    /// `false`, [`Self::fold`] never latches/advances `first`/`last` on
+    /// the forever 100 ms poller's idle ticks — the Live view's "Total
+    /// Duration" stays 0 until the test actually starts (never app open).
+    run_live: bool,
     prev_mode: String,
     markers: Vec<EngineMarker>,
     /// Previous status per stream id (completion-transition detection).
@@ -836,10 +843,22 @@ impl OverallAccumulator {
 
     /// Fold one published snapshot into the running totals.
     fn fold(&mut self, s: &MetricsSnapshot, now: Instant) {
-        if self.first.is_none() {
-            self.first = Some(now);
+        // The run clock (`first`/`last` → "Total Duration", `elapsed_sec`)
+        // only advances while a benchmark is actually running. The forever
+        // 100 ms hardware poller updates from app open; latching `first`
+        // there is exactly the "Total Duration starts at app open" bug.
+        // A run is live when the sequence opened the load window
+        // (`run_live` — set by [`MetricsState::mark_run_started`] the
+        // moment the first engine begins, after the idle baseline window)
+        // or a stream is active (standalone engine runs that don't go
+        // through the sequence).
+        let live = self.run_live || s.active_streams > 0 || s.status == StreamStatus::Streaming;
+        if live {
+            if self.first.is_none() {
+                self.first = Some(now);
+            }
+            self.last = Some(now);
         }
-        self.last = Some(now);
 
         // Engine-transition marker: the snapshot's `mode` identifies the
         // engine ("short"/"long" = A, "Concurrency" = B, "NIAH" = C1,
@@ -925,7 +944,8 @@ impl OverallAccumulator {
     /// would anchor to the *app open* (the forever 100 ms poller's first
     /// `update()`), and tokens / streams / averages would accumulate across
     /// runs. Resetting here re-anchors everything to the **first engine
-    /// start** of the new run.
+    /// start** of the new run — including the `run_live` latch, so the
+    /// clock stays 0 until the new run's sequence actually begins.
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -1046,6 +1066,23 @@ impl MetricsState {
         rs.last = None;
         let mut acc = self.overall_acc.lock().unwrap_or_else(|p| p.into_inner());
         acc.reset();
+    }
+
+    /// Mark the benchmark's load window as open. The sequence executor
+    /// calls this the moment the **first engine begins** (right after the
+    /// monitor's `start_load()`, once the idle baseline window elapses).
+    ///
+    /// From this point on the overall accumulator's run clock
+    /// (`first`/`last` → the Live view's "Total Duration" and
+    /// `elapsed_sec`) latches and advances. Without it, the clock would
+    /// anchor to the first `update()` — the forever 100 ms hardware
+    /// poller's tick at **app open** — and "Total Duration" would count
+    /// the idle time before the test. Cleared by [`Self::unfreeze`].
+    pub fn mark_run_started(&self) {
+        self.overall_acc
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .run_live = true;
     }
 
     /// `true` while the pipeline is frozen (a run completed and no new
@@ -1438,6 +1475,90 @@ mod tests {
             o.duration_sec < 1.0,
             "duration re-anchored to the new run: {}",
             o.duration_sec
+        );
+    }
+
+    #[test]
+    fn duration_stays_zero_before_the_run_starts() {
+        // The "Total Duration starts at app open" fix: the forever 100 ms
+        // poller's idle updates (no streams, no run window) must never
+        // latch the run clock. The duration stays 0 while the app sits
+        // idle and starts counting only when the sequence marks the run
+        // started (the first engine begins, after the idle window).
+        let state = MetricsState::new();
+        // App open: the poller ticks with idle snapshots.
+        state.update(MetricsSnapshot::default());
+        std::thread::sleep(Duration::from_millis(30));
+        state.update(MetricsSnapshot::default());
+        assert_eq!(
+            state.load().overall.duration_sec,
+            0.0,
+            "idle poller ticks never latch the run clock"
+        );
+        assert_eq!(state.load().elapsed_sec, 0.0);
+        // The first engine begins: the run clock latches and advances.
+        state.mark_run_started();
+        state.update(MetricsSnapshot::default());
+        std::thread::sleep(Duration::from_millis(30));
+        state.update(MetricsSnapshot::default());
+        let o = state.load().overall.clone();
+        assert!(
+            o.duration_sec > 0.0,
+            "run clock live after mark_run_started: {}",
+            o.duration_sec
+        );
+    }
+
+    #[test]
+    fn duration_latches_on_stream_activity() {
+        // Standalone engine runs (no sequence, no `mark_run_started`):
+        // idle ticks before the first stream do not latch; the first
+        // active stream does.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot::default());
+        assert_eq!(state.load().elapsed_sec, 0.0, "idle ticks never latch");
+        state.update(MetricsSnapshot {
+            active_streams: 1,
+            status: StreamStatus::Streaming,
+            ..Default::default()
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        state.update(MetricsSnapshot {
+            active_streams: 1,
+            status: StreamStatus::Streaming,
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert!(
+            o.duration_sec > 0.0,
+            "active stream latched the run clock: {}",
+            o.duration_sec
+        );
+    }
+
+    #[test]
+    fn unfreeze_clears_the_run_live_latch() {
+        // A completed run freezes the pipeline with the run latch set;
+        // the next run's `unfreeze` must clear it, so the duration stays
+        // 0 (not the previous run's frozen value, not app-open time)
+        // until the new run's first engine begins.
+        let state = MetricsState::new();
+        state.mark_run_started();
+        state.update(MetricsSnapshot::default());
+        std::thread::sleep(Duration::from_millis(30));
+        state.update(MetricsSnapshot::default());
+        assert!(
+            state.load().overall.duration_sec > 0.0,
+            "run clock was live"
+        );
+        state.freeze();
+        state.unfreeze();
+        std::thread::sleep(Duration::from_millis(30));
+        state.update(MetricsSnapshot::default());
+        assert_eq!(
+            state.load().overall.duration_sec,
+            0.0,
+            "unfreeze cleared the run latch — duration re-anchors to the new run's first engine"
         );
     }
 

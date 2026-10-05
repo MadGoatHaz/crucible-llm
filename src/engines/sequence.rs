@@ -718,6 +718,11 @@ impl BenchmarkSequence {
         // (load − idle) and the 1 Hz power history both start from a real
         // no-load floor. No-op without a hardware poller (N/A rule).
         self.prepare_power_monitor().await;
+        // The overall "Total Duration" clock anchors here: the first engine
+        // begins *now* (after the idle baseline window), never at app open
+        // (the forever 100 ms poller's ticks) and never at the `r` keypress
+        // (5 s earlier, mid-idle-window).
+        self.metrics.mark_run_started();
 
         let mut total_tokens = 0u64;
 
