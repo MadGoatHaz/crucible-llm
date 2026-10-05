@@ -189,7 +189,7 @@ impl Engine {
                 "JSON compliance. Tests whether the model follows\nthe response_format instruction — reliability for API\nand agent tool-calling."
             }
             Engine::Hardware => {
-                "GPU power profiling (watts, joules/token). MUST run on the\nmachine with the GPU. NVIDIA: built-in (NVML). AMD/Intel:\npending support. Remote users: reports N/A."
+                "GPU power profiling (watts, J/token, $/1M\ntokens). MUST run on the GPU box — NVIDIA\n(NVML)/AMD/Intel, multi-GPU. Remote users: N/A"
             }
             Engine::FlatOut => {
                 "Real-world maximum throughput. Runs at your server's\nsweet-spot concurrency for 60 seconds. The number to\nquote when comparing setups."

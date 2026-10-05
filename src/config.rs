@@ -87,8 +87,8 @@ pub mod env_vars {
 }
 
 /// The default electricity rate for the View 4 cost estimate ($/kWh).
-/// `0.15` is a representative US residential/commercial blended rate.
-pub const DEFAULT_RATE_KWH: f64 = 0.15;
+/// `0.16` is a representative US residential/commercial blended rate.
+pub const DEFAULT_RATE_KWH: f64 = 0.16;
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
 /// `--tokens`). `base` is accepted as an alias for `short`
@@ -464,7 +464,8 @@ pub struct Config {
     #[serde(skip)]
     pub engines_explicit: bool,
     /// The electricity rate for the View 4 (GPU & Power) cost estimate,
-    /// in $/kWh. Default [`DEFAULT_RATE_KWH`] ($0.15).
+    /// in $/kWh. Default [`DEFAULT_RATE_KWH`] ($0.16) — editable in the
+    /// Config view (tab 6) and layered from env / config file.
     pub rate_per_kwh: f64,
 }
 
@@ -906,7 +907,7 @@ pub fn layer(
         };
 
     // ── electricity rate ($/kWh, the View 4 cost estimate) ──
-    // env > file > the built-in default ($0.15). A negative rate is clamped
+    // env > file > the built-in default ($0.16). A negative rate is clamped
     // to zero (never a signed cost).
     let rate_per_kwh = env_get(env_vars::RATE_KWH)
         .and_then(|s| s.parse::<f64>().ok())
@@ -1213,10 +1214,10 @@ mod tests {
     // ── electricity rate ($/kWh, View 4 cost estimate) ───────────────────
 
     #[test]
-    fn rate_per_kwh_defaults_to_fifteen_cents() {
+    fn rate_per_kwh_defaults_to_sixteen_cents() {
         let cfg = Config::default();
         assert!((cfg.rate_per_kwh - DEFAULT_RATE_KWH).abs() < 1e-9);
-        assert!((cfg.rate_per_kwh - 0.15).abs() < 1e-9);
+        assert!((cfg.rate_per_kwh - 0.16).abs() < 1e-9);
     }
 
     #[test]

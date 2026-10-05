@@ -124,6 +124,10 @@ pub struct OverallStats {
     /// `usage.completion_tokens` across every completed stream (NOT the SSE
     /// frame count).
     pub total_tokens: u64,
+    /// Total **prompt** (input) tokens processed — the sum of
+    /// `pp_tokens` across every completed stream. The $/1M-*input*-token
+    /// cost's denominator (the View 4 COST ANALYSIS panel).
+    pub total_prompt_tokens: u64,
     /// Number of streams that reached a terminal state.
     pub completed_streams: u64,
     /// Mean active streams (time-weighted).
@@ -778,6 +782,7 @@ struct OverallAccumulator {
     itl_p50: Vec<f64>,
     itl_p99: Vec<f64>,
     total_tokens: u64,
+    total_prompt_tokens: u64,
     completed_streams: u64,
     active_max: usize,
     active_sum: f64,
@@ -849,6 +854,9 @@ impl OverallAccumulator {
                     if let Some(tok) = st.tg_tokens {
                         self.total_tokens += tok;
                     }
+                    if let Some(p) = st.pp_tokens {
+                        self.total_prompt_tokens += p;
+                    }
                 }
                 if let Some(t) = st.ttft_s.filter(|t| *t > 0.0) {
                     Self::push(&mut self.ttft, t);
@@ -879,6 +887,18 @@ impl OverallAccumulator {
         }
     }
 
+    /// Reset for a **new** run (called from [`MetricsState::unfreeze`]).
+    ///
+    /// Without this the accumulator (and its `first`-latched clock) would
+    /// survive across runs in one session: the Live view's "Total Duration"
+    /// would anchor to the *app open* (the forever 100 ms poller's first
+    /// `update()`), and tokens / streams / averages would accumulate across
+    /// runs. Resetting here re-anchors everything to the **first engine
+    /// start** of the new run.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// The computed [`OverallStats`] for the current snapshot.
     fn stats(&self) -> OverallStats {
         OverallStats {
@@ -888,6 +908,7 @@ impl OverallAccumulator {
             itl_p50: triple(&self.itl_p50),
             itl_p99: triple(&self.itl_p99),
             total_tokens: self.total_tokens,
+            total_prompt_tokens: self.total_prompt_tokens,
             completed_streams: self.completed_streams,
             active_avg: if self.active_count > 0 {
                 self.active_sum / self.active_count as f64
@@ -967,8 +988,12 @@ impl MetricsState {
     /// within a run (so the final numbers can never drift), but a fresh
     /// benchmark sequence must be able to update metrics again — the App
     /// calls this when the user starts the next run (`r` / `F5` /
-    /// launch). Also resets the rate tracker and clears the rolling
-    /// series so the new run starts with a clean convergence curve.
+    /// launch). Also resets the rate tracker, clears the rolling series
+    /// (so the new run starts with a clean convergence curve), and resets
+    /// the **overall accumulator** (so the Live view's "Total Duration"
+    /// anchors to the first engine start of *this* run, not the app open,
+    /// and tokens / streams / averages do not accumulate across runs in
+    /// one session).
     pub fn unfreeze(&self) {
         self.frozen.store(false, Ordering::Relaxed);
         self.rate_tracker
@@ -978,6 +1003,8 @@ impl MetricsState {
         let mut rs = self.rolling.lock().unwrap_or_else(|p| p.into_inner());
         rs.samples.clear();
         rs.last = None;
+        let mut acc = self.overall_acc.lock().unwrap_or_else(|p| p.into_inner());
+        acc.reset();
     }
 
     /// `true` while the pipeline is frozen (a run completed and no new
@@ -1314,6 +1341,63 @@ mod tests {
         assert_eq!(o.total_tokens, 256);
         assert!((o.gen.avg - 100.0).abs() < 1e-9);
         assert!((o.ttft.avg - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overall_counts_prompt_tokens_across_streams() {
+        // The $/1M-*input*-token cost's denominator: the sum of
+        // `pp_tokens` across every completed stream.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            streams: vec![
+                StreamMetric {
+                    id: 1,
+                    state: StreamStatus::Done,
+                    tg_tokens: Some(100),
+                    pp_tokens: Some(2000),
+                    ..Default::default()
+                },
+                StreamMetric {
+                    id: 2,
+                    state: StreamStatus::Done,
+                    tg_tokens: Some(50),
+                    pp_tokens: Some(8000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.total_prompt_tokens, 10_000, "sum of pp_tokens");
+        assert_eq!(o.total_tokens, 150);
+    }
+
+    #[test]
+    fn unfreeze_resets_the_overall_accumulator() {
+        // The "Total Duration starts at app open" fix: a completed run
+        // freezes the pipeline, and the *next* run's `unfreeze` must reset
+        // the overall accumulator — duration, tokens, and streams re-anchor
+        // to the new run's first engine, never accumulating across runs.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(60.0), Some(0.4), Some(300))],
+            ..Default::default()
+        });
+        state.freeze();
+        std::thread::sleep(Duration::from_millis(30));
+        state.unfreeze();
+        state.update(MetricsSnapshot {
+            streams: vec![done_stream(0, Some(60.0), Some(0.4), Some(100))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.total_tokens, 100, "unfreeze reset the token total");
+        assert_eq!(o.completed_streams, 1, "unfreeze reset the stream count");
+        assert!(
+            o.duration_sec < 1.0,
+            "duration re-anchored to the new run: {}",
+            o.duration_sec
+        );
     }
 
     #[test]

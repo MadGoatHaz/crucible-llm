@@ -8,6 +8,17 @@
 //! overhead (research "Intel Level Zero Sysman Guide" §7: ~0.2 % of one
 //! core at 10 Hz, NVML-class).
 //!
+//! **Multi-GPU:** `try_init` enumerates **every** driver's **every**
+//! device (`zesDriverGet` → `zesDeviceGet`, both stable core API —
+//! research "Level-Zero-Multi-GPU-Device-Names": a driver reports
+//! `pCount=2` for a dual-GPU box) and resolves the telemetry component
+//! handles **per device**, each with its own cumulative-counter baselines.
+//! [`GpuBackend::poll_all`] yields one [`GpuSample`] per GPU;
+//! [`GpuBackend::poll`] is their aggregate roll-up. Per-device names come
+//! from the sysfs `device/label` of each Intel card (paired by index —
+//! the same source the sysfs fallback backend uses); the version-sensitive
+//! `zesDeviceGetProperties` struct is deliberately **not** bound.
+//!
 //! **Dynamic loading, no link dependency:** the loader library and every
 //! `zes*` symbol are resolved at runtime via `libloading` (research §2:
 //! target the SONAME `libze_loader.so.1`). On a machine without the
@@ -42,12 +53,11 @@
 use std::ffi::c_void;
 use std::fmt;
 use std::ops::DerefMut;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use libloading::Library;
 
-use super::sysfs::read_trimmed;
+use super::intel::intel_card_labels;
 use super::{GpuBackend, GpuSample};
 
 // ── Level Zero result codes (research §3) ─────────────────────────────────
@@ -397,7 +407,7 @@ unsafe fn enumerate(f: FnZesEnum, device: ZePtr) -> Vec<ZePtr> {
     handles
 }
 
-/// Two-pass `zesDriverGet` (no device argument).
+/// Two-pass `zesDriverGet` (no device argument) — **all** drivers.
 unsafe fn enumerate_drivers(f: FnZesDriverGet) -> Vec<ZePtr> {
     let mut count: u32 = 0;
     if f(&mut count, std::ptr::null_mut()) != ZE_RESULT_SUCCESS || count == 0 {
@@ -411,7 +421,8 @@ unsafe fn enumerate_drivers(f: FnZesDriverGet) -> Vec<ZePtr> {
     handles
 }
 
-/// Two-pass `zesDeviceGet` for one driver.
+/// Two-pass `zesDeviceGet` for one driver — **all** of its devices
+/// (multi-GPU: a dual-Arc box reports two).
 unsafe fn enumerate_devices(f: FnZesDeviceGet, driver: ZePtr) -> Vec<ZePtr> {
     let mut count: u32 = 0;
     if f(driver, &mut count, std::ptr::null_mut()) != ZE_RESULT_SUCCESS || count == 0 {
@@ -425,38 +436,17 @@ unsafe fn enumerate_devices(f: FnZesDeviceGet, driver: ZePtr) -> Vec<ZePtr> {
     handles
 }
 
-/// The Intel card's marketing label from sysfs (e.g. "Intel Arc A770"),
-/// so [`GpuBackend::model`] matches the sysfs backend's naming. `None`
-/// when no Intel DRM card is present (the N/A rule).
-fn intel_card_label() -> Option<String> {
-    let drm = PathBuf::from("/sys/class/drm");
-    let cards = std::fs::read_dir(&drm).ok()?;
-    for entry in cards.flatten() {
-        let card = entry.path();
-        if read_trimmed(&card.join("device/vendor")).as_deref() != Some("0x8086") {
-            continue;
-        }
-        if let Some(label) = read_trimmed(&card.join("device/label")) {
-            return Some(label);
-        }
-    }
-    None
-}
-
 // ── The backend ───────────────────────────────────────────────────────────
 
-/// The Intel Level Zero Sysman GPU backend (discrete Arc first-class).
+/// One Level Zero device and its resolved telemetry component handles.
 ///
-/// `poll` is `&self` (the [`GpuBackend`] contract) with interior
-/// mutability for the cumulative-counter baselines; the `Mutex`es are
-/// uncontended in practice (single poller) and a poisoned lock degrades
-/// the field to `None` instead of panicking.
-pub struct IntelLevelZeroBackend {
-    /// Keeps `libze_loader.so` mapped for the backend's lifetime.
-    _lib: Library,
-    fns: SysmanFns,
-    /// Marketing name from sysfs (e.g. "Intel Arc A770"), if readable.
-    model: Option<String>,
+/// Each device carries its own cumulative-counter baselines
+/// (`prev_energy` / `prev_engine`) so the per-GPU delta math
+/// (µJ/µs → W, active-fraction → %) is independent per card.
+struct ZeDevice {
+    /// Display name (sysfs `device/label` paired by index, else
+    /// `"Intel GPU {i}"`).
+    name: String,
     // Resolved component handles (each `None` degrades its metric).
     pwr: Option<ZePtr>,
     engine: Option<ZePtr>,
@@ -469,10 +459,10 @@ pub struct IntelLevelZeroBackend {
     prev_engine: Mutex<EngineStats>,
 }
 
-impl fmt::Debug for IntelLevelZeroBackend {
+impl fmt::Debug for ZeDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IntelLevelZeroBackend")
-            .field("model", &self.model)
+        f.debug_struct("ZeDevice")
+            .field("name", &self.name)
             .field("power", &self.pwr.is_some())
             .field("engine", &self.engine.is_some())
             .field("memory", &self.mem.is_some())
@@ -483,152 +473,296 @@ impl fmt::Debug for IntelLevelZeroBackend {
     }
 }
 
+impl ZeDevice {
+    /// `true` when at least one telemetry component resolved (a device
+    /// with none is dropped — the N/A rule).
+    fn has_telemetry(&self) -> bool {
+        self.pwr.is_some()
+            || self.engine.is_some()
+            || self.mem.is_some()
+            || self.gpu_freq.is_some()
+            || self.mem_freq.is_some()
+            || self.temp.is_some()
+    }
+}
+
+/// The Intel Level Zero Sysman GPU backend — **all** Intel GPUs the
+/// loader reports, one [`GpuSample`] each.
+///
+/// `poll` is `&self` (the [`GpuBackend`] contract) with interior
+/// mutability for the cumulative-counter baselines; the `Mutex`es are
+/// uncontended in practice (single poller) and a poisoned lock degrades
+/// the field to `None` instead of panicking.
+pub struct IntelLevelZeroBackend {
+    /// Keeps `libze_loader.so` mapped for the backend's lifetime.
+    _lib: Library,
+    fns: SysmanFns,
+    /// Every discovered device with telemetry (≥1 component each).
+    devices: Vec<ZeDevice>,
+}
+
+impl fmt::Debug for IntelLevelZeroBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IntelLevelZeroBackend")
+            .field("devices", &self.devices)
+            .finish()
+    }
+}
+
+/// Resolve one device's telemetry component handles (power, engine,
+/// memory, GPU + memory frequency domains, temperature sensor) — the
+/// per-device half of the old single-device init.
+fn resolve_device(fns: &SysmanFns, device: ZePtr, name: String) -> ZeDevice {
+    // Power domain: the first one (single board rail on consumer Arc).
+    let pwr = unsafe { enumerate(fns.enum_power, device) }
+        .into_iter()
+        .next();
+
+    // Engine group: prefer `ALL`, then `COMPUTE_ALL` (research §1).
+    let engine = unsafe {
+        let mut chosen = None;
+        for h in enumerate(fns.enum_engine, device) {
+            let mut props = EngineProperties {
+                stype: STYPE_ENGINE_PROPERTIES,
+                ..EngineProperties::default()
+            };
+            if (fns.engine_props)(h, &mut props as *mut EngineProperties as *mut c_void)
+                == ZE_RESULT_SUCCESS
+                && (props.engine_type == ENGINE_GROUP_ALL
+                    || props.engine_type == ENGINE_GROUP_COMPUTE_ALL)
+            {
+                chosen = Some(h);
+                break;
+            }
+        }
+        chosen
+    };
+
+    // Memory module: the first one (single GDDR6 domain on consumer Arc).
+    let mem = unsafe { enumerate(fns.enum_mem, device) }
+        .into_iter()
+        .next();
+
+    // Frequency domains: GPU (core clock) + MEMORY (memory clock).
+    let (gpu_freq, mem_freq) = unsafe {
+        let mut gpu = None;
+        let mut memd = None;
+        for h in enumerate(fns.enum_freq, device) {
+            let mut props = FreqProperties {
+                stype: STYPE_FREQ_PROPERTIES,
+                ..FreqProperties::default()
+            };
+            if (fns.freq_props)(h, &mut props as *mut FreqProperties as *mut c_void)
+                == ZE_RESULT_SUCCESS
+            {
+                match props.domain_type {
+                    FREQ_DOMAIN_GPU => gpu = Some(h),
+                    FREQ_DOMAIN_MEMORY => memd = Some(h),
+                    _ => {}
+                }
+                if gpu.is_some() && memd.is_some() {
+                    break;
+                }
+            }
+        }
+        (gpu, memd)
+    };
+
+    // Temperature sensor: prefer the GPU sensor, fall back to GLOBAL.
+    let temp = unsafe {
+        let mut gpu_sensor = None;
+        let mut global_sensor = None;
+        for h in enumerate(fns.enum_temp, device) {
+            let mut props = TempProperties {
+                stype: STYPE_TEMP_PROPERTIES,
+                ..TempProperties::default()
+            };
+            if (fns.temp_props)(h, &mut props as *mut TempProperties as *mut c_void)
+                == ZE_RESULT_SUCCESS
+            {
+                match props.sensor_type {
+                    TEMP_SENSOR_GPU => gpu_sensor = Some(h),
+                    TEMP_SENSOR_GLOBAL if global_sensor.is_none() => global_sensor = Some(h),
+                    _ => {}
+                }
+                if gpu_sensor.is_some() {
+                    break;
+                }
+            }
+        }
+        gpu_sensor.or(global_sensor)
+    };
+
+    // Seed the cumulative-counter baselines (research §4: delta math
+    // starts from the first successful read).
+    let mut prev_energy = EnergyCounter::default();
+    if let Some(p) = pwr {
+        unsafe {
+            (fns.power_energy)(p, &mut prev_energy as *mut EnergyCounter as *mut c_void);
+        }
+    }
+    let mut prev_engine = EngineStats::default();
+    if let Some(e) = engine {
+        unsafe {
+            (fns.engine_activity)(e, &mut prev_engine as *mut EngineStats as *mut c_void);
+        }
+    }
+
+    ZeDevice {
+        name,
+        pwr,
+        engine,
+        mem,
+        gpu_freq,
+        mem_freq,
+        temp,
+        prev_energy: Mutex::new(prev_energy),
+        prev_engine: Mutex::new(prev_engine),
+    }
+}
+
 impl IntelLevelZeroBackend {
     /// Load the Level Zero loader, initialize Sysman (`zesInit(0)` —
     /// research §3: the modern explicit init, no `ZES_ENABLE_SYSMAN` env),
-    /// discover the first driver + device, and resolve the telemetry
-    /// component handles.
+    /// discover **every** driver's **every** device, and resolve the
+    /// telemetry component handles per device.
     ///
     /// Returns `None` — never panics — when any of: the loader library
     /// is absent, a required symbol is missing, `zesInit` fails, or no
-    /// Sysman driver / device is discovered. A backend with no usable
-    /// telemetry components is also rejected so the sysfs fallback is
-    /// used instead.
+    /// Sysman driver / device with usable telemetry is discovered.
     pub fn try_init() -> Option<Box<Self>> {
         let lib = load_library()?;
         let fns = load_symbols(&lib)?;
 
-        let device = unsafe {
+        unsafe {
             // Explicit Sysman initialization (research §3).
             if (fns.init)(0) != ZE_RESULT_SUCCESS {
                 return None;
             }
-            let driver = enumerate_drivers(fns.driver_get).into_iter().next()?;
-            enumerate_devices(fns.device_get, driver)
-                .into_iter()
-                .next()?
-        };
+        }
 
-        // Power domain: the first one (single board rail on consumer Arc).
-        let pwr = unsafe { enumerate(fns.enum_power, device) }
-            .into_iter()
-            .next();
-
-        // Engine group: prefer `ALL`, then `COMPUTE_ALL` (research §1).
-        let engine = unsafe {
-            let mut chosen = None;
-            for h in enumerate(fns.enum_engine, device) {
-                let mut props = EngineProperties {
-                    stype: STYPE_ENGINE_PROPERTIES,
-                    ..EngineProperties::default()
-                };
-                if (fns.engine_props)(h, &mut props as *mut EngineProperties as *mut c_void)
-                    == ZE_RESULT_SUCCESS
-                    && (props.engine_type == ENGINE_GROUP_ALL
-                        || props.engine_type == ENGINE_GROUP_COMPUTE_ALL)
-                {
-                    chosen = Some(h);
-                    break;
+        // All drivers → all devices (multi-GPU: `zesDeviceGet` returns
+        // every GPU the driver exposes, e.g. pCount=2 on a dual-Arc box).
+        let drivers = unsafe { enumerate_drivers(fns.driver_get) };
+        let labels = intel_card_labels(); // sysfs names, paired by index
+        let mut index = 0usize;
+        let mut devices = Vec::new();
+        for driver in drivers {
+            for device in unsafe { enumerate_devices(fns.device_get, driver) } {
+                let name = labels
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Intel GPU {index}"));
+                index += 1;
+                let dev = resolve_device(&fns, device, name);
+                if dev.has_telemetry() {
+                    devices.push(dev);
                 }
             }
-            chosen
-        };
+        }
 
-        // Memory module: the first one (single GDDR6 domain on consumer Arc).
-        let mem = unsafe { enumerate(fns.enum_mem, device) }
-            .into_iter()
-            .next();
-
-        // Frequency domains: GPU (core clock) + MEMORY (memory clock).
-        let (gpu_freq, mem_freq) = unsafe {
-            let mut gpu = None;
-            let mut memd = None;
-            for h in enumerate(fns.enum_freq, device) {
-                let mut props = FreqProperties {
-                    stype: STYPE_FREQ_PROPERTIES,
-                    ..FreqProperties::default()
-                };
-                if (fns.freq_props)(h, &mut props as *mut FreqProperties as *mut c_void)
-                    == ZE_RESULT_SUCCESS
-                {
-                    match props.domain_type {
-                        FREQ_DOMAIN_GPU => gpu = Some(h),
-                        FREQ_DOMAIN_MEMORY => memd = Some(h),
-                        _ => {}
-                    }
-                    if gpu.is_some() && memd.is_some() {
-                        break;
-                    }
-                }
-            }
-            (gpu, memd)
-        };
-
-        // Temperature sensor: prefer the GPU sensor, fall back to GLOBAL.
-        let temp = unsafe {
-            let mut gpu_sensor = None;
-            let mut global_sensor = None;
-            for h in enumerate(fns.enum_temp, device) {
-                let mut props = TempProperties {
-                    stype: STYPE_TEMP_PROPERTIES,
-                    ..TempProperties::default()
-                };
-                if (fns.temp_props)(h, &mut props as *mut TempProperties as *mut c_void)
-                    == ZE_RESULT_SUCCESS
-                {
-                    match props.sensor_type {
-                        TEMP_SENSOR_GPU => gpu_sensor = Some(h),
-                        TEMP_SENSOR_GLOBAL if global_sensor.is_none() => global_sensor = Some(h),
-                        _ => {}
-                    }
-                    if gpu_sensor.is_some() {
-                        break;
-                    }
-                }
-            }
-            gpu_sensor.or(global_sensor)
-        };
-
-        // A backend with no usable telemetry is useless — reject it so
-        // the sysfs fallback (detect_intel_backend) is used.
-        if pwr.is_none()
-            && engine.is_none()
-            && mem.is_none()
-            && gpu_freq.is_none()
-            && temp.is_none()
-        {
+        // No device with usable telemetry → the sysfs fallback
+        // (detect_intel_backend) is used instead.
+        if devices.is_empty() {
             return None;
-        }
-
-        // Seed the cumulative-counter baselines (research §4: delta math
-        // starts from the first successful read).
-        let mut prev_energy = EnergyCounter::default();
-        if let Some(p) = pwr {
-            unsafe {
-                (fns.power_energy)(p, &mut prev_energy as *mut EnergyCounter as *mut c_void);
-            }
-        }
-        let mut prev_engine = EngineStats::default();
-        if let Some(e) = engine {
-            unsafe {
-                (fns.engine_activity)(e, &mut prev_engine as *mut EngineStats as *mut c_void);
-            }
         }
 
         Some(Box::new(Self {
             _lib: lib,
             fns,
-            model: intel_card_label(),
-            pwr,
-            engine,
-            mem,
-            gpu_freq,
-            mem_freq,
-            temp,
-            prev_energy: Mutex::new(prev_energy),
-            prev_engine: Mutex::new(prev_engine),
+            devices,
         }))
     }
+}
+
+/// Read one device's full telemetry sample (all fields optional, N/A
+/// rule) — the per-GPU half of the old single-device `poll`.
+fn poll_device(fns: &SysmanFns, dev: &ZeDevice) -> GpuSample {
+    let mut sample = GpuSample::default();
+
+    // Power: ΔµJ / Δµs ≡ W (research §1).
+    if let Some(pwr) = dev.pwr {
+        let mut cur = EnergyCounter::default();
+        if unsafe { (fns.power_energy)(pwr, &mut cur as *mut EnergyCounter as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            if let Ok(mut guard) = dev.prev_energy.lock() {
+                // Explicit `deref_mut()` (not `&*`): a write through the
+                // guard needs `&mut`, and the method call avoids
+                // clippy::explicit_auto_deref on the read.
+                let prev = guard.deref_mut();
+                sample.power_watts = power_watts(prev, &cur);
+                *prev = cur;
+            }
+        }
+    }
+
+    // Utilization: ΔactiveTime / Δtimestamp × 100 (research §1).
+    if let Some(eng) = dev.engine {
+        let mut cur = EngineStats::default();
+        if unsafe { (fns.engine_activity)(eng, &mut cur as *mut EngineStats as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            if let Ok(mut guard) = dev.prev_engine.lock() {
+                let prev = guard.deref_mut();
+                sample.utilization_pct = utilization_pct(prev, &cur);
+                *prev = cur;
+            }
+        }
+    }
+
+    // VRAM: used = size − free, bytes → MB (research §1).
+    if let Some(mem) = dev.mem {
+        let mut state = MemState {
+            stype: STYPE_MEM_STATE,
+            ..MemState::default()
+        };
+        if unsafe { (fns.mem_state)(mem, &mut state as *mut MemState as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            sample.memory_total_mb = Some(state.size / (1024 * 1024));
+            sample.memory_used_mb = Some(state.size.saturating_sub(state.free) / (1024 * 1024));
+        }
+    }
+
+    // Core clock + throttle reasons: GPU frequency domain (research §1).
+    if let Some(freq) = dev.gpu_freq {
+        let mut state = FreqState {
+            stype: STYPE_FREQ_STATE,
+            ..FreqState::default()
+        };
+        if unsafe { (fns.freq_state)(freq, &mut state as *mut FreqState as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            sample.core_clock_mhz = Some(state.actual.round() as u32);
+            sample.throttle_reasons = format_throttle(state.throttle_reasons);
+        }
+    }
+
+    // Memory clock: MEMORY frequency domain (research §3 domain enum).
+    if let Some(freq) = dev.mem_freq {
+        let mut state = FreqState {
+            stype: STYPE_FREQ_STATE,
+            ..FreqState::default()
+        };
+        if unsafe { (fns.freq_state)(freq, &mut state as *mut FreqState as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            sample.memory_clock_mhz = Some(state.actual.round() as u32);
+        }
+    }
+
+    // Temperature: °C (research §1).
+    if let Some(temp) = dev.temp {
+        let mut val: f64 = 0.0;
+        if unsafe { (fns.temp_state)(temp, &mut val as *mut f64 as *mut c_void) }
+            == ZE_RESULT_SUCCESS
+        {
+            sample.temperature_c = Some(val.round() as i32);
+        }
+    }
+
+    sample
 }
 
 impl GpuBackend for IntelLevelZeroBackend {
@@ -636,98 +770,28 @@ impl GpuBackend for IntelLevelZeroBackend {
         "Intel"
     }
 
+    /// The first device's name: `gpu_display_name` composes the panel
+    /// title from it; the per-device table shows every GPU individually
+    /// via [`Self::device_names`].
     fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+        self.devices.first().map(|d| d.name.as_str())
     }
 
     fn poll(&self) -> GpuSample {
-        let mut sample = GpuSample::default();
+        GpuSample::aggregate(&self.poll_all())
+    }
 
-        // Power: ΔµJ / Δµs ≡ W (research §1).
-        if let Some(pwr) = self.pwr {
-            let mut cur = EnergyCounter::default();
-            if unsafe {
-                (self.fns.power_energy)(pwr, &mut cur as *mut EnergyCounter as *mut c_void)
-            } == ZE_RESULT_SUCCESS
-            {
-                if let Ok(mut guard) = self.prev_energy.lock() {
-                    // Explicit `deref_mut()` (not `&*`): a write through the
-                    // guard needs `&mut`, and the method call avoids
-                    // clippy::explicit_auto_deref on the read.
-                    let prev = guard.deref_mut();
-                    sample.power_watts = power_watts(prev, &cur);
-                    *prev = cur;
-                }
-            }
-        }
+    /// One sample per Intel GPU (the multi-GPU table's source).
+    fn poll_all(&self) -> Vec<GpuSample> {
+        self.devices
+            .iter()
+            .map(|d| poll_device(&self.fns, d))
+            .collect()
+    }
 
-        // Utilization: ΔactiveTime / Δtimestamp × 100 (research §1).
-        if let Some(eng) = self.engine {
-            let mut cur = EngineStats::default();
-            if unsafe {
-                (self.fns.engine_activity)(eng, &mut cur as *mut EngineStats as *mut c_void)
-            } == ZE_RESULT_SUCCESS
-            {
-                if let Ok(mut guard) = self.prev_engine.lock() {
-                    let prev = guard.deref_mut();
-                    sample.utilization_pct = utilization_pct(prev, &cur);
-                    *prev = cur;
-                }
-            }
-        }
-
-        // VRAM: used = size − free, bytes → MB (research §1).
-        if let Some(mem) = self.mem {
-            let mut state = MemState {
-                stype: STYPE_MEM_STATE,
-                ..MemState::default()
-            };
-            if unsafe { (self.fns.mem_state)(mem, &mut state as *mut MemState as *mut c_void) }
-                == ZE_RESULT_SUCCESS
-            {
-                sample.memory_total_mb = Some(state.size / (1024 * 1024));
-                sample.memory_used_mb = Some(state.size.saturating_sub(state.free) / (1024 * 1024));
-            }
-        }
-
-        // Core clock + throttle reasons: GPU frequency domain (research §1).
-        if let Some(freq) = self.gpu_freq {
-            let mut state = FreqState {
-                stype: STYPE_FREQ_STATE,
-                ..FreqState::default()
-            };
-            if unsafe { (self.fns.freq_state)(freq, &mut state as *mut FreqState as *mut c_void) }
-                == ZE_RESULT_SUCCESS
-            {
-                sample.core_clock_mhz = Some(state.actual.round() as u32);
-                sample.throttle_reasons = format_throttle(state.throttle_reasons);
-            }
-        }
-
-        // Memory clock: MEMORY frequency domain (research §3 domain enum).
-        if let Some(freq) = self.mem_freq {
-            let mut state = FreqState {
-                stype: STYPE_FREQ_STATE,
-                ..FreqState::default()
-            };
-            if unsafe { (self.fns.freq_state)(freq, &mut state as *mut FreqState as *mut c_void) }
-                == ZE_RESULT_SUCCESS
-            {
-                sample.memory_clock_mhz = Some(state.actual.round() as u32);
-            }
-        }
-
-        // Temperature: °C (research §1).
-        if let Some(temp) = self.temp {
-            let mut val: f64 = 0.0;
-            if unsafe { (self.fns.temp_state)(temp, &mut val as *mut f64 as *mut c_void) }
-                == ZE_RESULT_SUCCESS
-            {
-                sample.temperature_c = Some(val.round() as i32);
-            }
-        }
-
-        sample
+    /// The display name of each GPU (parallel to [`Self::poll_all`]).
+    fn device_names(&self) -> Vec<String> {
+        self.devices.iter().map(|d| d.name.clone()).collect()
     }
 }
 
@@ -737,13 +801,22 @@ mod tests {
 
     /// `try_init` must never panic: `None` on a machine without the Level
     /// Zero loader / Intel Compute Runtime (the sysfs fallback path), or a
-    /// working backend (whose `poll` also never panics) when one is present.
+    /// working backend (whose `poll` and `poll_all` also never panic) when
+    /// one is present.
     #[test]
     fn try_init_is_graceful() {
         let result = IntelLevelZeroBackend::try_init();
         if let Some(backend) = &result {
             assert_eq!(backend.vendor(), "Intel");
+            assert!(!backend.devices.is_empty(), "a backend holds ≥1 device");
             let _sample = backend.poll(); // must not panic
+            let all = backend.poll_all();
+            assert_eq!(all.len(), backend.devices.len(), "one sample per GPU");
+            assert_eq!(
+                all.len(),
+                backend.device_names().len(),
+                "names parallel to samples"
+            );
         }
     }
 
@@ -845,5 +918,23 @@ mod tests {
             format_throttle(THROTTLE_THERMAL_LIMIT | THROTTLE_HW_RANGE),
             Some("thermal,hw_range".to_string())
         );
+    }
+
+    /// A device with no resolved components is dropped (the N/A rule) —
+    /// the backend keeps only devices that can report something.
+    #[test]
+    fn device_without_telemetry_is_dropped() {
+        let bare = ZeDevice {
+            name: "none".into(),
+            pwr: None,
+            engine: None,
+            mem: None,
+            gpu_freq: None,
+            mem_freq: None,
+            temp: None,
+            prev_energy: Mutex::new(EnergyCounter::default()),
+            prev_engine: Mutex::new(EngineStats::default()),
+        };
+        assert!(!bare.has_telemetry());
     }
 }

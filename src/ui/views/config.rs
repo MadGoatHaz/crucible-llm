@@ -36,7 +36,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::config::{default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode};
+use crate::config::{
+    default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode, DEFAULT_RATE_KWH,
+};
 use crate::engines::concurrency::DEFAULT_LADDER;
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
@@ -62,11 +64,12 @@ pub enum Field {
     EngineStructured,
     EngineFlatOut,
     Theme,
+    RateKwh,
 }
 
 impl Field {
     /// Every field in cursor order.
-    pub const ALL: [Field; 18] = [
+    pub const ALL: [Field; 19] = [
         Field::Url,
         Field::Model,
         Field::Mode,
@@ -85,6 +88,7 @@ impl Field {
         Field::EngineStructured,
         Field::EngineFlatOut,
         Field::Theme,
+        Field::RateKwh,
     ];
 
     /// The form label for this field.
@@ -108,6 +112,7 @@ impl Field {
             Field::EngineStructured => "Engine C3 — Structured",
             Field::EngineFlatOut => "Engine F — Flat Out",
             Field::Theme => "Theme",
+            Field::RateKwh => "Electricity rate",
         }
     }
 
@@ -202,6 +207,12 @@ impl Field {
                  selects Cyberpunk / Vampire / Monochrome.\n\
                  Saved when you press Esc.",
             ),
+            Field::RateKwh => Some(
+                "Your electricity rate in $/kWh (e.g., 0.16).\n\
+                 Drives the $/1M-token cost in the GPU &\n\
+                 Power view. Blank/invalid falls back to $0.16.\n\
+                 Type digits and a decimal point.",
+            ),
             // Engine fields use `Engine::description()` via `engine()`.
             Field::Hardware
             | Field::EngineSpeed
@@ -271,6 +282,10 @@ pub struct ConfigState {
     pub engine_flatout: bool,
     /// The color theme (`"cyberpunk"` / `"vampire"` / `"monochrome"`).
     pub theme: String,
+    /// The electricity rate in $/kWh, kept as a text buffer for editing
+    /// (`"0.16"`) and parsed on save / run (blank or invalid input falls
+    /// back to the built-in default).
+    pub rate_text: String,
     /// The cursor's position in [`Field::ALL`].
     pub cursor: usize,
     /// Where `F2` writes the form.
@@ -323,6 +338,7 @@ impl ConfigState {
             engine_structured: cfg.engines.structured,
             engine_flatout: cfg.engines.flatout,
             theme: cfg.theme.clone(),
+            rate_text: format!("{}", cfg.rate_per_kwh),
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
@@ -370,6 +386,7 @@ impl ConfigState {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
         cfg.theme = self.theme.clone();
+        cfg.rate_per_kwh = parse_rate(&self.rate_text);
         cfg
     }
 
@@ -426,10 +443,10 @@ impl ConfigState {
             // The color theme is a pure preference — persisted so the
             // first-run picker is skipped on the next launch.
             theme: Some(self.theme.clone()),
-            // The `$/kWh` rate is a CLI/env/file concern — not edited from
-            // the form, so it is not persisted here (a file-set rate survives
-            // the normal env > file > default resolution on load).
-            rate_per_kwh: None,
+            // The `$/kWh` rate is edited from the form (the RateKwh field)
+            // and persisted so it survives into the next launch via the
+            // normal CLI > env > file > default resolution.
+            rate_per_kwh: Some(parse_rate(&self.rate_text)),
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {
@@ -537,6 +554,15 @@ impl ConfigState {
                     }
                 }
             }
+            // Electricity rate: digits and a single decimal point (the
+            // buffer is validated, so a half-typed "0." is kept but a
+            // second dot or a letter is rejected).
+            Field::RateKwh => {
+                let next = format!("{}{c}", self.rate_text);
+                if is_valid_rate(&next) {
+                    self.rate_text = next;
+                }
+            }
             // Mode / booleans don't take typed text.
             _ => {}
         }
@@ -569,6 +595,9 @@ impl ConfigState {
             }
             Field::Ladder => {
                 self.ladder.pop();
+            }
+            Field::RateKwh => {
+                self.rate_text.pop();
             }
             Field::Tokens => {
                 self.tokens /= 10;
@@ -649,6 +678,15 @@ impl ConfigState {
                     .unwrap_or(0);
                 let next = (idx as i32 + dir).rem_euclid(Theme::ALL.len() as i32) as usize;
                 self.theme = Theme::ALL[next].id().to_string();
+            }
+            // Electricity rate: step by a cent in the focused direction.
+            Field::RateKwh => {
+                let cur = if is_valid_rate(&self.rate_text) {
+                    self.rate_text.trim().parse::<f64>().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                self.rate_text = format!("{:.2}", (cur + dir as f64 * 0.01).max(0.0));
             }
             _ => {}
         }
@@ -924,6 +962,66 @@ fn field_display(
                 .unwrap_or_else(|| c.theme.clone()),
             style::value(th),
         ),
+        Field::RateKwh => {
+            // The raw buffer is shown (live edit feedback); a blank or
+            // half-typed value is flagged until it parses.
+            let text = c.rate_text.trim();
+            (
+                "Electricity rate".to_string(),
+                if text.is_empty() {
+                    "(default $0.16)".to_string()
+                } else {
+                    format!("${text}/kWh")
+                },
+                if is_valid_rate(text) {
+                    style::value(th)
+                } else {
+                    style::value_warn(th)
+                },
+            )
+        }
+    }
+}
+
+/// The maximum decimal places the `$/kWh` rate field accepts.
+const RATE_MAX_DECIMALS: usize = 3;
+
+/// Validate the rate text buffer: digits only, at most one `.`, at most
+/// [`RATE_MAX_DECIMALS`] decimals (so a half-typed `"0."` stays valid
+/// while typing, but `"0.1.2"` or a letter is rejected).
+fn is_valid_rate(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut dots = 0;
+    let mut decimals = 0;
+    for ch in s.chars() {
+        if ch == '.' {
+            dots += 1;
+        } else if ch.is_ascii_digit() {
+            if dots == 1 {
+                decimals += 1;
+            }
+        } else {
+            return false;
+        }
+    }
+    dots <= 1 && decimals <= RATE_MAX_DECIMALS
+}
+
+/// Parse the rate text buffer into `$/kWh`: a valid rate is clamped
+/// non-negative; blank / invalid input falls back to
+/// [`DEFAULT_RATE_KWH`] (the built-in default).
+fn parse_rate(s: &str) -> f64 {
+    if is_valid_rate(s) {
+        s.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| v.max(0.0))
+            .unwrap_or(DEFAULT_RATE_KWH)
+    } else {
+        DEFAULT_RATE_KWH
     }
 }
 
@@ -1143,6 +1241,99 @@ mod tests {
             text.contains("Settings saved to"),
             "gate shows config path: {text}"
         );
+    }
+
+    // ── electricity rate ($/kWh) field ───────────────────────────────────
+
+    #[test]
+    fn rate_field_renders_in_the_form() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+        app.config.cursor = 18; // RateKwh (the last field)
+        let text = render_text(&app, 120, 40);
+        assert!(
+            text.contains("Electricity rate"),
+            "rate field label: {text}"
+        );
+        assert!(text.contains("$0.16/kWh"), "default rate shown: {text}");
+    }
+
+    #[test]
+    fn rate_field_accepts_digits_and_decimal() {
+        let mut c = ConfigState {
+            cursor: 18, // RateKwh
+            rate_text: String::new(),
+            ..Default::default()
+        };
+        for ch in "0.18".chars() {
+            c.type_current(ch);
+        }
+        assert_eq!(c.rate_text, "0.18");
+        assert!((c.to_config().rate_per_kwh - 0.18).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rate_field_rejects_invalid_characters() {
+        let mut c = ConfigState {
+            cursor: 18, // RateKwh
+            rate_text: String::new(),
+            ..Default::default()
+        };
+        for ch in "1x2.".chars() {
+            c.type_current(ch);
+        }
+        // The letter is rejected; "12." is a valid half-typed state.
+        assert_eq!(c.rate_text, "12.");
+        c.type_current('3');
+        assert_eq!(c.rate_text, "12.3");
+    }
+
+    #[test]
+    fn rate_field_rejects_a_second_decimal_point() {
+        let mut c = ConfigState {
+            cursor: 18, // RateKwh
+            rate_text: "0.1".to_string(),
+            ..Default::default()
+        };
+        c.type_current('.');
+        assert_eq!(c.rate_text, "0.1", "second dot rejected");
+    }
+
+    #[test]
+    fn rate_backspace_and_step_work() {
+        let mut c = ConfigState {
+            cursor: 18, // RateKwh
+            rate_text: "0.16".to_string(),
+            ..Default::default()
+        };
+        c.backspace_current();
+        assert_eq!(c.rate_text, "0.1");
+        c.adjust_current(1);
+        assert_eq!(c.rate_text, "0.11");
+        c.adjust_current(-1);
+        assert_eq!(c.rate_text, "0.10");
+    }
+
+    #[test]
+    fn parse_rate_falls_back_on_invalid() {
+        assert!((parse_rate("0.16") - 0.16).abs() < 1e-9);
+        assert_eq!(parse_rate(""), DEFAULT_RATE_KWH);
+        assert_eq!(parse_rate("abc"), DEFAULT_RATE_KWH);
+        assert_eq!(parse_rate("0.1.2"), DEFAULT_RATE_KWH);
+        assert_eq!(parse_rate("-5"), DEFAULT_RATE_KWH);
+    }
+
+    #[test]
+    fn rate_round_trips_through_save() {
+        let c = ConfigState {
+            rate_text: "0.25".to_string(),
+            ..Default::default()
+        };
+        // `save` persists the parsed rate (it writes to disk; the parsed
+        // value is what the next launch layers in).
+        assert!((parse_rate(&c.rate_text) - 0.25).abs() < 1e-9);
+        assert!((c.to_config().rate_per_kwh - 0.25).abs() < 1e-9);
     }
 
     #[test]

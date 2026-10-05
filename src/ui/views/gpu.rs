@@ -8,16 +8,22 @@
 //!
 //! Layout (top → bottom):
 //!
-//! * **System Power** — total / idle / compute / peak draw, energy (kWh),
-//!   estimated cost (`$/kWh`), and the run duration (frozen at its final
-//!   value once the run completes).
+//! * **System Power** — total / idle / compute / peak draw, energy (kWh)
+//!   at the user's `$/kWh` rate, and the run duration (frozen at its
+//!   final value once the run completes).
 //! * **Power over time** — the 1 Hz aggregate power trace as a bar chart
 //!   (the "wow" factor), beside an **Efficiency** readout (J/token,
 //!   J/ktoken, tokens/W, $/1M tokens, avg/peak/idle/compute power).
 //! * **Per-GPU table** — one row per device: power, current *and*
 //!   whole-run average utilization, current *and* whole-run average
 //!   temperature, peak temperature, VRAM, core/mem clock, throttle (the
-//!   multi-GPU showcase).
+//!   multi-GPU showcase). The Name column grows to fit full card names
+//!   (up to 28 chars — "Radeon RX 9700", "NVIDIA A4000").
+//! * **Cost analysis** — the headline **$/1M-token** comparison: separate
+//!   *input* (prefill) and *output* (decode) rates measured from the
+//!   phase power draws, a blended rate, the run's total cost, all at the
+//!   user's `$/kWh` rate — beside cloud reference prices (GPT-4o,
+//!   Claude) for a direct local-vs-cloud comparison.
 //! * **Utilization + Temperature over time** — two 1 Hz **line** charts
 //!   whose y-axis **auto-scales to the actual data range** (with padding):
 //!   a signal hovering 85–97% renders as a visible curve, not a flat line
@@ -67,15 +73,16 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         None => "GPU & POWER MONITOR".to_string(),
     };
 
-    // The vertical plan: all four sections are percentage-sized (plus a small
-    // fixed header) so they never overflow the 80×24 minimum terminal — a
-    // long per-GPU table (8+ cards) clips its lowest rows rather than pushing
-    // the charts off-screen.
+    // The vertical plan: all five sections are percentage-sized (plus a
+    // small fixed header) so they never overflow the 80×24 minimum
+    // terminal — a long per-GPU table (8+ cards) clips its lowest rows
+    // rather than pushing the charts off-screen.
     let plan: Vec<(u8, Constraint)> = vec![
         (0, Constraint::Length(4)),      // system power
-        (1, Constraint::Percentage(38)), // power over time | efficiency
-        (2, Constraint::Percentage(36)), // per-GPU table
-        (3, Constraint::Percentage(22)), // utilization + temperature charts
+        (1, Constraint::Percentage(32)), // power over time | efficiency
+        (2, Constraint::Percentage(28)), // per-GPU table
+        (3, Constraint::Percentage(20)), // cost analysis ($/1M tokens)
+        (4, Constraint::Percentage(16)), // utilization + temperature charts
     ];
     let constraints: Vec<Constraint> = plan.iter().map(|(_, c)| *c).collect();
     let rects = Layout::default()
@@ -86,7 +93,8 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     render_system_power(rects[0], mon, &title, th, f);
     render_power_efficiency_row(rects[1], mon, th, f);
     render_gpu_table(rects[2], mon, th, f);
-    render_util_temp_row(rects[3], mon, th, f);
+    render_cost_analysis(rects[3], mon, th, f);
+    render_util_temp_row(rects[4], mon, th, f);
 }
 
 /// The "no GPU telemetry" placeholder (a driver-less host).
@@ -115,7 +123,9 @@ fn render_no_gpu(area: Rect, th: Theme, f: &mut Frame) {
 // ── System power summary ───────────────────────────────────────────────────
 
 /// The top **System Power** panel: total / idle / compute / peak draw, the
-/// energy consumed (kWh), the estimated cost, and the run duration.
+/// energy consumed (kWh) at the user's `$/kWh` rate, and the run duration.
+/// (The per-1M-token *cost* lives in the dedicated COST ANALYSIS panel —
+/// a flat "session cost" is not what operators compare against the cloud.)
 fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme, f: &mut Frame) {
     let block = theme::block(theme::panel_title(th, title), style::active_border(th));
     if area.width < 40 || area.height < 3 {
@@ -127,7 +137,6 @@ fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme
     let compute = mon.compute_power_w();
     let peak = mon.peak_power_w;
     let kwh = mon.energy_kwh();
-    let cost = mon.cost_usd();
     let dur = mon.duration_sec();
     let lines = vec![
         Line::from(vec![
@@ -143,8 +152,6 @@ fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme
         Line::from(vec![
             Span::styled("  Energy: ", style::label(th)),
             Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
-            Span::styled("   Est. Cost: ", style::footer(th)),
-            Span::styled(format_money(cost), style::value_ok(th)),
             Span::styled(
                 format!("   @ ${:.2}/kWh", mon.rate_per_kwh),
                 style::info(th),
@@ -235,7 +242,9 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame
     let jpt = mon.joules_per_token();
     let jkt = mon.joules_per_ktoken();
     let tpw = mon.tokens_per_watt();
-    let cmt = mon.cost_per_million_tokens();
+    // The blended $/1M rate from the phase-aware cost math (the same
+    // number the COST ANALYSIS panel shows).
+    let cmt = mon.token_costs().map(|c| c.blended);
     let na = "N/A".to_string();
     let lines = vec![
         eff_row(
@@ -289,6 +298,10 @@ fn eff_row(th: Theme, label: &str, value: String) -> Line<'static> {
 /// temperature, peak temperature, VRAM, core/mem clock, throttle). The
 /// multi-GPU showcase — the `AvgU` / `AvgT` / `MaxT` columns give the full
 /// run picture, not just "right now".
+///
+/// The **Name** column grows to fit the longest card name (12–28 chars) so
+/// full names like "Radeon RX 9700" / "NVIDIA A4000" are never
+/// mid-word-truncated.
 fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
     let block = theme::block(
         theme::panel_title(
@@ -316,9 +329,17 @@ fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame)
         );
         return;
     }
+    // The Name column width: the longest card name (clamped 12–28 chars).
+    let name_w = mon
+        .gpu_names
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(12)
+        .clamp(12, 28);
     let header = Line::from(vec![
         Span::styled(format!("{:<3}", "GPU"), style::muted_title(th)),
-        Span::styled(format!("{:<12}", "Name"), style::muted_title(th)),
+        Span::styled(format!("{:<name_w$}", "Name"), style::muted_title(th)),
         Span::styled(format!("{:>6}", "Power"), style::muted_title(th)),
         Span::styled(format!("{:>5}", "Util"), style::muted_title(th)),
         Span::styled(format!("{:>5}", "AvgU"), style::muted_title(th)),
@@ -334,9 +355,9 @@ fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame)
         let name = mon
             .gpu_names
             .get(i)
-            .map(|s| fmt::truncate(s, 12))
+            .map(|s| fmt::truncate(s, name_w))
             .unwrap_or_else(|| format!("GPU {i}"));
-        lines.push(gpu_row(th, i, &name, g, mon));
+        lines.push(gpu_row(th, i, &name, g, mon, name_w));
     }
     // The column legend (whole-run figures explained in one line).
     lines.push(Line::from(Span::styled(
@@ -357,6 +378,7 @@ fn gpu_row(
     name: &str,
     g: &crate::hw::GpuSample,
     mon: &GpuPowerMonitor,
+    name_w: usize,
 ) -> Line<'static> {
     let power = g
         .power_watts
@@ -414,7 +436,7 @@ fn gpu_row(
     };
     Line::from(vec![
         Span::styled(format!("{i:<3}"), style::label(th)),
-        Span::styled(format!(" {name:<12}"), style::value_secondary(th)),
+        Span::styled(format!(" {name:<name_w$}"), style::value_secondary(th)),
         Span::styled(format!(" {power:>6}"), style::value(th)),
         Span::styled(format!(" {util:>5}"), style::value(th)),
         Span::styled(format!(" {avg_util:>5}"), style::value_secondary(th)),
@@ -425,6 +447,98 @@ fn gpu_row(
         Span::styled(format!(" {clock:>8}"), style::value_secondary(th)),
         Span::styled(format!(" {throttle}"), throttle_style),
     ])
+}
+
+// ── Cost analysis ($/1M tokens, local vs cloud) ────────────────────────────
+
+/// Cloud reference pricing, $/1M tokens (input, output) at typical list
+/// prices — the comparison column that makes the local $/1M rates
+/// meaningful. Blended = (input + output) / 2.
+const CLOUD_REFERENCE: &[(&str, f64, f64)] = &[("GPT-4o", 2.50, 10.00), ("Claude", 3.00, 15.00)];
+
+/// The **COST ANALYSIS** panel — the headline local-vs-cloud comparison:
+/// **$/1M tokens** for *input* (prefill) and *output* (decode) **separately**
+/// (like the cloud providers' own pricing tables), a blended rate, and the
+/// run's total cost — all driven by the user's `$/kWh` rate and the
+/// measured prefill / decode power draws.
+fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
+    let block = theme::block(
+        theme::panel_title(th, "COST ANALYSIS — $/1M TOKENS"),
+        style::border(th),
+    );
+    if area.width < 40 || area.height < 3 {
+        f.render_widget(Paragraph::new("").block(block), area);
+        return;
+    }
+    let mut lines = vec![Line::from(vec![
+        Span::styled("  Your rate: ", style::label(th)),
+        Span::styled(format!("${:.2}/kWh", mon.rate_per_kwh), style::value(th)),
+        Span::styled("  (set in Config)", style::footer(th)),
+    ])];
+    match mon.token_costs() {
+        Some(c) => {
+            // One row per cost line: the local rate + the cloud references.
+            let rows: [(&str, f64); 3] = [
+                ("Input (prefill)", c.cost_per_1m_input),
+                ("Output (decode)", c.cost_per_1m_output),
+                ("Blended", c.blended),
+            ];
+            for (label, local) in rows {
+                let mut spans = vec![
+                    Span::styled(format!("  {label:<16}"), style::label(th)),
+                    Span::styled(format!(" ${}/1M", format_rate(local)), style::value(th)),
+                ];
+                for (name, cin, cout) in CLOUD_REFERENCE {
+                    let (cin, cout) = (*cin, *cout);
+                    let cloud = if label == "Blended" {
+                        (cin + cout) / 2.0
+                    } else if label.starts_with("Input") {
+                        cin
+                    } else {
+                        cout
+                    };
+                    spans.push(Span::styled(
+                        format!("   {name} ${cloud:.2}"),
+                        style::footer(th),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "  This run: {} in + {} out = {} total",
+                    fmt::format_tokens(c.prompt_tokens),
+                    fmt::format_tokens(c.completion_tokens),
+                    format_cost(c.total_cost)
+                ),
+                style::value_ok(th),
+            )]));
+            lines.push(Line::from(Span::styled(
+                "  ℹ Phase power: input = prefill, output = decode — compare to cloud list prices.",
+                style::info(th),
+            )));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  Awaiting token + power data…",
+                style::info(th),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  The $/1M rates appear once a run has input and output",
+                style::info(th),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  tokens plus measured power in each phase.",
+                style::info(th),
+            )));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        area,
+    );
 }
 
 // ── Utilization + temperature over time ────────────────────────────────────
@@ -864,6 +978,30 @@ fn format_money(v: f64) -> String {
     format!("${v:.2}")
 }
 
+/// Format a **$/1M-token rate**: sub-dollar rates get three decimals
+/// (`$0.031` — the precision that separates local from cloud),
+/// dollar-and-up rates get two (`$2.50`).
+fn format_rate(v: f64) -> String {
+    if v < 1.0 {
+        format!("{v:.3}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// Format a run's **total cost**: small amounts (under a cent) get four
+/// decimals (`$0.0011`), larger ones two. `N/A` for non-positive.
+fn format_cost(v: f64) -> String {
+    if v <= 0.0 {
+        return "N/A".to_string();
+    }
+    if v < 0.01 {
+        format!("${v:.4}")
+    } else {
+        format!("${v:.2}")
+    }
+}
+
 /// Format a large integer with thousands separators (J/ktoken).
 fn format_int(v: f64) -> String {
     let n = v as u64;
@@ -911,7 +1049,7 @@ mod tests {
 
     /// A monitor with a small power history + two GPUs, for the render tests.
     fn sample_monitor() -> GpuPowerMonitor {
-        let mut mon = GpuPowerMonitor::default().with_rate(0.15);
+        let mut mon = GpuPowerMonitor::default().with_rate(0.16);
         mon.begin_run();
         mon.record_idle(150.0);
         mon.start_load();
@@ -921,6 +1059,11 @@ mod tests {
         mon.max_temp_c = 72.0;
         mon.avg_util_pct = 91.0;
         mon.total_tokens = 20000;
+        // The $/1M cost panel's phase context: input tokens, a real
+        // prefill window (load start → first token), then decode.
+        mon.prompt_tokens = 5000;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        mon.first_token_at = Some(crate::timing::MonotonicInstant::now());
         mon.gpus = vec![
             GpuSample {
                 power_watts: Some(600.0),
@@ -959,6 +1102,9 @@ mod tests {
                 vram_gb: 32.0,
             });
         }
+        // Decode runs until "now" (the last-token clock).
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        mon.last_token_at = Some(crate::timing::MonotonicInstant::now());
         mon
     }
 
@@ -977,6 +1123,63 @@ mod tests {
         assert!(text.contains("AvgT"), "avg temp column: {text}");
         assert!(text.contains("MaxT"), "max temp column: {text}");
         assert!(text.contains("72°C"), "peak temp value: {text}");
+    }
+
+    // ── cost analysis ($/1M tokens, local vs cloud) ───────────────────────
+
+    #[test]
+    fn view4_cost_analysis_shows_input_output_and_cloud() {
+        let mut app = app_with_monitor(sample_monitor());
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 50);
+        assert!(text.contains("COST ANALYSIS"), "cost panel: {text}");
+        assert!(text.contains("$0.16/kWh"), "the user's rate: {text}");
+        assert!(text.contains("Input (prefill)"), "input row: {text}");
+        assert!(text.contains("Output (decode)"), "output row: {text}");
+        assert!(text.contains("Blended"), "blended row: {text}");
+        assert!(text.contains("GPT-4o"), "cloud reference: {text}");
+        assert!(text.contains("Claude"), "cloud reference: {text}");
+        assert!(text.contains("This run:"), "run total: {text}");
+    }
+
+    #[test]
+    fn view4_cost_panel_shows_awaiting_without_token_data() {
+        // A fresh monitor (no tokens, no phase latch) → the N/A state,
+        // never a spurious $0.00.
+        let mut app = App::new();
+        app.metrics.update(MetricsSnapshot {
+            gpu_monitor: Some(GpuPowerMonitor::default().with_rate(0.16)),
+            ..Default::default()
+        });
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("Awaiting token"), "N/A cost state: {text}");
+    }
+
+    #[test]
+    fn view4_table_name_column_fits_long_names() {
+        // "Radeon RX 9700" (14 chars) — the Name column must grow past
+        // the old 12-char cap to show the full name.
+        let mut mon = sample_monitor();
+        mon.gpu_names = vec!["Radeon RX 9700".into(), "NVIDIA A4000".into()];
+        let mut app = app_with_monitor(mon);
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("Radeon RX 9700"), "full AMD name: {text}");
+        assert!(text.contains("NVIDIA A4000"), "full NVIDIA name: {text}");
+    }
+
+    #[test]
+    fn format_rate_and_cost_adapt_precision() {
+        // Sub-dollar rates keep 3 decimals (the local-vs-cloud delta).
+        assert_eq!(format_rate(0.031), "0.031");
+        assert_eq!(format_rate(0.0), "0.000");
+        // Dollar-and-up rates use 2.
+        assert_eq!(format_rate(2.5), "2.50");
+        // Tiny run totals keep 4; normal totals 2; non-positive is N/A.
+        assert_eq!(format_cost(0.0011), "$0.0011");
+        assert_eq!(format_cost(0.0), "N/A");
+        assert_eq!(format_cost(12.345), "$12.35");
     }
 
     #[test]

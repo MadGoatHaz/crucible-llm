@@ -38,7 +38,7 @@ pub mod nvml;
 /// cost / efficiency panel. Pure data + math (no NVML, no locks).
 pub mod monitor;
 
-pub use monitor::{GpuPowerMonitor, PowerSample, HISTORY_CAPACITY, IDLE_WINDOW_SECS};
+pub use monitor::{GpuPowerMonitor, PowerSample, TokenPhase, HISTORY_CAPACITY, IDLE_WINDOW_SECS};
 
 #[cfg(target_os = "linux")]
 mod amd;
@@ -56,7 +56,7 @@ pub use intel_level_zero::IntelLevelZeroBackend;
 
 use std::sync::Arc;
 
-use crate::metrics::state::{MetricsSnapshot, MetricsState};
+use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamStatus};
 use crate::timing::MonotonicInstant;
 
 /// A unified, vendor-agnostic GPU telemetry sample (blueprint §5D).
@@ -573,10 +573,19 @@ impl HwPoller {
         // Feed the GPU & Power monitor (View 4): before the load window
         // opens, accumulate the idle baseline; once open, record the
         // per-GPU table (including the whole-run per-device stats) + the
-        // 1 Hz power history + efficiency.
+        // 1 Hz power history + efficiency + the $/1M-token phase split.
+        // The phase context carries the cumulative prompt/completion
+        // totals (the cost denominators), whether a stream is decoding
+        // right now (advances the last-token clock), and whether any token
+        // has arrived (latches the prefill→decode boundary).
+        let phase = TokenPhase {
+            prompt_tokens: snap.overall.total_prompt_tokens,
+            completion_tokens: snap.overall.total_tokens,
+            active: snap.status == StreamStatus::Streaming,
+            tokens_seen: snap.completion_tokens > 0 || snap.observed_frames > 0,
+        };
         if self.monitor.idle_finalized {
-            self.monitor
-                .record(&agg, &per_gpu, &self.gpu_names, snap.overall.total_tokens);
+            self.monitor.record(&agg, &per_gpu, &self.gpu_names, &phase);
         } else {
             self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
         }
