@@ -5,7 +5,7 @@ All notable changes to Crucible LLM.
 ## [0.1.3] - 2026-10-05
 
 ### Added
-- **View 6: GPU & Power Monitor** — dedicated tab with comprehensive hardware telemetry
+- **View 4: GPU & Power Monitor** — dedicated tab with comprehensive hardware telemetry
 - **Multi-GPU support** — per-GPU table showing all cards (power, util, temp, VRAM, clocks, throttle)
 - **Power-over-time graph** — 1Hz sampling during benchmark runs, rendered as a live graph
 - **Idle power baseline** — 5-second measurement before test starts; compute power = total − idle
@@ -13,7 +13,14 @@ All notable changes to Crucible LLM.
 - **Cost estimation** — configurable $/kWh rate; shows estimated cost per run
 - **Efficiency metrics** — J/token, J/ktoken, tokens/watt, $/1M tokens
 - **Peak tracking** — max power, max temperature across the entire run
-- **`$/kWh` config field** — set your electricity rate in Config (tab 5)
+- **`$/kWh` config field** — set your electricity rate in Config (tab 6)
+
+### Changed
+- Tab reorder: GPU & Power → [4], History → [5], Config → [6]
+- Auto-scaled utilization/temperature graphs (show variation, not flat lines)
+- Per-GPU average and max temperature tracking
+- Duration counter freezes when benchmark completes
+- Mean and peak markers on all GPU graphs
 
 ### Improved
 - GPU monitoring now tracks history (time-series) not just current snapshot
@@ -22,7 +29,7 @@ All notable changes to Crucible LLM.
 
 ### Code Quality
 - New `src/hw/monitor.rs` — power history tracker with 1Hz sampling
-- New `src/ui/views/gpu.rs` — View 6 rendering
+- New `src/ui/views/gpu.rs` — View 4 rendering
 - 676 tests, 0 clippy warnings, fmt clean
 
 ## [0.1.2] - 2026-10-04

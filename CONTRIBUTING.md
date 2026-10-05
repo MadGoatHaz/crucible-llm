@@ -71,8 +71,9 @@ src/
         ├── live.rs       # View 1: Live monitor
         ├── concurrency.rs # View 2: Concurrency
         ├── needle.rs     # View 3: NIAH
-        ├── history.rs    # View 4: History
-        └── config.rs     # View 5: Config
+        ├── gpu.rs        # View 4: GPU & Power
+        ├── history.rs    # View 5: History
+        └── config.rs     # View 6: Config
 ```
 
 ## Coding Standards

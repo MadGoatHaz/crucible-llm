@@ -70,9 +70,9 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
 - **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
 - **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
-- **View 4 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
-- **View 5 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
-- **View 6 · GPU & Power** — multi-GPU telemetry table, power-over-time graphs, energy (kWh), cost estimation, and efficiency metrics (J/token, tokens/watt, $/1M tokens).
+- **View 4 · GPU & Power** — multi-GPU telemetry table, power-over-time graph, auto-scaled utilization/temperature charts, energy (kWh), cost estimation, and efficiency metrics (J/token, tokens/watt, $/1M tokens).
+- **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
+- **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
 - **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 
@@ -100,7 +100,7 @@ Three complete color palettes — the entire TUI re-skins from a single source o
 | **Vampire** | Crimson · gold · dark purple | Dark, gothic |
 | **Monochrome Pastel** | Soft blue · lavender · clean whites | Calm, minimal |
 
-On your **first run** (no theme ever chosen) a full-screen **theme picker** appears before Setup — move with `↑`/`↓` and the whole screen live-previews the hovered theme; `Enter` applies and saves it. Change it any time from **Config (View 5)**'s Theme field (`←`/`→` to cycle, `1`/`2`/`3` to select).
+On your **first run** (no theme ever chosen) a full-screen **theme picker** appears before Setup — move with `↑`/`↓` and the whole screen live-previews the hovered theme; `Enter` applies and saves it. Change it any time from **Config (View 6)**'s Theme field (`←`/`→` to cycle, `1`/`2`/`3` to select).
 
 ### Headless / CLI Mode
 

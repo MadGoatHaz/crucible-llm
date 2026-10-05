@@ -472,13 +472,13 @@ The single detected backend is shared by the TUI panel, Engine D, and the Config
 - **Engine D default**: auto-enabled when a GPU is detected, auto-disabled when not. An explicit user selection (`--engine`, `CRUCIBLE_ENGINE`, or the config file) always wins over the auto-detection.
 - **Config / Setup views** show the detected GPU on the Engine D row (e.g. `[✓] Energy — RTX 4090`, or `no GPU`).
 
-## GPU & Power Monitor (View 6)
+## GPU & Power Monitor (View 4)
 
 A dedicated TUI view (`src/ui/views/gpu.rs`) that surfaces the full hardware/energy picture on one screen. It reads a `GpuPowerMonitor` (`src/hw/monitor.rs`) that the 100 ms hardware poller maintains and copies into the lock-free `MetricsSnapshot` — the render loop never blocks and never touches the timing path.
 
 ### Power History (1 Hz Sampling)
 
-During a benchmark run, the poller records one **aggregate** `PowerSample` per second (all GPUs summed): timestamp, total power (W), max utilization (%), max temperature (°C), and summed VRAM (GB). The history is bounded to 1800 samples (30 min), with the oldest dropping first. This time-series drives the power-over-time, utilization-over-time, and temperature-over-time bar charts in View 6.
+During a benchmark run, the poller records one **aggregate** `PowerSample` per second (all GPUs summed): timestamp, total power (W), max utilization (%), max temperature (°C), and summed VRAM (GB). The history is bounded to 1800 samples (30 min), with the oldest dropping first. This time-series drives the power-over-time, utilization-over-time, and temperature-over-time charts in View 4.
 
 ### Idle Baseline Measurement
 
@@ -502,21 +502,21 @@ The `GpuBackend::poll()` path returns one `GpuSample` per device (NVML's `nvmlDe
 - `gpus: Vec<GpuSample>` — one entry per device (power, utilization, temperature, VRAM, clocks, throttle)
 - `gpu_names: Vec<String>` — per-device display names
 
-The View 6 per-GPU table renders one row per device, making multi-GPU servers (e.g. 8× A4000) fully visible.
+The View 4 per-GPU table renders one row per device, making multi-GPU servers (e.g. 8× A4000) fully visible.
 
-### View 6 Layout
+### View 4 Layout
 
 | Section | Content |
 |---------|---------|
-| **System Power** (top) | Total / idle / compute / peak draw, energy (kWh), estimated cost, duration, avg power, max temp, throttle events |
+| **System Power** (top) | Total / idle / compute / peak draw, energy (kWh), estimated cost, duration (frozen once the run completes), avg power, max temp, throttle events |
 | **Power Over Time** (middle-left) | 1 Hz aggregate power bar chart with auto-scaling y-axis |
 | **Efficiency** (middle-right) | J/token, J/ktoken, tokens/watt, $/1M tokens, total tokens, avg/peak/idle/compute power |
-| **Per-GPU Table** (lower-middle) | One row per device: name, power, utilization, temperature, VRAM, core/mem clock, throttle |
-| **Utilization + Temperature** (bottom) | Two 1 Hz bar charts side by side |
+| **Per-GPU Table** (lower-middle) | One row per device: name, power, utilization, run-average utilization, temperature, run-average temperature, peak temperature, VRAM, core/mem clock, throttle |
+| **Utilization + Temperature** (bottom) | Two 1 Hz **auto-scaled line charts** side by side — the y-axis spans the data's real range (with padding) so a narrow band shows its variation, each with grid lines, an area fill, a dashed mean line, and a peak marker |
 
 ### N/A Rule
 
-With no GPU telemetry (driver-less host), View 6 renders a single "no GPU telemetry" placeholder — never a broken frame, never fake zeros. Every derived metric is `Option`-gated: no power → all efficiency metrics are `None` (rendered `N/A`).
+With no GPU telemetry (driver-less host), View 4 renders a single "no GPU telemetry" placeholder — never a broken frame, never fake zeros. Every derived metric is `Option`-gated: no power → all efficiency metrics are `None` (rendered `N/A`).
 
 ## Engine F: Flat Out
 
@@ -604,13 +604,13 @@ Crucible is a **single-source-of-truth** tool: one `Config` feeds the headless p
 CLI flag  >  environment variable  >  config file  >  built-in default
 ```
 
-The **config file** (`~/.config/crucible/config.json`) is the persistence seam. It is read on every start, and it is written from the **TUI Config view (View 5)** — `F2` (or `Esc` while editing) persists the current form back to the file through the same serde layer, so a value edited in the UI flows end-to-end into the next run, the SQLite persistence, and the `--export` output.
+The **config file** (`~/.config/crucible/config.json`) is the persistence seam. It is read on every start, and it is written from the **TUI Config view (View 6)** — `F2` (or `Esc` while editing) persists the current form back to the file through the same serde layer, so a value edited in the UI flows end-to-end into the next run, the SQLite persistence, and the `--export` output.
 
 **Skip-Setup on subsequent runs:** when a config file already carries a `url` **and** a non-placeholder `model`, a bare `crucible-llm` opens straight onto the dashboard — the interactive Setup walkthrough (URL → model discovery → config → launch) is **skipped**. Setup still runs on the first invocation (no file / no explicit target), and can be re-opened any time with `c`. This is what makes the tool "set it up once, then just run it."
 
 ## History & Comparison
 
-Every completed run is persisted to the SQLite store (`~/.local/share/crucible/benchmarks.db`), and **View 4 (History)** reads it back. The view has four modes:
+Every completed run is persisted to the SQLite store (`~/.local/share/crucible/benchmarks.db`), and **View 5 (History)** reads it back. The view has four modes:
 
 - **List** — the stored sessions, newest first, with a cursor (`j`/`↓`, `k`/`↑`).
 - **Detail** (`Enter`) — one run's per-engine summary (mean TTFT, gen t/s, prompt t/s, MTP, J/token, plus the NIAH pass count).
@@ -631,7 +631,7 @@ The TUI is skinned by a `Theme` enum with three complete palettes (`ui/theme.rs`
 
 Each theme supplies the full role set — `primary`, `secondary`, `tertiary`, `accent`, `success`, `danger`, `dim`, `bright`, `border`, `border_active`, plus the gradient-texture colors (`floor`, `bright_gradient`, `bg`) that give the charts their depth.
 
-**Selection & switching.** The theme resolves from `CRUCIBLE_THEME` / the config file's `theme` field / the built-in default (`cyberpunk`). On the **first run** (no theme ever chosen — `theme_explicit` is false) a full-screen **theme picker** takes over before Setup: `↑`/`↓` moves the cursor and the *entire* screen live-previews the hovered theme, while each option box shows its own palette; `Enter` applies it to `app.active_theme`, persists it to the config file, and falls through to Setup (fresh target) or the Dashboard (target given). **Subsequent runs** skip the picker. The theme is changeable any time from **Config (View 5)**'s Theme field — `←`/`→` cycles with a live preview, `1`/`2`/`3` select directly, and `Esc` saves.
+**Selection & switching.** The theme resolves from `CRUCIBLE_THEME` / the config file's `theme` field / the built-in default (`cyberpunk`). On the **first run** (no theme ever chosen — `theme_explicit` is false) a full-screen **theme picker** takes over before Setup: `↑`/`↓` moves the cursor and the *entire* screen live-previews the hovered theme, while each option box shows its own palette; `Enter` applies it to `app.active_theme`, persists it to the config file, and falls through to Setup (fresh target) or the Dashboard (target given). **Subsequent runs** skip the picker. The theme is changeable any time from **Config (View 6)**'s Theme field — `←`/`→` cycles with a live preview, `1`/`2`/`3` select directly, and `Esc` saves.
 
 Rendering stays a pure `&App` read (the `active_theme` field), so the theme never touches the measurement path.
 

@@ -72,9 +72,9 @@ No GPU? Engine D is disabled automatically. No N/A panels.
 | 1 | Live Monitor | Throughput graph, key metrics, event log, engine queue |
 | 2 | Concurrency | Sweep results, per-stream speed, practical sweet spot |
 | 3 | NIAH | Retrieval matrix by context size |
-| 4 | History | Past runs: list / detail / compare / delete |
-| 5 | Config | Editable settings with per-field explanations |
-| 6 | GPU & Power | Multi-GPU telemetry, power graphs, energy cost |
+| 4 | GPU & Power | Multi-GPU telemetry, power graphs, energy cost |
+| 5 | History | Past runs: list / detail / compare / delete |
+| 6 | Config | Editable settings with per-field explanations |
 
 ### Global Controls
 | Key | Action |
@@ -98,7 +98,7 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 
 **First run:** if you've never picked a theme, a full-screen picker appears before Setup. Move with `↑`/`↓` (the whole screen live-previews the hovered theme) and confirm with `Enter` — it's saved, so later runs skip the picker.
 
-**Change later:** open **Config (View 5)**, focus the **Theme** field, and cycle with `←`/`→` (live preview) or jump with `1`/`2`/`3`; `Esc` saves. You can also set it via the `theme` field in `~/.config/crucible/config.json` or the `CRUCIBLE_THEME` environment variable.
+**Change later:** open **Config (View 6)**, focus the **Theme** field, and cycle with `←`/`→` (live preview) or jump with `1`/`2`/`3`; `Esc` saves. You can also set it via the `theme` field in `~/.config/crucible/config.json` or the `CRUCIBLE_THEME` environment variable.
 
 ### Reading the Live Monitor (View 1)
 - **Throughput graph**: Real-time tokens/sec. Green=fast, red=slow. Vertical lines mark engine transitions.
@@ -116,7 +116,7 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 - **Colors**: Green ≥80%, Yellow 50-79%, Red <50%
 - **Verdict**: "Reliable up to ~Xk tokens"
 
-### Reading the History View (View 4)
+### Reading the History View (View 5)
 The History view reads your stored runs (from `~/.local/share/crucible/benchmarks.db`). It has four modes:
 
 - **List** (default) — one row per stored run: date, model, endpoint, duration. Navigate with `j`/`↓` (down) and `k`/`↑` (up).
@@ -129,7 +129,7 @@ The History view reads your stored runs (from `~/.local/share/crucible/benchmark
 
 > The list is empty ("No benchmark runs saved yet") until your first run completes.
 
-### Using the Config View (View 5)
+### Using the Config View (View 6)
 The Config view has an **edit gate**: you land on a read-only screen showing the current settings. It protects you from accidentally typing into a field while just viewing.
 
 - `Enter` — enter **edit mode** (the fields become live)
@@ -163,17 +163,18 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Engine A–F | Toggle each benchmark on/off (D / energy auto-selects with GPU detection; your explicit choice always wins) |
 | $/kWh | Electricity rate for cost estimation in the GPU & Power view (default $0.15) |
 
-## GPU & Power Monitor (Tab 6)
+## GPU & Power Monitor (Tab 4)
 
 Shows comprehensive hardware telemetry during and after benchmark runs:
 
-- **System Power**: Total, idle, compute, and peak power draw
-- **Power Graph**: Real-time power over time (1Hz sampling)
-- **Per-GPU Table**: Individual power, utilization, temp, VRAM, clocks for each GPU
+- **System Power**: Total, idle, compute, and peak power draw; energy (kWh); estimated cost; and run duration — which **freezes at its final value when the benchmark completes**
+- **Power Graph**: Real-time power over time (1Hz sampling), with mean and peak markers
+- **Per-GPU Table**: Individual power, utilization, temp, VRAM, clocks for each GPU — plus whole-run **average and max temperature** per card
+- **Auto-scaled Graphs**: Utilization and temperature over time render against the data's real range (a narrow 85–97% band shows its variation, not a flat line), each with grid lines, an area fill, a dashed mean line, and a peak marker
 - **Efficiency**: Joules/token, tokens/watt, estimated cost
 - **Energy**: Total kWh consumed during the run
 
-Set your electricity rate ($/kWh) in Config (tab 5) for accurate cost estimates.
+Set your electricity rate ($/kWh) in Config (tab 6) for accurate cost estimates.
 
 ## Headless / CLI Mode
 
@@ -276,7 +277,7 @@ Yes. Crucible uses the **server-reported `usage.completion_tokens`** as the auth
 - There is no GPU at all — in that case the GPU panel is simply hidden (by design, not an error) and Engine D stays off
 
 ### Setup appears every time
-- You don't have a saved config with a URL + model yet. Save one from the Config view (View 5 → `Enter` → `F2`), and the next run opens straight to the dashboard.
+- You don't have a saved config with a URL + model yet. Save one from the Config view (View 6 → `Enter` → `F2`), and the next run opens straight to the dashboard.
 
 ### Ctrl+C doesn't quit
 - By design. `Ctrl+C` is reserved for the terminal's copy selection. Press `q` and confirm with `y` to quit.
