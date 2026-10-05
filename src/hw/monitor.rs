@@ -697,9 +697,49 @@ impl GpuPowerMonitor {
         }
     }
 
-    /// Total energy `∫P(t)dt` over the load history, joules.
+    /// Total energy `∫P(t)dt` over the **test window**, joules.
+    ///
+    /// Window-based (the "statistics only count what happened during the
+    /// test" rule): the integral spans `[load_started, load_ended]`.
+    /// While the run is live (`load_ended` is `None`) that is everything
+    /// from load start to now; once the run completes, any samples the
+    /// still-running 100 ms poller records **after** `load_ended` are
+    /// excluded — the energy, and the avg-power / cost / J-token figures
+    /// derived from it, are final the moment the window closes.
     pub fn energy_joules(&self) -> f64 {
-        integrate_power(&self.history)
+        match (self.load_started, self.load_ended) {
+            (Some(start), Some(end)) => {
+                // Single pass, no allocation: trapezoids over consecutive
+                // in-window samples (the same math as `integrate_power`,
+                // with the window filter applied). A sample outside the
+                // window breaks the chain, so no interval ever bridges
+                // across an edge.
+                let mut joules = 0.0f64;
+                let mut prev: Option<&PowerSample> = None;
+                for s in &self.history {
+                    // `start <= s.t <= end` (clamped-delta ordering, the
+                    // same predicate `phase_avg_power` uses).
+                    let in_window = s.t.delta_nanos(&start) == 0 && end.delta_nanos(&s.t) == 0;
+                    if in_window {
+                        if let Some(p) = prev {
+                            let dt = p.t.delta_nanos(&s.t) as f64 / 1e9;
+                            // Total *system* draw (GPU + CPU) at each end
+                            // of the interval.
+                            let p0 = p.power_w + p.cpu_power_w;
+                            let p1 = s.power_w + s.cpu_power_w;
+                            joules += (p0 + p1) / 2.0 * dt;
+                        }
+                        prev = Some(s);
+                    } else {
+                        prev = None;
+                    }
+                }
+                joules
+            }
+            // No closed window (live run, or no load window yet): the
+            // whole history is in scope.
+            _ => integrate_power(&self.history),
+        }
     }
 
     /// Total energy in kWh (joules / 3.6e6).
@@ -730,8 +770,12 @@ impl GpuPowerMonitor {
         self.total_power_w + self.cpu_power_w
     }
 
-    /// Mean power over the load window: `energy / duration` (time-weighted).
-    /// `None` before the window has any span (the N/A rule).
+    /// Mean power over the test window: `energy / duration` (time-weighted).
+    /// Both the energy and the duration are windowed to
+    /// `[load_started, load_ended]`, so once the run completes this is
+    /// **final** — post-completion samples (the poller keeps running for
+    /// the live table) never dilute it. `None` before the window has any
+    /// span (the N/A rule).
     pub fn avg_power_w(&self) -> Option<f64> {
         let d = self.duration_sec();
         (d > 0.0 && self.has_power).then(|| self.energy_joules() / d)
@@ -1550,6 +1594,80 @@ mod tests {
             Some(999.0),
             "current per-GPU stays live"
         );
+    }
+
+    /// Window-based statistics: once the test window closes
+    /// (`end_load`), the energy / avg power / duration are **final** —
+    /// samples the still-running 100 ms poller records afterwards are in
+    /// the history (the live table keeps working) but contribute nothing
+    /// to the run statistics. The "duration + avg power keep running
+    /// after the tests end" regression: the poller does not stop, the
+    /// *math* does.
+    #[test]
+    fn stats_are_final_once_the_test_window_closes() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.start_load();
+        m.has_power = true;
+
+        // Two in-window samples ~50 ms apart at 300 W (a real gap so the
+        // trapezoid integrates to a positive energy).
+        let a = PowerSample {
+            power_w: 300.0,
+            ..Default::default()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = PowerSample {
+            power_w: 300.0,
+            ..Default::default()
+        };
+        m.history = vec![a, b];
+
+        // Close the window (the run is over)…
+        m.end_load();
+        let frozen_energy = m.energy_joules();
+        let frozen_avg = m.avg_power_w().expect("avg power");
+        let frozen_duration = m.duration_sec();
+        assert!(
+            frozen_energy > 0.0,
+            "positive in-window energy: {frozen_energy}"
+        );
+        assert!(frozen_avg > 0.0, "positive avg power: {frozen_avg}");
+        assert!(
+            frozen_duration > 0.0,
+            "positive duration: {frozen_duration}"
+        );
+
+        // …then the *still-running* poller records more samples after
+        // `load_ended` (a higher draw, to make any drift obvious).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let c = PowerSample {
+            power_w: 999.0,
+            ..Default::default()
+        };
+        m.history.push(c);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let d = PowerSample {
+            power_w: 999.0,
+            ..Default::default()
+        };
+        m.history.push(d);
+
+        // Every statistic is locked to the window: the post-end samples
+        // are recorded in `history` but change nothing.
+        assert_eq!(m.history.len(), 4, "the poller's samples are recorded");
+        assert!(
+            (m.energy_joules() - frozen_energy).abs() < 1e-9,
+            "energy is final: {} vs {frozen_energy}",
+            m.energy_joules()
+        );
+        assert!(
+            (m.avg_power_w().unwrap() - frozen_avg).abs() < 1e-9,
+            "avg power is final: {} vs {frozen_avg}",
+            m.avg_power_w().unwrap()
+        );
+        assert_eq!(m.duration_sec(), frozen_duration, "duration is final");
     }
 
     /// The "Measure Idle" action: arming a manual measurement clears the

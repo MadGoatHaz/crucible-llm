@@ -533,6 +533,25 @@ impl HwPoller {
         self.monitor.end_load();
     }
 
+    /// Publish the current [`GpuPowerMonitor`] state into the metrics
+    /// snapshot **without** a fresh hardware poll (the run-end seam).
+    ///
+    /// [`Self::tick`] is the monitor's normal publisher, but the 100 ms
+    /// poller task stops calling it the moment [`MetricsState`] is frozen
+    /// (and `update()` is a no-op while frozen) — so a monitor mutation
+    /// made at run end ([`Self::end_load`] closing the load window) would
+    /// never reach the lock-free snapshot View 4 renders: the panel would
+    /// keep showing the pre-`end_load` monitor (`load_ended = None`), the
+    /// duration would keep counting and the avg power would keep decaying
+    /// forever. The caller publishes **before** freezing the pipeline, so
+    /// the final, window-closed monitor state is the one the UI holds
+    /// from then on.
+    pub fn publish_monitor(&self, state: &MetricsState) {
+        let mut s = (*state.load()).clone();
+        s.gpu_monitor = Some(self.monitor.clone());
+        state.update(s);
+    }
+
     /// Arm a manual idle-baseline measurement on the monitor (the GPU tab's
     /// `[i]` "Measure Idle" action). The background poller then accumulates
     /// a fresh [`MANUAL_IDLE_WINDOW_SECS`] no-load window and finalizes it

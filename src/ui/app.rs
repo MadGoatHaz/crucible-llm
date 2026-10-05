@@ -703,16 +703,24 @@ impl App {
             let result = engine.run().await;
             slot.set_running(false);
             slot.store(result);
-            // FIX 2: the run is over — freeze the metrics pipeline (the
-            // hardware poller goes idle; the UI shows final numbers).
-            metrics.freeze();
-            // Close the GPU monitor's load window too: the duration freezes
-            // at its final value (a standalone run is a run).
+            // The run is over: close the GPU monitor's load window (the
+            // duration freezes at its final value — a standalone run is a
+            // run) and publish that final state *before* freezing the
+            // metrics pipeline: the 100 ms poller task (the monitor's only
+            // publisher) stops calling `tick()` once frozen, and
+            // `update()` is a no-op while frozen, so a post-freeze publish
+            // would never reach View 4 (the panel would keep showing the
+            // pre-`end_load` monitor: duration counting forever, avg power
+            // decaying forever).
             if let Some(p) = &hw {
                 if let Ok(mut poller) = p.lock() {
                     poller.end_load();
+                    poller.publish_monitor(&metrics);
                 }
             }
+            // FIX 2: freeze the metrics pipeline (the hardware poller goes
+            // idle; the UI shows final numbers).
+            metrics.freeze();
         });
     }
 

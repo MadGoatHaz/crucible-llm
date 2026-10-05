@@ -773,18 +773,25 @@ impl BenchmarkSequence {
             );
             self.publish_state(SeqPhase::Complete, *engine, &summary);
 
-            // FIX 2: the last engine is done — freeze the metrics
-            // pipeline *now*, before the summary hold. The 100 ms
-            // hardware poller would otherwise keep stamping samples and
+            // FIX 2: the last engine is done — close the monitor's load
+            // window, publish that final state to the snapshot, and
+            // *then* freeze the metrics pipeline, before the summary
+            // hold. The 100 ms hardware poller (the monitor's only
+            // publisher) would otherwise keep stamping samples and
             // growing `elapsed_sec` for the whole 2 s hold (and the
             // graph would keep animating), so the frozen state is the
-            // true final state from this point on. (The freeze at
-            // `AllComplete` below is the idempotent safety net.)
-            // Closing the monitor's load window with it freezes the GPU
-            // panel's duration at its final value (no more counting).
+            // true final state from this point on. The order matters:
+            // once the pipeline is frozen the poller stops calling
+            // `tick()` and `update()` is a no-op — a publish *after* the
+            // freeze would never reach the UI, and View 4 would keep
+            // showing the pre-`end_load` monitor (duration counting
+            // forever, avg power decaying forever). (The close + publish
+            // + freeze at `AllComplete` below is the idempotent safety
+            // net.)
             if i + 1 == self.engines.len() {
-                self.metrics.freeze();
                 self.end_power_monitor();
+                self.publish_power_monitor();
+                self.metrics.freeze();
             }
 
             // Brief summary hold so the user sees the result before the
@@ -806,18 +813,22 @@ impl BenchmarkSequence {
             *self.engines.last().unwrap(),
             &final_summary,
         );
-        // The run is over: freeze the metrics pipeline (idempotent — the
-        // last engine's `Complete` already froze it before the summary
-        // hold). This stops the forever-running 100 ms hardware poller
-        // (and any other writer) from re-stamping `0.0` throughput
-        // samples / growing `elapsed` / dragging the overall averages
-        // after the last engine finishes — so the OVERALL METRICS panel
-        // and the throughput graph hold their final values and stop
-        // animating. The monitor's load window closes with it (also
-        // idempotent): the GPU panel's duration freezes at its final
-        // value.
-        self.metrics.freeze();
+        // The run is over: close the monitor's load window, publish the
+        // final monitor state, and freeze the metrics pipeline (all
+        // idempotent — the last engine's `Complete` already did this
+        // before the summary hold). The freeze stops the
+        // forever-running 100 ms hardware poller (and any other writer)
+        // from re-stamping `0.0` throughput samples / growing `elapsed`
+        // / dragging the overall averages after the last engine
+        // finishes — so the OVERALL METRICS panel and the throughput
+        // graph hold their final values and stop animating. The publish
+        // runs *before* the freeze (see `publish_power_monitor`): the
+        // frozen pipeline would swallow it, and View 4 would keep
+        // showing the pre-`end_load` monitor (duration counting
+        // forever, avg power decaying forever).
         self.end_power_monitor();
+        self.publish_power_monitor();
+        self.metrics.freeze();
         self.log_line(format!("[seq] ✓ all benchmarks complete — {final_summary}"));
         self.logger.info(
             Context::Sequence,
@@ -1087,6 +1098,31 @@ impl BenchmarkSequence {
         // never touches it, measurement-isolation invariant, blueprint §4).
         if let Ok(mut p) = poller.lock() {
             p.end_load();
+        }
+    }
+
+    /// Publish the monitor's final state to the metrics snapshot (the
+    /// run-end seam that [`Self::end_power_monitor`] needs).
+    ///
+    /// The 100 ms poller task is the monitor's normal publisher, but it
+    /// stops calling `tick()` the moment [`MetricsState`] is frozen (and
+    /// `update()` is a no-op while frozen) — so this must run **before**
+    /// the freeze: it carries the `end_load()`-closed monitor state
+    /// (`load_ended` set → duration final, energy / avg power windowed to
+    /// the test) into the lock-free snapshot View 4 renders. Without it
+    /// the panel keeps showing the pre-`end_load` monitor: the duration
+    /// counts on forever and the avg power decays forever (the "GPU &
+    /// Power tab keeps running after the tests complete" bug). Idempotent
+    /// (the `AllComplete` safety net re-publishes the same state); a
+    /// no-op without a hardware poller.
+    fn publish_power_monitor(&self) {
+        let Some(poller) = &self.hw else {
+            return;
+        };
+        // A brief lock — never held across an await (the key/render path
+        // never touches it, measurement-isolation invariant, blueprint §4).
+        if let Ok(p) = poller.lock() {
+            p.publish_monitor(&self.metrics);
         }
     }
 
