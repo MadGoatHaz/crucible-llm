@@ -186,6 +186,17 @@ The GPU & Power tab shows your local inference cost in the industry-standard for
 
 Example: If your server shows $0.03/1M input and $0.13/1M output, you can directly compare that to GPT-4o ($2.50/$10.00) or Claude ($3.00/$15.00).
 
+### CPU Power
+
+Crucible also monitors CPU power and includes it in total system energy:
+- **Intel**: RAPL (`/sys/class/powercap/intel-rapl/energy_uj`)
+- **AMD**: Super I/O chip (motherboard voltage × current sensors)
+- **Fallback**: Estimated 40W (labeled as such)
+
+The system power line shows: `System: 2,920 W (GPU 2,847 + CPU 73)`
+
+Your $/1M token cost reflects TRUE system draw, not just the GPU.
+
 ## Headless / CLI Mode
 
 For scripting, CI/CD, or when you don't want a TUI:

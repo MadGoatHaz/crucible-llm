@@ -18,6 +18,10 @@ All notable changes to Crucible LLM.
 - **$/1M token cost analysis** — separate input (prefill) and output (decode) costs, directly comparable to cloud API pricing. User-set $/kWh rate.
 - **Duration anchored to test start** — no longer counts from app launch.
 - **Full GPU names** — no truncation in per-GPU table.
+- **CPU power monitoring** — Intel RAPL, AMD Super I/O, or estimated fallback. Total system draw (GPU + CPU) now included in energy and cost calculations.
+- **NVML power plausibility clamp** — anomalous readings (>2× TDP) are detected, logged, and capped. Prevents impossible values like 943W on a 300W card.
+- **All-vendor power ceiling** — 5000W global cap on all GPU backends as a safety net.
+- **System power display** — GPU tab now shows "System: X W (GPU Y + CPU Z)" for true total draw.
 
 ### Changed
 - Tab reorder: GPU & Power → [4], History → [5], Config → [6]

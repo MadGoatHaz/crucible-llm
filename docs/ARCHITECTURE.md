@@ -526,6 +526,19 @@ The View 4 per-GPU table renders one row per device, making multi-GPU servers (e
 
 With no GPU telemetry (driver-less host), View 4 renders a single "no GPU telemetry" placeholder — never a broken frame, never fake zeros. Every derived metric is `Option`-gated: no power → all efficiency metrics are `None` (rendered `N/A`).
 
+### CPU Power Monitoring
+
+Cascade detection at startup:
+1. Intel RAPL — cumulative `energy_uj` counter, delta at 1Hz → watts. Plausibility-clamped (≤250W).
+2. Super I/O — motherboard sensor chip (asusec, nct6775, it8688). Reads `power1_input` or calculates V×I.
+3. Estimated — 40W fixed. Labeled as estimate in UI.
+
+Total system power = Σ(GPU power) + CPU power. Feeds the energy integral and $/token cost.
+
+### Power Plausibility
+
+All GPU backends apply a clamp: readings >5000W are treated as errors. NVIDIA additionally clamps to 1.5× TDP (from `nvmlDeviceGetPowerManagementLimit`). Anomalous readings are logged once (warn-once latch) and capped.
+
 ## Engine F: Flat Out
 
 ### What It Measures
