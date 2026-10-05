@@ -1,4 +1,4 @@
-//! View 4 — History: list, detail, compare, and delete of stored benchmark
+//! View 5 — History: list, detail, compare, and delete of stored benchmark
 //! runs (blueprint §6).
 //!
 //! **Modes** (driven by the key path, rendered pure from `&App`):
@@ -8,7 +8,7 @@
 //! * [`HistoryMode::Compare`] — two runs side-by-side with signed deltas;
 //! * [`HistoryMode::DeleteConfirm`] — a `[y/N]` prompt before deleting.
 //!
-//! **Keys** (active in this view only; `1`–`5` and `q` are global):
+//! **Keys** (active in this view only; `1`–`6` and `q` are global):
 //!
 //! * `j` / `↓` and `k` / `↑` — move the cursor (List / Compare-select);
 //! * `Enter` — view details (List) / select the second run (Compare);

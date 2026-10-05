@@ -82,11 +82,11 @@ pub mod env_vars {
     pub const MATRIX_CONTEXT: &str = "CRUCIBLE_MATRIX_CONTEXT";
     /// The TUI color theme (`cyberpunk` | `vampire` | `monochrome`).
     pub const THEME: &str = "CRUCIBLE_THEME";
-    /// The electricity rate for the View 6 cost estimate ($/kWh).
+    /// The electricity rate for the View 4 cost estimate ($/kWh).
     pub const RATE_KWH: &str = "CRUCIBLE_RATE_KWH";
 }
 
-/// The default electricity rate for the View 6 cost estimate ($/kWh).
+/// The default electricity rate for the View 4 cost estimate ($/kWh).
 /// `0.15` is a representative US residential/commercial blended rate.
 pub const DEFAULT_RATE_KWH: f64 = 0.15;
 
@@ -177,7 +177,7 @@ impl std::str::FromStr for ExportFormat {
 /// `concurrency`, `niah`, `reasoning`, `structured`, and `flatout` are
 /// on; `hardware` is off (it must run on the machine with the GPU —
 /// remote users get N/A — so it is opt-in; the user can enable it in
-/// Setup / View 5 when they are on the GPU box).
+/// Setup / View 6 when they are on the GPU box).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineSelection {
@@ -463,7 +463,7 @@ pub struct Config {
     /// pick engines themselves.
     #[serde(skip)]
     pub engines_explicit: bool,
-    /// The electricity rate for the View 6 (GPU & Power) cost estimate,
+    /// The electricity rate for the View 4 (GPU & Power) cost estimate,
     /// in $/kWh. Default [`DEFAULT_RATE_KWH`] ($0.15).
     pub rate_per_kwh: f64,
 }
@@ -575,7 +575,7 @@ pub struct ConfigFile {
     pub matrix_contexts: Option<Vec<u32>>,
     /// The TUI color theme (`"cyberpunk"` | `"vampire"` | `"monochrome"`).
     pub theme: Option<String>,
-    /// The electricity rate for the View 6 cost estimate ($/kWh).
+    /// The electricity rate for the View 4 cost estimate ($/kWh).
     pub rate_per_kwh: Option<f64>,
 }
 
@@ -905,7 +905,7 @@ pub fn layer(
             None => ("cyberpunk".to_string(), false),
         };
 
-    // ── electricity rate ($/kWh, the View 6 cost estimate) ──
+    // ── electricity rate ($/kWh, the View 4 cost estimate) ──
     // env > file > the built-in default ($0.15). A negative rate is clamped
     // to zero (never a signed cost).
     let rate_per_kwh = env_get(env_vars::RATE_KWH)
@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(back.theme, Some("vampire".to_string()));
     }
 
-    // ── electricity rate ($/kWh, View 6 cost estimate) ───────────────────
+    // ── electricity rate ($/kWh, View 4 cost estimate) ───────────────────
 
     #[test]
     fn rate_per_kwh_defaults_to_fifteen_cents() {

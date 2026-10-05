@@ -1,5 +1,5 @@
 //! Chunk 18 — View 5 (Configuration) + full-engine integration acceptance
-//! tests (blueprint §6 View 5, plan Chunk 18).
+//! tests (blueprint §6 View 6, plan Chunk 18).
 //!
 //! Verifies:
 //! - the Config view renders every editable field (URL, model, mode, tokens,

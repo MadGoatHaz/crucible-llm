@@ -713,8 +713,7 @@ impl BenchmarkSequence {
                 }
             });
         }
-
-        // Arm the GPU & Power monitor (View 6) and measure the idle power
+        // Arm the GPU & Power monitor (View 4) and measure the idle power
         // baseline *before* any load hits the GPU, so the "compute power"
         // (load − idle) and the 1 Hz power history both start from a real
         // no-load floor. No-op without a hardware poller (N/A rule).
@@ -781,8 +780,11 @@ impl BenchmarkSequence {
             // graph would keep animating), so the frozen state is the
             // true final state from this point on. (The freeze at
             // `AllComplete` below is the idempotent safety net.)
+            // Closing the monitor's load window with it freezes the GPU
+            // panel's duration at its final value (no more counting).
             if i + 1 == self.engines.len() {
                 self.metrics.freeze();
+                self.end_power_monitor();
             }
 
             // Brief summary hold so the user sees the result before the
@@ -811,8 +813,11 @@ impl BenchmarkSequence {
         // samples / growing `elapsed` / dragging the overall averages
         // after the last engine finishes — so the OVERALL METRICS panel
         // and the throughput graph hold their final values and stop
-        // animating.
+        // animating. The monitor's load window closes with it (also
+        // idempotent): the GPU panel's duration freezes at its final
+        // value.
         self.metrics.freeze();
+        self.end_power_monitor();
         self.log_line(format!("[seq] ✓ all benchmarks complete — {final_summary}"));
         self.logger.info(
             Context::Sequence,
@@ -1025,7 +1030,7 @@ impl BenchmarkSequence {
         result.summary_line()
     }
 
-    /// Arm the GPU & Power monitor (View 6) and measure the **idle power
+    /// Arm the GPU & Power monitor (View 4) and measure the **idle power
     /// baseline** before any load hits the GPU.
     ///
     /// `begin_run()` resets the monitor and opens the idle clock; the
@@ -1036,7 +1041,7 @@ impl BenchmarkSequence {
     /// `start_load()` finalizes the baseline (mean idle power) and opens the
     /// load window, from which the 1 Hz power history is recorded.
     ///
-    /// This is what makes the View 6 **compute power** (`total − idle`) and
+    /// This is what makes the View 4 **compute power** (`total − idle`) and
     /// energy numbers meaningful: they are measured relative to the
     /// machine's real no-load floor, not from zero. No-op without a hardware
     /// poller (a driver-less host — the N/A rule).
@@ -1065,6 +1070,23 @@ impl BenchmarkSequence {
         // Open the load window (finalize the idle baseline; history begins).
         if let Ok(mut p) = poller.lock() {
             p.start_load();
+        }
+    }
+
+    /// Close the GPU & Power monitor's (View 4) **load window** when the run
+    /// ends: the duration (and the duration-derived averages) freeze at
+    /// their final values instead of keeping count on the frozen panel.
+    /// Idempotent — the sequence calls it at both freeze sites (the last
+    /// engine's `Complete` and the `AllComplete` safety net). No-op without
+    /// a hardware poller (a driver-less host — the N/A rule).
+    fn end_power_monitor(&self) {
+        let Some(poller) = &self.hw else {
+            return;
+        };
+        // A brief lock — never held across an await (the key/render path
+        // never touches it, measurement-isolation invariant, blueprint §4).
+        if let Ok(mut p) = poller.lock() {
+            p.end_load();
         }
     }
 

@@ -1,4 +1,4 @@
-//! The GPU & Power monitor (View 6): a dedicated, information-dense hardware
+//! The GPU & Power monitor (View 4): a dedicated, information-dense hardware
 //! panel for AI-server operators.
 //!
 //! This module is **pure data + math** — no NVML, no locks, no timing path —
@@ -11,13 +11,19 @@
 //! What the monitor tracks:
 //!
 //! * **Per-GPU** — one [`crate::hw::GpuSample`] per device (power, utilization,
-//!   temperature, VRAM, clocks, throttle) for the multi-GPU table.
+//!   temperature, VRAM, clocks, throttle) for the multi-GPU table, plus
+//!   *whole-run* statistics per device (running-average utilization,
+//!   running-average temperature, peak temperature) so the table shows the
+//!   full picture, not just "right now".
 //! * **Aggregate power** — all GPUs summed: current, peak, and the *idle
 //!   baseline* measured before load (so `compute = total − idle` is
 //!   meaningful, not "the whole draw").
 //! * **Energy** — `∫P(t)dt` over the 1 Hz power history (trapezoidal rule),
 //!   in joules / kWh, and a `$` estimate at a user-set `$/kWh` rate.
 //! * **Efficiency** — J/token, J/ktoken, tokens/W, and `$`/million tokens.
+//! * **Duration** — the load-window span, *frozen* at its final value once
+//!   the run ends ([`Self::end_load`]) — a completed run's duration must
+//!   not keep counting on screen.
 //!
 //! **N/A rule** (blueprint §5D): with no power telemetry every derived
 //! metric is `None` (rendered `N/A`), never a spurious `0.0`.
@@ -64,7 +70,7 @@ impl Default for PowerSample {
     }
 }
 
-/// The full GPU & Power monitor state for View 6.
+/// The full GPU & Power monitor state for View 4.
 ///
 /// Plain `Clone` data (no interior mutability, no locks) so a copy travels in
 /// the `ArcSwap<MetricsSnapshot>` double buffer and the render loop reads it
@@ -78,6 +84,13 @@ pub struct GpuPowerMonitor {
     /// Per-device display names (parallel to `gpus`); empty until the first
     /// poll that reports names.
     pub gpu_names: Vec<String>,
+    /// Running-average utilization per device, % (the whole-run figure the
+    /// table's `AvgU` column shows — not just the current reading).
+    pub avg_util_per_gpu: Vec<f64>,
+    /// Running-average temperature per device, °C (the table's `AvgT`).
+    pub avg_temp_per_gpu: Vec<f64>,
+    /// Peak temperature seen per device, °C (the table's `MaxT`).
+    pub max_temp_per_gpu: Vec<i32>,
 
     // ---- aggregate power (all GPUs summed) ----
     /// Current total power draw, watts.
@@ -106,6 +119,11 @@ pub struct GpuPowerMonitor {
     /// When the load (post-idle) window began; `None` while idle / before a
     /// run. The history and `duration` are measured from here.
     pub load_started: Option<MonotonicInstant>,
+    /// When the load window **closed** (the run ended and the metrics
+    /// pipeline froze); `None` while the run is live. Once set,
+    /// [`Self::duration_sec`] reports the frozen final span — a completed
+    /// run's duration must not keep counting on screen.
+    pub load_ended: Option<MonotonicInstant>,
     /// When the (idle) run began — set by [`Self::begin_run`].
     pub run_started: Option<MonotonicInstant>,
 
@@ -114,6 +132,10 @@ pub struct GpuPowerMonitor {
     pub idle_samples: Vec<f64>,
     /// `true` once the idle baseline has been finalized.
     pub idle_finalized: bool,
+    /// Per-device poll counts weighting the running averages above
+    /// (writer side: `avg = (avg·n + x) / (n+1)`).
+    pub util_sample_counts: Vec<u64>,
+    pub temp_sample_counts: Vec<u64>,
 
     // ---- config ----
     /// The electricity rate for cost estimation, $/kWh.
@@ -125,6 +147,9 @@ impl Default for GpuPowerMonitor {
         Self {
             gpus: Vec::new(),
             gpu_names: Vec::new(),
+            avg_util_per_gpu: Vec::new(),
+            avg_temp_per_gpu: Vec::new(),
+            max_temp_per_gpu: Vec::new(),
             total_power_w: 0.0,
             peak_power_w: 0.0,
             idle_power_w: 0.0,
@@ -135,9 +160,12 @@ impl Default for GpuPowerMonitor {
             total_tokens: 0,
             history: Vec::new(),
             load_started: None,
+            load_ended: None,
             run_started: None,
             idle_samples: Vec::new(),
             idle_finalized: false,
+            util_sample_counts: Vec::new(),
+            temp_sample_counts: Vec::new(),
             rate_per_kwh: 0.15,
         }
     }
@@ -151,7 +179,8 @@ impl GpuPowerMonitor {
         self
     }
 
-    /// Arm a **new** run: reset every accumulator and start the idle clock.
+    /// Arm a **new** run: reset every accumulator (including the per-GPU
+    /// run statistics and the load-window clock) and start the idle clock.
     /// The poller calls this when a benchmark sequence begins.
     pub fn begin_run(&mut self) {
         self.total_power_w = 0.0;
@@ -166,7 +195,13 @@ impl GpuPowerMonitor {
         self.idle_samples.clear();
         self.idle_finalized = false;
         self.load_started = None;
+        self.load_ended = None;
         self.run_started = Some(MonotonicInstant::now());
+        self.avg_util_per_gpu.clear();
+        self.avg_temp_per_gpu.clear();
+        self.max_temp_per_gpu.clear();
+        self.util_sample_counts.clear();
+        self.temp_sample_counts.clear();
     }
 
     /// Record one poll **during the idle window** (before load): accumulate
@@ -199,8 +234,9 @@ impl GpuPowerMonitor {
         self.load_started = Some(MonotonicInstant::now());
     }
 
-    /// Record one poll **during the load window**: update the per-GPU table,
-    /// the aggregate power stats, and append a 1 Hz point to the history.
+    /// Record one poll **during the load window**: update the per-GPU table
+    /// (including the whole-run per-device statistics), the aggregate power
+    /// stats, and append a 1 Hz point to the history.
     ///
     /// `agg` is the backend's aggregated sample (all GPUs combined);
     /// `per_gpu` is one sample per device; `names` the per-device labels;
@@ -220,6 +256,31 @@ impl GpuPowerMonitor {
         self.gpus = per_gpu.to_vec();
         if !names.is_empty() {
             self.gpu_names = names.to_vec();
+        }
+        // Per-GPU whole-run statistics: running means (utilization,
+        // temperature) + the peak temperature, one slot per device. A
+        // growing device count adds fresh slots; a shrinking one trims the
+        // tail (a hot-plug event — rare, but never out of bounds).
+        let n = per_gpu.len();
+        self.avg_util_per_gpu.resize(n, 0.0);
+        self.avg_temp_per_gpu.resize(n, 0.0);
+        self.max_temp_per_gpu.resize(n, 0);
+        self.util_sample_counts.resize(n, 0);
+        self.temp_sample_counts.resize(n, 0);
+        for (i, g) in per_gpu.iter().enumerate() {
+            if let Some(u) = g.utilization_pct {
+                let c = self.util_sample_counts[i];
+                self.avg_util_per_gpu[i] =
+                    (self.avg_util_per_gpu[i] * c as f64 + u as f64) / (c + 1) as f64;
+                self.util_sample_counts[i] = c + 1;
+            }
+            if let Some(t) = g.temperature_c {
+                let c = self.temp_sample_counts[i];
+                self.avg_temp_per_gpu[i] =
+                    (self.avg_temp_per_gpu[i] * c as f64 + t as f64) / (c + 1) as f64;
+                self.max_temp_per_gpu[i] = self.max_temp_per_gpu[i].max(t);
+                self.temp_sample_counts[i] = c + 1;
+            }
         }
         // Aggregate power.
         if let Some(w) = agg.power_watts {
@@ -289,13 +350,33 @@ impl GpuPowerMonitor {
         }
     }
 
+    // ── run-window lifecycle ──────────────────────────────────────────────
+
+    /// Close the load window (the run is over): freeze the duration at its
+    /// final value.
+    ///
+    /// The 100 ms poller stops ticking the moment the metrics pipeline
+    /// freezes, so without this close the `load_started`-anchored clock
+    /// would keep growing on a completed run's panel — the "duration keeps
+    /// counting" bug. **Idempotent**: the second call (the `AllComplete`
+    /// safety-net freeze) is a no-op, and it is ignored before a load
+    /// window has opened.
+    pub fn end_load(&mut self) {
+        if self.load_ended.is_none() && self.load_started.is_some() {
+            self.load_ended = Some(MonotonicInstant::now());
+        }
+    }
+
     // ── derived metrics (pure; the panel reads these) ─────────────────────
 
-    /// The load-window duration in seconds (`0.0` before load / no clock).
+    /// The load-window duration in seconds. While the run is live this
+    /// grows with the clock; once [`Self::end_load`] has closed the window
+    /// it is **frozen** at the final value (`0.0` before load / no clock).
     pub fn duration_sec(&self) -> f64 {
-        match self.load_started {
-            Some(start) => start.elapsed().as_secs_f64(),
-            None => 0.0,
+        match (self.load_started, self.load_ended) {
+            (Some(start), Some(end)) => end.delta_nanos(&start) as f64 / 1e9,
+            (Some(start), None) => start.elapsed().as_secs_f64(),
+            _ => 0.0,
         }
     }
 
@@ -502,14 +583,148 @@ mod tests {
         m.max_temp_c = 80.0;
         m.total_tokens = 12345;
         m.history.push(PowerSample::default());
+        m.avg_util_per_gpu = vec![90.0];
+        m.avg_temp_per_gpu = vec![65.0];
+        m.max_temp_per_gpu = vec![72];
+        m.util_sample_counts = vec![10];
+        m.temp_sample_counts = vec![10];
+        m.load_started = Some(MonotonicInstant::now());
+        m.load_ended = Some(MonotonicInstant::now());
         m.begin_run();
         assert_eq!(m.total_power_w, 0.0);
         assert_eq!(m.peak_power_w, 0.0);
         assert_eq!(m.max_temp_c, 0.0);
         assert_eq!(m.total_tokens, 0);
         assert!(m.history.is_empty());
+        assert!(m.avg_util_per_gpu.is_empty());
+        assert!(m.avg_temp_per_gpu.is_empty());
+        assert!(m.max_temp_per_gpu.is_empty());
+        assert!(m.util_sample_counts.is_empty());
+        assert!(m.temp_sample_counts.is_empty());
+        assert!(m.load_started.is_none());
+        assert!(m.load_ended.is_none());
         assert!(!m.idle_finalized);
         assert!(m.run_started.is_some());
+    }
+
+    #[test]
+    fn per_gpu_running_averages_and_peak() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        let g0a = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            temperature_c: Some(65),
+            ..Default::default()
+        };
+        let g0b = GpuSample {
+            power_watts: Some(320.0),
+            utilization_pct: Some(95),
+            temperature_c: Some(70),
+            ..Default::default()
+        };
+        let g1a = GpuSample {
+            power_watts: Some(350.0),
+            utilization_pct: Some(80),
+            temperature_c: Some(55),
+            ..Default::default()
+        };
+        let g1b = GpuSample {
+            power_watts: Some(340.0),
+            utilization_pct: Some(84),
+            temperature_c: Some(58),
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(&[g0a.clone(), g1a.clone()]);
+        m.record(&agg, &[g0a, g1a], &[], 0);
+        let agg = GpuSample::aggregate(&[g0b.clone(), g1b.clone()]);
+        m.record(&agg, &[g0b, g1b], &[], 10);
+        // Whole-run means: (90+95)/2, (65+70)/2; peaks: 70, 58.
+        assert!((m.avg_util_per_gpu[0] - 92.5).abs() < 1e-9);
+        assert!((m.avg_temp_per_gpu[0] - 67.5).abs() < 1e-9);
+        assert_eq!(m.max_temp_per_gpu[0], 70);
+        assert!((m.avg_util_per_gpu[1] - 82.0).abs() < 1e-9);
+        assert!((m.avg_temp_per_gpu[1] - 56.5).abs() < 1e-9);
+        assert_eq!(m.max_temp_per_gpu[1], 58);
+    }
+
+    #[test]
+    fn per_gpu_stats_survive_a_missing_reading() {
+        // A poll with no temperature must not stall the temperature
+        // average: the next real reading folds in cleanly.
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        let g0 = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            temperature_c: Some(60),
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(std::slice::from_ref(&g0));
+        m.record(&agg, std::slice::from_ref(&g0), &[], 0);
+        let g1 = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            temperature_c: None, // sensor glitch on this poll
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(std::slice::from_ref(&g1));
+        m.record(&agg, std::slice::from_ref(&g1), &[], 0);
+        let g2 = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            temperature_c: Some(80),
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(std::slice::from_ref(&g2));
+        m.record(&agg, std::slice::from_ref(&g2), &[], 0);
+        // Temp average over the two real readings: (60+80)/2 = 70.
+        assert!((m.avg_temp_per_gpu[0] - 70.0).abs() < 1e-9);
+        assert_eq!(m.max_temp_per_gpu[0], 80);
+        // Util average over all three: 90.
+        assert!((m.avg_util_per_gpu[0] - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn end_load_freezes_the_duration() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.start_load();
+        let before = m.duration_sec();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let live = m.duration_sec();
+        assert!(live > before, "the live duration grows: {live} > {before}");
+        // Close the window: the duration freezes at its final value…
+        m.end_load();
+        let frozen = m.duration_sec();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            m.duration_sec(),
+            frozen,
+            "the frozen duration does not grow"
+        );
+        // …and a second close (the AllComplete safety-net) is a no-op.
+        m.end_load();
+        assert_eq!(m.duration_sec(), frozen);
+        // A fresh run re-arms: the clock grows again from zero.
+        m.begin_run();
+        assert!(m.duration_sec() == 0.0);
+        m.start_load();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(m.duration_sec() > 0.0);
+    }
+
+    #[test]
+    fn end_load_before_a_load_window_is_a_noop() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.end_load();
+        assert!(m.load_ended.is_none());
+        assert_eq!(m.duration_sec(), 0.0);
     }
 
     #[test]

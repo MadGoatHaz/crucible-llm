@@ -200,11 +200,12 @@ pub struct MetricsSnapshot {
     /// clocks, VRAM, throttle reasons). `None` when no GPU is present:
     /// the panel is hidden entirely, never shown as an N/A box.
     pub gpu: Option<GpuSample>,
-    /// The GPU & Power monitor (View 6): per-GPU table, aggregate power,
-    /// idle baseline, the 1 Hz power history, and the energy / cost /
-    /// efficiency math. `None` when no GPU is present (View 6 shows its
-    /// "no telemetry" placeholder). Preserved across engine publishes so
-    /// the panel never flickers (see [`MetricsState::update`]).
+    /// The GPU & Power monitor (View 4): per-GPU table (with whole-run
+    /// per-device stats), aggregate power, idle baseline, the 1 Hz power
+    /// history, and the energy / cost / efficiency math. `None` when no
+    /// GPU is present (View 4 shows its "no telemetry" placeholder).
+    /// Preserved across engine publishes so the panel never flickers (see
+    /// [`MetricsState::update`]).
     pub gpu_monitor: Option<GpuPowerMonitor>,
 
     // ---- inter-token latency percentiles (nanoseconds) ----
@@ -1016,7 +1017,7 @@ impl MetricsState {
         snapshot = snapshot
             .with_derived_prompt_throughput()
             .with_derived_labeled_throughputs();
-        // Preserve the hardware telemetry (the single GPU sample + the View 6
+        // Preserve the hardware telemetry (the single GPU sample + the View 4
         // GPU & Power monitor) across engine publishes: engines send *fresh*
         // snapshots with `gpu`/`gpu_monitor` = `None`, which would otherwise
         // make the GPU panels flicker between the 100 ms poller's updates.

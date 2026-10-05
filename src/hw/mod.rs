@@ -34,7 +34,7 @@
 #[cfg(feature = "nvml")]
 pub mod nvml;
 
-/// The GPU & Power monitor (View 6): the dedicated multi-GPU power / energy /
+/// The GPU & Power monitor (View 4): the dedicated multi-GPU power / energy /
 /// cost / efficiency panel. Pure data + math (no NVML, no locks).
 pub mod monitor;
 
@@ -92,7 +92,7 @@ impl GpuSample {
     /// (deduped, comma-separated; `None` when no device is throttling).
     ///
     /// This is the multi-GPU roll-up the 100 ms poller feeds the energy
-    /// math and the View 6 aggregate panels. An empty slice yields an all-
+    /// math and the View 4 aggregate panels. An empty slice yields an all-
     /// `None` sample (the N/A rule).
     #[must_use]
     pub fn aggregate(samples: &[GpuSample]) -> GpuSample {
@@ -171,7 +171,7 @@ pub trait GpuBackend: Send + Sync + std::fmt::Debug {
     /// One sample **per device** (multi-GPU). The default returns a single
     /// element wrapping [`GpuBackend::poll`] — single-GPU backends (AMD /
     /// Intel sysfs) need no override. Multi-GPU backends (NVML) override
-    /// this to expose each device so View 6 can render the per-GPU table.
+    /// this to expose each device so View 4 can render the per-GPU table.
     fn poll_all(&self) -> Vec<GpuSample> {
         vec![self.poll()]
     }
@@ -363,9 +363,10 @@ pub struct HwPoller {
     trace: Vec<HwSample>,
     /// Rolling trace capacity (oldest samples drop first).
     capacity: usize,
-    /// The GPU & Power monitor (View 6): per-GPU samples, aggregate power,
-    /// the idle baseline, the 1 Hz power history, and the energy/cost/
-    /// efficiency math. Written by [`Self::tick`], read into the snapshot.
+    /// The GPU & Power monitor (View 4): per-GPU samples (plus whole-run
+    /// per-device stats), aggregate power, the idle baseline, the 1 Hz
+    /// power history, and the energy/cost/efficiency math. Written by
+    /// [`Self::tick`], read into the snapshot.
     monitor: GpuPowerMonitor,
     /// Per-device display names (parallel to the monitor's per-GPU table),
     /// refreshed from the backend on each poll.
@@ -415,7 +416,7 @@ impl HwPoller {
         }
     }
 
-    /// Set the `$/kWh` electricity rate the View 6 cost estimate uses
+    /// Set the `$/kWh` electricity rate the View 4 cost estimate uses
     /// (builder-style; the entry point wires it from the resolved config).
     #[must_use]
     pub fn with_rate(mut self, rate: f64) -> Self {
@@ -444,9 +445,17 @@ impl HwPoller {
         self.monitor.start_load();
     }
 
-    /// The GPU & Power monitor (View 6) state.
+    /// The GPU & Power monitor (View 4) state.
     pub fn monitor(&self) -> &GpuPowerMonitor {
         &self.monitor
+    }
+
+    /// Close the monitor's load window (the run is over): the duration
+    /// freezes at its final value. Idempotent — the sequence calls it at
+    /// both freeze sites (the last engine's `Complete` and the `AllComplete`
+    /// safety net), and it is a no-op before a load window has opened.
+    pub fn end_load(&mut self) {
+        self.monitor.end_load();
     }
 
     /// `true` when a GPU backend is available (any vendor).
@@ -551,7 +560,7 @@ impl HwPoller {
     /// (measurement-isolation invariant, blueprint §4).
     pub fn tick(&mut self, state: &MetricsState) {
         // One sample per device (multi-GPU), then the aggregate roll-up the
-        // energy math and the View 6 aggregate panels consume.
+        // energy math and the View 4 aggregate panels consume.
         let per_gpu = self.gpu.as_ref().map(|g| g.poll_all()).unwrap_or_default();
         if let Some(g) = &self.gpu {
             self.gpu_names = g.device_names();
@@ -561,9 +570,10 @@ impl HwPoller {
         // Read the current snapshot once (lock-free) for both the token
         // count and the merge base.
         let snap = state.load();
-        // Feed the GPU & Power monitor (View 6): before the load window
+        // Feed the GPU & Power monitor (View 4): before the load window
         // opens, accumulate the idle baseline; once open, record the
-        // per-GPU table + the 1 Hz power history + efficiency.
+        // per-GPU table (including the whole-run per-device stats) + the
+        // 1 Hz power history + efficiency.
         if self.monitor.idle_finalized {
             self.monitor
                 .record(&agg, &per_gpu, &self.gpu_names, snap.overall.total_tokens);
@@ -620,9 +630,9 @@ pub fn merge_hw(
     // throttle, …) the Live view's GPU panel renders. `None` (no GPU) →
     // the panel is hidden entirely (never an N/A box).
     s.gpu = gpu.cloned();
-    // The GPU & Power monitor (View 6): per-GPU table, aggregate power,
+    // The GPU & Power monitor (View 4): per-GPU table, aggregate power,
     // idle baseline, 1 Hz history, energy/cost/efficiency. `None` (no
-    // GPU) → View 6 shows its "no telemetry" placeholder.
+    // GPU) → View 4 shows its "no telemetry" placeholder.
     s.gpu_monitor = monitor.cloned();
     s
 }
@@ -642,7 +652,7 @@ mod tests {
         assert_eq!(merged.gpu_clock_mhz, 0.0);
         assert_eq!(merged.joules_per_token, 0.0);
         assert!(merged.gpu.is_none()); // no GPU → the panel is hidden
-        assert!(merged.gpu_monitor.is_none()); // no monitor → View 6 placeholder
+        assert!(merged.gpu_monitor.is_none()); // no monitor → View 4 placeholder
                                                // Non-hardware fields pass through untouched.
         assert_eq!(merged.endpoint, snap.endpoint);
         assert_eq!(merged.model, snap.model);

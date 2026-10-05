@@ -1,4 +1,4 @@
-//! View 6 — GPU & Power Monitor (the dedicated hardware / energy panel).
+//! View 4 — GPU & Power Monitor (the dedicated hardware / energy panel).
 //!
 //! The "wow" panel for AI-server operators: everything that matters about
 //! the *power and energy* side of a run, on one screen. It reads the
@@ -9,13 +9,21 @@
 //! Layout (top → bottom):
 //!
 //! * **System Power** — total / idle / compute / peak draw, energy (kWh),
-//!   estimated cost (`$/kWh`), and the run duration.
+//!   estimated cost (`$/kWh`), and the run duration (frozen at its final
+//!   value once the run completes).
 //! * **Power over time** — the 1 Hz aggregate power trace as a bar chart
 //!   (the "wow" factor), beside an **Efficiency** readout (J/token,
 //!   J/ktoken, tokens/W, $/1M tokens, avg/peak/idle/compute power).
-//! * **Per-GPU table** — one row per device: power, utilization,
-//!   temperature, VRAM, core/mem clock, throttle (the multi-GPU showcase).
-//! * **Utilization + Temperature over time** — two more 1 Hz charts.
+//! * **Per-GPU table** — one row per device: power, current *and*
+//!   whole-run average utilization, current *and* whole-run average
+//!   temperature, peak temperature, VRAM, core/mem clock, throttle (the
+//!   multi-GPU showcase).
+//! * **Utilization + Temperature over time** — two 1 Hz **line** charts
+//!   whose y-axis **auto-scales to the actual data range** (with padding):
+//!   a signal hovering 85–97% renders as a visible curve, not a flat line
+//!   at the top of a 0–100 axis. Each carries grid lines, a dim area fill
+//!   under the curve, a dashed `avg:` line, a `peak:` marker, and time
+//!   markers on the x-axis.
 //!
 //! **No GPU** (a driver-less host) → a single "no telemetry" placeholder,
 //! never a broken frame (the N/A rule, blueprint §5D).
@@ -33,7 +41,7 @@ use crate::hw::GpuPowerMonitor;
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
 
-/// Render the GPU & Power view (View 6) into `area`.
+/// Render the GPU & Power view (View 4) into `area`.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let th = app.active_theme;
     let snap = app.metrics.load();
@@ -276,8 +284,11 @@ fn eff_row(th: Theme, label: &str, value: String) -> Line<'static> {
 
 // ── Per-GPU table ──────────────────────────────────────────────────────────
 
-/// The **per-GPU** table: one row per device (power, utilization,
-/// temperature, VRAM, core/mem clock, throttle). The multi-GPU showcase.
+/// The **per-GPU** table: one row per device (power, current *and*
+/// whole-run average utilization, current *and* whole-run average
+/// temperature, peak temperature, VRAM, core/mem clock, throttle). The
+/// multi-GPU showcase — the `AvgU` / `AvgT` / `MaxT` columns give the full
+/// run picture, not just "right now".
 fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
     let block = theme::block(
         theme::panel_title(
@@ -306,24 +317,32 @@ fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame)
         return;
     }
     let header = Line::from(vec![
-        Span::styled(format!("{:<4}", "GPU"), style::muted_title(th)),
-        Span::styled(format!("{:<16}", "Name"), style::muted_title(th)),
+        Span::styled(format!("{:<3}", "GPU"), style::muted_title(th)),
+        Span::styled(format!("{:<12}", "Name"), style::muted_title(th)),
         Span::styled(format!("{:>6}", "Power"), style::muted_title(th)),
         Span::styled(format!("{:>5}", "Util"), style::muted_title(th)),
+        Span::styled(format!("{:>5}", "AvgU"), style::muted_title(th)),
         Span::styled(format!("{:>5}", "Temp"), style::muted_title(th)),
-        Span::styled(format!("{:<13}", "VRAM"), style::muted_title(th)),
-        Span::styled(format!("{:<12}", "Clock(C/M)"), style::muted_title(th)),
-        Span::styled("Throttle".to_string(), style::muted_title(th)),
+        Span::styled(format!("{:>5}", "AvgT"), style::muted_title(th)),
+        Span::styled(format!("{:>5}", "MaxT"), style::muted_title(th)),
+        Span::styled(format!("{:>8}", "VRAM"), style::muted_title(th)),
+        Span::styled(format!("{:>8}", "Clock"), style::muted_title(th)),
+        Span::styled("Thr", style::muted_title(th)),
     ]);
     let mut lines = vec![header];
     for (i, g) in mon.gpus.iter().enumerate() {
         let name = mon
             .gpu_names
             .get(i)
-            .map(|s| fmt::truncate(s, 16))
+            .map(|s| fmt::truncate(s, 12))
             .unwrap_or_else(|| format!("GPU {i}"));
-        lines.push(gpu_row(th, i, &name, g));
+        lines.push(gpu_row(th, i, &name, g, mon));
     }
+    // The column legend (whole-run figures explained in one line).
+    lines.push(Line::from(Span::styled(
+        "  ℹ AvgU/AvgT = run average · MaxT = peak",
+        style::info(th),
+    )));
     f.render_widget(
         Paragraph::new(Text::from(lines))
             .block(block)
@@ -332,7 +351,13 @@ fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame)
     );
 }
 
-fn gpu_row(th: Theme, i: usize, name: &str, g: &crate::hw::GpuSample) -> Line<'static> {
+fn gpu_row(
+    th: Theme,
+    i: usize,
+    name: &str,
+    g: &crate::hw::GpuSample,
+    mon: &GpuPowerMonitor,
+) -> Line<'static> {
     let power = g
         .power_watts
         .map(|w| format!("{w:.0}W"))
@@ -341,15 +366,38 @@ fn gpu_row(th: Theme, i: usize, name: &str, g: &crate::hw::GpuSample) -> Line<'s
         .utilization_pct
         .map(|u| format!("{u}%"))
         .unwrap_or_else(|| "N/A".to_string());
+    // Whole-run per-device statistics (the monitor's running averages and
+    // peak — `N/A` until the device has reported the metric).
+    let avg_util = mon
+        .avg_util_per_gpu
+        .get(i)
+        .copied()
+        .filter(|v| *v > 0.0)
+        .map(|v| format!("{v:.0}%"))
+        .unwrap_or_else(|| "N/A".to_string());
     let temp = g
         .temperature_c
         .map(|t| format!("{t}°C"))
         .unwrap_or_else(|| "N/A".to_string());
+    let avg_temp = mon
+        .avg_temp_per_gpu
+        .get(i)
+        .copied()
+        .filter(|v| *v > 0.0)
+        .map(|v| format!("{v:.0}°C"))
+        .unwrap_or_else(|| "N/A".to_string());
+    let max_temp = mon
+        .max_temp_per_gpu
+        .get(i)
+        .copied()
+        .filter(|v| *v > 0)
+        .map(|v| format!("{v}°C"))
+        .unwrap_or_else(|| "N/A".to_string());
     let vram = match (g.memory_used_mb, g.memory_total_mb) {
         (Some(used), Some(total)) if total > 0 => {
-            format!("{:.1}/{:.1}GB", used as f64 / 1024.0, total as f64 / 1024.0)
+            format!("{:.1}/{:.0}G", used as f64 / 1024.0, total as f64 / 1024.0)
         }
-        (Some(used), None) => format!("{:.1}GB", used as f64 / 1024.0),
+        (Some(used), None) => format!("{:.1}G", used as f64 / 1024.0),
         _ => "N/A".to_string(),
     };
     let clock = match (g.core_clock_mhz, g.memory_clock_mhz) {
@@ -365,21 +413,26 @@ fn gpu_row(th: Theme, i: usize, name: &str, g: &crate::hw::GpuSample) -> Line<'s
         style::value_warn(th)
     };
     Line::from(vec![
-        Span::styled(format!("{i:<3} "), style::label(th)),
-        Span::styled(format!("{:<16}", name), style::value_secondary(th)),
-        Span::styled(format!("{power:>6} "), style::value(th)),
-        Span::styled(format!("{util:>5} "), style::value(th)),
-        Span::styled(format!("{temp:>5} "), style::value(th)),
-        Span::styled(format!("{vram:<13} "), style::value_secondary(th)),
-        Span::styled(format!("{clock:<12} "), style::value_secondary(th)),
-        Span::styled(throttle.to_string(), throttle_style),
+        Span::styled(format!("{i:<3}"), style::label(th)),
+        Span::styled(format!(" {name:<12}"), style::value_secondary(th)),
+        Span::styled(format!(" {power:>6}"), style::value(th)),
+        Span::styled(format!(" {util:>5}"), style::value(th)),
+        Span::styled(format!(" {avg_util:>5}"), style::value_secondary(th)),
+        Span::styled(format!(" {temp:>5}"), style::value(th)),
+        Span::styled(format!(" {avg_temp:>5}"), style::value_secondary(th)),
+        Span::styled(format!(" {max_temp:>5}"), style::value_warn(th)),
+        Span::styled(format!(" {vram:>8}"), style::value_secondary(th)),
+        Span::styled(format!(" {clock:>8}"), style::value_secondary(th)),
+        Span::styled(format!(" {throttle}"), throttle_style),
     ])
 }
 
 // ── Utilization + temperature over time ────────────────────────────────────
 
 /// The bottom row: the **utilization** (left) and **temperature** (right)
-/// 1 Hz bar charts.
+/// 1 Hz line charts — auto-scaled to the data's real range (a flat 90–95%
+/// signal shows its variation instead of sitting as a flat line at the top
+/// of a 0–100 axis).
 fn render_util_temp_row(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -391,7 +444,7 @@ fn render_util_temp_row(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Fr
 
 fn render_util_chart(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
     let block = theme::block(
-        theme::panel_title(th, "UTILIZATION OVER TIME (%)"),
+        theme::panel_title(th, "UTILIZATION OVER TIME (%) — auto-scaled"),
         style::border(th),
     );
     if area.width < 10 || area.height < 4 {
@@ -403,13 +456,13 @@ fn render_util_chart(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame
         vertical: 1,
     });
     let values: Vec<f64> = mon.history.iter().map(|s| s.util_pct).collect();
-    let lines = build_bar_chart(&values, inner.width, inner.height, "%", th);
+    let lines = build_line_chart(&values, inner.width, inner.height, "%", th);
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 fn render_temp_chart(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
     let block = theme::block(
-        theme::panel_title(th, "TEMPERATURE OVER TIME (°C)"),
+        theme::panel_title(th, "TEMPERATURE OVER TIME (°C) — auto-scaled"),
         style::border(th),
     );
     if area.width < 10 || area.height < 4 {
@@ -421,7 +474,7 @@ fn render_temp_chart(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame
         vertical: 1,
     });
     let values: Vec<f64> = mon.history.iter().map(|s| s.temp_c).collect();
-    let lines = build_bar_chart(&values, inner.width, inner.height, "°C", th);
+    let lines = build_line_chart(&values, inner.width, inner.height, "°C", th);
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
@@ -550,6 +603,240 @@ fn build_bar_chart(values: &[f64], w: u16, h: u16, unit: &str, th: Theme) -> Vec
         .collect()
 }
 
+// ── Generic auto-scaled line chart ─────────────────────────────────────────
+
+/// Auto-scale a y-axis to the data's *actual* range: `(min − pad, max +
+/// pad)` where `pad = range × padding` (at least 1.0 unit, so a flat
+/// signal never collapses to a zero-height axis).
+///
+/// This is the fix for the "flat line straight across" symptom: a signal
+/// that hovers in a narrow band (utilization 85–97%, temperature 62–74°C)
+/// renders against a scaled axis and its small variations become
+/// visible — instead of sitting as an invisible line at the top of a
+/// 0–100 scale.
+#[must_use]
+pub fn auto_scale_axis(values: &[f64], padding: f64) -> (f64, f64) {
+    if values.is_empty() {
+        return (0.0, 1.0);
+    }
+    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    let pad = (range * padding).max(1.0);
+    (min - pad, max + pad)
+}
+
+/// A "nice" x-axis time step (seconds) for a 1 Hz series spanning `span`
+/// seconds: the smallest of 1/2/5/10/15/30/60/120/300/600 that yields at
+/// most five labels.
+fn nice_time_step(span: f64) -> f64 {
+    for s in [1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0] {
+        if span / s <= 5.0 {
+            return s;
+        }
+    }
+    600.0
+}
+
+/// The x-axis time label for `t` seconds: whole minutes (`2m`) once a
+/// minute or more, else whole seconds (`45s`).
+fn format_time_label(t: f64) -> String {
+    if t >= 60.0 {
+        format!("{:.0}m", t / 60.0)
+    } else {
+        format!("{t:.0}s")
+    }
+}
+
+/// The **auto-scaled line chart** (the utilization / temperature graphs).
+///
+/// * the y-axis spans the data's *real* range (via [`auto_scale_axis`],
+///   15% padding) — labelled at the scaled max / mid / min;
+/// * subtle horizontal grid lines at the quarter marks (dim `·`);
+/// * the curve in the theme's **primary** color (cyan in Cyberpunk), with
+///   a very dim **area fill** (the theme's floor color) under it — the
+///   fill bridges the steps between columns, so the trace is connected;
+/// * a dashed **mean line** tagged `avg: …` (top-left of the plot);
+/// * a **peak marker** (▲) tagged `peak: …` (top-right);
+/// * an x-axis baseline with **time markers** (1 Hz samples: `0s`, `5s`,
+///   `2m`, `4m`, … at a "nice" step).
+///
+/// Pure over its inputs (unit-testable, no terminal). An empty series
+/// renders "Awaiting samples…".
+fn build_line_chart(values: &[f64], w: u16, h: u16, unit: &str, th: Theme) -> Vec<Line<'static>> {
+    const Y_AXIS_W: usize = 7;
+    let w = w as usize;
+    let h = h as usize;
+    if w < Y_AXIS_W + 8 || h < 4 {
+        return vec![Line::from("chart too small")];
+    }
+    if values.is_empty() {
+        return vec![Line::from(Span::styled(
+            "Awaiting samples…",
+            style::info(th),
+        ))];
+    }
+
+    let (min, max) = auto_scale_axis(values, 0.15);
+    let plot_w = w - Y_AXIS_W;
+    let plot_h = h - 1; // bottom row reserved for the x-axis
+
+    // Map a value to its grid row (0 = top of the plot, plot_h−1 = the
+    // baseline just above the x-axis).
+    let row = |v: f64| {
+        let ratio = ((v - min) / (max - min)).clamp(0.0, 1.0);
+        (plot_h - 1).saturating_sub((ratio * plot_h as f64).round() as usize)
+    };
+
+    let mut grid: Vec<Vec<(char, Option<Color>)>> = vec![vec![(' ', None); w]; h];
+
+    // Horizontal grid lines at the quarter marks (dim, every 2 columns —
+    // subtle enough not to fight the curve).
+    for frac in [0.25, 0.5, 0.75] {
+        let r = (frac * plot_h as f64).round() as usize;
+        if r < plot_h {
+            for c in (Y_AXIS_W..w).step_by(2) {
+                if grid[r][c].0 == ' ' {
+                    grid[r][c] = ('·', Some(th.dim()));
+                }
+            }
+        }
+    }
+
+    // The curve: one column per sample (right-aligned, newest at the right
+    // edge, like every other chart in the app). Each column carries a very
+    // dim area fill from the baseline up to the value, and the primary
+    // color (cyan) runs along the tops.
+    for col in 0..plot_w {
+        let idx = values.len().saturating_sub(plot_w - col);
+        if idx >= values.len() {
+            continue;
+        }
+        let top = row(values[idx]);
+        let grid_col = Y_AXIS_W + col;
+        if grid_col >= w {
+            continue;
+        }
+        for (r, row_cells) in grid.iter_mut().enumerate().take(plot_h).skip(top) {
+            row_cells[grid_col] = if r == top {
+                ('▓', Some(th.primary()))
+            } else {
+                ('░', Some(th.floor()))
+            };
+        }
+    }
+
+    // The mean line: dashed at the data's average, in the theme's tertiary
+    // color (deep blue in Cyberpunk).
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    for (i, cell) in grid[row(mean)][Y_AXIS_W..].iter_mut().enumerate() {
+        if cell.0 == ' ' && i % 2 == 1 {
+            *cell = ('┄', Some(th.tertiary()));
+        }
+    }
+
+    // The y-axis labels (scaled max / mid / min + unit), drawn before the
+    // tags so the gutter stays readable; one decimal for narrow ranges.
+    let decimals = if max - min < 10.0 { 1 } else { 0 };
+    let mut write_y = |r: usize, v: f64| {
+        if r >= h {
+            return;
+        }
+        let text = format!("{v:.prec$}{unit}", prec = decimals);
+        let start = Y_AXIS_W.saturating_sub(text.len());
+        for (i, ch) in text.chars().enumerate() {
+            let col = start + i;
+            if col < Y_AXIS_W {
+                grid[r][col] = (ch, Some(th.dim()));
+            }
+        }
+    };
+    write_y(0, max);
+    write_y(plot_h / 2, (min + max) / 2.0);
+    write_y(plot_h.saturating_sub(1), min);
+
+    // The avg / peak tags (top row of the plot).
+    let avg_tag = format!("avg: {mean:.1}{unit}");
+    for (i, ch) in avg_tag.chars().enumerate() {
+        let col = Y_AXIS_W + i;
+        if col < w {
+            grid[0][col] = (ch, Some(th.tertiary()));
+        }
+    }
+    let peak = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let peak_tag = format!("peak: {peak:.1}{unit}");
+    let tag_start = (w as i64 - peak_tag.len() as i64).max(Y_AXIS_W as i64) as usize;
+    for (i, ch) in peak_tag.chars().enumerate() {
+        let col = tag_start + i;
+        if col < w {
+            grid[0][col] = (ch, Some(th.accent()));
+        }
+    }
+
+    // The peak marker (▲, drawn last): one row above the highest sample's
+    // top cell (on the top row itself when the peak already reaches it).
+    // If that cell is occupied (e.g. by the `peak:` tag) it steps down
+    // until it finds a free cell (max 3 tries) — the marker then rides on
+    // the area fill, which reads fine.
+    if let Some(idx) = values.iter().rposition(|v| *v == peak) {
+        // Plot only when the peak falls in the visible window (the newest
+        // `plot_w` samples — older ones are not drawn, like the curve).
+        let offset = values.len() - idx; // 1..=values.len() (rposition)
+        if offset <= plot_w {
+            let col = Y_AXIS_W + plot_w - offset;
+            let mut marker_row = row(peak).max(1) - 1;
+            for _ in 0..3 {
+                if grid[marker_row][col].0 == ' ' {
+                    break;
+                }
+                if marker_row + 1 < plot_h {
+                    marker_row += 1;
+                }
+            }
+            grid[marker_row][col] = ('▲', Some(th.accent()));
+        }
+    }
+
+    // The x-axis: a baseline + time markers (1 Hz: sample index = seconds).
+    let span = (values.len() - 1).max(1) as f64;
+    for cell in &mut grid[h - 1][Y_AXIS_W..] {
+        *cell = ('─', Some(th.dim()));
+    }
+    grid[h - 1][Y_AXIS_W] = ('├', Some(th.dim()));
+    let step = nice_time_step(span);
+    let mut label_end: i64 = -1;
+    let mut t = 0.0;
+    while t <= span {
+        let center = Y_AXIS_W as i64 + ((t / span) * (plot_w as f64 - 1.0)).round() as i64;
+        let text = format_time_label(t);
+        let mut start = (center - text.len() as i64 / 2).max(Y_AXIS_W as i64);
+        start = start.min((w as i64) - (text.len() as i64));
+        if start > label_end {
+            for (i, ch) in text.chars().enumerate() {
+                let col = (start + i as i64) as usize;
+                if col < w {
+                    grid[h - 1][col] = (ch, Some(th.dim()));
+                }
+            }
+            label_end = start + text.len() as i64;
+        }
+        t += step;
+    }
+
+    grid.into_iter()
+        .map(|row| {
+            Line::from(
+                row.into_iter()
+                    .map(|(ch, c)| match c {
+                        Some(color) => Span::styled(ch.to_string(), Style::default().fg(color)),
+                        None => Span::raw(ch.to_string()),
+                    })
+                    .collect::<Vec<Span>>(),
+            )
+        })
+        .collect()
+}
+
 /// Format a power value in watts: `1,234 W` (thousands separator) or `N/A`
 /// for a non-positive reading.
 fn format_w(watts: f64) -> String {
@@ -657,13 +944,18 @@ mod tests {
             },
         ];
         mon.gpu_names = vec!["NVIDIA A4000".into(), "NVIDIA A4000".into()];
-        // A small power history (a few seconds of the run).
+        // Whole-run per-GPU statistics (the table's AvgU/AvgT/MaxT columns).
+        mon.avg_util_per_gpu = vec![91.0, 88.0];
+        mon.avg_temp_per_gpu = vec![64.0, 62.0];
+        mon.max_temp_per_gpu = vec![72, 70];
+        // A small power history (a few seconds of the run) with a narrow,
+        // *varying* band — the test data for the auto-scaled line charts.
         for i in 0..10 {
             mon.history.push(crate::hw::PowerSample {
                 t: crate::timing::MonotonicInstant::now(),
                 power_w: 1000.0 + (i as f64) * 20.0,
-                util_pct: 90.0,
-                temp_c: 70.0,
+                util_pct: 85.0 + (i as f64) * 1.2, // 85 → 95.8
+                temp_c: 62.0 + (i as f64) * 1.1,   // 62 → 71.9
                 vram_gb: 32.0,
             });
         }
@@ -671,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn view6_renders_system_power_and_per_gpu() {
+    fn view4_renders_system_power_and_per_gpu() {
         let mut app = app_with_monitor(sample_monitor());
         app.view = crate::ui::app::View::Gpu;
         let text = render_text(&app, 120, 40);
@@ -680,10 +972,28 @@ mod tests {
         assert!(text.contains("PER-GPU"), "per-GPU table: {text}");
         assert!(text.contains("A4000"), "GPU name: {text}");
         assert!(text.contains("thermal"), "throttle reason: {text}");
+        // The whole-run per-GPU columns.
+        assert!(text.contains("AvgU"), "avg util column: {text}");
+        assert!(text.contains("AvgT"), "avg temp column: {text}");
+        assert!(text.contains("MaxT"), "max temp column: {text}");
+        assert!(text.contains("72°C"), "peak temp value: {text}");
     }
 
     #[test]
-    fn view6_renders_efficiency_and_graphs() {
+    fn view4_table_shows_run_averages_and_peak() {
+        let mut app = app_with_monitor(sample_monitor());
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("91%"), "avg util 91%: {text}");
+        assert!(text.contains("88%"), "avg util 88%: {text}");
+        assert!(text.contains("64°C"), "avg temp 64°C: {text}");
+        assert!(text.contains("62°C"), "avg temp 62°C: {text}");
+        // The legend explains the run-average columns.
+        assert!(text.contains("run average"), "legend: {text}");
+    }
+
+    #[test]
+    fn view4_renders_efficiency_and_graphs() {
         let mut app = app_with_monitor(sample_monitor());
         app.view = crate::ui::app::View::Gpu;
         let text = render_text(&app, 120, 40);
@@ -691,10 +1001,13 @@ mod tests {
         assert!(text.contains("POWER OVER TIME"), "power graph: {text}");
         assert!(text.contains("UTILIZATION OVER TIME"), "util graph: {text}");
         assert!(text.contains("TEMPERATURE OVER TIME"), "temp graph: {text}");
+        // The line charts carry their avg / peak tags and the scaled axis.
+        assert!(text.contains("avg:"), "mean tag: {text}");
+        assert!(text.contains("peak:"), "peak tag: {text}");
     }
 
     #[test]
-    fn view6_no_gpu_shows_the_placeholder() {
+    fn view4_no_gpu_shows_the_placeholder() {
         // A monitor is present but empty (no GPUs) → the per-GPU table shows
         // its "awaiting samples" state, and the panel still renders.
         let mut app = App::new();
@@ -702,6 +1015,72 @@ mod tests {
         // No gpu_monitor set → the "no GPU telemetry" placeholder.
         let text = render_text(&app, 120, 40);
         assert!(text.contains("No GPU telemetry"), "placeholder: {text}");
+    }
+
+    // ── auto-scaled line chart ─────────────────────────────────────────────
+
+    #[test]
+    fn auto_scale_axis_pads_a_narrow_band() {
+        let vals: Vec<f64> = (0..12).map(|i| 85.0 + i as f64).collect(); // 85…96
+        let (min, max) = auto_scale_axis(&vals, 0.1);
+        // range 11 → pad 1.1: (83.9, 97.1)
+        assert!((min - 83.9).abs() < 1e-9, "min: {min}");
+        assert!((max - 97.1).abs() < 1e-9, "max: {max}");
+    }
+
+    #[test]
+    fn auto_scale_axis_flat_signal_gets_one_unit_of_padding() {
+        // A perfectly flat signal (the "flat line" case) still gets a
+        // visible 2-unit-tall axis.
+        let (min, max) = auto_scale_axis(&[90.0, 90.0, 90.0], 0.1);
+        assert!((min - 89.0).abs() < 1e-9);
+        assert!((max - 91.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn auto_scale_axis_empty_falls_back_to_a_unit_range() {
+        assert_eq!(auto_scale_axis(&[], 0.1), (0.0, 1.0));
+    }
+
+    #[test]
+    fn build_line_chart_empty_shows_awaiting() {
+        let lines = build_line_chart(&[], 40, 10, "%", Theme::Cyberpunk);
+        assert!(lines[0].to_string().contains("Awaiting"));
+    }
+
+    #[test]
+    fn build_line_chart_shows_scaled_axis_mean_and_peak() {
+        // A narrow band (85 → 96): the axis must span *that* band (with
+        // padding) — not 0–100 — and the mean / peak tags must appear.
+        let vals: Vec<f64> = (0..12).map(|i| 85.0 + i as f64).collect();
+        let lines = build_line_chart(&vals, 60, 12, "%", Theme::Cyberpunk);
+        let joined: String = lines.iter().map(|l| l.to_string()).collect();
+        // The scaled y-axis labels — 15% padding on the 85…96 band gives
+        // (83.35, 97.65) → "98%" / "90%" / "83%": the axis spans the
+        // data's real band, never 0–100.
+        assert!(joined.contains("98%"), "scaled max label: {joined}");
+        assert!(joined.contains("90%"), "scaled mid label: {joined}");
+        assert!(joined.contains("83%"), "scaled min label: {joined}");
+        // The mean + peak tags.
+        assert!(joined.contains("avg: 90.5%"), "mean tag: {joined}");
+        assert!(joined.contains("peak: 96.0%"), "peak tag: {joined}");
+        // The curve (primary line + floor area fill) and the peak marker.
+        assert!(joined.contains('▓'), "line present: {joined}");
+        assert!(joined.contains('░'), "area fill present: {joined}");
+        assert!(joined.contains('▲'), "peak marker present: {joined}");
+    }
+
+    #[test]
+    fn build_line_chart_labels_the_time_axis_in_minutes() {
+        // 15 minutes of 1 Hz samples: the x-axis steps to whole minutes
+        // (0s / 5m / 10m / 15m — ≤ 5 labels).
+        let vals: Vec<f64> = (0..901).map(|i| 90.0 + (i % 7) as f64).collect();
+        let lines = build_line_chart(&vals, 60, 12, "%", Theme::Cyberpunk);
+        let joined: String = lines.iter().map(|l| l.to_string()).collect();
+        assert!(joined.contains("0s"), "start label: {joined}");
+        assert!(joined.contains("5m"), "minute label: {joined}");
+        assert!(joined.contains("10m"), "minute label: {joined}");
+        assert!(joined.contains("15m"), "end label: {joined}");
     }
 
     #[test]

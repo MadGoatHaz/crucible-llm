@@ -1,14 +1,15 @@
 //! `App` state machine: the `View` enum (`Live`, `Concurrency`, `Needle`,
-//! `History`, `Config`) and key handling (blueprint §6 footer: `1`-`5` switch
-//! views, `Space` pause/resume, `+` step concurrency, `n` new needle,
-//! `e` export, `q` quit — with a `[y/N]` confirmation overlay).
+//! `Gpu`, `History`, `Config`) and key handling (blueprint §6 footer:
+//! `1`-`6` switch views, `Space` pause/resume, `+` step concurrency,
+//! `n` new needle, `e` export, `q` quit — with a `[y/N]` confirmation
+//! overlay).
 //!
 //! **State-aware key guards** (the TUI interaction audit): a benchmark
 //! is a *server-load* event, so while a `BenchmarkSequence` (or any
 //! standalone engine run) is in progress the keys that would add load —
 //! `n` (NIAH matrix), `+` (concurrency step), `c` (setup takeover, whose
 //! URL stage fires an HTTP discovery) — are locked and log why. The
-//! always-available keys are view switching (`1`-`5`), `Space`
+//! always-available keys are view switching (`1`-`6`), `Space`
 //! (pause/resume: the shared [`RunPause`] gate holds each engine before
 //! its next request, in-flight streams complete, resume continues where
 //! it left off), `e` (local file export), and `q` (quit — the *only* quit
@@ -67,12 +68,12 @@ pub enum View {
     Concurrency,
     /// View 3 — Needle-in-a-Haystack matrix.
     Needle,
-    /// View 4 — Historical Comparison & Diff.
-    History,
-    /// View 5 — Configuration.
-    Config,
-    /// View 6 — GPU & Power Monitor (the dedicated hardware / energy panel).
+    /// View 4 — GPU & Power Monitor (the dedicated hardware / energy panel).
     Gpu,
+    /// View 5 — Historical Comparison & Diff.
+    History,
+    /// View 6 — Configuration.
+    Config,
 }
 
 impl View {
@@ -81,9 +82,9 @@ impl View {
         View::Live,
         View::Concurrency,
         View::Needle,
+        View::Gpu,
         View::History,
         View::Config,
-        View::Gpu,
     ];
 
     /// 0-based index (position in the tab bar).
@@ -92,9 +93,9 @@ impl View {
             View::Live => 0,
             View::Concurrency => 1,
             View::Needle => 2,
-            View::History => 3,
-            View::Config => 4,
-            View::Gpu => 5,
+            View::Gpu => 3,
+            View::History => 4,
+            View::Config => 5,
         }
     }
 
@@ -110,30 +111,30 @@ impl View {
         }
     }
 
-    /// Map a digit (`1`..=`6`) to a view.
+    /// Map a digit (`1`..=`6`) to a view (the tab-bar order).
     pub fn from_digit(d: u8) -> Option<View> {
         match d {
             1 => Some(View::Live),
             2 => Some(View::Concurrency),
             3 => Some(View::Needle),
-            4 => Some(View::History),
-            5 => Some(View::Config),
-            6 => Some(View::Gpu),
+            4 => Some(View::Gpu),
+            5 => Some(View::History),
+            6 => Some(View::Config),
             _ => None,
         }
     }
 }
 
 /// The TUI phase: the pre-dashboard **Setup** takeover, or the
-/// five-view dashboard itself.
+/// six-view dashboard itself.
 ///
-/// Setup is *not* a sixth tab: it is a full-screen flow (URL → model
+/// Setup is *not* a seventh tab: it is a full-screen flow (URL → model
 /// discovery/selection → benchmark config → launch) that occupies the
 /// whole frame with its own top bar and footer. `App::new()` starts in
 /// [`Phase::Dashboard`] (the previous behavior); the entry point moves it
 /// to [`Phase::Setup`] when the target (URL + model) was not given
 /// explicitly, and the `c` key re-opens Setup from any dashboard view
-/// (except View 5, where `c` is a typeable character).
+/// (except View 6, where `c` is a typeable character).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Phase {
     /// The first-run theme picker (full-screen takeover, shown before
@@ -141,8 +142,8 @@ pub enum Phase {
     ThemePicker,
     /// The interactive setup flow (full-screen takeover).
     Setup,
-    /// The five-view dashboard (Live / Concurrency / Needle / History /
-    /// Config).
+    /// The six-view dashboard (Live / Concurrency / Needle / GPU / History
+    /// / Config).
     #[default]
     Dashboard,
 }
@@ -228,7 +229,7 @@ pub struct App {
     pub structured_slot: Arc<ResultSlot<StructuredResult>>,
     /// Lock-free Engine F (Flat Out) result holder.
     pub flatout_slot: Arc<ResultSlot<crate::engines::flatout::FlatOutResult>>,
-    /// The editable Configuration form (View 5, Chunk 18). Seeded from the
+    /// The editable Configuration form (View 6, Chunk 18). Seeded from the
     /// resolved [`Config`]; edited on the key path; `F2` persists it and
     /// `F5`/`r` runs the selected engines from it.
     pub config: ConfigState,
@@ -387,7 +388,7 @@ impl App {
         self
     }
 
-    /// Seed the editable Configuration form (View 5, Chunk 18) from the
+    /// Seed the editable Configuration form (View 6, Chunk 18) from the
     /// resolved [`Config`]. The form is the TUI's edit surface over the
     /// same config the headless/export paths consume; `F2` persists it and
     /// `F5`/`r` run the selected engines from it. Also refreshes the NIAH
@@ -659,7 +660,7 @@ impl App {
         // this one finishes (below) so the numbers stop drifting.
         self.metrics.unfreeze();
         // Chunk 18: the `n` key runs against the *current* Configuration
-        // form, so edits made in View 5 apply immediately.
+        // form, so edits made in View 6 apply immediately.
         let config = NiahEngineConfig::from_config(&self.config.to_config());
         let engine = match config.engine() {
             Ok(e) => e,
@@ -690,6 +691,7 @@ impl App {
         let logger = self.logger.clone();
         let engine = engine.pause(self.pause.clone()).logger(logger.clone());
         let metrics = self.metrics.clone();
+        let hw = self.hw.clone();
         tokio::spawn(async move {
             logger.info(
                 Context::EngineC1,
@@ -704,6 +706,13 @@ impl App {
             // FIX 2: the run is over — freeze the metrics pipeline (the
             // hardware poller goes idle; the UI shows final numbers).
             metrics.freeze();
+            // Close the GPU monitor's load window too: the duration freezes
+            // at its final value (a standalone run is a run).
+            if let Some(p) = &hw {
+                if let Ok(mut poller) = p.lock() {
+                    poller.end_load();
+                }
+            }
         });
     }
 
@@ -730,7 +739,7 @@ impl App {
             );
             return;
         }
-        // The form (View 5 / the setup flow) is the source of the target
+        // The form (View 6 / the setup flow) is the source of the target
         // URL and API key, so edits apply immediately.
         let cfg = self.config.to_config();
         let url = cfg.url.clone();
@@ -826,7 +835,7 @@ impl App {
         let cfg = self.config.to_config();
         if cfg.engines.is_empty() {
             self.push_log(
-                "[seq] no engines selected — enable some in the Config view (View 5)".to_string(),
+                "[seq] no engines selected — enable some in the Config view (View 6)".to_string(),
                 style::value_warn(th),
             );
             return;
@@ -1031,7 +1040,7 @@ impl App {
         // Setup stage 1 routes it to the confirmation above).
 
         // `c` — re-open the interactive Setup takeover. Scoped away from
-        // View 5, where `c` is a typeable character in a field. Locked
+        // View 6, where `c` is a typeable character in a field. Locked
         // while a benchmark sequence runs: the takeover's URL stage
         // fires an HTTP discovery request, which must not land on the
         // endpoint mid-benchmark.
@@ -1051,11 +1060,11 @@ impl App {
 
         // Config view (Chunk 18 + FIX 4): the view has an **edit gate**.
         // On entry it is [`ConfigMode::Viewing`] — a read-only "press
-        // Enter to edit" screen. The number keys `1`–`4` *always* switch
+        // Enter to edit" screen. The number keys `1`–`6` *always* switch
         // views (they are never captured by field editing), `Esc` leaves
         // the config, and `q` quits (handled above) — so the user can
         // never get stuck. Only after `Enter` does [`ConfigMode::Editing`]
-        // make the fields live (there `Esc` / `1`–`4` save and exit).
+        // make the fields live (there `Esc` / `1`–`6` save and exit).
         if self.view == View::Config {
             // PageDown / PageUp cycle to the neighbouring view (always
             // available, even at the gate) and reset to the read-only gate.
@@ -1077,7 +1086,7 @@ impl App {
                 // ── The gate (read-only). ──
                 ConfigMode::Viewing => match key.code {
                     // `1`–`6` always switch views (never typed into a field);
-                    // `5` is the Config view itself (stays at the gate).
+                    // `6` is the Config view itself (stays at the gate).
                     KeyCode::Char(c @ '1'..='6') => {
                         if let Some(d) = c.to_digit(10) {
                             if let Some(view) = View::from_digit(d as u8) {
@@ -1134,7 +1143,7 @@ impl App {
                 },
                 // ── Editing (the fields are live). ──
                 ConfigMode::Editing => {
-                    // `Esc`: save and return to the gate (stay on tab 5).
+                    // `Esc`: save and return to the gate (stay on tab 6).
                     if key.code == KeyCode::Esc {
                         let _ = self.config.save();
                         self.config.edit_mode = ConfigMode::Viewing;
@@ -1175,9 +1184,8 @@ impl App {
         // History view (Chunk 14 + rewrite): full keyboard navigation.
         // Scoped to the History view; the `c` key is consumed here (not
         // routed to the Setup takeover) and `Esc` returns to the List.
-        // History view (Chunk 14 + rewrite): full keyboard navigation.
         // Only the specific History keys are consumed here; all other
-        // keys (digit 1-5, Space, etc.) fall through to the general
+        // keys (digit 1-6, Space, etc.) fall through to the general
         // handler so view switching and quit always work.
         if self.view == View::History {
             if let Some(h) = self.history.as_mut() {
@@ -1507,7 +1515,7 @@ impl App {
 
     /// Draw the full frame.
     ///
-    /// The Setup phase is a **full-screen takeover** (not one of the five
+    /// The Setup phase is a **full-screen takeover** (not one of the six
     /// tabs): it draws its own top bar, centered panel, and key-hint
     /// footer across the entire frame. The dashboard keeps the classic
     /// status bar / tab bar / view / footer layout.
@@ -1693,10 +1701,10 @@ impl App {
     /// terminal). A single clean line:
     ///
     /// ```text
-    /// [1]Live [2]Conc [3]NIAH [4]Hist [5]Cfg │ ● Connected │ Engine B: Step 5/9 │ [Space]Pause [q]Quit
+    /// [1]Live [2]Conc [3]NIAH [4]GPU [5]Hist [6]Cfg │ ● Connected │ Engine B: Step 5/9 │ [Space]Pause [q]Quit
     /// ```
     ///
-    /// * the five view tabs — the current view in **accent** (bold), the
+    /// * the six view tabs — the current view in **accent** (bold), the
     ///   rest dim;
     /// * a connection-status dot (green `● Connected`, red `● Disconnected`);
     /// * the running engine's status (`Engine B: Step 5/9`) — shown only
@@ -1743,8 +1751,8 @@ impl App {
         ])
     }
 
-    /// The five view tabs: `[1]Live [2]Conc [3]NIAH [4]Hist [5]Cfg` — the
-    /// current view in **accent** (bold), the rest dim.
+    /// The six view tabs: `[1]Live [2]Conc [3]NIAH [4]GPU [5]Hist [6]Cfg` —
+    /// the current view in **accent** (bold), the rest dim.
     fn footer_view_tabs(&self) -> Vec<Span<'static>> {
         let th = self.active_theme;
         View::ALL
@@ -2626,8 +2634,9 @@ mod tests {
                 ('1', View::Live),
                 ('2', View::Concurrency),
                 ('3', View::Needle),
-                ('4', View::History),
-                ('5', View::Config),
+                ('4', View::Gpu),
+                ('5', View::History),
+                ('6', View::Config),
             ] {
                 app.handle_key(&char_key(digit));
                 assert_eq!(app.view, expected, "from {view:?}, {digit} → {expected:?}");
@@ -2649,6 +2658,8 @@ mod tests {
         app.handle_key(&char_key('2'));
         assert_eq!(app.view, View::Concurrency, "mid-run view switch works");
         app.handle_key(&char_key('4'));
+        assert_eq!(app.view, View::Gpu);
+        app.handle_key(&char_key('5'));
         assert_eq!(app.view, View::History);
         app.handle_key(&char_key('1'));
         assert_eq!(app.view, View::Live);
@@ -2699,9 +2710,9 @@ mod tests {
             "1 types into the field (not switch)"
         );
         assert_eq!(app.config.ladder, "81");
-        // Esc saves and returns to the gate (stay on tab 5).
+        // Esc saves and returns to the gate (stay on tab 6).
         app.handle_key(&key(KeyCode::Esc));
-        assert_eq!(app.view, View::Config, "Esc stays on tab 5");
+        assert_eq!(app.view, View::Config, "Esc stays on tab 6");
         assert_eq!(
             app.config.edit_mode,
             ConfigMode::Viewing,
@@ -2739,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn config_esc_in_editing_saves_and_stays_on_tab5() {
+    fn config_esc_in_editing_saves_and_stays_on_tab6() {
         let mut app = App::new();
         app.view = View::Config;
         app.config.edit_mode = ConfigMode::Editing;
@@ -2748,7 +2759,7 @@ mod tests {
         app.config.config_path =
             std::env::temp_dir().join(format!("crucible-esc-{}.json", std::process::id()));
         app.handle_key(&key(KeyCode::Esc));
-        assert_eq!(app.view, View::Config, "Esc stays on tab 5");
+        assert_eq!(app.view, View::Config, "Esc stays on tab 6");
         assert_eq!(
             app.config.edit_mode,
             ConfigMode::Viewing,
@@ -2784,9 +2795,11 @@ mod tests {
     fn footer_is_idle_when_nothing_runs() {
         let app = App::new();
         let t = line_text(&app.footer_line());
-        // All five view tabs, the connection dot, and the idle action keys.
+        // All six view tabs, the connection dot, and the idle action keys.
         assert!(t.contains("[1]Live"), "{t}");
-        assert!(t.contains("[5]Cfg"), "{t}");
+        assert!(t.contains("[4]GPU"), "{t}");
+        assert!(t.contains("[5]Hist"), "{t}");
+        assert!(t.contains("[6]Cfg"), "{t}");
         assert!(t.contains("●"), "connection dot present: {t}");
         assert!(t.contains("[R]Run"), "idle shows the run key: {t}");
         assert!(t.contains("[q]Quit"), "{t}");

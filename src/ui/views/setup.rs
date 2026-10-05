@@ -1,5 +1,5 @@
 //! The interactive Setup phase — a **full-screen takeover** shown before the
-//! five-view dashboard (plan: "TUI Setup phase").
+//! six-view dashboard (plan: "TUI Setup phase").
 //!
 //! Four stages guide a first-time user from "bare `crucible-llm`" to a
 //! running benchmark:
@@ -488,7 +488,7 @@ impl SetupState {
                 self.form_field = self.form_field.saturating_sub(1);
                 SetupKeyResult::Inert
             }
-            // `Space` toggles booleans / cycles the mode (matches View 5).
+            // `Space` toggles booleans / cycles the mode (matches View 6).
             KeyCode::Char(' ') => {
                 self.form_toggle(cfg);
                 SetupKeyResult::Inert

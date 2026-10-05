@@ -625,7 +625,7 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>
         runtime.block_on(async {
             let mut event_loop = EventLoop::new()?;
             // Chunk 18: the App is seeded with the full resolved config —
-            // the editable Configuration form (View 5) and the engine
+            // the editable Configuration form (View 6) and the engine
             // selection all draw from the same `Config` the headless and
             // export paths use.
             let mut app = App::new()

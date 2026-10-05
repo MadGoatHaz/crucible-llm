@@ -1,4 +1,4 @@
-//! View 5 — Configuration (blueprint §6 / plan Chunk 18): an *editable*
+//! View 6 — Configuration (blueprint §6 / plan Chunk 18): an *editable*
 //! form for the target URL, model, mode, tokens, iterations, timeout,
 //! API key, tokenizer path, cache-bypass, concurrency ladder, the hardware
 //! (Engine D) toggle, and the per-engine enable switches (A/B/C1/C2/C3).
@@ -222,7 +222,7 @@ impl Field {
 ///   (save) and `F5` (run → Live) are live; every other key is ignored, so
 ///   the view can never capture the number keys and trap the user.
 /// * [`Editing`] — the form is editable. `Esc` saves and returns to the
-///   gate (stay on tab 5); `q` always quits; all other keys (characters
+///   gate (stay on tab 6); `q` always quits; all other keys (characters
 ///   including `1`–`9`/`0`, Tab, arrows, `F2`, `F5`) edit the focused
 ///   field. `F5` launches the run and switches to Live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -243,7 +243,7 @@ pub enum ConfigKeyResult {
     Run,
 }
 
-/// The editable Configuration form (View 5).
+/// The editable Configuration form (View 6).
 ///
 /// Seeded from a resolved [`Config`] via [`from_config`]; edited in place by
 /// the key path; turned back into a [`Config`] via [`to_config`] (for runs)

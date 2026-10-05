@@ -87,7 +87,7 @@ impl GpuBackend for NvmlBackend {
     }
 
     /// One [`GpuSample`] **per visible device** (the multi-GPU source for
-    /// View 6's per-GPU table). Each device is read independently with
+    /// View 4's per-GPU table). Each device is read independently with
     /// per-field degradation (a reading the driver cannot provide is `None`
     /// for that field only); a lost device is skipped entirely.
     fn poll_all(&self) -> Vec<GpuSample> {

@@ -1,4 +1,4 @@
-//! The five dashboard views (blueprint §6) plus the pre-dashboard
+//! The six dashboard views (blueprint §6) plus the pre-dashboard
 //! **Setup** phase (a full-screen takeover, not a tab).
 //!
 //! Each view is a pure function of `&App` state: it renders into `area`
