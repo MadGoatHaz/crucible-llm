@@ -176,6 +176,16 @@ Shows comprehensive hardware telemetry during and after benchmark runs:
 
 Set your electricity rate ($/kWh) in Config (tab 6) for accurate cost estimates.
 
+### Cost Analysis
+
+The GPU & Power tab shows your local inference cost in the industry-standard format: **$ per 1M tokens**, split into input and output — directly comparable to cloud API pricing.
+
+- **Input cost**: Energy during the prefill phase ÷ prompt tokens
+- **Output cost**: Energy during the decode phase ÷ completion tokens
+- **Your rate**: Set your electricity cost ($/kWh) in Config [6]. Default: $0.16.
+
+Example: If your server shows $0.03/1M input and $0.13/1M output, you can directly compare that to GPT-4o ($2.50/$10.00) or Claude ($3.00/$15.00).
+
 ## Headless / CLI Mode
 
 For scripting, CI/CD, or when you don't want a TUI:

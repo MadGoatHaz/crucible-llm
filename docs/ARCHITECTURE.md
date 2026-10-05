@@ -496,6 +496,14 @@ where `Δt(i)` is the time between consecutive samples. This yields:
 - **Energy (kWh)** = joules / 3,600,000
 - **Cost** = kWh × `rate_per_kwh` (user-configurable, default $0.15)
 
+### Cost Calculation
+
+Energy cost is calculated by separating prefill and decode phases:
+- Prefill energy = avg_power(T0→T_first_token) × TTFT_duration
+- Decode energy = avg_power(T_first→T_last) × decode_duration
+- $/1M input = (prefill_kWh × $/kWh) / (prompt_tokens / 1M)
+- $/1M output = (decode_kWh × $/kWh) / (completion_tokens / 1M)
+
 ### Multi-GPU Support
 
 The `GpuBackend::poll()` path returns one `GpuSample` per device (NVML's `nvmlDeviceGetCount` + per-device reads; sysfs enumerates all `card*` directories; Level Zero queries all Sysman devices). The monitor stores:

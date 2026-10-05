@@ -53,6 +53,8 @@ A new tab that puts the entire power and energy picture on one screen:
 - **Energy & cost** — kWh consumed + estimated $ cost (set your rate in Config)
 - **Efficiency** — J/token, tokens/watt, $/1M tokens
 - **Peak tracking** — max power and max temp across the entire run
+- **Multi-GPU** — every card (NVIDIA, AMD, Intel) detected and shown, no name truncation
+- **$/1M token cost** — input (prefill) and output (decode) costs split separately, directly comparable to cloud API pricing
 
 Point it at your 8× A4000 box and watch every card in real-time.
 
@@ -114,7 +116,7 @@ https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1
 
 | Version | Date | Highlights |
 |---------|------|-----------|
-| **0.1.3** | 2026-10-05 | GPU & Power Monitor (View 4): multi-GPU table, auto-scaled graphs, per-GPU avg/max stats, power-over-time, energy (kWh), cost estimation, efficiency metrics, tab reorder |
+| **0.1.3** | 2026-10-05 | GPU & Power Monitor (View 4): multi-GPU table, auto-scaled graphs, per-GPU avg/max stats, power-over-time, energy (kWh), cost estimation, efficiency metrics, tab reorder + $/1M token cost, multi-GPU |
 | **0.1.2** | 2026-10-04 | Multi-vendor GPU monitoring (NVIDIA/AMD/Intel), auto-detection, NVIDIA default, full TUI hardware panel, J/token |
 | **0.1.1** | 2026-10-03 | 3 themes, Flat Out engine, accurate token counting, multi-backend support, 30 t/s sweet spot, methodology transparency, loop guard, history view |
 | **0.1.0** | 2026-10-01 | Initial release. 6 engines, TUI, headless CLI, SQLite history, export, concurrency sweep |

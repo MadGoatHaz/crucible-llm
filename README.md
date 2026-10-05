@@ -61,6 +61,8 @@ By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enable
 - Energy efficiency: Joules per token
 - Full TUI panel (shown only when GPU is active)
 - **Dedicated GPU & Power tab** — multi-GPU table, power-over-time graphs, energy (kWh), cost estimation, efficiency metrics (J/token, $/1M tokens)
+- **$/1M token cost** — compare your local server's energy cost directly to cloud API pricing (input and output separately)
+- **Multi-GPU** — all cards detected and displayed (NVIDIA, AMD, Intel)
 
 ### TUI Interface
 
