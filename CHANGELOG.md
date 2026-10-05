@@ -19,8 +19,8 @@ All notable changes to Crucible LLM.
 - **Duration anchored to test start** — no longer counts from app launch.
 - **Full GPU names** — no truncation in per-GPU table.
 - **CPU power monitoring** — Intel RAPL, AMD Super I/O, or estimated fallback. Total system draw (GPU + CPU) now included in energy and cost calculations.
-- **NVML power plausibility clamp** — anomalous readings (>2× TDP) are detected, logged, and capped. Prevents impossible values like 943W on a 300W card.
-- **All-vendor power ceiling** — 5000W global cap on all GPU backends as a safety net.
+- **NVML power plausibility clamp** — anomalous readings (>2× TDP) are detected, logged, and capped. The TDP reference is the card's *default* power-management limit (factory TDP, not user-settable), falling back to the current limit — so the clamp engages even when the current-limit query fails. Prevents impossible values like 974W on a 200W A4000 from inflating the $/1M cost.
+- **All-vendor power ceiling** — 1000W global cap on all GPU backends as a last-resort safety net (no single GPU draws more).
 - **System power display** — GPU tab now shows "System: X W (GPU Y + CPU Z)" for true total draw.
 
 ### Changed

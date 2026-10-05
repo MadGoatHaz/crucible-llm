@@ -115,11 +115,23 @@ impl GpuBackend for NvmlBackend {
                 .map(|mi| (mi.used, mi.total))
                 .unwrap_or((0, 0));
             // Power: NVML reports *milliwatts* (mW / 1000 = W) — the units
-            // are correct. The TDP (power-management limit, also mW) drives
-            // the plausibility clamp: a reading > 2× the TDP (e.g. the 943 W
-            // on a single 300 W A4000) is flagged and capped at 1.5× the TDP.
+            // are correct. The TDP drives the plausibility clamp: a reading
+            // > 2× the TDP (e.g. the 943 W on a single 200 W A4000) is
+            // flagged and capped at 1.5× the TDP.
+            //
+            // The TDP reference is the **default** power-management limit
+            // (the card's factory TDP — not user-settable). We fall back to
+            // the *current* limit only if the default query is unsupported.
+            // Relying on the current limit alone is the bug this fixes:
+            // `nvidia-smi -pl` can raise it (defeating the clamp), and on
+            // some hosts the current-limit query fails outright (returns
+            // `None`), which disabled the clamp and let a phantom reading
+            // (the 974 W peak on this A4000) flow into the `$/1M` cost math
+            // ~10× too high. The default limit is a static property of the
+            // card, so it is available even when the current one is not.
             let tdp_w = device
-                .power_management_limit()
+                .power_management_limit_default()
+                .or_else(|_| device.power_management_limit())
                 .ok()
                 .map(|mw| mw as f64 / 1000.0);
             let power_watts = device.power_usage().ok().and_then(|mw| {
@@ -170,16 +182,18 @@ impl GpuBackend for NvmlBackend {
 }
 
 /// Plausibility-clamp an NVML power reading (watts) against the card's
-/// power-management limit (TDP, watts) and the global ceiling.
+/// TDP (watts) and the global ceiling.
 ///
-/// NVML's `power_usage()` **and** `power_management_limit()` both return
-/// *milliwatts*; the caller converts to watts before calling this. A reading
-/// **> 2× the TDP** is a unit/scale bug or a phantom spike — the canonical
-/// case is the **943 W reported on a single 300 W A4000** (3.14× its TDP,
-/// physically impossible). It is flagged with a `[WARN]` (once per anomaly
-/// episode, via the `warned` latch) and **capped at 1.5× the TDP**
-/// (transient spikes are possible, 3× is not). When no TDP is available
-/// (the limit query is unsupported on some hosts) the global
+/// NVML's `power_usage()`, `power_management_limit_default()` **and**
+/// `power_management_limit()` all return *milliwatts*; the caller converts
+/// to watts before calling this. The TDP reference is the **default**
+/// power-management limit (the factory TDP, not user-settable), falling back
+/// to the current limit. A reading **> 2× the TDP** is a unit/scale bug or a
+/// phantom spike — the canonical case is the **943 W reported on a single
+/// 200 W A4000** (4.7× its TDP, physically impossible). It is flagged with a
+/// `[WARN]` (once per anomaly episode, via the `warned` latch) and **capped
+/// at 1.5× the TDP** (transient spikes are possible, 3× is not). When no TDP
+/// is available (both limit queries unsupported on some hosts) the global
 /// [`MAX_GPU_POWER_W`] ceiling stands in.
 #[must_use]
 fn clamp_nvml_power(
@@ -243,6 +257,25 @@ mod tests {
         // would fire), the value is still capped.
         let out2 = clamp_nvml_power(943.0, Some(300.0), 0, &mut warned);
         assert_eq!(out2, Some(450.0));
+    }
+
+    /// The A4000 phantom from `work/testing/latest.log` (Engine D "peak 974
+    /// W" on a single 200 W-TDP card): 974 > 2×200 = 400 → flagged and
+    /// capped at 1.5×200 = 300 W. This is the reading that, when the TDP
+    /// reference was the *current* limit (which fails on some hosts →
+    /// `None`), slipped past the clamp through the 5 000 W global cap and
+    /// inflated the `$/1M` output cost ~10×. With the TDP now sourced from
+    /// the *default* limit, the clamp engages and caps it.
+    #[test]
+    fn nvml_clamp_caps_the_a4000_phantom_reading() {
+        let mut warned = false;
+        let out = clamp_nvml_power(974.0, Some(200.0), 0, &mut warned);
+        assert_eq!(
+            out,
+            Some(300.0),
+            "974 W on a 200 W TDP is capped at 1.5× = 300 W"
+        );
+        assert!(warned, "the anomaly was flagged");
     }
 
     /// A normal (sub-2×TDP) reading passes through untouched and resets the

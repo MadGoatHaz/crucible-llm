@@ -70,11 +70,13 @@ use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamStatus};
 use crate::timing::MonotonicInstant;
 
 /// A global plausibility ceiling for a *single* GPU's power draw (watts). No
-/// consumer or datacenter GPU draws 5 kW; a reading above it is a unit /
-/// scale bug (e.g. microwatts treated as watts) or a phantom sensor. Applied
-/// in every GPU backend (NVML uses a tighter, TDP-based bound; the sysfs and
-/// Level Zero backends use this global ceiling).
-pub const MAX_GPU_POWER_W: f64 = 5000.0;
+/// single consumer or datacenter GPU draws more than ~1 kW (the most
+/// power-hungry cards, e.g. an NVIDIA B200 SXM, top out near 1 000 W); a
+/// reading above it is a unit / scale bug (e.g. milliwatts treated as watts)
+/// or a phantom sensor. Applied in every GPU backend (NVML uses a tighter,
+/// TDP-based bound; the sysfs and Level Zero backends use this global
+/// ceiling as their last-resort guard).
+pub const MAX_GPU_POWER_W: f64 = 1000.0;
 
 /// Clamp a single-GPU power reading (watts) to [`MAX_GPU_POWER_W`].
 ///

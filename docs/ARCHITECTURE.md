@@ -537,7 +537,7 @@ Total system power = Σ(GPU power) + CPU power. Feeds the energy integral and $/
 
 ### Power Plausibility
 
-All GPU backends apply a clamp: readings >5000W are treated as errors. NVIDIA additionally clamps to 1.5× TDP (from `nvmlDeviceGetPowerManagementLimit`). Anomalous readings are logged once (warn-once latch) and capped.
+All GPU backends apply a clamp: readings >1000W are treated as errors (no single GPU draws more). NVIDIA additionally clamps to 1.5× TDP, where the TDP is the card's *default* power-management limit (`nvmlDeviceGetPowerManagementDefaultLimit` — the factory TDP, not user-settable), falling back to the current limit (`nvmlDeviceGetPowerManagementLimit`) if the default query is unsupported. Anomalous readings are logged once (warn-once latch) and capped.
 
 ## Engine F: Flat Out
 
