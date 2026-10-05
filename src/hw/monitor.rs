@@ -44,6 +44,12 @@ use super::GpuSample;
 /// The idle-baseline sampling window (seconds) taken **before** load begins.
 pub const IDLE_WINDOW_SECS: u64 = 5;
 
+/// The manual "Measure Idle" window (seconds) — the GPU tab's `[i]` action
+/// sits the system idle for this long and records the mean as the new idle
+/// baseline. Longer than the automatic [`IDLE_WINDOW_SECS`] pre-test window
+/// for a cleaner no-load floor.
+pub const MANUAL_IDLE_WINDOW_SECS: u64 = 10;
+
 /// The 1 Hz power-history cadence (one aggregate sample per second).
 pub const HISTORY_PERIOD_SECS: f64 = 1.0;
 
@@ -104,6 +110,14 @@ pub struct TokenPhase {
     pub active: bool,
     /// At least one token has been observed this run.
     pub tokens_seen: bool,
+    /// Run-average **prefill** (input) throughput, tokens/sec (total input
+    /// tokens ÷ total prefill time). `0.0` until a stream completes — the
+    /// $/1M-*input* cost's phase rate.
+    pub prefill_throughput: f64,
+    /// Run-average **decode** (output) throughput, tokens/sec (total output
+    /// tokens ÷ total decode time). `0.0` until a stream completes — the
+    /// $/1M-*output* cost's phase rate.
+    pub decode_throughput: f64,
 }
 
 /// The $/1M-token cost breakdown for a run (the View 4 **COST ANALYSIS**
@@ -132,22 +146,44 @@ pub struct TokenCosts {
 
 /// The $/1M-token cost math (pure — unit-testable without any hardware).
 ///
-/// Each phase's energy is its **measured average power** times its
-/// **measured duration**:
+/// Each phase's energy is its **measured average power** applied over the
+/// **time that phase actually occupied** during the run:
 ///
 /// ```text
-/// prefill_kWh = avg_prefill_power_W × TTFT_s / 3.6e6
-/// decode_kWh  = avg_decode_power_W × decode_s / 3.6e6
+/// primary (throughput model — the multi-request-correct one):
+///   prefill_J = prompt_tokens   × avg_prefill_power_W / prefill_throughput
+///   decode_J  = completion_tokens × avg_decode_power_W / decode_throughput
+///
+/// fallback (no throughput measured yet — a single-request run):
+///   prefill_J = avg_prefill_power_W × TTFT_s
+///   decode_J  = avg_decode_power_W  × decode_s
 ///
 /// $/1M input  = prefill_kWh × rate / (prompt_tokens / 1e6)
 /// $/1M output = decode_kWh  × rate / (completion_tokens / 1e6)
 /// blended     = (prefill_kWh + decode_kWh) × rate / (total_tokens / 1e6)
 /// ```
 ///
+/// The throughput model is a **strict generalization** of the old
+/// `power × duration` formula: for a single request, `throughput =
+/// tokens / duration`, so the two are identical. For a multi-engine run
+/// (the case that produced the "$0 input" bug), the cumulative input token
+/// total is matched against the *total* prefill time across every request —
+/// not just the first request's TTFT — so the input cost is a real,
+/// non-zero number.
+///
+/// The **blended** rate is the token-count-weighted mean of the input and
+/// output rates (`(in·N_in + out·N_out) / (N_in + N_out)`), which is always
+/// *between* the two — it can never fall below the cheaper phase (the
+/// "blended < output" bug is now structurally impossible).
+///
 /// A phase with zero tokens yields a `0.0` rate (nothing to normalize);
 /// the N/A *display* decision (show `N/A` vs `0.00`) is the UI's, made on
 /// the presence of a [`GpuPowerMonitor::token_costs`] result.
 #[must_use]
+// Nine scalar inputs (two token counts, two phase durations, two phase
+// powers, two phase throughputs, one rate) — a pure, positional math
+// function; grouping them into a struct would obscure the formula.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_token_costs(
     prompt_tokens: u64,
     completion_tokens: u64,
@@ -155,10 +191,27 @@ pub fn calculate_token_costs(
     decode_secs: f64,
     avg_prefill_power_w: f64,
     avg_decode_power_w: f64,
+    prefill_throughput: f64,
+    decode_throughput: f64,
     rate_per_kwh: f64,
 ) -> TokenCosts {
-    let prefill_kwh = avg_prefill_power_w * ttft_secs / 3_600_000.0;
-    let decode_kwh = avg_decode_power_w * decode_secs / 3_600_000.0;
+    // Each phase's energy in joules. Primary: the throughput model (total
+    // phase tokens × measured phase power ÷ measured phase throughput =
+    // the energy that phase consumed over the whole run). Fallback (no
+    // throughput measured yet): phase power × the measured phase window.
+    let prefill_joules = if prefill_throughput > 0.0 && prompt_tokens > 0 {
+        prompt_tokens as f64 * avg_prefill_power_w / prefill_throughput
+    } else {
+        avg_prefill_power_w * ttft_secs
+    };
+    let decode_joules = if decode_throughput > 0.0 && completion_tokens > 0 {
+        completion_tokens as f64 * avg_decode_power_w / decode_throughput
+    } else {
+        avg_decode_power_w * decode_secs
+    };
+
+    let prefill_kwh = prefill_joules / 3_600_000.0;
+    let decode_kwh = decode_joules / 3_600_000.0;
 
     let cost_per_1m_input = if prompt_tokens > 0 {
         (prefill_kwh * rate_per_kwh) / (prompt_tokens as f64 / 1_000_000.0)
@@ -173,6 +226,9 @@ pub fn calculate_token_costs(
 
     let total_tokens = prompt_tokens + completion_tokens;
     let total_kwh = prefill_kwh + decode_kwh;
+    // The blended rate = the token-count-weighted mean of the input and
+    // output rates, so it is always *between* them (never below the cheaper
+    // phase) — the "blended < output" bug is structurally impossible now.
     let blended = if total_tokens > 0 {
         (total_kwh * rate_per_kwh) / (total_tokens as f64 / 1_000_000.0)
     } else {
@@ -242,6 +298,13 @@ pub struct GpuPowerMonitor {
     /// Total **input** (prompt) tokens processed this run (cumulative
     /// across all engines) — the $/1M-input denominator.
     pub prompt_tokens: u64,
+    /// Run-average prefill (input) throughput, tokens/sec — the latest
+    /// snapshot's figure; `0.0` until a stream completes. The $/1M-input
+    /// cost's phase rate (converts the input token total into prefill time).
+    pub prefill_throughput: f64,
+    /// Run-average decode (output) throughput, tokens/sec — the $/1M-output
+    /// cost's phase rate.
+    pub decode_throughput: f64,
 
     // ---- phase boundaries (the prefill / decode split) ----
     /// When the **first token** was observed this run (the prefill→decode
@@ -270,6 +333,12 @@ pub struct GpuPowerMonitor {
     pub idle_samples: Vec<f64>,
     /// `true` once the idle baseline has been finalized.
     pub idle_finalized: bool,
+    /// `true` while a *manual* "Measure Idle" window is running (the GPU
+    /// tab's `[i]` action): the poller accumulates a fresh no-load baseline
+    /// and finalizes it when the window elapses.
+    pub measure_idle: bool,
+    /// When the manual idle measurement started (the window's origin).
+    pub idle_measure_started: Option<MonotonicInstant>,
     /// Per-device poll counts weighting the running averages above
     /// (writer side: `avg = (avg·n + x) / (n+1)`).
     pub util_sample_counts: Vec<u64>,
@@ -299,6 +368,8 @@ impl Default for GpuPowerMonitor {
             cpu_power_peak_w: 0.0,
             total_tokens: 0,
             prompt_tokens: 0,
+            prefill_throughput: 0.0,
+            decode_throughput: 0.0,
             first_token_at: None,
             last_token_at: None,
             history: Vec::new(),
@@ -307,6 +378,8 @@ impl Default for GpuPowerMonitor {
             run_started: None,
             idle_samples: Vec::new(),
             idle_finalized: false,
+            measure_idle: false,
+            idle_measure_started: None,
             util_sample_counts: Vec::new(),
             temp_sample_counts: Vec::new(),
             rate_per_kwh: 0.16,
@@ -347,11 +420,15 @@ impl GpuPowerMonitor {
         self.cpu_power_peak_w = 0.0;
         self.total_tokens = 0;
         self.prompt_tokens = 0;
+        self.prefill_throughput = 0.0;
+        self.decode_throughput = 0.0;
         self.first_token_at = None;
         self.last_token_at = None;
         self.history.clear();
         self.idle_samples.clear();
         self.idle_finalized = false;
+        self.measure_idle = false;
+        self.idle_measure_started = None;
         self.load_started = None;
         self.load_ended = None;
         self.run_started = Some(MonotonicInstant::now());
@@ -366,7 +443,10 @@ impl GpuPowerMonitor {
     /// the aggregate power for the baseline. No-op once the idle window is
     /// finalized (the run is no longer idle).
     pub fn record_idle(&mut self, power_w: f64) {
-        if self.idle_finalized {
+        // Accumulate while the pre-load window is open, *or* during a
+        // manual "Measure Idle" window (which runs after a run has already
+        // finalized its baseline).
+        if self.idle_finalized && !self.measure_idle {
             return;
         }
         if power_w > 0.0 {
@@ -376,6 +456,47 @@ impl GpuPowerMonitor {
             }
         }
         self.total_power_w = power_w;
+    }
+
+    /// Arm a **manual** idle-baseline measurement (the GPU tab's `[i]`
+    /// "Measure Idle" action): clear the idle samples and start a fresh
+    /// [`MANUAL_IDLE_WINDOW_SECS`] no-load window. Unlike [`Self::begin_run`]
+    /// this does *not* reset the run stats — it only re-measures the idle
+    /// floor, so the last run's figures stay on screen. The poller
+    /// accumulates the window and calls [`Self::finalize_idle_measurement`]
+    /// when it elapses.
+    pub fn begin_idle_measurement(&mut self) {
+        self.measure_idle = true;
+        self.idle_samples.clear();
+        self.idle_measure_started = Some(MonotonicInstant::now());
+    }
+
+    /// Finalize a manual idle measurement: set the idle baseline to the mean
+    /// of the accumulated window and clear the measurement flag. The existing
+    /// run stats (a completed run's power / energy / cost) are untouched.
+    pub fn finalize_idle_measurement(&mut self) {
+        if !self.idle_samples.is_empty() {
+            self.idle_power_w =
+                self.idle_samples.iter().sum::<f64>() / self.idle_samples.len() as f64;
+        }
+        self.measure_idle = false;
+        self.idle_measure_started = None;
+    }
+
+    /// Cancel an in-progress manual idle measurement (the `[i]` key pressed
+    /// again): clear the flag and the partial samples without touching the
+    /// existing idle baseline.
+    pub fn cancel_idle_measurement(&mut self) {
+        self.measure_idle = false;
+        self.idle_measure_started = None;
+        self.idle_samples.clear();
+    }
+
+    /// `true` while a manual idle measurement is in progress (the GPU tab
+    /// shows a "measuring idle…" status line).
+    #[must_use]
+    pub fn is_measuring_idle(&self) -> bool {
+        self.measure_idle
     }
 
     /// Finalize the idle baseline (mean of the pre-load samples) and open the
@@ -411,6 +532,35 @@ impl GpuPowerMonitor {
         // Capture the *previous* throttle state before overwriting the
         // per-GPU table (a rising edge is one event, not one per poll).
         let prev_throttled = self.gpus_was_throttled();
+
+        // The run-average phase throughputs (the $/1M cost model's inputs)
+        // — carried from the current snapshot each poll.
+        self.prefill_throughput = phase.prefill_throughput;
+        self.decode_throughput = phase.decode_throughput;
+
+        // The *current* per-GPU table + total power are live "right now"
+        // readings — they keep updating even after the run ends.
+        self.gpus = per_gpu.to_vec();
+        if !names.is_empty() {
+            self.gpu_names = names.to_vec();
+        }
+        if let Some(w) = agg.power_watts {
+            self.has_power = true;
+            self.total_power_w = w;
+        }
+
+        // Once the load window is closed ([`Self::end_load`]), freeze every
+        // *run-accumulating* stat: the peak, the per-GPU whole-run averages,
+        // the throttle counter, the prefill/decode phase clocks, and the 1 Hz
+        // energy history (the source of `energy_joules` → the avg-power and
+        // cost figures). This is the "avg power keeps running after the tests
+        // end" fix — a completed run's numbers must not drift on screen. The
+        // current readings above stay live.
+        if self.load_ended.is_some() {
+            return;
+        }
+
+        // Run-accumulating token / phase state.
         self.prompt_tokens = phase.prompt_tokens;
         self.total_tokens = phase.completion_tokens;
         // The prefill→decode boundary: latch the first-token instant on
@@ -421,11 +571,6 @@ impl GpuPowerMonitor {
         }
         if phase.active {
             self.last_token_at = Some(MonotonicInstant::now());
-        }
-        // Per-GPU table.
-        self.gpus = per_gpu.to_vec();
-        if !names.is_empty() {
-            self.gpu_names = names.to_vec();
         }
         // Per-GPU whole-run statistics: running means (utilization,
         // temperature) + the peak temperature, one slot per device. A
@@ -452,10 +597,8 @@ impl GpuPowerMonitor {
                 self.temp_sample_counts[i] = c + 1;
             }
         }
-        // Aggregate power.
+        // Aggregate power peak + max temperature.
         if let Some(w) = agg.power_watts {
-            self.has_power = true;
-            self.total_power_w = w;
             self.peak_power_w = self.peak_power_w.max(w);
         }
         if let Some(t) = agg.temperature_c {
@@ -742,6 +885,8 @@ impl GpuPowerMonitor {
             decode_secs,
             prefill_w,
             decode_w,
+            self.prefill_throughput,
+            self.decode_throughput,
             rate,
         ))
     }
@@ -777,6 +922,7 @@ mod tests {
             completion_tokens: completion,
             active,
             tokens_seen: seen,
+            ..Default::default()
         }
     }
 
@@ -1178,7 +1324,9 @@ mod tests {
     /// total       = 5.7222e-3 × 0.16 = 9.1556e-4
     #[test]
     fn token_costs_match_the_hand_calculation() {
-        let c = calculate_token_costs(2_000, 8_000, 2.0, 40.0, 300.0, 500.0, 0.16);
+        // Throughputs `0.0` → the duration fallback (a single-request run),
+        // which is the original `power × duration` model.
+        let c = calculate_token_costs(2_000, 8_000, 2.0, 40.0, 300.0, 500.0, 0.0, 0.0, 0.16);
         assert!(
             (c.cost_per_1m_input - 0.013333).abs() < 1e-5,
             "in: {}",
@@ -1207,12 +1355,12 @@ mod tests {
     /// normalize), the other phase is unaffected.
     #[test]
     fn token_costs_zero_tokens_yield_zero_rate() {
-        let c = calculate_token_costs(0, 1000, 1.0, 10.0, 200.0, 400.0, 0.16);
+        let c = calculate_token_costs(0, 1000, 1.0, 10.0, 200.0, 400.0, 0.0, 0.0, 0.16);
         assert_eq!(c.cost_per_1m_input, 0.0);
         assert!(c.cost_per_1m_output > 0.0);
         assert!(c.blended > 0.0);
         // All-zero run: every rate 0.0, total 0.0.
-        let empty = calculate_token_costs(0, 0, 0.0, 0.0, 0.0, 0.0, 0.16);
+        let empty = calculate_token_costs(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.16);
         assert_eq!(empty.cost_per_1m_input, 0.0);
         assert_eq!(empty.cost_per_1m_output, 0.0);
         assert_eq!(empty.blended, 0.0);
@@ -1224,13 +1372,222 @@ mod tests {
     /// the input rate.
     #[test]
     fn input_and_output_rates_are_separate() {
-        let c = calculate_token_costs(1_000, 9_000, 0.5, 30.0, 150.0, 600.0, 0.16);
+        let c = calculate_token_costs(1_000, 9_000, 0.5, 30.0, 150.0, 600.0, 0.0, 0.0, 0.16);
         assert!(
             c.cost_per_1m_output > c.cost_per_1m_input,
             "output ({}) > input ({})",
             c.cost_per_1m_output,
             c.cost_per_1m_input
         );
+    }
+
+    /// The throughput model is a **strict generalization** of the old
+    /// `power × duration` formula: for a *single* request, `throughput =
+    /// tokens / duration`, so the two give identical costs. This pins the
+    /// backward-compatibility guarantee.
+    #[test]
+    fn token_costs_throughput_model_matches_duration_for_a_single_request() {
+        // One request: 2 000 input tokens prefilling in 2 s, 8 000 output
+        // tokens decoding over 40 s.
+        let dur = calculate_token_costs(2_000, 8_000, 2.0, 40.0, 300.0, 500.0, 0.0, 0.0, 0.16);
+        let thr = calculate_token_costs(
+            2_000,
+            8_000,
+            2.0,
+            40.0,
+            300.0,
+            500.0,
+            2_000.0 / 2.0,  // = 1 000 tok/s (the single request's prefill rate)
+            8_000.0 / 40.0, // = 200 tok/s (its decode rate)
+            0.16,
+        );
+        assert!(
+            (dur.cost_per_1m_input - thr.cost_per_1m_input).abs() < 1e-9,
+            "input matches: {} vs {}",
+            dur.cost_per_1m_input,
+            thr.cost_per_1m_input
+        );
+        assert!(
+            (dur.cost_per_1m_output - thr.cost_per_1m_output).abs() < 1e-9,
+            "output matches: {} vs {}",
+            dur.cost_per_1m_output,
+            thr.cost_per_1m_output
+        );
+        assert!((dur.blended - thr.blended).abs() < 1e-9);
+    }
+
+    /// The headline regression (the user's "$0.000 input" bug): a
+    /// **multi-request** run with 2 M cumulative input tokens and a measured
+    /// prefill throughput must yield a **non-zero** input cost, and the
+    /// blended rate must sit **between** input and output. The old
+    /// `power × first-request-TTFT` model divided ~0.4 s of prefill energy
+    /// by 2 M tokens → $0; the throughput model matches the 2 M tokens
+    /// against the *total* prefill time → a real number.
+    #[test]
+    fn token_costs_throughput_model_fixes_multi_request_input() {
+        // 2 M input tokens prefilling at 2 000 tok/s = 1 000 s of prefill;
+        // 14 686 output tokens decoding at 50 tok/s = 293.7 s of decode.
+        // Prefill power 200 W, decode power 300 W, $0.16/kWh.
+        let c = calculate_token_costs(
+            2_000_000, 14_686, 0.4,    // first-request TTFT (would give ~$0 in the old model)
+            1158.0, // whole-run decode span (would inflate output in the old model)
+            200.0, 300.0, 2_000.0, // prefill throughput
+            50.0,    // decode throughput
+            0.16,
+        );
+        // Input energy = 2 000 000 × 200 / 2 000 = 200 000 J = 0.0556 kWh.
+        // $/1M input = 0.0556 × 0.16 / 2.0 = 0.00444 — non-zero.
+        assert!(
+            c.cost_per_1m_input > 0.0,
+            "input cost must be non-zero: {}",
+            c.cost_per_1m_input
+        );
+        assert!(
+            (c.cost_per_1m_input - 0.004444).abs() < 1e-4,
+            "input: {}",
+            c.cost_per_1m_input
+        );
+        // Output energy = 14 686 × 300 / 50 = 88 116 J = 0.0245 kWh.
+        // $/1M output = 0.0245 × 0.16 / 0.014686 = 0.266.
+        assert!(
+            (c.cost_per_1m_output - 0.266).abs() < 0.01,
+            "output: {}",
+            c.cost_per_1m_output
+        );
+        // Blended is the token-weighted mean → always between the two.
+        assert!(
+            c.blended >= c.cost_per_1m_input - 1e-9 && c.blended <= c.cost_per_1m_output + 1e-9,
+            "blended ({}) between input ({}) and output ({})",
+            c.blended,
+            c.cost_per_1m_input,
+            c.cost_per_1m_output
+        );
+    }
+
+    /// Property: the blended rate is the token-count-weighted mean of the
+    /// input and output rates, so it is **always** between them — never
+    /// below the cheaper phase (the "blended < output" bug).
+    #[test]
+    fn blended_rate_is_always_between_input_and_output() {
+        // A spread of (N_in, N_out, prefill_rate, decode_rate) shapes,
+        // including the input-dominated and output-dominated extremes.
+        for (nin, nout, tin, tout) in [
+            (2_000_000u64, 14_686u64, 2_000.0, 50.0),
+            (100u64, 900u64, 100.0, 90.0),
+            (10_000u64, 10u64, 1_000.0, 10.0),
+            (1u64, 1_000_000u64, 1.0, 100.0),
+        ] {
+            let c = calculate_token_costs(nin, nout, 1.0, 10.0, 200.0, 300.0, tin, tout, 0.16);
+            let lo = c.cost_per_1m_input.min(c.cost_per_1m_output);
+            let hi = c.cost_per_1m_input.max(c.cost_per_1m_output);
+            assert!(
+                (c.blended >= lo - 1e-9) && (c.blended <= hi + 1e-9),
+                "blended ({}) must be between [{}, {}] for N_in={} N_out={}",
+                c.blended,
+                lo,
+                hi,
+                nin,
+                nout
+            );
+        }
+    }
+
+    /// The "avg power keeps running after the tests end" fix: once the load
+    /// window is closed (`end_load`), `record()` no longer grows the 1 Hz
+    /// history, the energy integral, the peak, or the phase clocks — while
+    /// the *current* per-GPU table and total power stay live.
+    #[test]
+    fn record_freezes_run_stats_after_end_load() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.start_load();
+        let g0 = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            temperature_c: Some(65),
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(std::slice::from_ref(&g0));
+        m.record(
+            &agg,
+            std::slice::from_ref(&g0),
+            &[],
+            &phase(1000, 100, true, true),
+        );
+        let history_before = m.history.len();
+        let peak_before = m.peak_power_w;
+        let energy_before = m.energy_joules();
+        assert!(history_before > 0, "a history point was recorded");
+
+        // Close the load window, then a *higher* reading arrives after the
+        // run ends.
+        m.end_load();
+        let g_hot = GpuSample {
+            power_watts: Some(999.0),
+            utilization_pct: Some(99),
+            temperature_c: Some(99),
+            ..Default::default()
+        };
+        let agg_hot = GpuSample::aggregate(std::slice::from_ref(&g_hot));
+        m.record(
+            &agg_hot,
+            std::slice::from_ref(&g_hot),
+            &[],
+            &phase(5000, 500, true, true),
+        );
+
+        // The run aggregates are frozen…
+        assert_eq!(m.history.len(), history_before, "history is frozen");
+        assert_eq!(m.peak_power_w, peak_before, "peak is frozen");
+        assert_eq!(m.energy_joules(), energy_before, "energy is frozen");
+        assert_eq!(m.prompt_tokens, 1000, "run input-token total is frozen");
+        assert_eq!(m.total_tokens, 100, "run output-token total is frozen");
+        // …while the *current* readings stay live (the 999 W shows now).
+        assert_eq!(m.total_power_w, 999.0, "current power stays live");
+        assert_eq!(
+            m.gpus[0].power_watts,
+            Some(999.0),
+            "current per-GPU stays live"
+        );
+    }
+
+    /// The "Measure Idle" action: arming a manual measurement clears the
+    /// samples, accumulating during the window, and finalizing sets the idle
+    /// baseline to the mean — without touching the run stats.
+    #[test]
+    fn manual_idle_measurement_arms_accumulates_and_finalizes() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.start_load();
+        assert!((m.idle_power_w - 100.0).abs() < 1e-9, "prior baseline");
+        // Arm a manual re-measurement after the run.
+        m.end_load();
+        m.begin_idle_measurement();
+        assert!(m.is_measuring_idle());
+        m.record_idle(150.0);
+        m.record_idle(170.0);
+        // Finalize: the baseline is the new mean (160).
+        m.finalize_idle_measurement();
+        assert!(!m.is_measuring_idle());
+        assert!((m.idle_power_w - 160.0).abs() < 1e-9, "mean of 150/170");
+    }
+
+    /// Cancelling a manual measurement leaves the existing baseline intact.
+    #[test]
+    fn manual_idle_measurement_cancel_preserves_baseline() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(100.0);
+        m.start_load();
+        m.end_load();
+        let before = m.idle_power_w;
+        m.begin_idle_measurement();
+        m.record_idle(999.0); // a partial sample
+        m.cancel_idle_measurement();
+        assert!(!m.is_measuring_idle());
+        assert!((m.idle_power_w - before).abs() < 1e-9, "baseline unchanged");
     }
 
     /// The monitor derives the phase powers from its 1 Hz history:

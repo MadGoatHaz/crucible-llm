@@ -43,7 +43,10 @@ pub mod monitor;
 /// cascade falls through to the clearly-labeled estimate.
 pub mod cpu_power;
 
-pub use monitor::{GpuPowerMonitor, PowerSample, TokenPhase, HISTORY_CAPACITY, IDLE_WINDOW_SECS};
+pub use monitor::{
+    GpuPowerMonitor, PowerSample, TokenPhase, HISTORY_CAPACITY, IDLE_WINDOW_SECS,
+    MANUAL_IDLE_WINDOW_SECS,
+};
 
 pub use cpu_power::CpuPowerBackend;
 
@@ -528,6 +531,20 @@ impl HwPoller {
         self.monitor.end_load();
     }
 
+    /// Arm a manual idle-baseline measurement on the monitor (the GPU tab's
+    /// `[i]` "Measure Idle" action). The background poller then accumulates
+    /// a fresh [`MANUAL_IDLE_WINDOW_SECS`] no-load window and finalizes it
+    /// (mean → the idle baseline).
+    pub fn begin_idle_measurement(&mut self) {
+        self.monitor.begin_idle_measurement();
+    }
+
+    /// Cancel an in-progress manual idle measurement (the `[i]` key pressed
+    /// again): the existing idle baseline is left untouched.
+    pub fn cancel_idle_measurement(&mut self) {
+        self.monitor.cancel_idle_measurement();
+    }
+
     /// `true` when a GPU backend is available (any vendor).
     pub fn has_gpu(&self) -> bool {
         self.gpu.is_some()
@@ -672,6 +689,10 @@ impl HwPoller {
             completion_tokens: snap.overall.total_tokens,
             active: snap.status == StreamStatus::Streaming,
             tokens_seen: snap.completion_tokens > 0 || snap.observed_frames > 0,
+            // The run-average phase throughputs (the $/1M cost model): total
+            // tokens ÷ total phase time, accumulated by the metrics pipeline.
+            prefill_throughput: snap.overall.prefill_throughput,
+            decode_throughput: snap.overall.decode_throughput,
         };
 
         // Poll the 100 ms `P(t)` sample (GPU aggregate + the CPU power
@@ -684,7 +705,18 @@ impl HwPoller {
             .unwrap_or(0.0);
         self.monitor.set_cpu_power(cpu_w);
 
-        if self.monitor.idle_finalized {
+        if self.monitor.measure_idle {
+            // A manual "Measure Idle" window is running: accumulate the
+            // no-load baseline, then finalize it (mean → idle_power_w) when
+            // the window elapses. This runs independently of the run's own
+            // idle/load state, so it works after a completed run too.
+            self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
+            if let Some(start) = self.monitor.idle_measure_started {
+                if start.elapsed() >= std::time::Duration::from_secs(MANUAL_IDLE_WINDOW_SECS) {
+                    self.monitor.finalize_idle_measurement();
+                }
+            }
+        } else if self.monitor.idle_finalized {
             self.monitor.record(&agg, &per_gpu, &self.gpu_names, &phase);
         } else {
             self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));

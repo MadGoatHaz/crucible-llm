@@ -47,7 +47,7 @@ use crate::engines::{
     SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
     VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
-use crate::hw::{GpuBackend, HwPoller};
+use crate::hw::{GpuBackend, HwPoller, MANUAL_IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
@@ -716,6 +716,62 @@ impl App {
         });
     }
 
+    /// Arm a manual idle-baseline measurement (the `[i]` GPU-tab action):
+    /// the 100 ms hardware poller sits the system no-load for
+    /// [`MANUAL_IDLE_WINDOW_SECS`] and records the mean as the new idle
+    /// floor — a clean reference point the user controls, not just the
+    /// automatic 5 s pre-test window. Pressing `[i]` again cancels an
+    /// in-progress measurement. Locked while a benchmark sequence or a
+    /// standalone NIAH run is in progress (those own the power window); a
+    /// driver-less host (no poller) degrades to a log line — the
+    /// N/A-never-fail rule.
+    pub fn measure_idle(&mut self) {
+        let th = self.active_theme;
+        if self.seq.is_running() || self.niah.is_running() {
+            self.push_log(
+                "[idle] locked while a benchmark is running — finish it first".to_string(),
+                style::value_warn(th),
+            );
+            return;
+        }
+        let Some(poller) = &self.hw else {
+            self.push_log(
+                "[idle] no GPU telemetry — nothing to measure".to_string(),
+                style::value_warn(th),
+            );
+            return;
+        };
+        // Perform the action inside the lock, capture the outcome, and drop
+        // the guard *before* touching `self` again (the immutable `poller`
+        // borrow of `self.hw` must end first).
+        let cancelled = match poller.lock() {
+            Ok(mut p) => {
+                if p.monitor().is_measuring_idle() {
+                    p.cancel_idle_measurement();
+                    true
+                } else {
+                    p.begin_idle_measurement();
+                    false
+                }
+            }
+            Err(_) => return,
+        };
+        if cancelled {
+            self.push_log(
+                "[idle] measurement cancelled".to_string(),
+                style::value_warn(th),
+            );
+        } else {
+            self.push_log(
+                format!(
+                    "[idle] measuring idle baseline ({}s) — press [i] again to cancel",
+                    MANUAL_IDLE_WINDOW_SECS
+                ),
+                style::value_ok(th),
+            );
+        }
+    }
+
     /// Trigger model discovery (Chunk 20): `tokio::spawn` a
     /// `GET {base}/v1/models` call (OpenAI-compatible; the base is taken
     /// from the current Configuration form) and publish the result to the
@@ -1330,6 +1386,15 @@ impl App {
                 KeyAction::NewNeedle
             }
             KeyCode::Char('e') => KeyAction::Export,
+            // `i` — measure a fresh idle power baseline (the GPU tab's
+            // manual idle test): the 100 ms poller sits the system no-load
+            // for [`MANUAL_IDLE_WINDOW_SECS`] and records the mean as the
+            // new idle floor. Pressing it again cancels. Locked while a
+            // benchmark runs (those own the power window).
+            KeyCode::Char('i') => {
+                self.measure_idle();
+                KeyAction::Continue
+            }
             // Chunk 18: `r` runs the engines selected in the Config view.
             KeyCode::Char('r') => {
                 self.start_run();

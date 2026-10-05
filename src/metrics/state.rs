@@ -128,6 +128,18 @@ pub struct OverallStats {
     /// `pp_tokens` across every completed stream. The $/1M-*input*-token
     /// cost's denominator (the View 4 COST ANALYSIS panel).
     pub total_prompt_tokens: u64,
+    /// Average **prefill** (input) throughput over the whole run,
+    /// tokens/sec: total input tokens ÷ total prefill time (the sum of
+    /// every completed stream's TTFT). The $/1M-*input*-cost's phase rate
+    /// (View 4) — it converts the cumulative input token count into the
+    /// total prefill time the energy math needs (a single-request run
+    /// reduces to `prompt_tokens / TTFT`). `0.0` until a stream completes.
+    pub prefill_throughput: f64,
+    /// Average **decode** (output) throughput over the whole run,
+    /// tokens/sec: total output tokens ÷ total decode time (the sum of
+    /// every completed stream's generation time). The $/1M-*output*-cost's
+    /// phase rate. `0.0` until a stream completes.
+    pub decode_throughput: f64,
     /// Number of streams that reached a terminal state.
     pub completed_streams: u64,
     /// Mean active streams (time-weighted).
@@ -783,6 +795,14 @@ struct OverallAccumulator {
     itl_p99: Vec<f64>,
     total_tokens: u64,
     total_prompt_tokens: u64,
+    /// Total prefill (input) time this run, seconds: the sum of every
+    /// completed (non-looping) stream's TTFT — the prefill-throughput
+    /// denominator.
+    total_prefill_time: f64,
+    /// Total decode (output) time this run, seconds: the sum of every
+    /// completed (non-looping) stream's generation time (tokens ÷ rate) —
+    /// the decode-throughput denominator.
+    total_decode_time: f64,
     completed_streams: u64,
     active_max: usize,
     active_sum: f64,
@@ -850,6 +870,11 @@ impl OverallAccumulator {
                 if !st.looping {
                     if let Some(g) = st.gen_tps.filter(|g| *g > 0.0) {
                         Self::push(&mut self.gen, g);
+                        // Decode time for this stream = tokens ÷ rate (the
+                        // generation window, excluding TTFT).
+                        if let Some(tok) = st.tg_tokens {
+                            self.total_decode_time += tok as f64 / g;
+                        }
                     }
                     if let Some(tok) = st.tg_tokens {
                         self.total_tokens += tok;
@@ -860,6 +885,12 @@ impl OverallAccumulator {
                 }
                 if let Some(t) = st.ttft_s.filter(|t| *t > 0.0) {
                     Self::push(&mut self.ttft, t);
+                    // Prefill time for this stream = its TTFT. Kept only for
+                    // non-looping streams so it matches the input-token
+                    // denominator the $/1M-cost math uses.
+                    if !st.looping {
+                        self.total_prefill_time += t;
+                    }
                 }
             }
             self.prev_status.insert(st.id, st.state);
@@ -909,6 +940,16 @@ impl OverallAccumulator {
             itl_p99: triple(&self.itl_p99),
             total_tokens: self.total_tokens,
             total_prompt_tokens: self.total_prompt_tokens,
+            prefill_throughput: if self.total_prefill_time > 0.0 && self.total_prompt_tokens > 0 {
+                self.total_prompt_tokens as f64 / self.total_prefill_time
+            } else {
+                0.0
+            },
+            decode_throughput: if self.total_decode_time > 0.0 && self.total_tokens > 0 {
+                self.total_tokens as f64 / self.total_decode_time
+            } else {
+                0.0
+            },
             completed_streams: self.completed_streams,
             active_avg: if self.active_count > 0 {
                 self.active_sum / self.active_count as f64

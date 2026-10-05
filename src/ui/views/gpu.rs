@@ -94,10 +94,15 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .constraints(constraints)
         .split(area);
 
+    // The number of requests that made up this run (the Live view's
+    // completed-stream count) — the cost panel shows the cumulative token
+    // totals *with* this so "2.0M input" reads as "across N requests", not
+    // one 2 M-token prompt.
+    let requests = m.overall.completed_streams;
     render_system_power(rects[0], mon, &title, rate, th, f);
     render_power_efficiency_row(rects[1], mon, rate, th, f);
     render_gpu_table(rects[2], mon, th, f);
-    render_cost_analysis(rects[3], mon, rate, th, f);
+    render_cost_analysis(rects[3], mon, rate, requests, th, f);
     render_util_temp_row(rects[4], mon, th, f);
 }
 
@@ -137,7 +142,11 @@ fn render_system_power(
     th: Theme,
     f: &mut Frame,
 ) {
-    let block = theme::block(theme::panel_title(th, title), style::active_border(th));
+    // The panel title carries the manual "Measure Idle" hint ([i]).
+    let block = theme::block(
+        theme::panel_title(th, format!("{title}   [i] idle")),
+        style::active_border(th),
+    );
     if area.width < 40 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
@@ -147,6 +156,25 @@ fn render_system_power(
     let peak = mon.peak_power_w;
     let kwh = mon.energy_kwh();
     let dur = mon.duration_sec();
+    // The idle-baseline line: the measured floor, or a live "measuring
+    // idle…" status while the manual [i] window is running (it re-records
+    // the no-load baseline after a run).
+    let idle_line = if mon.is_measuring_idle() {
+        Line::from(vec![
+            Span::styled("  Measuring idle… ", style::value_warn(th)),
+            Span::styled(format_w(mon.total_power_w), style::value(th)),
+            Span::styled("   (10 s window)", style::footer(th)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("  Idle: ", style::label(th)),
+            Span::styled(format_w(idle), style::value_secondary(th)),
+            Span::styled("   Compute: ", style::footer(th)),
+            Span::styled(format_w(compute), style::value_ok(th)),
+            Span::styled("   Peak: ", style::footer(th)),
+            Span::styled(format_w(peak), style::value_warn(th)),
+        ])
+    };
     let lines = vec![
         // The total *system* draw, split into its GPU and CPU components
         // (the CPU power is the draw the GPU-only figure used to miss).
@@ -162,14 +190,7 @@ fn render_system_power(
                 style::footer(th),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("  Idle: ", style::label(th)),
-            Span::styled(format_w(idle), style::value_secondary(th)),
-            Span::styled("   Compute: ", style::footer(th)),
-            Span::styled(format_w(compute), style::value_ok(th)),
-            Span::styled("   Peak: ", style::footer(th)),
-            Span::styled(format_w(peak), style::value_warn(th)),
-        ]),
+        idle_line,
         Line::from(vec![
             Span::styled("  Energy: ", style::label(th)),
             Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
@@ -473,7 +494,14 @@ fn gpu_row(
 /// *output* (decode) **separately**, a blended rate, and the run's total
 /// cost — all driven by the user's live `$/kWh` rate (read from the Config
 /// form at render time) and the measured prefill / decode power draws.
-fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f: &mut Frame) {
+fn render_cost_analysis(
+    area: Rect,
+    mon: &GpuPowerMonitor,
+    rate: f64,
+    requests: u64,
+    th: Theme,
+    f: &mut Frame,
+) {
     let block = theme::block(theme::panel_title(th, "COST ANALYSIS"), style::border(th));
     if area.width < 40 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -498,10 +526,19 @@ fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme,
                 ]));
             }
             lines.push(Line::raw(""));
+            // The cumulative token totals *with* the request count, so a
+            // large input figure reads as "across N requests" (a multi-
+            // engine run), not one enormous prompt.
+            let req_note = if requests > 1 {
+                format!(" ({} requests)", requests)
+            } else {
+                String::new()
+            };
             lines.push(Line::from(vec![Span::styled(
                 format!(
-                    "  This run: {} input + {} output tokens = {} total",
+                    "  This run: {} input{} + {} output = {} total",
                     fmt::format_tokens(c.prompt_tokens),
+                    req_note,
                     fmt::format_tokens(c.completion_tokens),
                     format_cost(c.total_cost)
                 ),
@@ -509,11 +546,11 @@ fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme,
             )]));
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled(
-                "  ℹ Input = energy during prefill ÷ prompt tokens.",
+                "  ℹ In=Σprefill⚡÷in-tokens · Out=Σdecode⚡÷out-tokens (all reqs)",
                 style::info(th),
             )]));
             lines.push(Line::from(vec![Span::styled(
-                "    Output = energy during decode ÷ completion tokens.",
+                "    Blended = token-weighted mean (always between in & out)",
                 style::info(th),
             )]));
             // The prefill fallback warning (Issue D): when the TTFT window
