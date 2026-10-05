@@ -82,7 +82,7 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
     // terminal — a long per-GPU table (8+ cards) clips its lowest rows
     // rather than pushing the charts off-screen.
     let plan: Vec<(u8, Constraint)> = vec![
-        (0, Constraint::Length(4)),      // system power
+        (0, Constraint::Length(6)),      // system power
         (1, Constraint::Percentage(32)), // power over time | efficiency
         (2, Constraint::Percentage(28)), // per-GPU table
         (3, Constraint::Percentage(20)), // cost analysis ($/1M tokens)
@@ -142,17 +142,28 @@ fn render_system_power(
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
-    let total = mon.total_power_w;
     let idle = mon.idle_power_w;
     let compute = mon.compute_power_w();
     let peak = mon.peak_power_w;
     let kwh = mon.energy_kwh();
     let dur = mon.duration_sec();
     let lines = vec![
+        // The total *system* draw, split into its GPU and CPU components
+        // (the CPU power is the draw the GPU-only figure used to miss).
         Line::from(vec![
-            Span::styled("  Total: ", style::label(th)),
-            Span::styled(format_w(total), style::value(th)),
-            Span::styled("   Idle: ", style::footer(th)),
+            Span::styled("  System: ", style::label(th)),
+            Span::styled(format_w(mon.system_power_w()), style::value(th)),
+            Span::styled(
+                format!(
+                    "  (GPU {} + CPU {})",
+                    format_w(mon.total_power_w),
+                    format_w(mon.cpu_power_w)
+                ),
+                style::footer(th),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Idle: ", style::label(th)),
             Span::styled(format_w(idle), style::value_secondary(th)),
             Span::styled("   Compute: ", style::footer(th)),
             Span::styled(format_w(compute), style::value_ok(th)),
@@ -1051,6 +1062,7 @@ mod tests {
         mon.start_load();
         mon.has_power = true;
         mon.total_power_w = 1200.0;
+        mon.cpu_power_w = 73.0;
         mon.peak_power_w = 1400.0;
         mon.max_temp_c = 72.0;
         mon.avg_util_pct = 91.0;
@@ -1093,6 +1105,7 @@ mod tests {
             mon.history.push(crate::hw::PowerSample {
                 t: crate::timing::MonotonicInstant::now(),
                 power_w: 1000.0 + (i as f64) * 20.0,
+                cpu_power_w: 0.0,
                 util_pct: 85.0 + (i as f64) * 1.2, // 85 → 95.8
                 temp_c: 62.0 + (i as f64) * 1.1,   // 62 → 71.9
                 vram_gb: 32.0,
@@ -1110,7 +1123,8 @@ mod tests {
         app.view = crate::ui::app::View::Gpu;
         let text = render_text(&app, 120, 40);
         assert!(text.contains("GPU & POWER"), "title: {text}");
-        assert!(text.contains("Total:"), "system power total: {text}");
+        assert!(text.contains("System:"), "system power total: {text}");
+        assert!(text.contains("CPU"), "CPU power breakdown: {text}");
         assert!(text.contains("PER-GPU"), "per-GPU table: {text}");
         assert!(text.contains("A4000"), "GPU name: {text}");
         assert!(text.contains("thermal"), "throttle reason: {text}");

@@ -100,11 +100,14 @@ pub fn integrate_joules(
         if !in_window {
             continue;
         }
-        let Some(mw) = s.power_mw else {
+        // Total *system* draw (GPU + CPU), watts. A sample with neither
+        // contributes nothing (the N/A rule) — the trapezoid spans the gap.
+        let p_w = s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+            + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0);
+        if p_w <= 0.0 {
             continue;
-        };
+        }
         has_power = true;
-        let p_w = mw as f64 / 1000.0;
         if let Some((t_prev, p_prev)) = prev {
             let dt_s = t_prev.delta_nanos(&s.t) as f64 / 1e9;
             joules += (p_prev + p_w) / 2.0 * dt_s;
@@ -152,17 +155,23 @@ pub fn profile(
         })
         .collect();
 
-    let peak_power_w = in_scope
-        .iter()
-        .filter_map(|s| s.power_mw)
-        .max()
-        .map(|mw| mw as f64 / 1000.0);
+    // Peak *system* draw (GPU + CPU) over the in-scope samples.
+    let peak = in_scope.iter().fold(0.0_f64, |max, s| {
+        let p = s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+            + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0);
+        max.max(p)
+    });
+    let peak_power_w = (peak > 0.0).then_some(peak);
 
     // Mean power = energy / span of the power-bearing samples in scope.
     let avg_power_w = if has_power {
         let ts: Vec<&MonotonicInstant> = in_scope
             .iter()
-            .filter(|s| s.power_mw.is_some())
+            .filter(|s| {
+                (s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+                    + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0))
+                    > 0.0
+            })
             .map(|s| &s.t)
             .collect();
         match (ts.first(), ts.last()) {
@@ -451,5 +460,29 @@ mod tests {
         assert_eq!(r.vendor.as_deref(), Some("NVIDIA"));
         assert_eq!(r.model.as_deref(), Some("RTX 4090"));
         assert!((r.peak_power_w.unwrap() - 285.0).abs() < 1.0);
+    }
+
+    /// A CPU-only sample (no GPU power) still contributes to the energy
+    /// integral — the total *system* draw (GPU + CPU) is what `∫P dt` uses.
+    #[test]
+    fn integrate_joules_includes_cpu_only_samples() {
+        let a = MonotonicInstant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let b = MonotonicInstant::now();
+        let samples = vec![
+            HwSample {
+                t: a,
+                cpu_power_mw: Some(40_000), // 40 W CPU, no GPU
+                ..HwSample::default()
+            },
+            HwSample {
+                t: b,
+                cpu_power_mw: Some(40_000),
+                ..HwSample::default()
+            },
+        ];
+        let (joules, has_power) = integrate_joules(&samples, None);
+        assert!(has_power, "a CPU-only sample carries power");
+        assert!(joules > 0.0, "CPU-only energy is positive: {joules}");
     }
 }

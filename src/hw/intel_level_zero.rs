@@ -58,7 +58,7 @@ use std::sync::Mutex;
 use libloading::Library;
 
 use super::intel::intel_card_labels;
-use super::{GpuBackend, GpuSample};
+use super::{clamp_gpu_power, GpuBackend, GpuSample};
 
 // ── Level Zero result codes (research §3) ─────────────────────────────────
 const ZE_RESULT_SUCCESS: i32 = 0;
@@ -457,6 +457,9 @@ struct ZeDevice {
     // Cumulative-counter baselines for delta math.
     prev_energy: Mutex<EnergyCounter>,
     prev_engine: Mutex<EngineStats>,
+    /// "Power anomaly already warned" latch (a stuck unit-bug reading must
+    /// not spam the console every 100 ms poll).
+    power_warned: Mutex<bool>,
 }
 
 impl fmt::Debug for ZeDevice {
@@ -618,6 +621,7 @@ fn resolve_device(fns: &SysmanFns, device: ZePtr, name: String) -> ZeDevice {
         temp,
         prev_energy: Mutex::new(prev_energy),
         prev_engine: Mutex::new(prev_engine),
+        power_warned: Mutex::new(false),
     }
 }
 
@@ -694,6 +698,14 @@ fn poll_device(fns: &SysmanFns, dev: &ZeDevice) -> GpuSample {
                 sample.power_watts = power_watts(prev, &cur);
                 *prev = cur;
             }
+            // Plausibility clamp (the Sysman energy counter is µJ/µs ≡ W; a
+            // unit/scale bug would show as a 5 kW+ reading).
+            let mut warned = dev.power_warned.lock().unwrap_or_else(|e| e.into_inner());
+            sample.power_watts = clamp_gpu_power(
+                sample.power_watts,
+                &format!("Intel GPU ({})", dev.name),
+                &mut warned,
+            );
         }
     }
 
@@ -934,6 +946,7 @@ mod tests {
             temp: None,
             prev_energy: Mutex::new(EnergyCounter::default()),
             prev_engine: Mutex::new(EngineStats::default()),
+            power_warned: Mutex::new(false),
         };
         assert!(!bare.has_telemetry());
     }

@@ -32,7 +32,9 @@ use crucible_llm::engines::{
     build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StreamCountSource,
     StructuredEngine,
 };
-use crucible_llm::hw::{detect_gpu, gpu_display_name, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
+use crucible_llm::hw::{
+    detect_gpu, gpu_display_name, CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS,
+};
 use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
@@ -90,6 +92,29 @@ fn main() {
             );
         }
     }
+
+    // CPU power detection (early, alongside the GPU): the cascade is
+    // RAPL → Super I/O → a clearly-labeled fixed estimate. Logged once so
+    // the run record shows which source drives the CPU draw (the system
+    // power / energy / `$/1M` cost math now includes it — GPU alone
+    // underreports the real draw). Never `None`: the cascade ends in the
+    // estimate.
+    let cpu_power: Option<Box<CpuPowerBackend>> = CpuPowerBackend::try_init();
+    match &cpu_power {
+        Some(c) => {
+            let name = c.method_name();
+            eprintln!("[HW] CPU power: {name}");
+            logger.info(Context::Setup, format!("[HW] CPU power: {name}"));
+        }
+        None => {
+            eprintln!("[HW] No CPU power telemetry available");
+            logger.info(
+                Context::Setup,
+                "[HW] No CPU power telemetry available".to_string(),
+            );
+        }
+    }
+
     // Detection-based Engine D default: on when a GPU is present, off
     // when not — applied *only* when the user did not pick engines
     // explicitly (CLI `--engine` / env / config file win over detection).
@@ -120,7 +145,7 @@ fn main() {
                 cfg.timeout
             ),
         );
-        let code = run_headless(&cfg, logger.clone(), gpu.clone());
+        let code = run_headless(&cfg, logger.clone(), gpu, cpu_power);
         logger.info(
             Context::Setup,
             format!("run ended — headless — exit code {code}"),
@@ -143,7 +168,7 @@ fn main() {
                 .unwrap_or_default()
         ),
     );
-    let ok = run_tui(&cfg, logger.clone(), gpu);
+    let ok = run_tui(&cfg, logger.clone(), gpu, cpu_power);
     EventLoop::restore(); // best-effort terminal restore on all paths
     logger.info(Context::Tui, format!("run ended — TUI — ok={ok}"));
     logger.finish(); // flush before exit (drops are skipped by process::exit)
@@ -155,7 +180,12 @@ fn main() {
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
 /// and print the prototype's result box(es) / summary — or `--json` on
 /// stdout. Returns the process exit code (1 iff every run failed).
-fn run_headless(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>>) -> i32 {
+fn run_headless(
+    cfg: &Config,
+    logger: Arc<RunLogger>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    cpu_power: Option<Box<CpuPowerBackend>>,
+) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io() // the stream worker does real network I/O
@@ -170,10 +200,13 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBac
     // Chunk 17: the 100 ms hardware sampler (blueprint §4.3) runs for the
     // whole headless run; its power trace is sliced per-iteration into the
     // Silicon Efficiency Metric (Joules/Token). The detected backend (any
-    // vendor) drives the GPU fields; a driverless host simply yields N/A
-    // and the run proceeds normally.
+    // vendor) drives the GPU fields; the CPU power backend drives the CPU
+    // draw (the system total = GPU + CPU); a driverless host simply yields
+    // N/A and the run proceeds normally.
     let hw = Arc::new(Mutex::new(
-        HwPoller::with_backend(gpu).with_rate(cfg.rate_per_kwh),
+        HwPoller::with_backend(gpu)
+            .with_cpu_power(cpu_power)
+            .with_rate(cfg.rate_per_kwh),
     ));
     rt.spawn({
         let hw = hw.clone();
@@ -608,13 +641,20 @@ fn run_export(
 /// foreground terminal program, so a current-thread runtime is all it
 /// needs; the worker pool will run on its own multi-thread runtime in
 /// later chunks.
-fn run_tui(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>>) -> bool {
+fn run_tui(
+    cfg: &Config,
+    logger: Arc<RunLogger>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    cpu_power: Option<Box<CpuPowerBackend>>,
+) -> bool {
     let export_format = cfg.export.unwrap_or_default();
-    // Chunk 17: the detected backend (any vendor) + sysinfo drive the
-    // 100 ms poller. Never fails — a driverless host simply runs with
-    // N/A GPU fields.
+    // Chunk 17: the detected backend (any vendor) + the CPU power backend +
+    // sysinfo drive the 100 ms poller. Never fails — a driverless host
+    // simply runs with N/A GPU fields.
     let hw = Arc::new(Mutex::new(
-        HwPoller::with_backend(gpu.clone()).with_rate(cfg.rate_per_kwh),
+        HwPoller::with_backend(gpu.clone())
+            .with_cpu_power(cpu_power)
+            .with_rate(cfg.rate_per_kwh),
     ));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()

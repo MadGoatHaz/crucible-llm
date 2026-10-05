@@ -34,10 +34,11 @@
 //! panic.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use super::intel_level_zero::IntelLevelZeroBackend;
 use super::sysfs::{find_hwmon, read_i32, read_trimmed, read_u32, read_u64};
-use super::{GpuBackend, GpuSample};
+use super::{clamp_gpu_power, GpuBackend, GpuSample};
 
 /// One Intel DRM card and the telemetry nodes resolved for it at init.
 #[derive(Debug)]
@@ -58,6 +59,10 @@ struct IntelCard {
 #[derive(Debug)]
 pub struct IntelSysfsBackend {
     cards: Vec<IntelCard>,
+    /// Per-card "power anomaly already warned" latches (the `GpuBackend`
+    /// poll is `&self`; a stuck unit-bug reading must not spam the console
+    /// every 100 ms). Parallel to `cards`.
+    warned: Mutex<Vec<bool>>,
 }
 
 impl IntelSysfsBackend {
@@ -91,7 +96,12 @@ impl IntelSysfsBackend {
                 model: read_trimmed(&device.join("label")),
             });
         }
-        (!found.is_empty()).then(|| Box::new(Self { cards: found }))
+        (!found.is_empty()).then(|| {
+            Box::new(Self {
+                cards: found,
+                warned: Mutex::new(Vec::new()),
+            })
+        })
     }
 }
 
@@ -113,7 +123,13 @@ impl GpuBackend for IntelSysfsBackend {
 
     /// One sample per Intel card (the multi-GPU table's source).
     fn poll_all(&self) -> Vec<GpuSample> {
-        self.cards.iter().map(sample_card).collect()
+        let mut guard = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        guard.resize(self.cards.len(), false);
+        self.cards
+            .iter()
+            .enumerate()
+            .map(|(i, card)| sample_card(card, i as u32, &mut guard[i]))
+            .collect()
     }
 
     /// The display name of each card (parallel to [`Self::poll_all`]).
@@ -127,18 +143,22 @@ impl GpuBackend for IntelSysfsBackend {
 }
 
 /// Read one card's full telemetry sample (all fields optional, N/A rule).
-fn sample_card(card: &IntelCard) -> GpuSample {
+fn sample_card(card: &IntelCard, index: u32, warned: &mut bool) -> GpuSample {
     let device = card.card_path.join("device");
 
     // Temperature + power from the hwmon child (millidegrees C,
     // microwatts); `None` for both when no hwmon node is registered
     // (e.g. integrated iGPUs, whose power lives in the CPU RAPL node).
-    let (temperature_c, power_watts) = card.hwmon_path.as_ref().map_or((None, None), |hwmon| {
+    let (temperature_c, power_raw) = card.hwmon_path.as_ref().map_or((None, None), |hwmon| {
         (
             read_i32(&hwmon.join("temp1_input")).map(|milli| milli / 1000),
             read_hwmon_power(hwmon),
         )
     });
+
+    // Plausibility clamp (hwmon power is µW → W; a unit bug would show as a
+    // 5 kW+ reading). The warn-once latch lives on the backend.
+    let power_watts = clamp_gpu_power(power_raw, &format!("Intel GPU {index}"), warned);
 
     GpuSample {
         // Utilization: NOT in Intel sysfs (documented limitation) —
@@ -239,6 +259,7 @@ fn read_hwmon_power(hwmon: &Path) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::hw::sysfs::{read_i32, read_trimmed, read_u32, read_u64};
+    use crate::hw::MAX_GPU_POWER_W;
     use std::path::Path;
 
     /// `try_init` must never panic: `None` on a machine without an Intel
@@ -302,5 +323,26 @@ mod tests {
         assert_eq!(read_u32(missing), None);
         assert_eq!(read_i32(missing), None);
         assert_eq!(read_trimmed(missing), None);
+    }
+
+    /// The hwmon power unit is microwatts (µW → W via ÷1e6), and the
+    /// plausibility clamp caps a unit-bug reading at the global ceiling
+    /// while a normal reading (e.g. a 250 W Arc A770) passes untouched.
+    #[test]
+    fn hwmon_power_unit_and_clamp() {
+        let uw = 250_000_000u64; // 250 W in microwatts
+        assert!((uw as f64 / 1_000_000.0 - 250.0).abs() < 1e-9);
+        let mut warned = false;
+        assert_eq!(
+            clamp_gpu_power(Some(250.0), "Intel GPU 0", &mut warned),
+            Some(250.0)
+        );
+        assert!(!warned);
+        let mut warned = false;
+        assert_eq!(
+            clamp_gpu_power(Some(250_000.0), "Intel GPU 0", &mut warned),
+            Some(MAX_GPU_POWER_W)
+        );
+        assert!(warned);
     }
 }

@@ -28,9 +28,10 @@
 //! panic.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use super::sysfs::{find_hwmon, read_i32, read_trimmed, read_u64, read_u8};
-use super::{GpuBackend, GpuSample};
+use super::{clamp_gpu_power, GpuBackend, GpuSample};
 
 /// One AMD DRM card and the telemetry nodes resolved for it at init.
 #[derive(Debug)]
@@ -49,6 +50,10 @@ struct AmdCard {
 #[derive(Debug)]
 pub struct AmdSysfsBackend {
     cards: Vec<AmdCard>,
+    /// Per-card "power anomaly already warned" latches (the `GpuBackend`
+    /// poll is `&self`; a stuck unit-bug reading must not spam the console
+    /// every 100 ms). Parallel to `cards`.
+    warned: Mutex<Vec<bool>>,
 }
 
 impl AmdSysfsBackend {
@@ -77,7 +82,12 @@ impl AmdSysfsBackend {
                 model: read_trimmed(&device.join("label")),
             });
         }
-        (!found.is_empty()).then(|| Box::new(Self { cards: found }))
+        (!found.is_empty()).then(|| {
+            Box::new(Self {
+                cards: found,
+                warned: Mutex::new(Vec::new()),
+            })
+        })
     }
 }
 
@@ -99,7 +109,13 @@ impl GpuBackend for AmdSysfsBackend {
 
     /// One sample per AMD card (the multi-GPU table's source).
     fn poll_all(&self) -> Vec<GpuSample> {
-        self.cards.iter().map(sample_card).collect()
+        let mut guard = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        guard.resize(self.cards.len(), false);
+        self.cards
+            .iter()
+            .enumerate()
+            .map(|(i, card)| sample_card(card, i as u32, &mut guard[i]))
+            .collect()
     }
 
     /// The display name of each card (parallel to [`Self::poll_all`]).
@@ -113,17 +129,22 @@ impl GpuBackend for AmdSysfsBackend {
 }
 
 /// Read one card's full telemetry sample (all fields optional, N/A rule).
-fn sample_card(card: &AmdCard) -> GpuSample {
+fn sample_card(card: &AmdCard, index: u32, warned: &mut bool) -> GpuSample {
     let device = card.card_path.join("device");
 
     // Temperature + power from the hwmon child (millidegrees C,
     // microwatts); `None` for both when no hwmon node is registered.
-    let (temperature_c, power_watts) = card.hwmon_path.as_ref().map_or((None, None), |hwmon| {
+    let (temperature_c, power_raw) = card.hwmon_path.as_ref().map_or((None, None), |hwmon| {
         (
             read_i32(&hwmon.join("temp1_input")).map(|milli| milli / 1000),
             read_hwmon_power(hwmon),
         )
     });
+
+    // Plausibility clamp (hwmon power is µW → W; a unit bug — e.g. reading
+    // microwatts as watts — would show as a 5 kW+ reading). The warn-once
+    // latch lives on the backend so a stuck reading does not spam.
+    let power_watts = clamp_gpu_power(power_raw, &format!("AMD GPU {index}"), warned);
 
     GpuSample {
         // Utilization: 0–100 integer (time-averaged SMU compute activity).
@@ -205,6 +226,7 @@ fn parse_pp_dpm_mhz(content: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::hw::sysfs::{read_i32, read_trimmed, read_u32, read_u64, read_u8};
+    use crate::hw::MAX_GPU_POWER_W;
     use std::path::Path;
 
     /// `try_init` must never panic: `None` on a machine without an AMD GPU,
@@ -270,5 +292,30 @@ mod tests {
         assert_eq!(read_u8(missing), None);
         assert_eq!(read_i32(missing), None);
         assert_eq!(read_trimmed(missing), None);
+    }
+
+    /// The hwmon power unit is microwatts (µW → W via ÷1e6), and the
+    /// plausibility clamp caps a unit-bug reading (microwatts treated as
+    /// watts → a 355,000 "W" figure on a 355 W RX 9700) at the global
+    /// ceiling while a normal reading passes untouched.
+    #[test]
+    fn hwmon_power_unit_and_clamp() {
+        // µW → W: a 355 W card reports 355,000,000 µW.
+        let uw = 355_000_000u64;
+        assert!((uw as f64 / 1_000_000.0 - 355.0).abs() < 1e-9);
+        // A normal reading passes the clamp untouched.
+        let mut warned = false;
+        assert_eq!(
+            clamp_gpu_power(Some(355.0), "AMD GPU 0", &mut warned),
+            Some(355.0)
+        );
+        assert!(!warned);
+        // A unit-bug reading is capped at the global ceiling + flagged.
+        let mut warned = false;
+        assert_eq!(
+            clamp_gpu_power(Some(355_000.0), "AMD GPU 0", &mut warned),
+            Some(MAX_GPU_POWER_W)
+        );
+        assert!(warned);
     }
 }

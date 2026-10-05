@@ -38,7 +38,14 @@ pub mod nvml;
 /// cost / efficiency panel. Pure data + math (no NVML, no locks).
 pub mod monitor;
 
+/// CPU power monitoring (RAPL → Super I/O → fixed estimate). Not
+/// platform-gated: off-Linux the `/sys` reads simply yield `None` and the
+/// cascade falls through to the clearly-labeled estimate.
+pub mod cpu_power;
+
 pub use monitor::{GpuPowerMonitor, PowerSample, TokenPhase, HISTORY_CAPACITY, IDLE_WINDOW_SECS};
+
+pub use cpu_power::CpuPowerBackend;
 
 #[cfg(target_os = "linux")]
 mod amd;
@@ -58,6 +65,42 @@ use std::sync::Arc;
 
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamStatus};
 use crate::timing::MonotonicInstant;
+
+/// A global plausibility ceiling for a *single* GPU's power draw (watts). No
+/// consumer or datacenter GPU draws 5 kW; a reading above it is a unit /
+/// scale bug (e.g. microwatts treated as watts) or a phantom sensor. Applied
+/// in every GPU backend (NVML uses a tighter, TDP-based bound; the sysfs and
+/// Level Zero backends use this global ceiling).
+pub const MAX_GPU_POWER_W: f64 = 5000.0;
+
+/// Clamp a single-GPU power reading (watts) to [`MAX_GPU_POWER_W`].
+///
+/// * a non-finite reading (`NaN` / `inf`) → `None` (the N/A rule);
+/// * a reading at or under the ceiling → returned unchanged and the `warned`
+///   latch reset (so a *future* anomaly warns again);
+/// * a reading over the ceiling → capped at [`MAX_GPU_POWER_W`], with a
+///   `[WARN]` emitted the first time (the `warned` latch prevents a stuck
+///   unit-bug reading from spamming the console every 100 ms poll).
+///
+/// Pure (no I/O beyond the warning); the caller owns the latch.
+#[must_use]
+pub fn clamp_gpu_power(power_w: Option<f64>, context: &str, warned: &mut bool) -> Option<f64> {
+    let w = power_w?;
+    if !w.is_finite() {
+        return None;
+    }
+    if w <= MAX_GPU_POWER_W {
+        *warned = false;
+        return Some(w);
+    }
+    if !*warned {
+        eprintln!(
+            "[WARN] [HW] {context} reported {w:.0} W — implausibly high (>{MAX_GPU_POWER_W:.0} W), capping to {MAX_GPU_POWER_W:.0} W"
+        );
+        *warned = true;
+    }
+    Some(MAX_GPU_POWER_W)
+}
 
 /// A unified, vendor-agnostic GPU telemetry sample (blueprint §5D).
 ///
@@ -251,12 +294,13 @@ pub fn hw_sample_from_gpu(t: MonotonicInstant, g: &GpuSample) -> HwSample {
     }
 }
 
-/// Shared, infallible sysfs read helpers for the AMD and Intel backends.
+/// Shared, infallible sysfs read helpers for the GPU and CPU backends.
 ///
 /// Every read returns `Option` — a missing node (ENOENT) or an
-/// unparseable value is `None`, never a panic (the N/A rule). Linux-only:
-/// the `/sys` tree does not exist on other platforms.
-#[cfg(target_os = "linux")]
+/// unparseable value is `None`, never a panic (the N/A rule). Not
+/// platform-gated: the helpers read `/sys` paths via `std::fs`, which
+/// simply yield `None` on hosts where that tree is absent (non-Linux), so
+/// the callers degrade gracefully everywhere.
 pub(crate) mod sysfs {
     use std::path::{Path, PathBuf};
 
@@ -280,6 +324,11 @@ pub(crate) mod sysfs {
 
     /// Read a file as a `u64`, or `None`.
     pub(crate) fn read_u64(path: &Path) -> Option<u64> {
+        read_trimmed(path)?.parse().ok()
+    }
+
+    /// Read a file as an `f64`, or `None` (hwmon `in*` / `power*` values).
+    pub(crate) fn read_f64(path: &Path) -> Option<f64> {
         read_trimmed(path)?.parse().ok()
     }
 
@@ -326,6 +375,10 @@ pub struct HwSample {
     pub vram_total_bytes: Option<u64>,
     /// Instantaneous GPU power draw, milliwatts.
     pub power_mw: Option<u64>,
+    /// Instantaneous CPU power draw, milliwatts (RAPL / Super I-O /
+    /// estimate). `None` when no CPU power source is active. The total
+    /// system draw for the energy integral is `power_mw + cpu_power_mw`.
+    pub cpu_power_mw: Option<u64>,
     /// GPU (SM) core clock, MHz.
     pub gpu_clock_mhz: Option<u32>,
     /// GPU core temperature, °C.
@@ -371,6 +424,10 @@ pub struct HwPoller {
     /// Per-device display names (parallel to the monitor's per-GPU table),
     /// refreshed from the backend on each poll.
     gpu_names: Vec<String>,
+    /// The CPU power backend (RAPL → Super I/O → estimate). `None` until
+    /// [`Self::with_cpu_power`] injects one (the entry point creates and
+    /// logs it at startup); a `None` poller simply reports no CPU draw.
+    cpu_power: Option<Box<CpuPowerBackend>>,
 }
 
 impl std::fmt::Debug for HwPoller {
@@ -380,6 +437,7 @@ impl std::fmt::Debug for HwPoller {
             .field("energy_joules", &self.energy_joules)
             .field("trace_len", &self.trace.len())
             .field("gpu_count", &self.gpu_names.len())
+            .field("cpu_power", &self.cpu_power.as_ref().map(|c| c.method()))
             .finish()
     }
 }
@@ -413,6 +471,9 @@ impl HwPoller {
             capacity: HW_TRACE_CAPACITY,
             monitor: GpuPowerMonitor::default(),
             gpu_names: Vec::new(),
+            // The entry point injects the CPU power backend (it creates and
+            // logs it at startup); a bare `with_backend` has none.
+            cpu_power: None,
         }
     }
 
@@ -421,6 +482,15 @@ impl HwPoller {
     #[must_use]
     pub fn with_rate(mut self, rate: f64) -> Self {
         self.monitor = self.monitor.with_rate(rate);
+        self
+    }
+
+    /// Inject the CPU power backend (builder-style; the entry point creates
+    /// it at startup, logs its method, and shares it here). `None` leaves
+    /// the poller with no CPU draw (every CPU field reports N/A).
+    #[must_use]
+    pub fn with_cpu_power(mut self, cpu_power: Option<Box<CpuPowerBackend>>) -> Self {
+        self.cpu_power = cpu_power;
         self
     }
 
@@ -499,8 +569,10 @@ impl HwPoller {
     }
 
     /// The shared sample-advance logic: fold the (optional) GPU sample
-    /// into a fresh [`HwSample`], add the CPU/RAM counters, advance the
-    /// trapezoidal `∫P(t)dt` integral, and append to the bounded trace.
+    /// into a fresh [`HwSample`], poll the CPU power backend, add the
+    /// CPU/RAM counters, advance the trapezoidal `∫P(t)dt` integral over
+    /// the *total system draw* (GPU + CPU), and append to the bounded
+    /// trace.
     fn advance(&mut self, gpu: &Option<GpuSample>) -> HwSample {
         let mut sample = HwSample {
             t: MonotonicInstant::now(),
@@ -516,6 +588,17 @@ impl HwPoller {
             sample.gpu_util_pct = g_sample.gpu_util_pct;
         }
 
+        // CPU power (the system-draw component the GPU-only trace used to
+        // miss): poll the backend (RAPL / Super I-O / estimate) and store
+        // it in milliwatts. No backend (or a `None` reading) → `None`
+        // (the N/A rule).
+        let cpu_w = self
+            .cpu_power
+            .as_deref_mut()
+            .map(|c| c.poll())
+            .unwrap_or(0.0);
+        sample.cpu_power_mw = (cpu_w > 0.0).then_some((cpu_w * 1000.0).round().max(0.0) as u64);
+
         // Cross-platform CPU/RAM (sysinfo): a couple of /proc reads —
         // cheap enough for the 100 ms cadence, and it never touches the
         // stream workers' timing path.
@@ -525,23 +608,23 @@ impl HwPoller {
         sample.ram_used_bytes = Some(self.sys.used_memory());
         sample.ram_total_bytes = Some(self.sys.total_memory());
 
-        // Trapezoidal update of ∫P(t)dt (watts × seconds). A missing
-        // power reading contributes nothing (N/A rule) — the integral
-        // simply spans from the last known reading to the next.
-        if let Some(mw) = sample.power_mw {
-            let p = mw as f64 / 1000.0;
+        // Trapezoidal update of ∫P(t)dt (watts × seconds) over the *total
+        // system draw* (GPU + CPU). A sample with neither contributes
+        // nothing (N/A rule) — the integral spans from the last known
+        // reading to the next.
+        let p_total = Self::sample_total_watts(&sample);
+        if p_total > 0.0 {
             let p_prev = self
                 .trace
                 .last()
-                .and_then(|prev| prev.power_mw)
-                .map(|m| m as f64 / 1000.0)
-                .unwrap_or(p);
+                .map(Self::sample_total_watts)
+                .unwrap_or(p_total);
             let dt = self
                 .trace
                 .last()
                 .map(|prev| prev.t.delta_nanos(&sample.t) as f64 / 1e9)
                 .unwrap_or(0.0);
-            self.energy_joules += (p_prev + p) / 2.0 * dt;
+            self.energy_joules += (p_prev + p_total) / 2.0 * dt;
         }
 
         self.trace.push(sample.clone());
@@ -549,6 +632,12 @@ impl HwPoller {
             self.trace.drain(0..self.trace.len() - self.capacity);
         }
         sample
+    }
+
+    /// The total system draw (watts) of one sample: GPU + CPU.
+    fn sample_total_watts(s: &HwSample) -> f64 {
+        s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+            + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
     }
 
     /// The metrics-pipeline seam (blueprint §4.2): poll once and merge the
@@ -584,15 +673,23 @@ impl HwPoller {
             active: snap.status == StreamStatus::Streaming,
             tokens_seen: snap.completion_tokens > 0 || snap.observed_frames > 0,
         };
+
+        // Poll the 100 ms `P(t)` sample (GPU aggregate + the CPU power
+        // backend) *first*, so the CPU watts are available for the monitor
+        // below (the system-draw component the GPU-only math used to miss).
+        let sample = self.advance(&Some(agg.clone()));
+        let cpu_w = sample
+            .cpu_power_mw
+            .map(|m| m as f64 / 1000.0)
+            .unwrap_or(0.0);
+        self.monitor.set_cpu_power(cpu_w);
+
         if self.monitor.idle_finalized {
             self.monitor.record(&agg, &per_gpu, &self.gpu_names, &phase);
         } else {
             self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
         }
 
-        // The existing 100 ms `P(t)` trace + cumulative energy integral
-        // (Engine D's Silicon Efficiency Metric) over the aggregate.
-        let sample = self.advance(&Some(agg.clone()));
         let merged = merge_hw(
             &snap,
             &sample,
@@ -733,6 +830,26 @@ mod tests {
             },
         );
         assert_eq!(s2.gpu_temp_c, Some(0));
+    }
+
+    /// `sample_total_watts` sums the GPU + CPU draw of a sample (the
+    /// system-draw figure the energy integral and the `$`/1M cost use).
+    #[test]
+    fn sample_total_watts_sums_gpu_and_cpu() {
+        let s = HwSample {
+            power_mw: Some(285_000),    // 285 W GPU
+            cpu_power_mw: Some(73_000), // 73 W CPU
+            ..HwSample::default()
+        };
+        assert!((HwPoller::sample_total_watts(&s) - 358.0).abs() < 1e-9);
+        // CPU-only sample (no GPU): the total is just the CPU draw.
+        let s2 = HwSample {
+            cpu_power_mw: Some(40_000),
+            ..HwSample::default()
+        };
+        assert!((HwPoller::sample_total_watts(&s2) - 40.0).abs() < 1e-9);
+        // No power at all → 0.0 (the N/A rule).
+        assert_eq!(HwPoller::sample_total_watts(&HwSample::default()), 0.0);
     }
 
     /// `GpuSample::aggregate` rolls up per-device samples: power + VRAM

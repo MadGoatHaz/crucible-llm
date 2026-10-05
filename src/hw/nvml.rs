@@ -27,11 +27,14 @@
 //! provide (e.g. `power_usage()` on some vGPU hosts) is `None` for that
 //! field only — the rest of the sample is unaffected.
 
+use std::sync::Mutex;
+
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::Nvml;
 
 use super::GpuBackend;
 use super::GpuSample;
+use super::MAX_GPU_POWER_W;
 
 /// The NVML-backed GPU backend (NVIDIA).
 ///
@@ -44,6 +47,10 @@ pub struct NvmlBackend {
     count: u32,
     /// The target (first) GPU's marketing name.
     name: String,
+    /// Per-device "power anomaly already warned" latches (the `GpuBackend`
+    /// poll is `&self`; a stuck anomalous reading must not spam the console
+    /// every 100 ms). Parallel to the device indices.
+    warned: Mutex<Vec<bool>>,
 }
 
 impl NvmlBackend {
@@ -63,7 +70,12 @@ impl NvmlBackend {
             .ok()?
             .name()
             .unwrap_or_else(|_| "NVIDIA GPU".to_string());
-        Some(Box::new(Self { nvml, count, name }))
+        Some(Box::new(Self {
+            nvml,
+            count,
+            name,
+            warned: Mutex::new(vec![false; count as usize]),
+        }))
     }
 
     /// The target (first) GPU's marketing name.
@@ -92,6 +104,8 @@ impl GpuBackend for NvmlBackend {
     /// for that field only); a lost device is skipped entirely.
     fn poll_all(&self) -> Vec<GpuSample> {
         let mut out = Vec::with_capacity(self.count as usize);
+        let mut guard = self.warned.lock().unwrap_or_else(|e| e.into_inner());
+        guard.resize(self.count as usize, false);
         for i in 0..self.count {
             let Ok(device) = self.nvml.device_by_index(i) else {
                 continue; // per-device degradation: skip a lost device
@@ -100,8 +114,19 @@ impl GpuBackend for NvmlBackend {
                 .memory_info()
                 .map(|mi| (mi.used, mi.total))
                 .unwrap_or((0, 0));
+            // Power: NVML reports *milliwatts* (mW / 1000 = W) — the units
+            // are correct. The TDP (power-management limit, also mW) drives
+            // the plausibility clamp: a reading > 2× the TDP (e.g. the 943 W
+            // on a single 300 W A4000) is flagged and capped at 1.5× the TDP.
+            let tdp_w = device
+                .power_management_limit()
+                .ok()
+                .map(|mw| mw as f64 / 1000.0);
+            let power_watts = device.power_usage().ok().and_then(|mw| {
+                clamp_nvml_power(mw as f64 / 1000.0, tdp_w, i, &mut guard[i as usize])
+            });
             out.push(GpuSample {
-                power_watts: device.power_usage().ok().map(|mw| mw as f64 / 1000.0),
+                power_watts,
                 utilization_pct: device
                     .utilization_rates()
                     .ok()
@@ -144,9 +169,112 @@ impl GpuBackend for NvmlBackend {
     }
 }
 
+/// Plausibility-clamp an NVML power reading (watts) against the card's
+/// power-management limit (TDP, watts) and the global ceiling.
+///
+/// NVML's `power_usage()` **and** `power_management_limit()` both return
+/// *milliwatts*; the caller converts to watts before calling this. A reading
+/// **> 2× the TDP** is a unit/scale bug or a phantom spike — the canonical
+/// case is the **943 W reported on a single 300 W A4000** (3.14× its TDP,
+/// physically impossible). It is flagged with a `[WARN]` (once per anomaly
+/// episode, via the `warned` latch) and **capped at 1.5× the TDP**
+/// (transient spikes are possible, 3× is not). When no TDP is available
+/// (the limit query is unsupported on some hosts) the global
+/// [`MAX_GPU_POWER_W`] ceiling stands in.
+#[must_use]
+fn clamp_nvml_power(
+    power_w: f64,
+    tdp_w: Option<f64>,
+    index: u32,
+    warned: &mut bool,
+) -> Option<f64> {
+    if !power_w.is_finite() {
+        return None;
+    }
+    // TDP-based bound (the 943 W-on-a-300 W A4000 guard).
+    if let Some(tdp) = tdp_w {
+        if tdp > 0.0 && power_w > 2.0 * tdp {
+            if !*warned {
+                eprintln!(
+                    "[WARN] [HW] GPU {index} reported {power_w:.0} W but TDP is {tdp:.0} W — possible unit error"
+                );
+                *warned = true;
+            }
+            return Some(power_w.min(1.5 * tdp));
+        }
+    }
+    // Global ceiling (no consumer / datacenter GPU draws 5 kW).
+    if power_w > MAX_GPU_POWER_W {
+        if !*warned {
+            eprintln!(
+                "[WARN] [HW] GPU {index} reported {power_w:.0} W — implausibly high (>{MAX_GPU_POWER_W:.0} W), capping"
+            );
+            *warned = true;
+        }
+        return Some(MAX_GPU_POWER_W);
+    }
+    *warned = false;
+    Some(power_w)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NVML reports power in *milliwatts*: the `/1000.0` in `poll_all` is
+    /// the mW → W conversion.
+    #[test]
+    fn nvml_power_unit_is_milliwatts() {
+        let mw = 300_000u32; // a 300 W A4000
+        assert!((mw as f64 / 1000.0 - 300.0).abs() < 1e-9);
+        assert!((19_500_f64 / 1000.0 - 19.5).abs() < 1e-9);
+    }
+
+    /// The 943 W-on-a-300 W A4000 bug: 943 > 2×300 = 600 → flagged and
+    /// capped at 1.5×300 = 450 W. A stuck reading does not re-warn (the
+    /// latch holds until the reading normalizes).
+    #[test]
+    fn nvml_clamp_flags_and_caps_a_3x_tdp_reading() {
+        let mut warned = false;
+        let out = clamp_nvml_power(943.0, Some(300.0), 0, &mut warned);
+        assert_eq!(out, Some(450.0), "capped at 1.5× the TDP");
+        assert!(warned, "the anomaly was flagged");
+        // A second identical reading: the latch is already set (no new warn
+        // would fire), the value is still capped.
+        let out2 = clamp_nvml_power(943.0, Some(300.0), 0, &mut warned);
+        assert_eq!(out2, Some(450.0));
+    }
+
+    /// A normal (sub-2×TDP) reading passes through untouched and resets the
+    /// latch.
+    #[test]
+    fn nvml_clamp_passes_a_normal_reading() {
+        let mut warned = true; // start "latched"
+        let out = clamp_nvml_power(285.0, Some(300.0), 0, &mut warned);
+        assert_eq!(out, Some(285.0), "a sub-2×TDP reading is untouched");
+        assert!(!warned, "a normal reading resets the latch");
+    }
+
+    /// Without a TDP (the limit query is unsupported), a 5 kW+ reading hits
+    /// the global ceiling.
+    #[test]
+    fn nvml_clamp_falls_back_to_the_global_cap_without_a_tdp() {
+        let mut warned = false;
+        let out = clamp_nvml_power(355_000.0, None, 1, &mut warned);
+        assert_eq!(out, Some(MAX_GPU_POWER_W));
+        assert!(warned);
+    }
+
+    /// A non-finite reading degrades to `None` (the N/A rule).
+    #[test]
+    fn nvml_clamp_non_finite_is_na() {
+        let mut warned = false;
+        assert_eq!(
+            clamp_nvml_power(f64::NAN, Some(300.0), 0, &mut warned),
+            None
+        );
+        assert_eq!(clamp_nvml_power(f64::INFINITY, None, 0, &mut warned), None);
+    }
 
     /// `try_init` must return `None` — never panic — on a driver-less
     /// host (Chunk 17 acceptance: graceful degradation).

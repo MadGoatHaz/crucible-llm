@@ -59,6 +59,10 @@ pub struct PowerSample {
     pub t: MonotonicInstant,
     /// Aggregate power draw, watts (all GPUs summed).
     pub power_w: f64,
+    /// CPU power draw, watts (RAPL / Super I-O / estimate). The total
+    /// *system* draw is `power_w + cpu_power_w` — the energy integral and
+    /// the `$/1M` cost math use the sum, not the GPU alone.
+    pub cpu_power_w: f64,
     /// Aggregate (max) compute utilization, % (0–100).
     pub util_pct: f64,
     /// Aggregate (max) temperature, °C.
@@ -72,6 +76,7 @@ impl Default for PowerSample {
         Self {
             t: MonotonicInstant::now(),
             power_w: 0.0,
+            cpu_power_w: 0.0,
             util_pct: 0.0,
             temp_c: 0.0,
             vram_gb: 0.0,
@@ -224,6 +229,12 @@ pub struct GpuPowerMonitor {
     /// `true` once any power reading has been seen (the N/A rule's gate).
     pub has_power: bool,
 
+    // ---- CPU power (the system-draw component the GPU-only math missed) ----
+    /// Current CPU power draw, watts (RAPL / Super I-O / estimate).
+    pub cpu_power_w: f64,
+    /// Peak CPU power draw observed this run, watts.
+    pub cpu_power_peak_w: f64,
+
     // ---- tokens (the efficiency + cost denominators) ----
     /// Total **output** tokens generated this run (cumulative across all
     /// engines) — the J/token and $/1M-output denominators.
@@ -284,6 +295,8 @@ impl Default for GpuPowerMonitor {
             avg_util_pct: 0.0,
             throttle_events: 0,
             has_power: false,
+            cpu_power_w: 0.0,
+            cpu_power_peak_w: 0.0,
             total_tokens: 0,
             prompt_tokens: 0,
             first_token_at: None,
@@ -309,6 +322,15 @@ impl GpuPowerMonitor {
         self
     }
 
+    /// Record the current CPU power draw (watts). Called by the poller on
+    /// each tick, *before* [`Self::record`] / [`Self::record_idle`], so the
+    /// 1 Hz history point carries the CPU component. The running peak is
+    /// tracked too.
+    pub fn set_cpu_power(&mut self, watts: f64) {
+        self.cpu_power_w = watts.max(0.0);
+        self.cpu_power_peak_w = self.cpu_power_peak_w.max(self.cpu_power_w);
+    }
+
     /// Arm a **new** run: reset every accumulator (including the per-GPU
     /// run statistics, the phase clocks, and the load-window clock) and
     /// start the idle clock. The poller calls this when a benchmark
@@ -321,6 +343,8 @@ impl GpuPowerMonitor {
         self.avg_util_pct = 0.0;
         self.throttle_events = 0;
         self.has_power = false;
+        self.cpu_power_w = 0.0;
+        self.cpu_power_peak_w = 0.0;
         self.total_tokens = 0;
         self.prompt_tokens = 0;
         self.first_token_at = None;
@@ -478,6 +502,10 @@ impl GpuPowerMonitor {
         let sample = PowerSample {
             t: now,
             power_w: agg.power_watts.unwrap_or(0.0),
+            // The CPU component of the system draw (set by `set_cpu_power`
+            // before `record` on each tick) — the energy / cost math sums it
+            // with the GPU power.
+            cpu_power_w: self.cpu_power_w,
             util_pct: agg.utilization_pct.map(|u| u as f64).unwrap_or(0.0),
             temp_c: agg.temperature_c.map(|t| t as f64).unwrap_or(0.0),
             vram_gb: agg
@@ -550,6 +578,13 @@ impl GpuPowerMonitor {
     /// added, not the machine's floor). Clamped non-negative.
     pub fn compute_power_w(&self) -> f64 {
         (self.total_power_w - self.idle_power_w).max(0.0)
+    }
+
+    /// Total **system** power draw (all GPUs + the CPU), watts — the figure
+    /// the "Total" line in the View 4 system-power panel and the energy /
+    /// cost math are built from (GPU alone underreports the real draw).
+    pub fn system_power_w(&self) -> f64 {
+        self.total_power_w + self.cpu_power_w
     }
 
     /// Mean power over the load window: `energy / duration` (time-weighted).
@@ -655,7 +690,9 @@ impl GpuPowerMonitor {
                 // the next phase.
                 in_window && (end_inclusive || s.t != end)
             })
-            .map(|s| s.power_w)
+            // Total *system* draw (GPU + CPU) — the phase powers that feed
+            // the `$/1M` cost math include the CPU, not just the GPU.
+            .map(|s| s.power_w + s.cpu_power_w)
             .collect();
         (!vals.is_empty()).then(|| vals.iter().sum::<f64>() / vals.len() as f64)
     }
@@ -720,7 +757,11 @@ pub fn integrate_power(history: &[PowerSample]) -> f64 {
     let mut joules = 0.0f64;
     for pair in history.windows(2) {
         let dt = pair[0].t.delta_nanos(&pair[1].t) as f64 / 1e9;
-        joules += (pair[0].power_w + pair[1].power_w) / 2.0 * dt;
+        // Total *system* draw (GPU + CPU) at each end of the interval — the
+        // energy the `$`/1M cost is computed from (GPU alone underreports).
+        let p0 = pair[0].power_w + pair[0].cpu_power_w;
+        let p1 = pair[1].power_w + pair[1].cpu_power_w;
+        joules += (p0 + p1) / 2.0 * dt;
     }
     joules
 }
@@ -1387,5 +1428,96 @@ mod tests {
         assert!(c.total_cost > 0.0, "total cost: {}", c.total_cost);
         // Decode's longer window at 2× the power → the output rate wins.
         assert!(c.cost_per_1m_output > c.cost_per_1m_input);
+    }
+
+    // ── CPU power integration (the system-draw component) ────────────────
+
+    /// `set_cpu_power` tracks the current + peak CPU draw (a lower later
+    /// reading does not lower the peak).
+    #[test]
+    fn set_cpu_power_tracks_current_and_peak() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.set_cpu_power(50.0);
+        m.set_cpu_power(73.0);
+        m.set_cpu_power(20.0);
+        assert!(
+            (m.cpu_power_w - 20.0).abs() < 1e-9,
+            "current is the last read"
+        );
+        assert!(
+            (m.cpu_power_peak_w - 73.0).abs() < 1e-9,
+            "peak is the max seen"
+        );
+    }
+
+    /// `system_power_w` is the GPU + CPU sum (the "Total" the panel shows).
+    #[test]
+    fn system_power_is_gpu_plus_cpu() {
+        let mut m = GpuPowerMonitor {
+            total_power_w: 2847.0,
+            ..Default::default()
+        };
+        m.set_cpu_power(73.0);
+        assert!((m.system_power_w() - 2920.0).abs() < 1e-9);
+    }
+
+    /// The energy integral uses the *total system draw* (GPU + CPU per
+    /// sample): the same GPU power with a nonzero CPU draw integrates to
+    /// more energy.
+    #[test]
+    fn energy_joules_includes_the_cpu_draw() {
+        let mut m = GpuPowerMonitor::default().with_rate(0.16);
+        m.begin_run();
+        m.start_load();
+        let load_start = m.load_started.unwrap();
+        m.set_cpu_power(40.0);
+        m.history.push(PowerSample {
+            t: load_start,
+            power_w: 300.0,
+            cpu_power_w: 40.0,
+            ..Default::default()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = MonotonicInstant::now();
+        m.history.push(PowerSample {
+            t: now,
+            power_w: 300.0,
+            cpu_power_w: 40.0,
+            ..Default::default()
+        });
+        let with_cpu = m.energy_joules();
+        // The identical samples with no CPU draw.
+        let gpu_only = GpuPowerMonitor {
+            history: vec![
+                PowerSample {
+                    t: load_start,
+                    power_w: 300.0,
+                    ..Default::default()
+                },
+                PowerSample {
+                    t: now,
+                    power_w: 300.0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+        .energy_joules();
+        assert!(
+            with_cpu > gpu_only,
+            "system energy ({with_cpu}) > GPU-only ({gpu_only})"
+        );
+    }
+
+    /// `begin_run` resets the CPU power fields.
+    #[test]
+    fn begin_run_resets_cpu_power() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.set_cpu_power(73.0);
+        m.begin_run();
+        assert_eq!(m.cpu_power_w, 0.0);
+        assert_eq!(m.cpu_power_peak_w, 0.0);
     }
 }
