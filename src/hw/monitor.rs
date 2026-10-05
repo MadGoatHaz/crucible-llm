@@ -28,8 +28,7 @@
 //! * **Cost per 1M tokens** — [`calculate_token_costs`] turns the phase
 //!   power + phase durations + token counts into **separate** $/1M rates
 //!   for *input* (prefill) and *output* (decode) tokens, plus a blended
-//!   rate and the run's total cost — directly comparable to cloud API
-//!   pricing (GPT-4o / Claude list prices shown beside them in View 4).
+//!   rate and the run's total cost at the user's `$/kWh` rate.
 //! * **Efficiency** — J/token, J/ktoken, tokens/W.
 //! * **Duration** — the load-window span, *frozen* at its final value once
 //!   the run ends ([`Self::end_load`]) — a completed run's duration must
@@ -106,8 +105,7 @@ pub struct TokenPhase {
 /// panel's data).
 ///
 /// * **Input** (prefill) and **output** (decode) are *separate* rates —
-///   like the cloud providers' own pricing tables (GPT-4o charges
-///   differently for prompt vs completion tokens);
+///   prefill and decode draw very different power;
 /// * **Blended** is the all-in rate over `input + output` tokens;
 /// * **Total cost** is what this run's measured energy actually cost at
 ///   the user's `$/kWh` rate.
@@ -522,7 +520,7 @@ impl GpuPowerMonitor {
     /// it is **frozen** at the final value (`0.0` before load / no clock).
     pub fn duration_sec(&self) -> f64 {
         match (self.load_started, self.load_ended) {
-            (Some(start), Some(end)) => end.delta_nanos(&start) as f64 / 1e9,
+            (Some(start), Some(end)) => start.delta_nanos(&end) as f64 / 1e9,
             (Some(start), None) => start.elapsed().as_secs_f64(),
             _ => 0.0,
         }
@@ -541,6 +539,11 @@ impl GpuPowerMonitor {
     /// Estimated cost at the configured `$/kWh` rate.
     pub fn cost_usd(&self) -> f64 {
         self.energy_kwh() * self.rate_per_kwh
+    }
+
+    /// Estimated cost at an explicit `$/kWh` rate (the live-config variant).
+    pub fn cost_usd_at_rate(&self, rate: f64) -> f64 {
+        self.energy_kwh() * rate
     }
 
     /// Compute power = total draw − idle baseline (the power the *work*
@@ -581,14 +584,40 @@ impl GpuPowerMonitor {
     /// The window is **half-open** (`[load_start, first_token)`): a sample
     /// sitting exactly on the first-token instant belongs to the decode
     /// phase. A sub-second TTFT rarely contains a whole 1 Hz sample; when
-    /// the window is empty the **first** history sample (the one closest
-    /// to load start) stands in — the best available estimate of the
-    /// prefill draw. `None` when the history is empty (the N/A rule).
+    /// fewer than 2 samples fall in the window the **overall average
+    /// power** stands in (see [`Self::prefill_uses_fallback`] for the UI
+    /// warning). `None` when the history is empty (the N/A rule).
     pub fn avg_prefill_power(&self) -> Option<f64> {
         let first = self.first_token_at?;
         let start = self.load_started.unwrap_or(first);
-        self.phase_avg_power(start, first, false)
-            .or_else(|| self.history.first().map(|s| s.power_w))
+        if self.prefill_uses_fallback() {
+            // Fewer than 2 samples in the TTFT window: use the overall
+            // average power (the best available estimate).
+            self.avg_power_w()
+                .or_else(|| self.history.first().map(|s| s.power_w))
+        } else {
+            self.phase_avg_power(start, first, false)
+        }
+    }
+
+    /// `true` when the prefill window contains fewer than 2 power samples
+    /// (a sub-second TTFT at 1 Hz sampling). The UI shows a warning note
+    /// when this is set: the prefill power is the overall average, not a
+    /// phase-specific measurement.
+    pub fn prefill_uses_fallback(&self) -> bool {
+        let Some(first) = self.first_token_at else {
+            return true; // no first token → no prefill measurement possible
+        };
+        let start = self.load_started.unwrap_or(first);
+        let count = self
+            .history
+            .iter()
+            .filter(|s| {
+                let in_window = s.t.delta_nanos(&start) == 0 && first.delta_nanos(&s.t) == 0;
+                in_window && s.t != first
+            })
+            .count();
+        count < 2
     }
 
     /// The **average power draw during the decode phase** (first token →
@@ -633,14 +662,24 @@ impl GpuPowerMonitor {
 
     /// The **$/1M-token cost breakdown** for this run: separate *input*
     /// (prefill) and *output* (decode) rates, a blended rate, and the run's
-    /// total cost — the data the View 4 **COST ANALYSIS** panel renders
-    /// beside cloud reference prices.
+    /// total cost — the data the View 4 **COST ANALYSIS** panel renders.
     ///
     /// `None` (the N/A rule) when there is no power telemetry, no token
     /// data, no first-token latch, or no power history to measure the
     /// phase draws from.
     #[must_use]
     pub fn token_costs(&self) -> Option<TokenCosts> {
+        self.token_costs_at_rate(self.rate_per_kwh)
+    }
+
+    /// The **$/1M-token cost breakdown** at an explicit `rate` ($/kWh).
+    ///
+    /// This is the live-rate variant: the UI calls it with the user's
+    /// current `$/kWh` from the Config form so a rate change takes effect
+    /// immediately (the monitor's own `rate_per_kwh` is set at startup and
+    /// may be stale).
+    #[must_use]
+    pub fn token_costs_at_rate(&self, rate: f64) -> Option<TokenCosts> {
         if !self.has_power {
             return None;
         }
@@ -666,7 +705,7 @@ impl GpuPowerMonitor {
             decode_secs,
             prefill_w,
             decode_w,
-            self.rate_per_kwh,
+            rate,
         ))
     }
 }
@@ -1189,16 +1228,17 @@ mod tests {
         assert!((m.avg_decode_power().unwrap() - 310.0).abs() < 1e-9);
     }
 
-    /// A sub-second phase (no 1 Hz sample inside the window) falls back to
-    /// the nearest history sample — never `None` while power exists.
+    /// A sub-second prefill phase (fewer than 2 samples inside the window)
+    /// falls back to the overall average power — never `None` while power
+    /// exists.
     #[test]
-    fn monitor_phase_power_falls_back_to_nearest_sample() {
+    fn monitor_prefill_falls_back_to_overall_average() {
         let mut m = GpuPowerMonitor::default();
         m.begin_run();
         m.start_load();
         let load_start = m.load_started.unwrap();
         // One sample right at load start, the first token a few ms later
-        // (no sample inside the prefill window).
+        // (only 1 sample inside the prefill window → fallback triggered).
         m.history.push(PowerSample {
             t: load_start,
             power_w: 80.0,
@@ -1214,8 +1254,51 @@ mod tests {
             ..Default::default()
         });
         m.has_power = true;
-        assert!((m.avg_prefill_power().unwrap() - 80.0).abs() < 1e-9);
+        // Freeze the duration so `avg_power_w` is stable across calls.
+        m.end_load();
+        // The fallback is detected…
+        assert!(m.prefill_uses_fallback(), "fallback detected");
+        // …and the value equals the overall average (not the single 80 W).
+        let prefill = m.avg_prefill_power().unwrap();
+        let overall = m.avg_power_w().unwrap();
+        assert!((prefill - overall).abs() < 1e-9);
+        // The prefill value is *not* just the 80 W sample — it's the
+        // time-weighted average of both samples (~165 W).
+        assert!(
+            prefill > 100.0,
+            "overall avg > single 80W sample: {prefill}"
+        );
+        // Decode still uses its own window (the 250 W sample).
         assert!((m.avg_decode_power().unwrap() - 250.0).abs() < 1e-9);
+    }
+
+    /// Two or more samples in the prefill window → the real phase average
+    /// is used and no fallback is indicated.
+    #[test]
+    fn monitor_prefill_uses_phase_average_with_enough_samples() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        let load_start = m.load_started.unwrap();
+        // Two prefill samples (100 W, 200 W) before the first token.
+        m.history.push(PowerSample {
+            t: load_start,
+            power_w: 100.0,
+            ..Default::default()
+        });
+        m.history.push(PowerSample {
+            t: load_start,
+            power_w: 200.0,
+            ..Default::default()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let first = MonotonicInstant::now();
+        m.first_token_at = Some(first);
+        m.last_token_at = Some(first);
+        m.has_power = true;
+        assert!(!m.prefill_uses_fallback(), "no fallback with 2 samples");
+        let prefill = m.avg_prefill_power().unwrap();
+        assert!((prefill - 150.0).abs() < 1e-9, "mean of 100+200");
     }
 
     /// `token_costs` is `None` (the N/A rule) without power, without a

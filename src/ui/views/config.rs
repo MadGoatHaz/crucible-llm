@@ -1025,6 +1025,14 @@ fn parse_rate(s: &str) -> f64 {
     }
 }
 
+/// The user's **live** `$/kWh` rate from the Config form (read at render
+/// time so a rate change in View 6 immediately affects the GPU & Power
+/// view's cost calculations — the monitor's own `rate_per_kwh` is a
+/// startup snapshot and can be stale).
+pub fn current_rate(app: &crate::ui::app::App) -> f64 {
+    parse_rate(&app.config.rate_text)
+}
+
 /// The toggle state glyph: `[✓]` on, `[ ]` off (clear, at-a-glance state).
 fn bool_str(b: bool) -> String {
     if b {

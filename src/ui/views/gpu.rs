@@ -17,13 +17,12 @@
 //! * **Per-GPU table** — one row per device: power, current *and*
 //!   whole-run average utilization, current *and* whole-run average
 //!   temperature, peak temperature, VRAM, core/mem clock, throttle (the
-//!   multi-GPU showcase). The Name column grows to fit full card names
-//!   (up to 28 chars — "Radeon RX 9700", "NVIDIA A4000").
-//! * **Cost analysis** — the headline **$/1M-token** comparison: separate
-//!   *input* (prefill) and *output* (decode) rates measured from the
-//!   phase power draws, a blended rate, the run's total cost, all at the
-//!   user's `$/kWh` rate — beside cloud reference prices (GPT-4o,
-//!   Claude) for a direct local-vs-cloud comparison.
+//!   multi-GPU showcase). The Name column is a **fixed 24-char** width
+//!   (pad/truncate) so all subsequent columns align perfectly.
+//! * **Cost analysis** — the headline **$/1M-token** rates: separate
+//!   *input* (prefill) and *output* (decode) measured from the phase
+//!   power draws, a blended rate, and the run's total cost — all at the
+//!   user's live `$/kWh` rate from the Config form.
 //! * **Utilization + Temperature over time** — two 1 Hz **line** charts
 //!   whose y-axis **auto-scales to the actual data range** (with padding):
 //!   a signal hovering 85–97% renders as a visible curve, not a flat line
@@ -60,6 +59,11 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         return;
     };
 
+    // The live `$/kWh` rate from the Config form (the user may have changed
+    // it since startup; the monitor's own `rate_per_kwh` is a startup
+    // snapshot and can be stale).
+    let rate = crate::ui::views::config::current_rate(app);
+
     // The title: the vendor + model, with the device count when multi-GPU.
     let title = match &app.gpu {
         Some(be) => {
@@ -90,10 +94,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
         .constraints(constraints)
         .split(area);
 
-    render_system_power(rects[0], mon, &title, th, f);
-    render_power_efficiency_row(rects[1], mon, th, f);
+    render_system_power(rects[0], mon, &title, rate, th, f);
+    render_power_efficiency_row(rects[1], mon, rate, th, f);
     render_gpu_table(rects[2], mon, th, f);
-    render_cost_analysis(rects[3], mon, th, f);
+    render_cost_analysis(rects[3], mon, rate, th, f);
     render_util_temp_row(rects[4], mon, th, f);
 }
 
@@ -124,9 +128,15 @@ fn render_no_gpu(area: Rect, th: Theme, f: &mut Frame) {
 
 /// The top **System Power** panel: total / idle / compute / peak draw, the
 /// energy consumed (kWh) at the user's `$/kWh` rate, and the run duration.
-/// (The per-1M-token *cost* lives in the dedicated COST ANALYSIS panel —
-/// a flat "session cost" is not what operators compare against the cloud.)
-fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme, f: &mut Frame) {
+/// (The per-1M-token *cost* lives in the dedicated COST ANALYSIS panel.)
+fn render_system_power(
+    area: Rect,
+    mon: &GpuPowerMonitor,
+    title: &str,
+    rate: f64,
+    th: Theme,
+    f: &mut Frame,
+) {
     let block = theme::block(theme::panel_title(th, title), style::active_border(th));
     if area.width < 40 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -152,10 +162,7 @@ fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme
         Line::from(vec![
             Span::styled("  Energy: ", style::label(th)),
             Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
-            Span::styled(
-                format!("   @ ${:.2}/kWh", mon.rate_per_kwh),
-                style::info(th),
-            ),
+            Span::styled(format!("   @ ${:.2}/kWh", rate), style::info(th)),
             Span::styled("   Duration: ", style::footer(th)),
             Span::styled(fmt::format_duration(dur), style::value(th)),
         ]),
@@ -203,13 +210,19 @@ fn render_system_power(area: Rect, mon: &GpuPowerMonitor, title: &str, th: Theme
 
 /// The middle row: the **power-over-time** bar chart (left) and the
 /// **efficiency** readout (right).
-fn render_power_efficiency_row(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
+fn render_power_efficiency_row(
+    area: Rect,
+    mon: &GpuPowerMonitor,
+    rate: f64,
+    th: Theme,
+    f: &mut Frame,
+) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
     render_power_graph(cols[0], mon, th, f);
-    render_efficiency(cols[1], mon, th, f);
+    render_efficiency(cols[1], mon, rate, th, f);
 }
 
 /// The **power-over-time** bar chart: the 1 Hz aggregate power trace.
@@ -233,7 +246,7 @@ fn render_power_graph(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Fram
 
 /// The **efficiency** readout: J/token, J/ktoken, tokens/W, $/1M tokens, and
 /// the avg / peak / idle / compute power figures.
-fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
+fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f: &mut Frame) {
     let block = theme::block(theme::panel_title(th, "EFFICIENCY"), style::border(th));
     if area.width < 12 || area.height < 4 {
         f.render_widget(Paragraph::new("").block(block), area);
@@ -243,8 +256,8 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame
     let jkt = mon.joules_per_ktoken();
     let tpw = mon.tokens_per_watt();
     // The blended $/1M rate from the phase-aware cost math (the same
-    // number the COST ANALYSIS panel shows).
-    let cmt = mon.token_costs().map(|c| c.blended);
+    // number the COST ANALYSIS panel shows), at the live config rate.
+    let cmt = mon.token_costs_at_rate(rate).map(|c| c.blended);
     let na = "N/A".to_string();
     let lines = vec![
         eff_row(
@@ -299,10 +312,11 @@ fn eff_row(th: Theme, label: &str, value: String) -> Line<'static> {
 /// multi-GPU showcase — the `AvgU` / `AvgT` / `MaxT` columns give the full
 /// run picture, not just "right now".
 ///
-/// The **Name** column grows to fit the longest card name (12–28 chars) so
-/// full names like "Radeon RX 9700" / "NVIDIA A4000" are never
-/// mid-word-truncated.
+/// The **Name** column is a **fixed 24-char** width (pad with spaces,
+/// truncate with `…` when longer) so all subsequent columns align
+/// perfectly regardless of the card name length.
 fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
+    const NAME_W: usize = 24;
     let block = theme::block(
         theme::panel_title(
             th,
@@ -329,14 +343,7 @@ fn render_gpu_table(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame)
         );
         return;
     }
-    // The Name column width: the longest card name (clamped 12–28 chars).
-    let name_w = mon
-        .gpu_names
-        .iter()
-        .map(|s| s.chars().count())
-        .max()
-        .unwrap_or(12)
-        .clamp(12, 28);
+    let name_w = NAME_W;
     let header = Line::from(vec![
         Span::styled(format!("{:<3}", "GPU"), style::muted_title(th)),
         Span::styled(format!("{:<name_w$}", "Name"), style::muted_title(th)),
@@ -449,74 +456,63 @@ fn gpu_row(
     ])
 }
 
-// ── Cost analysis ($/1M tokens, local vs cloud) ────────────────────────────
+// ── Cost analysis ($/1M tokens) ───────────────────────────────────────────
 
-/// Cloud reference pricing, $/1M tokens (input, output) at typical list
-/// prices — the comparison column that makes the local $/1M rates
-/// meaningful. Blended = (input + output) / 2.
-const CLOUD_REFERENCE: &[(&str, f64, f64)] = &[("GPT-4o", 2.50, 10.00), ("Claude", 3.00, 15.00)];
-
-/// The **COST ANALYSIS** panel — the headline local-vs-cloud comparison:
-/// **$/1M tokens** for *input* (prefill) and *output* (decode) **separately**
-/// (like the cloud providers' own pricing tables), a blended rate, and the
-/// run's total cost — all driven by the user's `$/kWh` rate and the
-/// measured prefill / decode power draws.
-fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, th: Theme, f: &mut Frame) {
-    let block = theme::block(
-        theme::panel_title(th, "COST ANALYSIS — $/1M TOKENS"),
-        style::border(th),
-    );
+/// The **COST ANALYSIS** panel: **$/1M tokens** for *input* (prefill) and
+/// *output* (decode) **separately**, a blended rate, and the run's total
+/// cost — all driven by the user's live `$/kWh` rate (read from the Config
+/// form at render time) and the measured prefill / decode power draws.
+fn render_cost_analysis(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f: &mut Frame) {
+    let block = theme::block(theme::panel_title(th, "COST ANALYSIS"), style::border(th));
     if area.width < 40 || area.height < 3 {
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
     let mut lines = vec![Line::from(vec![
-        Span::styled("  Your rate: ", style::label(th)),
-        Span::styled(format!("${:.2}/kWh", mon.rate_per_kwh), style::value(th)),
-        Span::styled("  (set in Config)", style::footer(th)),
+        Span::styled("  Electricity Rate: ", style::label(th)),
+        Span::styled(format!("${:.2}/kWh", rate), style::value(th)),
     ])];
-    match mon.token_costs() {
+    match mon.token_costs_at_rate(rate) {
         Some(c) => {
-            // One row per cost line: the local rate + the cloud references.
+            lines.push(Line::raw(""));
             let rows: [(&str, f64); 3] = [
-                ("Input (prefill)", c.cost_per_1m_input),
-                ("Output (decode)", c.cost_per_1m_output),
-                ("Blended", c.blended),
+                ("$/1M Input (prefill):", c.cost_per_1m_input),
+                ("$/1M Output (decode):", c.cost_per_1m_output),
+                ("$/1M Blended:         ", c.blended),
             ];
-            for (label, local) in rows {
-                let mut spans = vec![
-                    Span::styled(format!("  {label:<16}"), style::label(th)),
-                    Span::styled(format!(" ${}/1M", format_rate(local)), style::value(th)),
-                ];
-                for (name, cin, cout) in CLOUD_REFERENCE {
-                    let (cin, cout) = (*cin, *cout);
-                    let cloud = if label == "Blended" {
-                        (cin + cout) / 2.0
-                    } else if label.starts_with("Input") {
-                        cin
-                    } else {
-                        cout
-                    };
-                    spans.push(Span::styled(
-                        format!("   {name} ${cloud:.2}"),
-                        style::footer(th),
-                    ));
-                }
-                lines.push(Line::from(spans));
+            for (label, val) in rows {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {label}"), style::label(th)),
+                    Span::styled(format!(" ${}/1M", format_rate(val)), style::value(th)),
+                ]));
             }
+            lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled(
                 format!(
-                    "  This run: {} in + {} out = {} total",
+                    "  This run: {} input + {} output tokens = {} total",
                     fmt::format_tokens(c.prompt_tokens),
                     fmt::format_tokens(c.completion_tokens),
                     format_cost(c.total_cost)
                 ),
                 style::value_ok(th),
             )]));
-            lines.push(Line::from(Span::styled(
-                "  ℹ Phase power: input = prefill, output = decode — compare to cloud list prices.",
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  ℹ Input = energy during prefill ÷ prompt tokens.",
                 style::info(th),
-            )));
+            )]));
+            lines.push(Line::from(vec![Span::styled(
+                "    Output = energy during decode ÷ completion tokens.",
+                style::info(th),
+            )]));
+            // The prefill fallback warning (Issue D): when the TTFT window
+            // had fewer than 2 power samples, we used the overall average.
+            if mon.prefill_uses_fallback() {
+                lines.push(Line::from(vec![Span::styled(
+                    "  ⚠ Prefill too short for separate power measurement — using overall average.",
+                    style::value_warn(th),
+                )]));
+            }
         }
         None => {
             lines.push(Line::from(Span::styled(
@@ -1125,10 +1121,10 @@ mod tests {
         assert!(text.contains("72°C"), "peak temp value: {text}");
     }
 
-    // ── cost analysis ($/1M tokens, local vs cloud) ───────────────────────
+    // ── cost analysis ($/1M tokens) ──────────────────────────────────────
 
     #[test]
-    fn view4_cost_analysis_shows_input_output_and_cloud() {
+    fn view4_cost_analysis_shows_input_output_and_blended() {
         let mut app = app_with_monitor(sample_monitor());
         app.view = crate::ui::app::View::Gpu;
         let text = render_text(&app, 120, 50);
@@ -1137,9 +1133,10 @@ mod tests {
         assert!(text.contains("Input (prefill)"), "input row: {text}");
         assert!(text.contains("Output (decode)"), "output row: {text}");
         assert!(text.contains("Blended"), "blended row: {text}");
-        assert!(text.contains("GPT-4o"), "cloud reference: {text}");
-        assert!(text.contains("Claude"), "cloud reference: {text}");
         assert!(text.contains("This run:"), "run total: {text}");
+        // No cloud references.
+        assert!(!text.contains("GPT-4o"), "no cloud refs: {text}");
+        assert!(!text.contains("Claude"), "no cloud refs: {text}");
     }
 
     #[test]
@@ -1157,16 +1154,31 @@ mod tests {
     }
 
     #[test]
-    fn view4_table_name_column_fits_long_names() {
-        // "Radeon RX 9700" (14 chars) — the Name column must grow past
-        // the old 12-char cap to show the full name.
+    fn view4_table_name_column_fixed_width() {
+        // The Name column is a fixed 24 chars: short names are padded,
+        // long names are truncated with "…". All subsequent columns
+        // align perfectly.
         let mut mon = sample_monitor();
         mon.gpu_names = vec!["Radeon RX 9700".into(), "NVIDIA A4000".into()];
         let mut app = app_with_monitor(mon);
         app.view = crate::ui::app::View::Gpu;
         let text = render_text(&app, 120, 40);
+        // Both names fit in 24 chars → shown in full.
         assert!(text.contains("Radeon RX 9700"), "full AMD name: {text}");
         assert!(text.contains("NVIDIA A4000"), "full NVIDIA name: {text}");
+    }
+
+    #[test]
+    fn view4_table_truncates_names_over_24_chars() {
+        // A name longer than 24 chars is truncated with "…".
+        let mut mon = sample_monitor();
+        mon.gpu_names = vec!["NVIDIA GeForce RTX 4090 Titan X Ultra".into()];
+        mon.gpus = vec![mon.gpus[0].clone()];
+        let mut app = app_with_monitor(mon);
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        // The truncated name should appear (with the ellipsis).
+        assert!(text.contains('…'), "truncation ellipsis: {text}");
     }
 
     #[test]
