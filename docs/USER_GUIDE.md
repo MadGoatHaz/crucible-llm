@@ -186,6 +186,15 @@ The GPU & Power tab shows your local inference cost in the industry-standard for
 
 Example: If your server shows $0.03/1M input and $0.13/1M output, you can directly compare that to GPT-4o ($2.50/$10.00) or Claude ($3.00/$15.00).
 
+### Power Accuracy
+
+GPU power readings are plausibility-clamped to prevent phantom values:
+- NVIDIA: capped at 1.5× factory TDP (from `power_management_limit_default`)
+- All vendors: global ceiling of 1000W
+- Anomalous readings are logged and capped automatically
+
+Average power is calculated over the active test window only (not from app launch). Press `[i]` in the GPU tab to take a fresh idle baseline measurement.
+
 ### CPU Power
 
 Crucible also monitors CPU power and includes it in total system energy:

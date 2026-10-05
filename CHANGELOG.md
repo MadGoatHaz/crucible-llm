@@ -30,6 +30,13 @@ All notable changes to Crucible LLM.
 - Duration counter freezes when benchmark completes
 - Mean and peak markers on all GPU graphs
 
+### Fixed
+- **Cost calculation accuracy** — throughput-based energy model correctly attributes power to input vs output tokens across multi-request runs. Blended rate is always between input and output.
+- **NVML power clamp fixed** — uses factory TDP (`power_management_limit_default`) instead of user-settable limit. Global ceiling tightened to 1000W. Eliminates phantom power readings (e.g., 974W on a 200W card).
+- **Avg power window** — now only averages during active test duration. Freezes when tests complete. No more creeping from app launch.
+- **Manual idle measurement** — press `[i]` in GPU tab for a fresh 10-second no-load baseline.
+- **Token count clarity** — display shows "N input (M requests)" to distinguish per-request from cumulative.
+
 ### Improved
 - GPU monitoring now tracks history (time-series) not just current snapshot
 - System power summary panel (total, idle, compute, peak)
