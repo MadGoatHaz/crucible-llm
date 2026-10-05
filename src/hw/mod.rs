@@ -34,6 +34,12 @@
 #[cfg(feature = "nvml")]
 pub mod nvml;
 
+/// The GPU & Power monitor (View 6): the dedicated multi-GPU power / energy /
+/// cost / efficiency panel. Pure data + math (no NVML, no locks).
+pub mod monitor;
+
+pub use monitor::{GpuPowerMonitor, PowerSample, HISTORY_CAPACITY, IDLE_WINDOW_SECS};
+
 #[cfg(target_os = "linux")]
 mod amd;
 #[cfg(target_os = "linux")]
@@ -79,6 +85,73 @@ pub struct GpuSample {
     pub throttle_reasons: Option<String>,
 }
 
+impl GpuSample {
+    /// Combine a set of per-device samples into one **aggregate** sample:
+    /// power and VRAM are **summed**, core clock / memory clock / temperature
+    /// / utilization take the **max**, and throttle reasons are **joined**
+    /// (deduped, comma-separated; `None` when no device is throttling).
+    ///
+    /// This is the multi-GPU roll-up the 100 ms poller feeds the energy
+    /// math and the View 6 aggregate panels. An empty slice yields an all-
+    /// `None` sample (the N/A rule).
+    #[must_use]
+    pub fn aggregate(samples: &[GpuSample]) -> GpuSample {
+        if samples.is_empty() {
+            return GpuSample::default();
+        }
+        let power_sum: f64 = samples.iter().filter_map(|s| s.power_watts).sum();
+        let power_watts = (power_sum > 0.0).then_some(power_sum);
+        let utilization_pct = samples
+            .iter()
+            .filter_map(|s| s.utilization_pct)
+            .max()
+            .map(|u| u.min(100));
+        let memory_used_mb = {
+            let sum: u64 = samples
+                .iter()
+                .filter_map(|s| s.memory_used_mb)
+                .fold(0u64, u64::saturating_add);
+            (sum > 0).then_some(sum)
+        };
+        let memory_total_mb = {
+            let sum: u64 = samples
+                .iter()
+                .filter_map(|s| s.memory_total_mb)
+                .fold(0u64, u64::saturating_add);
+            (sum > 0).then_some(sum)
+        };
+        let core_clock_mhz = samples.iter().filter_map(|s| s.core_clock_mhz).max();
+        let memory_clock_mhz = samples.iter().filter_map(|s| s.memory_clock_mhz).max();
+        let temperature_c = samples.iter().filter_map(|s| s.temperature_c).max();
+        // Join the distinct, non-trivial throttle reasons (a device reporting
+        // `None`/`"None"` is not throttling).
+        let mut reasons: Vec<String> = Vec::new();
+        for s in samples {
+            if let Some(r) = s
+                .throttle_reasons
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty() && *r != "None")
+            {
+                if !reasons.iter().any(|x| x == r) {
+                    reasons.push(r.to_string());
+                }
+            }
+        }
+        let throttle_reasons = (!reasons.is_empty()).then(|| reasons.join(", "));
+        GpuSample {
+            power_watts,
+            utilization_pct,
+            memory_used_mb,
+            memory_total_mb,
+            core_clock_mhz,
+            memory_clock_mhz,
+            temperature_c,
+            throttle_reasons,
+        }
+    }
+}
+
 /// A vendor-agnostic GPU telemetry backend.
 ///
 /// Implementations read from the platform's native telemetry surface
@@ -94,6 +167,24 @@ pub trait GpuBackend: Send + Sync + std::fmt::Debug {
     fn model(&self) -> Option<&str>;
     /// One telemetry sample (all fields optional, N/A rule).
     fn poll(&self) -> GpuSample;
+
+    /// One sample **per device** (multi-GPU). The default returns a single
+    /// element wrapping [`GpuBackend::poll`] — single-GPU backends (AMD /
+    /// Intel sysfs) need no override. Multi-GPU backends (NVML) override
+    /// this to expose each device so View 6 can render the per-GPU table.
+    fn poll_all(&self) -> Vec<GpuSample> {
+        vec![self.poll()]
+    }
+
+    /// A display name **per device** (parallel to [`Self::poll_all`]). The
+    /// default repeats the single [`GpuBackend::model`] name; multi-GPU
+    /// backends override to label each card.
+    fn device_names(&self) -> Vec<String> {
+        vec![self
+            .model()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.vendor().to_string())]
+    }
 }
 
 /// Auto-detect the best available GPU backend (NVIDIA → AMD → Intel).
@@ -272,6 +363,13 @@ pub struct HwPoller {
     trace: Vec<HwSample>,
     /// Rolling trace capacity (oldest samples drop first).
     capacity: usize,
+    /// The GPU & Power monitor (View 6): per-GPU samples, aggregate power,
+    /// the idle baseline, the 1 Hz power history, and the energy/cost/
+    /// efficiency math. Written by [`Self::tick`], read into the snapshot.
+    monitor: GpuPowerMonitor,
+    /// Per-device display names (parallel to the monitor's per-GPU table),
+    /// refreshed from the backend on each poll.
+    gpu_names: Vec<String>,
 }
 
 impl std::fmt::Debug for HwPoller {
@@ -280,6 +378,7 @@ impl std::fmt::Debug for HwPoller {
             .field("gpu_name", &self.gpu_name)
             .field("energy_joules", &self.energy_joules)
             .field("trace_len", &self.trace.len())
+            .field("gpu_count", &self.gpu_names.len())
             .finish()
     }
 }
@@ -311,7 +410,17 @@ impl HwPoller {
             energy_joules: 0.0,
             trace: Vec::new(),
             capacity: HW_TRACE_CAPACITY,
+            monitor: GpuPowerMonitor::default(),
+            gpu_names: Vec::new(),
         }
+    }
+
+    /// Set the `$/kWh` electricity rate the View 6 cost estimate uses
+    /// (builder-style; the entry point wires it from the resolved config).
+    #[must_use]
+    pub fn with_rate(mut self, rate: f64) -> Self {
+        self.monitor = self.monitor.with_rate(rate);
+        self
     }
 
     /// Override the rolling trace capacity (defaults to
@@ -319,6 +428,25 @@ impl HwPoller {
     pub fn with_capacity(mut self, capacity: usize) -> Self {
         self.capacity = capacity.max(1);
         self
+    }
+
+    /// Arm a **new** benchmark run on the monitor: reset every accumulator
+    /// and open the idle clock. The sequence executor calls this before the
+    /// pre-load idle window.
+    pub fn begin_run(&mut self) {
+        self.monitor.begin_run();
+    }
+
+    /// Open the **load** window on the monitor (finalize the idle baseline
+    /// and start recording the 1 Hz power history). The sequence executor
+    /// calls this once the idle window elapses and the benchmark load begins.
+    pub fn start_load(&mut self) {
+        self.monitor.start_load();
+    }
+
+    /// The GPU & Power monitor (View 6) state.
+    pub fn monitor(&self) -> &GpuPowerMonitor {
+        &self.monitor
     }
 
     /// `true` when a GPU backend is available (any vendor).
@@ -422,14 +550,36 @@ impl HwPoller {
     /// never touches the stream workers' quanta timing path
     /// (measurement-isolation invariant, blueprint §4).
     pub fn tick(&mut self, state: &MetricsState) {
-        let gpu = self.gpu.as_ref().map(|g| g.poll());
-        let sample = self.advance(&gpu);
+        // One sample per device (multi-GPU), then the aggregate roll-up the
+        // energy math and the View 6 aggregate panels consume.
+        let per_gpu = self.gpu.as_ref().map(|g| g.poll_all()).unwrap_or_default();
+        if let Some(g) = &self.gpu {
+            self.gpu_names = g.device_names();
+        }
+        let agg = GpuSample::aggregate(&per_gpu);
+
+        // Read the current snapshot once (lock-free) for both the token
+        // count and the merge base.
         let snap = state.load();
+        // Feed the GPU & Power monitor (View 6): before the load window
+        // opens, accumulate the idle baseline; once open, record the
+        // per-GPU table + the 1 Hz power history + efficiency.
+        if self.monitor.idle_finalized {
+            self.monitor
+                .record(&agg, &per_gpu, &self.gpu_names, snap.overall.total_tokens);
+        } else {
+            self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
+        }
+
+        // The existing 100 ms `P(t)` trace + cumulative energy integral
+        // (Engine D's Silicon Efficiency Metric) over the aggregate.
+        let sample = self.advance(&Some(agg.clone()));
         let merged = merge_hw(
             &snap,
             &sample,
             self.live_joules_per_token(snap.completion_tokens),
-            gpu.as_ref(),
+            Some(&agg),
+            Some(&self.monitor),
         );
         state.update(merged);
     }
@@ -452,6 +602,7 @@ pub fn merge_hw(
     sample: &HwSample,
     jpt: Option<f64>,
     gpu: Option<&GpuSample>,
+    monitor: Option<&GpuPowerMonitor>,
 ) -> MetricsSnapshot {
     let mut s = snap.clone();
     s.vram_used_gb = sample
@@ -469,6 +620,10 @@ pub fn merge_hw(
     // throttle, …) the Live view's GPU panel renders. `None` (no GPU) →
     // the panel is hidden entirely (never an N/A box).
     s.gpu = gpu.cloned();
+    // The GPU & Power monitor (View 6): per-GPU table, aggregate power,
+    // idle baseline, 1 Hz history, energy/cost/efficiency. `None` (no
+    // GPU) → View 6 shows its "no telemetry" placeholder.
+    s.gpu_monitor = monitor.cloned();
     s
 }
 
@@ -480,16 +635,27 @@ mod tests {
     fn merge_hw_maps_na_to_zero_sentinels() {
         let snap = MetricsSnapshot::default();
         let sample = HwSample::default(); // every field None
-        let merged = merge_hw(&snap, &sample, None, None);
+        let merged = merge_hw(&snap, &sample, None, None, None);
         assert_eq!(merged.vram_used_gb, 0.0);
         assert_eq!(merged.vram_total_gb, 0.0);
         assert_eq!(merged.power_w, 0.0);
         assert_eq!(merged.gpu_clock_mhz, 0.0);
         assert_eq!(merged.joules_per_token, 0.0);
         assert!(merged.gpu.is_none()); // no GPU → the panel is hidden
-                                       // Non-hardware fields pass through untouched.
+        assert!(merged.gpu_monitor.is_none()); // no monitor → View 6 placeholder
+                                               // Non-hardware fields pass through untouched.
         assert_eq!(merged.endpoint, snap.endpoint);
         assert_eq!(merged.model, snap.model);
+    }
+
+    #[test]
+    fn merge_hw_carries_the_gpu_monitor() {
+        let snap = MetricsSnapshot::default();
+        let sample = HwSample::default();
+        let mon = GpuPowerMonitor::default().with_rate(0.25);
+        let merged = merge_hw(&snap, &sample, None, None, Some(&mon));
+        assert!(merged.gpu_monitor.is_some());
+        assert!((merged.gpu_monitor.as_ref().unwrap().rate_per_kwh - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -508,7 +674,7 @@ mod tests {
             temperature_c: Some(68),
             ..GpuSample::default()
         };
-        let merged = merge_hw(&snap, &sample, Some(0.338), Some(&gpu));
+        let merged = merge_hw(&snap, &sample, Some(0.338), Some(&gpu), None);
         assert!((merged.vram_used_gb - 21.4).abs() < 1e-9);
         assert!((merged.vram_total_gb - 24.0).abs() < 1e-9);
         assert!((merged.power_w - 285.0).abs() < 1e-9);
@@ -548,6 +714,71 @@ mod tests {
             },
         );
         assert_eq!(s2.gpu_temp_c, Some(0));
+    }
+
+    /// `GpuSample::aggregate` rolls up per-device samples: power + VRAM
+    /// summed, clocks / temp / util maxed, throttle reasons joined.
+    #[test]
+    fn aggregate_sums_power_vram_and_maxes_the_rest() {
+        let g0 = GpuSample {
+            power_watts: Some(300.0),
+            utilization_pct: Some(90),
+            memory_used_mb: Some(8000),
+            memory_total_mb: Some(16000),
+            core_clock_mhz: Some(1500),
+            memory_clock_mhz: Some(1200),
+            temperature_c: Some(65),
+            throttle_reasons: None,
+        };
+        let g1 = GpuSample {
+            power_watts: Some(350.0),
+            utilization_pct: Some(97),
+            memory_used_mb: Some(9000),
+            memory_total_mb: Some(16000),
+            core_clock_mhz: Some(1450),
+            memory_clock_mhz: Some(1215),
+            temperature_c: Some(70),
+            throttle_reasons: Some("thermal".into()),
+        };
+        let a = GpuSample::aggregate(&[g0, g1]);
+        assert!((a.power_watts.unwrap() - 650.0).abs() < 1e-9);
+        assert_eq!(a.utilization_pct, Some(97));
+        assert_eq!(a.memory_used_mb, Some(17000));
+        assert_eq!(a.memory_total_mb, Some(32000));
+        assert_eq!(a.core_clock_mhz, Some(1500));
+        assert_eq!(a.memory_clock_mhz, Some(1215));
+        assert_eq!(a.temperature_c, Some(70));
+        assert_eq!(a.throttle_reasons.as_deref(), Some("thermal"));
+    }
+
+    #[test]
+    fn aggregate_dedupes_and_joins_throttle_reasons() {
+        let a = GpuSample {
+            throttle_reasons: Some("thermal".into()),
+            ..Default::default()
+        };
+        let b = GpuSample {
+            throttle_reasons: Some("power".into()),
+            ..Default::default()
+        };
+        let c = GpuSample {
+            throttle_reasons: Some("thermal".into()), // duplicate
+            ..Default::default()
+        };
+        let d = GpuSample {
+            throttle_reasons: Some("None".into()), // not a real throttle
+            ..Default::default()
+        };
+        let agg = GpuSample::aggregate(&[a, b, c, d]);
+        assert_eq!(agg.throttle_reasons.as_deref(), Some("thermal, power"));
+    }
+
+    #[test]
+    fn aggregate_empty_is_all_na() {
+        let a = GpuSample::aggregate(&[]);
+        assert!(a.power_watts.is_none());
+        assert!(a.utilization_pct.is_none());
+        assert!(a.throttle_reasons.is_none());
     }
 
     #[test]

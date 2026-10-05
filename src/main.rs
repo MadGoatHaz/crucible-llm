@@ -172,7 +172,9 @@ fn run_headless(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBac
     // Silicon Efficiency Metric (Joules/Token). The detected backend (any
     // vendor) drives the GPU fields; a driverless host simply yields N/A
     // and the run proceeds normally.
-    let hw = Arc::new(Mutex::new(HwPoller::with_backend(gpu)));
+    let hw = Arc::new(Mutex::new(
+        HwPoller::with_backend(gpu).with_rate(cfg.rate_per_kwh),
+    ));
     rt.spawn({
         let hw = hw.clone();
         async move {
@@ -611,7 +613,9 @@ fn run_tui(cfg: &Config, logger: Arc<RunLogger>, gpu: Option<Arc<dyn GpuBackend>
     // Chunk 17: the detected backend (any vendor) + sysinfo drive the
     // 100 ms poller. Never fails — a driverless host simply runs with
     // N/A GPU fields.
-    let hw = Arc::new(Mutex::new(HwPoller::with_backend(gpu.clone())));
+    let hw = Arc::new(Mutex::new(
+        HwPoller::with_backend(gpu.clone()).with_rate(cfg.rate_per_kwh),
+    ));
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()

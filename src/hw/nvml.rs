@@ -86,52 +86,61 @@ impl GpuBackend for NvmlBackend {
         Some(&self.name)
     }
 
-    fn poll(&self) -> GpuSample {
-        let mut vram_used = 0u64;
-        let mut vram_total = 0u64;
-        let mut power_w = 0.0f64;
-        let mut power_some = false;
-        let mut core_clock_mhz = None;
-        let mut memory_clock_mhz = None;
-        let mut gpu_temp_c = None;
-        let mut gpu_util_pct = None;
-
+    /// One [`GpuSample`] **per visible device** (the multi-GPU source for
+    /// View 6's per-GPU table). Each device is read independently with
+    /// per-field degradation (a reading the driver cannot provide is `None`
+    /// for that field only); a lost device is skipped entirely.
+    fn poll_all(&self) -> Vec<GpuSample> {
+        let mut out = Vec::with_capacity(self.count as usize);
         for i in 0..self.count {
             let Ok(device) = self.nvml.device_by_index(i) else {
                 continue; // per-device degradation: skip a lost device
             };
-            if let Ok(mi) = device.memory_info() {
-                vram_used += mi.used;
-                vram_total += mi.total;
-            }
-            if let Ok(mw) = device.power_usage() {
-                power_w += mw as f64 / 1000.0;
-                power_some = true;
-            }
-            if let Ok(mhz) = device.clock_info(Clock::Graphics) {
-                core_clock_mhz = Some(core_clock_mhz.unwrap_or(0).max(mhz));
-            }
-            if let Ok(mhz) = device.clock_info(Clock::Memory) {
-                memory_clock_mhz = Some(memory_clock_mhz.unwrap_or(0).max(mhz));
-            }
-            if let Ok(c) = device.temperature(TemperatureSensor::Gpu) {
-                gpu_temp_c = Some(gpu_temp_c.unwrap_or(0).max(c));
-            }
-            if let Ok(u) = device.utilization_rates() {
-                gpu_util_pct = Some(gpu_util_pct.unwrap_or(0).max(u.gpu));
-            }
+            let (vram_used, vram_total) = device
+                .memory_info()
+                .map(|mi| (mi.used, mi.total))
+                .unwrap_or((0, 0));
+            out.push(GpuSample {
+                power_watts: device.power_usage().ok().map(|mw| mw as f64 / 1000.0),
+                utilization_pct: device
+                    .utilization_rates()
+                    .ok()
+                    .map(|u| u.gpu.min(100) as u8),
+                memory_used_mb: (vram_total > 0).then_some(vram_used / (1024 * 1024)),
+                memory_total_mb: (vram_total > 0).then_some(vram_total / (1024 * 1024)),
+                core_clock_mhz: device.clock_info(Clock::Graphics).ok(),
+                memory_clock_mhz: device.clock_info(Clock::Memory).ok(),
+                temperature_c: device
+                    .temperature(TemperatureSensor::Gpu)
+                    .ok()
+                    .map(|c| c as i32),
+                // NVML throttle reasons are not read on this path (kept `None`
+                // — the N/A rule); the Intel Level Zero backend does surface
+                // them. The aggregate joins whatever a backend reports.
+                throttle_reasons: None,
+            });
         }
+        out
+    }
 
-        GpuSample {
-            power_watts: power_some.then_some(power_w),
-            utilization_pct: gpu_util_pct.map(|u| u.min(100) as u8),
-            memory_used_mb: (vram_total > 0).then_some(vram_used / (1024 * 1024)),
-            memory_total_mb: (vram_total > 0).then_some(vram_total / (1024 * 1024)),
-            core_clock_mhz,
-            memory_clock_mhz,
-            temperature_c: gpu_temp_c.map(|c| c as i32),
-            throttle_reasons: None,
-        }
+    /// A display name **per device** (parallel to [`Self::poll_all`]).
+    fn device_names(&self) -> Vec<String> {
+        (0..self.count)
+            .map(|i| {
+                self.nvml
+                    .device_by_index(i)
+                    .ok()
+                    .and_then(|d| d.name().ok())
+                    .unwrap_or_else(|| self.name.clone())
+            })
+            .collect()
+    }
+
+    /// The single **aggregate** sample: every visible device rolled up
+    /// (power + VRAM summed, clocks / temp / utilization maxed) — the value
+    /// the 100 ms energy math and the Live panel consume.
+    fn poll(&self) -> GpuSample {
+        GpuSample::aggregate(&self.poll_all())
     }
 }
 

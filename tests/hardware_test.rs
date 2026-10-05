@@ -204,7 +204,7 @@ fn poller_tick_publishes_to_the_lock_free_snapshot() {
 fn merge_hw_is_a_pure_na_mapping() {
     let base = MetricsSnapshot::default();
     let na = HwSample::default(); // every field None
-    let merged = merge_hw(&base, &na, None, None);
+    let merged = merge_hw(&base, &na, None, None, None);
     assert_eq!(merged.vram_used_gb, 0.0);
     assert_eq!(merged.vram_total_gb, 0.0);
     assert_eq!(merged.power_w, 0.0);
@@ -223,7 +223,7 @@ fn merge_hw_is_a_pure_na_mapping() {
         power_watts: Some(285.0),
         ..Default::default()
     };
-    let merged = merge_hw(&base, &full, Some(0.338), Some(&gpu));
+    let merged = merge_hw(&base, &full, Some(0.338), Some(&gpu), None);
     assert!((merged.vram_used_gb - 21.4).abs() < 1e-9);
     assert!((merged.vram_total_gb - 24.0).abs() < 1e-9);
     assert!((merged.power_w - 285.0).abs() < 1e-9);

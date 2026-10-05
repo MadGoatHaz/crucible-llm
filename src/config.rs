@@ -82,7 +82,13 @@ pub mod env_vars {
     pub const MATRIX_CONTEXT: &str = "CRUCIBLE_MATRIX_CONTEXT";
     /// The TUI color theme (`cyberpunk` | `vampire` | `monochrome`).
     pub const THEME: &str = "CRUCIBLE_THEME";
+    /// The electricity rate for the View 6 cost estimate ($/kWh).
+    pub const RATE_KWH: &str = "CRUCIBLE_RATE_KWH";
 }
+
+/// The default electricity rate for the View 6 cost estimate ($/kWh).
+/// `0.15` is a representative US residential/commercial blended rate.
+pub const DEFAULT_RATE_KWH: f64 = 0.15;
 
 /// Prompt mode (`--mode`): `short` (~50 tok) or `long` (padded to
 /// `--tokens`). `base` is accepted as an alias for `short`
@@ -457,6 +463,9 @@ pub struct Config {
     /// pick engines themselves.
     #[serde(skip)]
     pub engines_explicit: bool,
+    /// The electricity rate for the View 6 (GPU & Power) cost estimate,
+    /// in $/kWh. Default [`DEFAULT_RATE_KWH`] ($0.15).
+    pub rate_per_kwh: f64,
 }
 
 impl Default for Config {
@@ -488,6 +497,7 @@ impl Default for Config {
             theme: "cyberpunk".to_string(),
             theme_explicit: false,
             engines_explicit: false,
+            rate_per_kwh: DEFAULT_RATE_KWH,
         }
     }
 }
@@ -565,6 +575,8 @@ pub struct ConfigFile {
     pub matrix_contexts: Option<Vec<u32>>,
     /// The TUI color theme (`"cyberpunk"` | `"vampire"` | `"monochrome"`).
     pub theme: Option<String>,
+    /// The electricity rate for the View 6 cost estimate ($/kWh).
+    pub rate_per_kwh: Option<f64>,
 }
 
 impl ConfigFile {
@@ -640,6 +652,9 @@ impl ConfigFile {
         if let Some(v) = &self.theme {
             c.theme = v.clone();
             c.theme_explicit = true;
+        }
+        if let Some(v) = self.rate_per_kwh {
+            c.rate_per_kwh = v.max(0.0);
         }
         c.target_explicit = self.url.is_some();
         c
@@ -890,6 +905,15 @@ pub fn layer(
             None => ("cyberpunk".to_string(), false),
         };
 
+    // ── electricity rate ($/kWh, the View 6 cost estimate) ──
+    // env > file > the built-in default ($0.15). A negative rate is clamped
+    // to zero (never a signed cost).
+    let rate_per_kwh = env_get(env_vars::RATE_KWH)
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| file.and_then(|f| f.rate_per_kwh))
+        .unwrap_or(DEFAULT_RATE_KWH)
+        .max(0.0);
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -977,6 +1001,7 @@ pub fn layer(
         theme,
         theme_explicit,
         engines_explicit,
+        rate_per_kwh,
     })
 }
 
@@ -1183,6 +1208,52 @@ mod tests {
         assert!(json.contains("\"theme\""), "theme persisted: {json}");
         let back: ConfigFile = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.theme, Some("vampire".to_string()));
+    }
+
+    // ── electricity rate ($/kWh, View 6 cost estimate) ───────────────────
+
+    #[test]
+    fn rate_per_kwh_defaults_to_fifteen_cents() {
+        let cfg = Config::default();
+        assert!((cfg.rate_per_kwh - DEFAULT_RATE_KWH).abs() < 1e-9);
+        assert!((cfg.rate_per_kwh - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rate_per_kwh_layers_from_env_and_file() {
+        // env wins.
+        let env = [(env_vars::RATE_KWH.to_string(), "0.30".to_string())];
+        let cfg = layer(
+            &cli_from(&["crucible-llm"]),
+            &matches_from(&["crucible-llm"]),
+            &env,
+            None,
+        )
+        .unwrap();
+        assert!((cfg.rate_per_kwh - 0.30).abs() < 1e-9);
+        // a file value (no env) also layers in.
+        let file = ConfigFile {
+            rate_per_kwh: Some(0.12),
+            ..Default::default()
+        };
+        let cfg = layer(
+            &cli_from(&["crucible-llm"]),
+            &matches_from(&["crucible-llm"]),
+            &[],
+            Some(&file),
+        )
+        .unwrap();
+        assert!((cfg.rate_per_kwh - 0.12).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_negative_rate_per_kwh_clamps_to_zero() {
+        let file = ConfigFile {
+            rate_per_kwh: Some(-5.0),
+            ..Default::default()
+        };
+        let cfg = file.to_config();
+        assert_eq!(cfg.rate_per_kwh, 0.0);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
 use super::histogram::LatencyHistogram;
-use crate::hw::GpuSample;
+use crate::hw::{GpuPowerMonitor, GpuSample};
 
 /// Per-stream / overall run status (blueprint §6 stream-matrix `STATE` column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -200,6 +200,12 @@ pub struct MetricsSnapshot {
     /// clocks, VRAM, throttle reasons). `None` when no GPU is present:
     /// the panel is hidden entirely, never shown as an N/A box.
     pub gpu: Option<GpuSample>,
+    /// The GPU & Power monitor (View 6): per-GPU table, aggregate power,
+    /// idle baseline, the 1 Hz power history, and the energy / cost /
+    /// efficiency math. `None` when no GPU is present (View 6 shows its
+    /// "no telemetry" placeholder). Preserved across engine publishes so
+    /// the panel never flickers (see [`MetricsState::update`]).
+    pub gpu_monitor: Option<GpuPowerMonitor>,
 
     // ---- inter-token latency percentiles (nanoseconds) ----
     pub itl_p50_ns: u64,
@@ -275,6 +281,7 @@ impl Default for MetricsSnapshot {
             joules_per_token: 0.0,
             gpu_clock_mhz: 0.0,
             gpu: None,
+            gpu_monitor: None,
             itl_p50_ns: 0,
             itl_p90_ns: 0,
             itl_p99_ns: 0,
@@ -1009,6 +1016,21 @@ impl MetricsState {
         snapshot = snapshot
             .with_derived_prompt_throughput()
             .with_derived_labeled_throughputs();
+        // Preserve the hardware telemetry (the single GPU sample + the View 6
+        // GPU & Power monitor) across engine publishes: engines send *fresh*
+        // snapshots with `gpu`/`gpu_monitor` = `None`, which would otherwise
+        // make the GPU panels flicker between the 100 ms poller's updates.
+        // When the incoming snapshot carries no telemetry, copy it from the
+        // previous pointee so the panels stay stable.
+        if snapshot.gpu.is_none() || snapshot.gpu_monitor.is_none() {
+            let prev = self.inner.load();
+            if snapshot.gpu.is_none() {
+                snapshot.gpu = prev.gpu.clone();
+            }
+            if snapshot.gpu_monitor.is_none() {
+                snapshot.gpu_monitor = prev.gpu_monitor.clone();
+            }
+        }
         {
             // The cumulative decode rate: `tokens_received / (now −
             // first_token)` — computed in real time while the stream is

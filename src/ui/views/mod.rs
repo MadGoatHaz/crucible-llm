@@ -15,6 +15,7 @@ use crate::ui::theme::{style, Theme};
 
 pub mod concurrency;
 pub mod config;
+pub mod gpu;
 pub mod history;
 pub mod live;
 pub mod needle;
@@ -29,6 +30,7 @@ pub fn render_current(area: Rect, app: &App, f: &mut Frame) {
         View::Needle => needle::render(area, app, f),
         View::History => history::render(area, app, f),
         View::Config => config::render(area, app, f),
+        View::Gpu => gpu::render(area, app, f),
     }
 }
 

@@ -58,7 +58,7 @@ use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::{HistoryMode, HistoryState};
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
-/// The five dashboard views (blueprint §6).
+/// The six dashboard views (blueprint §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum View {
     /// View 1 — Live Monitor & Telemetry.
@@ -71,16 +71,19 @@ pub enum View {
     History,
     /// View 5 — Configuration.
     Config,
+    /// View 6 — GPU & Power Monitor (the dedicated hardware / energy panel).
+    Gpu,
 }
 
 impl View {
     /// All views in tab-bar order.
-    pub const ALL: [View; 5] = [
+    pub const ALL: [View; 6] = [
         View::Live,
         View::Concurrency,
         View::Needle,
         View::History,
         View::Config,
+        View::Gpu,
     ];
 
     /// 0-based index (position in the tab bar).
@@ -91,6 +94,7 @@ impl View {
             View::Needle => 2,
             View::History => 3,
             View::Config => 4,
+            View::Gpu => 5,
         }
     }
 
@@ -102,10 +106,11 @@ impl View {
             View::Needle => "Needle (NIAH)",
             View::History => "History Diff",
             View::Config => "Config",
+            View::Gpu => "GPU & Power",
         }
     }
 
-    /// Map a digit (`1`..=`5`) to a view.
+    /// Map a digit (`1`..=`6`) to a view.
     pub fn from_digit(d: u8) -> Option<View> {
         match d {
             1 => Some(View::Live),
@@ -113,6 +118,7 @@ impl View {
             3 => Some(View::Needle),
             4 => Some(View::History),
             5 => Some(View::Config),
+            6 => Some(View::Gpu),
             _ => None,
         }
     }
@@ -1070,21 +1076,22 @@ impl App {
             match self.config.edit_mode {
                 // ── The gate (read-only). ──
                 ConfigMode::Viewing => match key.code {
-                    // `1`–`4` always switch views (never typed into a field).
-                    KeyCode::Char(c @ '1'..='4') => {
+                    // `1`–`6` always switch views (never typed into a field);
+                    // `5` is the Config view itself (stays at the gate).
+                    KeyCode::Char(c @ '1'..='6') => {
                         if let Some(d) = c.to_digit(10) {
                             if let Some(view) = View::from_digit(d as u8) {
-                                self.view = view;
-                                self.config.edit_mode = ConfigMode::Viewing;
-                                if view == View::History {
-                                    self.ensure_history();
+                                if view != View::Config {
+                                    self.view = view;
+                                    self.config.edit_mode = ConfigMode::Viewing;
+                                    if view == View::History {
+                                        self.ensure_history();
+                                    }
                                 }
                             }
                         }
                         return KeyAction::Continue;
                     }
-                    // `5` stays at the gate.
-                    KeyCode::Char('5') => return KeyAction::Continue,
                     // `Enter` opens the editor.
                     KeyCode::Enter => {
                         self.config.edit_mode = ConfigMode::Editing;
@@ -1239,7 +1246,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 // `c as u8` is the Unicode code point (49 for '1') — use
                 // the digit's *value* (1) for the view lookup.
                 if let Some(view) = View::from_digit(c.to_digit(10).unwrap() as u8) {
@@ -1831,6 +1838,7 @@ fn footer_view_label(v: View) -> &'static str {
         View::Needle => "NIAH",
         View::History => "Hist",
         View::Config => "Cfg",
+        View::Gpu => "GPU",
     }
 }
 

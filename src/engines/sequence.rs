@@ -43,7 +43,7 @@ use crate::engines::flatout::{FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT
 use crate::engines::hardware::profile;
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
-use crate::hw::HwPoller;
+use crate::hw::{HwPoller, IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
 use crate::storage::db::Database;
@@ -714,6 +714,12 @@ impl BenchmarkSequence {
             });
         }
 
+        // Arm the GPU & Power monitor (View 6) and measure the idle power
+        // baseline *before* any load hits the GPU, so the "compute power"
+        // (load − idle) and the 1 Hz power history both start from a real
+        // no-load floor. No-op without a hardware poller (N/A rule).
+        self.prepare_power_monitor().await;
+
         let mut total_tokens = 0u64;
 
         for (i, engine) in self.engines.iter().enumerate() {
@@ -1017,6 +1023,49 @@ impl BenchmarkSequence {
         self.slots.structured.set_running(false);
         self.slots.structured.store(result.clone());
         result.summary_line()
+    }
+
+    /// Arm the GPU & Power monitor (View 6) and measure the **idle power
+    /// baseline** before any load hits the GPU.
+    ///
+    /// `begin_run()` resets the monitor and opens the idle clock; the
+    /// background 100 ms poller task then accumulates `IDLE_WINDOW_SECS` of
+    /// no-load power into the monitor's idle baseline while we simply sleep
+    /// (a pure async yield — no mutex held, so the poller task keeps
+    /// ticking on the current-thread runtime). Once the window elapses,
+    /// `start_load()` finalizes the baseline (mean idle power) and opens the
+    /// load window, from which the 1 Hz power history is recorded.
+    ///
+    /// This is what makes the View 6 **compute power** (`total − idle`) and
+    /// energy numbers meaningful: they are measured relative to the
+    /// machine's real no-load floor, not from zero. No-op without a hardware
+    /// poller (a driver-less host — the N/A rule).
+    async fn prepare_power_monitor(&self) {
+        let Some(poller) = &self.hw else {
+            return;
+        };
+        // Arm the monitor (a brief lock — never held across an await).
+        if let Ok(mut p) = poller.lock() {
+            p.begin_run();
+        }
+        self.log_line(format!(
+            "[GPU] measuring idle power baseline ({}s) before load…",
+            IDLE_WINDOW_SECS
+        ));
+        self.logger.info(
+            Context::Sequence,
+            format!(
+                "measuring idle power baseline ({}s) before the benchmark load",
+                IDLE_WINDOW_SECS
+            ),
+        );
+        // Sleep the idle window: the background poller accumulates the
+        // baseline while we wait.
+        tokio::time::sleep(Duration::from_secs(IDLE_WINDOW_SECS)).await;
+        // Open the load window (finalize the idle baseline; history begins).
+        if let Ok(mut p) = poller.lock() {
+            p.start_load();
+        }
     }
 
     /// Engine D — the continuous energy profiler: a short final sampling

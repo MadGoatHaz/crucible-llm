@@ -426,6 +426,10 @@ impl ConfigState {
             // The color theme is a pure preference — persisted so the
             // first-run picker is skipped on the next launch.
             theme: Some(self.theme.clone()),
+            // The `$/kWh` rate is a CLI/env/file concern — not edited from
+            // the form, so it is not persisted here (a file-set rate survives
+            // the normal env > file > default resolution on load).
+            rate_per_kwh: None,
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {
