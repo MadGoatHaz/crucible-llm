@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-652%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-676%20green-brightgreen)](#)
 
 </div>
 
@@ -60,10 +60,11 @@ By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enable
 - Live telemetry: power, utilization, VRAM, temperature, clocks, throttle
 - Energy efficiency: Joules per token
 - Full TUI panel (shown only when GPU is active)
+- **Dedicated GPU & Power tab** — multi-GPU table, power-over-time graphs, energy (kWh), cost estimation, efficiency metrics (J/token, $/1M tokens)
 
 ### TUI Interface
 
-The **default mode** — a bare `crucible-llm` opens it, no flag required. A keyboard-first, 60 Hz dashboard (vim-style navigation) with five views (`1`–`5`):
+The **default mode** — a bare `crucible-llm` opens it, no flag required. A keyboard-first, 60 Hz dashboard (vim-style navigation) with six views (`1`–`6`):
 
 - **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker (first run only; a saved config skips straight to the dashboard).
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
@@ -71,6 +72,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
 - **View 4 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 5 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
+- **View 6 · GPU & Power** — multi-GPU telemetry table, power-over-time graphs, energy (kWh), cost estimation, and efficiency metrics (J/token, tokens/watt, $/1M tokens).
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
 - **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 

@@ -43,6 +43,24 @@ On first run, the TUI asks you to pick a theme, then walks you through entering 
 
 ---
 
+## — **Crucible LLM v0.1.3 — GPU & Power Monitor**
+
+**View 6: Dedicated Hardware Telemetry Tab**
+A new tab that puts the entire power and energy picture on one screen:
+- **Multi-GPU table** — per-card power, utilization, temp, VRAM, clocks, throttle (built for 8-GPU servers)
+- **Power-over-time graph** — 1 Hz sampling during your run, rendered live
+- **Idle baseline** — measures power before the test; compute power = total − idle
+- **Energy & cost** — kWh consumed + estimated $ cost (set your rate in Config)
+- **Efficiency** — J/token, tokens/watt, $/1M tokens
+- **Peak tracking** — max power and max temp across the entire run
+
+Point it at your 8× A4000 box and watch every card in real-time.
+
+**Download**
+https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.3
+
+---
+
 ## — **Crucible LLM v0.1.2 — GPU Monitoring for Everyone**
 
 **Multi-Vendor GPU Telemetry**
@@ -96,6 +114,7 @@ https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1
 
 | Version | Date | Highlights |
 |---------|------|-----------|
+| **0.1.3** | 2026-10-05 | GPU & Power Monitor (View 6): multi-GPU table, power-over-time graphs, energy (kWh), cost estimation, efficiency metrics |
 | **0.1.2** | 2026-10-04 | Multi-vendor GPU monitoring (NVIDIA/AMD/Intel), auto-detection, NVIDIA default, full TUI hardware panel, J/token |
 | **0.1.1** | 2026-10-03 | 3 themes, Flat Out engine, accurate token counting, multi-backend support, 30 t/s sweet spot, methodology transparency, loop guard, history view |
 | **0.1.0** | 2026-10-01 | Initial release. 6 engines, TUI, headless CLI, SQLite history, export, concurrency sweep |

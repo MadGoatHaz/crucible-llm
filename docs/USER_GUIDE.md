@@ -74,11 +74,12 @@ No GPU? Engine D is disabled automatically. No N/A panels.
 | 3 | NIAH | Retrieval matrix by context size |
 | 4 | History | Past runs: list / detail / compare / delete |
 | 5 | Config | Editable settings with per-field explanations |
+| 6 | GPU & Power | Multi-GPU telemetry, power graphs, energy cost |
 
 ### Global Controls
 | Key | Action |
 |-----|--------|
-| 1-5 | Switch views (always available) |
+| 1-6 | Switch views (always available) |
 | Space | Pause / Resume benchmark |
 | c | Re-open the Setup flow |
 | e | Export results |
@@ -160,6 +161,19 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Hardware telemetry | Engine D energy poller — auto on when a GPU is detected; shows the detected GPU (e.g. `[✓] Energy — RTX 4090`) |
 | Theme | TUI color theme — Cyberpunk / Vampire / Monochrome Pastel; `←`/`→` cycles, `1`/`2`/`3` selects |
 | Engine A–F | Toggle each benchmark on/off (D / energy auto-selects with GPU detection; your explicit choice always wins) |
+| $/kWh | Electricity rate for cost estimation in the GPU & Power view (default $0.15) |
+
+## GPU & Power Monitor (Tab 6)
+
+Shows comprehensive hardware telemetry during and after benchmark runs:
+
+- **System Power**: Total, idle, compute, and peak power draw
+- **Power Graph**: Real-time power over time (1Hz sampling)
+- **Per-GPU Table**: Individual power, utilization, temp, VRAM, clocks for each GPU
+- **Efficiency**: Joules/token, tokens/watt, estimated cost
+- **Energy**: Total kWh consumed during the run
+
+Set your electricity rate ($/kWh) in Config (tab 5) for accurate cost estimates.
 
 ## Headless / CLI Mode
 
