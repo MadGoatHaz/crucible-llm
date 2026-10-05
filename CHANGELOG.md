@@ -15,7 +15,7 @@ All notable changes to Crucible LLM.
 - **Peak tracking** — max power, max temperature across the entire run
 - **`$/kWh` config field** — set your electricity rate in Config (tab 6)
 - **Multi-GPU detection (AMD + Intel)** — scans all DRM cards, not just the first. Quad/octo GPU setups show every card.
-- **$/1M token cost analysis** — separate input (prefill) and output (decode) costs, directly comparable to cloud API pricing. User-set $/kWh rate.
+- **$/1M token cost analysis** — separate input (prefill) and output (decode) rates, plus a token-weighted blended rate. Throughput-based energy model. User-set $/kWh rate in Config.
 - **Duration anchored to test start** — no longer counts from app launch.
 - **Full GPU names** — no truncation in per-GPU table.
 - **CPU power monitoring** — Intel RAPL, AMD Super I/O, or estimated fallback. Total system draw (GPU + CPU) now included in energy and cost calculations.

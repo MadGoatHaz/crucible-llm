@@ -47,14 +47,17 @@ On first run, the TUI asks you to pick a theme, then walks you through entering 
 
 **View 4: Dedicated Hardware Telemetry Tab**
 A new tab that puts the entire power and energy picture on one screen:
-- **Multi-GPU table** — per-card power, utilization, temp, VRAM, clocks, throttle (built for 8-GPU servers)
-- **Power-over-time graph** — 1 Hz sampling during your run, rendered live
-- **Idle baseline** — measures power before the test; compute power = total − idle
-- **Energy & cost** — kWh consumed + estimated $ cost (set your rate in Config)
-- **Efficiency** — J/token, tokens/watt, $/1M tokens
+- **Multi-GPU table** — per-card full names, power, utilization, avg utilization, temp, avg temp, max temp, VRAM, clocks, throttle (built for 8-GPU servers)
+- **Power-over-time graph** — 1 Hz sampling during your run, auto-scaled, rendered live
+- **Auto-scaled utilization & temperature charts** — with mean and peak markers
+- **Idle baseline** — auto 5-second measurement before the test; press `[i]` for a fresh 10-second manual baseline
+- **Duration** — starts at the first engine, freezes at completion (shows `--` when idle)
+- **System power** — GPU + CPU total (Intel RAPL, AMD Super I/O, or estimated CPU draw)
+- **Energy & cost** — kWh consumed + estimated $ cost (set your $/kWh rate in Config)
+- **$/1M token cost analysis** — separate input (prefill) and output (decode) rates, plus a token-weighted blended rate. Throughput-based energy model.
+- **Efficiency** — J/token, tokens/watt
 - **Peak tracking** — max power and max temp across the entire run
-- **Multi-GPU** — every card (NVIDIA, AMD, Intel) detected and shown, no name truncation
-- **$/1M token cost** — input (prefill) and output (decode) costs split separately, directly comparable to cloud API pricing
+- **Avg power** — only during the active test window
 
 Point it at your 8× A4000 box and watch every card in real-time.
 
@@ -116,7 +119,7 @@ https://github.com/MadGoatHaz/crucible-llm/releases/tag/v0.1.1
 
 | Version | Date | Highlights |
 |---------|------|-----------|
-| **0.1.3** | 2026-10-05 | GPU & Power Monitor (View 4): multi-GPU table, auto-scaled graphs, per-GPU avg/max stats, power-over-time, energy (kWh), cost estimation, efficiency metrics, tab reorder + $/1M token cost, multi-GPU + CPU power, NVML clamp |
+| **0.1.3** | 2026-10-05 | GPU & Power Monitor (View 4): multi-GPU table (full names, avg/max stats), power-over-time graph, auto-scaled util/temp charts with mean/peak markers, system power (GPU+CPU), idle baseline (auto 5s / manual `[i]` 10s), duration freeze, energy (kWh), $/1M token cost (input/output/blended, throughput model), efficiency metrics, NVML power clamp, tab reorder |
 | **0.1.2** | 2026-10-04 | Multi-vendor GPU monitoring (NVIDIA/AMD/Intel), auto-detection, NVIDIA default, full TUI hardware panel, J/token |
 | **0.1.1** | 2026-10-03 | 3 themes, Flat Out engine, accurate token counting, multi-backend support, 30 t/s sweet spot, methodology transparency, loop guard, history view |
 | **0.1.0** | 2026-10-01 | Initial release. 6 engines, TUI, headless CLI, SQLite history, export, concurrency sweep |

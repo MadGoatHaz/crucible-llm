@@ -484,6 +484,8 @@ During a benchmark run, the poller records one **aggregate** `PowerSample` per s
 
 Before load begins, the poller collects power samples during a 5-second idle window (`IDLE_WINDOW_SECS`). The mean of those samples becomes the **idle baseline** (`idle_power_w`). Once the benchmark load starts (`start_load()`), the baseline is frozen and the load window opens. **Compute power** is then defined as `total_power_w − idle_power_w` (clamped non-negative) — the power the *work* added, not the machine's floor.
 
+A **manual** idle measurement is available from the GPU tab: pressing `[i]` starts a fresh 10-second no-load window (`MANUAL_IDLE_WINDOW_SECS`), after which the mean replaces the idle baseline. This works after a completed run (it does not reset the run's statistics — only the idle floor).
+
 ### Energy Integration (Trapezoidal Rule)
 
 Total energy is computed as `∫P(t)dt` over the 1 Hz power history using the trapezoidal rule:
@@ -492,17 +494,29 @@ Total energy is computed as `∫P(t)dt` over the 1 Hz power history using the tr
 Energy (J) = Σ (P(i) + P(i+1)) / 2 × Δt(i)
 ```
 
-where `Δt(i)` is the time between consecutive samples. This yields:
+where `Δt(i)` is the time between consecutive samples. The power at each sample is the **total system draw** (GPU + CPU). This yields:
 - **Energy (kWh)** = joules / 3,600,000
-- **Cost** = kWh × `rate_per_kwh` (user-configurable, default $0.15)
+- **Cost** = kWh × `rate_per_kwh` (user-configurable, default $0.16)
 
 ### Cost Calculation
 
-Energy cost is calculated by separating prefill and decode phases:
-- Prefill energy = avg_power(T0→T_first_token) × TTFT_duration
-- Decode energy = avg_power(T_first→T_last) × decode_duration
-- $/1M input = (prefill_kWh × $/kWh) / (prompt_tokens / 1M)
-- $/1M output = (decode_kWh × $/kWh) / (completion_tokens / 1M)
+The $/1M-token cost uses a **throughput-based energy model** (the multi-request-correct one):
+
+```
+Primary (throughput model):
+  prefill_J = prompt_tokens   × avg_prefill_power_W / prefill_throughput
+  decode_J  = completion_tokens × avg_decode_power_W / decode_throughput
+
+Fallback (no throughput measured yet — single-request runs):
+  prefill_J = avg_prefill_power_W × TTFT_s
+  decode_J  = avg_decode_power_W  × decode_s
+
+$/1M input  = (prefill_kWh × $/kWh) / (prompt_tokens / 1M)
+$/1M output = (decode_kWh  × $/kWh) / (completion_tokens / 1M)
+$/1M blended = (prefill_kWh + decode_kWh) × $/kWh / (total_tokens / 1M)
+```
+
+The blended rate is the **token-count-weighted mean** of the input and output rates — always between the two (structurally impossible to fall below the cheaper phase). The throughput model is a strict generalization of `power × duration`: for a single request they are identical; for a multi-engine run it correctly attributes the cumulative input token total against the *total* prefill time across every request.
 
 ### Multi-GPU Support
 
@@ -516,10 +530,11 @@ The View 4 per-GPU table renders one row per device, making multi-GPU servers (e
 
 | Section | Content |
 |---------|---------|
-| **System Power** (top) | Total / idle / compute / peak draw, energy (kWh), estimated cost, duration (frozen once the run completes), avg power, max temp, throttle events |
-| **Power Over Time** (middle-left) | 1 Hz aggregate power bar chart with auto-scaling y-axis |
-| **Efficiency** (middle-right) | J/token, J/ktoken, tokens/watt, $/1M tokens, total tokens, avg/peak/idle/compute power |
-| **Per-GPU Table** (lower-middle) | One row per device: name, power, utilization, run-average utilization, temperature, run-average temperature, peak temperature, VRAM, core/mem clock, throttle |
+| **System Power** (top) | Total (GPU + CPU) / idle / compute / peak draw, energy (kWh), estimated cost, duration (frozen once the run completes; `--` when idle), avg power, max temp, throttle events |
+| **Power Over Time** (middle-left) | 1 Hz aggregate power bar chart with auto-scaling y-axis, mean and peak markers |
+| **Efficiency** (middle-right) | J/token, J/ktoken, tokens/watt, $/1M tokens (blended), total tokens, avg/peak/idle/compute power |
+| **Per-GPU Table** (lower-middle) | One row per device: full name (24-char, truncated with `…`), power, utilization, run-average utilization, temperature, run-average temperature, peak temperature, VRAM, core/mem clock, throttle |
+| **Cost Analysis** | $/1M Input (prefill), $/1M Output (decode), $/1M Blended (token-weighted), total run cost, token totals with request count |
 | **Utilization + Temperature** (bottom) | Two 1 Hz **auto-scaled line charts** side by side — the y-axis spans the data's real range (with padding) so a narrow band shows its variation, each with grid lines, an area fill, a dashed mean line, and a peak marker |
 
 ### N/A Rule

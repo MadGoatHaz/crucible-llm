@@ -167,24 +167,33 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 
 Shows comprehensive hardware telemetry during and after benchmark runs:
 
-- **System Power**: Total, idle, compute, and peak power draw; energy (kWh); estimated cost; and run duration — which **freezes at its final value when the benchmark completes**
-- **Power Graph**: Real-time power over time (1Hz sampling), with mean and peak markers
-- **Per-GPU Table**: Individual power, utilization, temp, VRAM, clocks for each GPU — plus whole-run **average and max temperature** per card
+- **System Power**: Total (GPU + CPU), idle, compute, and peak power draw; energy (kWh); estimated cost; and run duration — which **freezes at its final value when the benchmark completes** (shows `--` when idle)
+- **Power Graph**: Real-time power over time (1 Hz sampling), auto-scaled, with mean and peak markers
+- **Per-GPU Table**: Full names (no truncation), individual power, utilization, avg utilization, temp, avg temp, max temp, VRAM, clocks for each GPU
 - **Auto-scaled Graphs**: Utilization and temperature over time render against the data's real range (a narrow 85–97% band shows its variation, not a flat line), each with grid lines, an area fill, a dashed mean line, and a peak marker
-- **Efficiency**: Joules/token, tokens/watt, estimated cost
-- **Energy**: Total kWh consumed during the run
+- **Efficiency**: Joules/token, tokens/watt, $/1M tokens (blended)
+- **Energy**: Total kWh consumed during the run (GPU + CPU)
+- **Idle Baseline**: Auto 5s before the test; press `[i]` for a manual 10s measurement
+- **CPU Power**: RAPL / Super I/O / estimated (included in total system draw)
 
 Set your electricity rate ($/kWh) in Config (tab 6) for accurate cost estimates.
 
 ### Cost Analysis
 
-The GPU & Power tab shows your local inference cost in the industry-standard format: **$ per 1M tokens**, split into input and output — directly comparable to cloud API pricing.
+The GPU & Power tab shows your local inference cost in the industry-standard format: **$ per 1M tokens**, split into input (prefill) and output (decode), plus a token-weighted blended rate.
 
-- **Input cost**: Energy during the prefill phase ÷ prompt tokens
-- **Output cost**: Energy during the decode phase ÷ completion tokens
+- **$/1M Input (prefill)**: Energy during the prefill phase ÷ prompt tokens
+- **$/1M Output (decode)**: Energy during the decode phase ÷ completion tokens
+- **$/1M Blended**: Token-weighted mean of input and output (always between the two)
 - **Your rate**: Set your electricity cost ($/kWh) in Config [6]. Default: $0.16.
+- **Model**: Throughput-based energy (total phase tokens × measured phase power ÷ measured phase throughput), with a power×duration fallback for single-request runs.
 
-Example: If your server shows $0.03/1M input and $0.13/1M output, you can directly compare that to GPT-4o ($2.50/$10.00) or Claude ($3.00/$15.00).
+### Duration & Idle Baseline
+
+- **Duration**: Starts when the first engine begins, freezes at its final value when the run completes. Shows `--` when idle (no active run).
+- **Auto idle baseline**: A 5-second no-load measurement is taken before each test starts.
+- **Manual idle baseline**: Press `[i]` in the GPU tab for a fresh 10-second no-load measurement (useful after a run to re-establish the floor).
+- **Avg power**: Calculated over the active test window only — not from app launch.
 
 ### Power Accuracy
 

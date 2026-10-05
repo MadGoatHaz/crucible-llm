@@ -60,10 +60,13 @@ By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enable
 - Live telemetry: power, utilization, VRAM, temperature, clocks, throttle
 - Energy efficiency: Joules per token
 - Full TUI panel (shown only when GPU is active)
-- **Dedicated GPU & Power tab** — multi-GPU table, power-over-time graphs, energy (kWh), cost estimation, efficiency metrics (J/token, $/1M tokens)
-- **$/1M token cost** — compare your local server's energy cost directly to cloud API pricing (input and output separately)
-- **Multi-GPU** — all cards detected and displayed (NVIDIA, AMD, Intel)
-* **CPU power included** — total system energy (GPU + CPU) for accurate cost calculation. Intel RAPL, AMD Super I/O, or estimated fallback.
+- **Dedicated GPU & Power tab** — multi-GPU table, power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), cost estimation, efficiency metrics (J/token, $/1M tokens)
+- **$/1M token cost** — separate input (prefill) and output (decode) rates, plus a token-weighted blended rate. Throughput-based energy model; user sets $/kWh in Config
+- **Multi-GPU** — all cards detected and displayed (NVIDIA, AMD, Intel), full names with no truncation
+- **CPU power included** — total system energy (GPU + CPU) for accurate cost calculation. Intel RAPL, AMD Super I/O, or estimated fallback
+- **Idle baseline** — auto 5-second measurement before the test; press `[i]` in the GPU tab for a fresh 10-second manual baseline
+- **Duration** — starts at the first engine, freezes at completion (shows `--` when idle)
+- **Avg power** — calculated over the active test window only
 
 ### TUI Interface
 
@@ -73,7 +76,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
 - **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
 - **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
-- **View 4 · GPU & Power** — multi-GPU telemetry table, power-over-time graph, auto-scaled utilization/temperature charts, energy (kWh), cost estimation, and efficiency metrics (J/token, tokens/watt, $/1M tokens).
+- **View 4 · GPU & Power** — multi-GPU telemetry table (full names, power, util, avg util, temp, avg temp, max temp, VRAM, clocks), power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), $/1M token cost analysis (input/output/blended), efficiency metrics (J/token, tokens/watt), system power (GPU + CPU), idle baseline (auto 5s / manual `[i]` 10s), and duration (freezes at completion).
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
