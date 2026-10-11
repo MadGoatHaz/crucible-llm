@@ -38,6 +38,17 @@ enum Mock {
     /// Drop the first `n` connections immediately, then serve a full SSE
     /// stream (simulates a flaky endpoint coming up).
     Flaky(u32),
+    /// An SSE stream that opens with keep-alive / comment preamble lines
+    /// before its first `data:` frame (Issue #1 — must be parsed as SSE,
+    /// never misrouted to the JSON path).
+    KeepAlive,
+    /// A `200` response whose body is garbage: neither valid SSE (no
+    /// parseable `data:` frame) nor valid JSON → a real `InvalidTransport`
+    /// error, not a silent retrieval miss.
+    Garbage,
+    /// A non-streaming JSON completion served with an *absent* content type
+    /// (we default to SSE, then the end-of-stream rescue parses it as JSON).
+    JsonNoContentType,
 }
 
 async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
@@ -103,6 +114,44 @@ async fn respond(sock: &mut TcpStream, mock: Mock) {
             write_chunk(sock, FRAME_ROLE.as_bytes()).await;
             // Then silence: the worker's idle read timeout must fire.
             tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        Mock::KeepAlive => {
+            // SSE headers, then keep-alive / comment preamble lines, then the
+            // full vLLM frames, then the terminating chunk.
+            write_all(sock, SSE_HEADERS).await;
+            write_chunk(
+                sock,
+                b":keep-alive\n\n: server warming up\n\nevent: message\nid: 1\n\n",
+            )
+            .await;
+            for frame in VLLM_STREAM {
+                write_chunk(sock, frame.as_bytes()).await;
+            }
+            write_chunk(sock, b"").await; // terminating chunk
+            let _ = sock.shutdown().await;
+        }
+        Mock::Garbage => {
+            // SSE headers (so we route to the SSE path) but a body that is
+            // neither valid SSE (no parseable `data:` frame) nor valid JSON.
+            write_all(sock, SSE_HEADERS).await;
+            write_chunk(
+                sock,
+                b"this is not a valid sse stream nor json\n\n\x01\x02\x03garbage\n\n",
+            )
+            .await;
+            write_chunk(sock, b"").await; // terminating chunk
+            let _ = sock.shutdown().await;
+        }
+        Mock::JsonNoContentType => {
+            // A JSON completion with NO content-type header: we requested
+            // `stream: true`, so the worker defaults to SSE, then the
+            // end-of-stream rescue parses the body as a JSON completion.
+            let header =
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+            write_all(sock, header).await;
+            write_chunk(sock, PLAIN_JSON_BODY.as_bytes()).await;
+            write_chunk(sock, b"").await; // terminating chunk
+            let _ = sock.shutdown().await;
         }
     }
 }
@@ -421,4 +470,105 @@ async fn non_retriable_failure_is_not_retried() {
     ));
     // One attempt only: a single Failed event, no retry traffic.
     assert_eq!(event_count, 1);
+}
+
+// ── Issue #1: SSE keep-alive / preamble robustness ────────────────────────
+
+#[tokio::test]
+async fn keepalive_preamble_stream_is_parsed_as_sse_not_json() {
+    let (url, _server) = start_mock(Mock::KeepAlive).await;
+    let (outcome, events) = run_worker(&url, IDLE, 0).await;
+
+    // The keep-alive-prefixed stream is a valid, clean SSE completion — NOT a
+    // misrouted JSON parse and NOT a transport error (Issue #1).
+    assert!(outcome.is_ok(), "outcome: {:?}", outcome.error);
+    assert!(!outcome.premature, "clean [DONE] end");
+    assert_eq!(outcome.malformed_frames, 0);
+
+    // The preamble produced no frames; the 7 vLLM frames did.
+    let fr = frames(&events);
+    assert_eq!(
+        fr.len(),
+        7,
+        "keep-alive preamble is skipped, data frames parsed"
+    );
+    assert_eq!(
+        fr.iter()
+            .filter(|f| matches!(f.chunk, Chunk::Reasoning(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fr.iter()
+            .filter(|f| matches!(f.chunk, Chunk::Content(_)))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fr.iter()
+            .filter(|f| matches!(f.chunk, Chunk::Usage(_)))
+            .count(),
+        1
+    );
+    assert!(fr.last().unwrap().done, "[DONE] terminator");
+    assert_eq!(
+        outcome.usage,
+        Some(Usage {
+            prompt_tokens: 128,
+            completion_tokens: 34
+        })
+    );
+}
+
+#[tokio::test]
+async fn garbage_body_is_a_real_transport_error_not_a_silent_miss() {
+    let (url, _server) = start_mock(Mock::Garbage).await;
+    let (outcome, events) = run_worker(&url, IDLE, 0).await;
+
+    // Genuinely neither valid SSE nor valid JSON → a real, labeled transport
+    // error (not a silent retrieval miss, not a JSON parse error).
+    assert!(!outcome.is_ok());
+    assert!(
+        matches!(&outcome.error, Some(StreamError::InvalidTransport(_))),
+        "expected InvalidTransport, got {:?}",
+        outcome.error
+    );
+    // No frames were emitted (the body carried no parseable `data:` frame).
+    assert!(frames(&events).is_empty());
+    assert!(matches!(events.last().unwrap(), StreamEvent::Failed { .. }));
+    // Not retriable: a definitive protocol fault, not a transient connect.
+    assert!(!outcome.error.as_ref().unwrap().is_retriable());
+}
+
+#[tokio::test]
+async fn json_completion_with_absent_content_type_is_rescued_not_errored() {
+    let (url, _server) = start_mock(Mock::JsonNoContentType).await;
+    let (outcome, events) = run_worker(&url, IDLE, 0).await;
+
+    // Absent content type + we requested `stream: true` → routed to SSE, then
+    // the end-of-stream rescue parses the JSON completion. Not an error.
+    assert!(outcome.is_ok(), "outcome: {:?}", outcome.error);
+    assert!(
+        !outcome.premature,
+        "a complete JSON response is not premature"
+    );
+    let fr = frames(&events);
+    assert_eq!(fr.len(), 2);
+    assert_eq!(fr[0].chunk, Chunk::Content("Hello, world!".to_string()));
+    assert_eq!(
+        fr[1].chunk,
+        Chunk::Usage(Usage {
+            prompt_tokens: 42,
+            completion_tokens: 7
+        })
+    );
+    assert_eq!(
+        outcome.usage,
+        Some(Usage {
+            prompt_tokens: 42,
+            completion_tokens: 7
+        })
+    );
+    // E2E-only (a plain-JSON blob, not a streaming measurement).
+    assert!(outcome.is_e2e_only());
 }

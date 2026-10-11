@@ -266,6 +266,95 @@ fn empty_feed_and_empty_finish_produce_no_frames() {
     assert!(parser.finish().is_empty());
 }
 
+// ── Issue #1: SSE keep-alive / preamble robustness ────────────────────────
+
+#[test]
+fn keepalive_preamble_is_skipped_and_data_frames_parse() {
+    // A stream that opens with SSE keep-alive / comment lines (plus
+    // `event:`/`id:`/`retry:` fields and blank lines) before its first
+    // `data:` frame must still parse as SSE: the preamble carries no payload
+    // and is skipped, and every `data:` frame is classified.
+    let stream = concat!(
+        ":keep-alive\n",
+        "\n",
+        ": server warming up\n",
+        "event: message\n",
+        "id: 1\n",
+        "retry: 3000\n",
+        "\n",
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n",
+        "\n",
+        ":keep-alive\n",
+        "\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n",
+        "\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
+    let mut parser = SseParser::new();
+    let frames = parser.feed(stream.as_bytes()).to_vec();
+
+    // Only the four `data:` frames become frames; the preamble is skipped.
+    assert_eq!(frames.len(), 4, "preamble produces no frames");
+    assert!(
+        matches!(frames[0].chunk, Chunk::Control),
+        "role-only opener"
+    );
+    assert_eq!(frames[1].chunk, Chunk::Content("hello".to_string()));
+    assert_eq!(
+        frames[2].chunk,
+        Chunk::Usage(Usage {
+            prompt_tokens: 5,
+            completion_tokens: 2
+        })
+    );
+    assert!(frames[3].done, "[DONE] terminator");
+    // The parser saw real `data:` frames and all parsed: a valid SSE stream,
+    // NOT a preamble-only / garbage body.
+    assert!(parser.has_valid_frame());
+    assert_eq!(parser.valid_frame_count(), 4);
+    assert_eq!(parser.data_frame_count(), 4);
+    assert_eq!(parser.malformed_frames(), 0);
+    assert_eq!(
+        parser.usage(),
+        Some(Usage {
+            prompt_tokens: 5,
+            completion_tokens: 2
+        })
+    );
+}
+
+#[test]
+fn preamble_only_stream_has_no_valid_frame() {
+    // A stream of only keep-alive comments and control fields — no `data:`
+    // payload at all. `has_valid_frame()` must be false: this is the shape
+    // the worker turns into a transport error (or a JSON rescue) at the end
+    // of the stream.
+    let stream = ":keep-alive\n\n: still waiting\n\nevent: message\nid: 9\n\n";
+    let mut parser = SseParser::new();
+    parser.feed(stream.as_bytes());
+    assert!(!parser.has_valid_frame());
+    assert_eq!(parser.valid_frame_count(), 0);
+    assert_eq!(parser.data_frame_count(), 0);
+    assert!(parser.finish().is_empty());
+}
+
+#[test]
+fn all_malformed_data_frames_have_no_valid_frame() {
+    // `data:` lines that are all invalid JSON: the frames are counted, all
+    // flagged malformed, and no valid frame is produced — the "neither valid
+    // SSE nor valid JSON" signal.
+    let stream = "data: not-json-at-all\n\ndata: {broken\n\n";
+    let mut parser = SseParser::new();
+    parser.feed(stream.as_bytes());
+    assert!(!parser.has_valid_frame());
+    assert_eq!(parser.data_frame_count(), 2);
+    assert_eq!(parser.valid_frame_count(), 0);
+    assert_eq!(parser.malformed_frames(), 2);
+}
+
 #[test]
 fn chunk_is_token_classifies_the_token_categories() {
     // The shared worker/engine seam: reasoning + content are tokens;
@@ -340,8 +429,14 @@ fn usage_details_reads_vllm_openai_reasoning_and_cached() {
         }
     });
     let d = UsageDetails::from_value(&value);
-    assert_eq!(d.reasoning_tokens, 256, "reasoning_tokens read from completion_tokens_details");
-    assert_eq!(d.cached_tokens, 12, "cached_tokens read from prompt_tokens_details");
+    assert_eq!(
+        d.reasoning_tokens, 256,
+        "reasoning_tokens read from completion_tokens_details"
+    );
+    assert_eq!(
+        d.cached_tokens, 12,
+        "cached_tokens read from prompt_tokens_details"
+    );
     // The whole 256-token completion budget is CoT (Strawberry smoking gun).
     assert!(d.is_reasoning_dominated(256));
 }
@@ -360,7 +455,10 @@ fn usage_details_reads_sglang_output_tokens_details() {
         }
     });
     let d = UsageDetails::from_value(&value);
-    assert_eq!(d.reasoning_tokens, 45, "SGLang output_tokens_details.reasoning_tokens");
+    assert_eq!(
+        d.reasoning_tokens, 45,
+        "SGLang output_tokens_details.reasoning_tokens"
+    );
     assert_eq!(d.cached_tokens, 28);
     assert!(!d.is_reasoning_dominated(112), "45 < 112 → not dominated");
 }

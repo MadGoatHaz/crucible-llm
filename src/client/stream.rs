@@ -73,8 +73,13 @@ const V1_SUFFIX: &str = "/v1";
 /// UTF-8 byte-order mark (some servers prefix the stream with one).
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
-/// Minimum prefix length needed to recognize an SSE `data:` frame.
-const SSE_PREFIX_LEN: usize = b"data:".len();
+/// Cap on the response body retained on the SSE path for end-of-stream
+/// inspection (the JSON rescue / [`StreamError::InvalidTransport`] check).
+/// A normal stream confirms itself with its first valid `data:` frame, so the
+/// buffer only grows large for degenerate (zero-valid-frame) bodies — at most
+/// a JSON completion (a few KB) or garbage. 1 MiB bounds the worst case
+/// without touching normal-stream memory.
+const PENDING_BODY_CAP: usize = 1 << 20;
 
 /// Default idle (read) timeout: a stream that produces no bytes for this
 /// long is declared stalled.
@@ -148,6 +153,20 @@ pub enum StreamError {
     /// A non-streaming response body that is not valid JSON.
     #[error("non-streaming response is not valid JSON: {0}")]
     InvalidJson(String),
+    /// The response body was **neither a valid SSE stream nor valid JSON**.
+    ///
+    /// This is a genuine transport/protocol fault, not a measurement: the
+    /// worker asked for `stream: true`, the server answered `200`, but the
+    /// body carried no parseable `data:` frame (so it is not usable SSE) and
+    /// does not decode as a JSON completion (so it is not the non-streaming
+    /// fallback). The canonical cause it guards against is a stream whose
+    /// preamble (keep-alive `:comment` lines, `event:`/`id:`/`retry:` fields)
+    /// is followed by nothing but garbage — which the old first-byte sniff
+    /// would have misrouted to the JSON path and reported as a spurious
+    /// "retrieval miss". Surfacing it as a real error keeps a broken
+    /// endpoint out of the throughput/accuracy results.
+    #[error("response body is neither valid SSE nor valid JSON: {0}")]
+    InvalidTransport(String),
 }
 
 impl StreamError {
@@ -536,13 +555,23 @@ impl StreamWorker {
                 .await;
         }
 
+        // The response shape is decided by the `Content-Type` header and our
+        // request intent — NOT by sniffing the first data byte (which broke on
+        // SSE keep-alive `:comment` preambles; see `route_is_sse`, Issue #1).
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
         let mut stream = resp.bytes_stream();
         let mut parser = SseParser::new();
 
-        // The first bytes decide the response shape. A tiny first segment
-        // cannot be classified yet, so accumulate until the `data:` prefix
-        // (or lack of one) is visible.
-        let mut head: Vec<u8> = match read_chunk(&mut stream, self.read_timeout).await {
+        // Read the first body chunk: it stamps T2 (first byte) and surfaces
+        // the empty-body / timeout / read-error terminal cases. The routing
+        // decision no longer depends on these bytes.
+        let head: Vec<u8> = match read_chunk(&mut stream, self.read_timeout).await {
             ChunkRead::Bytes(b) => b.to_vec(),
             ChunkRead::Eof => {
                 // Empty 200 body: nothing to measure.
@@ -573,24 +602,6 @@ impl StreamWorker {
                     .await;
             }
         };
-        while head.len() < SSE_PREFIX_LEN {
-            match read_chunk(&mut stream, self.read_timeout).await {
-                ChunkRead::Bytes(b) => head.extend_from_slice(b.as_ref()),
-                ChunkRead::Eof => break,
-                ChunkRead::Timeout => {
-                    ts.t_end = Some(MonotonicInstant::now());
-                    return self
-                        .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout), false, 0)
-                        .await;
-                }
-                ChunkRead::Error(msg) => {
-                    ts.t_end = Some(MonotonicInstant::now());
-                    return self
-                        .finish_failed(tx, ts, StreamError::Read(msg), false, 0)
-                        .await;
-                }
-            }
-        }
         let head_at = MonotonicInstant::now();
         if ts.t2.is_none() {
             ts.t2 = Some(head_at);
@@ -608,7 +619,7 @@ impl StreamWorker {
             );
         }
 
-        if looks_like_sse(head.as_ref()) {
+        if route_is_sse(&content_type) {
             self.run_sse(head, head_at, &mut parser, &mut ts, &mut stream, tx)
                 .await
         } else {
@@ -645,6 +656,13 @@ impl StreamWorker {
         };
         let mut tokens = 0u64;
         let mut last_token_at: Option<MonotonicInstant> = None;
+        // Retain the body (bounded) so a stream that ends with *zero* valid
+        // `data:` frames can be inspected: rescued as a non-streaming JSON
+        // completion, or surfaced as a real [`StreamError::InvalidTransport`]
+        // (Issue #1 — never a silent retrieval miss).
+        let mut pending_body: Vec<u8> = Vec::new();
+        let mut body_dropped = false;
+        extend_pending_body(&mut pending_body, &mut body_dropped, head.as_ref());
         let mut done = match self
             .emit_frames(
                 parser.feed(head.as_ref()),
@@ -666,15 +684,16 @@ impl StreamWorker {
                 ts.t_end = Some(MonotonicInstant::now());
                 let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                 return self
-                    .finish_complete(
+                    .resolve_sse_end(
                         tx,
                         ts,
-                        parser.usage(),
-                        parser.usage().map(|_| parser.details()),
                         true,
-                        parser.malformed_frames(),
+                        parser,
+                        &pending_body,
+                        body_dropped,
                         (looping, excluded),
                         tokens,
+                        &last_token_at,
                     )
                     .await;
             }
@@ -699,18 +718,18 @@ impl StreamWorker {
                         tokens += tc;
                     }
                     ts.t_end = Some(at);
-                    self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
                     let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                     return self
-                        .finish_complete(
+                        .resolve_sse_end(
                             tx,
                             ts,
-                            parser.usage(),
-                            parser.usage().map(|_| parser.details()),
                             true,
-                            parser.malformed_frames(),
+                            parser,
+                            &pending_body,
+                            body_dropped,
                             (looping, excluded),
                             tokens,
+                            &last_token_at,
                         )
                         .await;
                 }
@@ -733,18 +752,18 @@ impl StreamWorker {
                             tokens += tc;
                         }
                         ts.t_end = Some(at);
-                        self.log_stream_end(ts, tokens, parser.usage(), last_token_at, true);
                         let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                         return self
-                            .finish_complete(
+                            .resolve_sse_end(
                                 tx,
                                 ts,
-                                parser.usage(),
-                                parser.usage().map(|_| parser.details()),
                                 true,
-                                parser.malformed_frames(),
+                                parser,
+                                &pending_body,
+                                body_dropped,
                                 (looping, excluded),
                                 tokens,
+                                &last_token_at,
                             )
                             .await;
                     }
@@ -757,6 +776,7 @@ impl StreamWorker {
                     if ts.t2.is_none() {
                         ts.t2 = Some(at);
                     }
+                    extend_pending_body(&mut pending_body, &mut body_dropped, b.as_ref());
                     match self
                         .emit_frames(
                             parser.feed(b.as_ref()),
@@ -777,15 +797,16 @@ impl StreamWorker {
                             ts.t_end = Some(at);
                             let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
                             return self
-                                .finish_complete(
+                                .resolve_sse_end(
                                     tx,
                                     ts,
-                                    parser.usage(),
-                                    parser.usage().map(|_| parser.details()),
                                     !done,
-                                    parser.malformed_frames(),
+                                    parser,
+                                    &pending_body,
+                                    body_dropped,
                                     (looping, excluded),
                                     tokens,
+                                    &last_token_at,
                                 )
                                 .await;
                         }
@@ -796,17 +817,17 @@ impl StreamWorker {
 
         // `[DONE]` received: Tn — stream close.
         ts.t_end = Some(MonotonicInstant::now());
-        self.log_stream_end(ts, tokens, parser.usage(), last_token_at, false);
         let (looping, excluded) = loop_state(&guard, parser.usage(), tokens);
-        self.finish_complete(
+        self.resolve_sse_end(
             tx,
             ts,
-            parser.usage(),
-            parser.usage().map(|_| parser.details()),
             false,
-            parser.malformed_frames(),
+            parser,
+            &pending_body,
+            body_dropped,
             (looping, excluded),
             tokens,
+            &last_token_at,
         )
         .await
     }
@@ -947,55 +968,10 @@ impl StreamWorker {
                 }
             }
         }
-
-        // A single non-streaming completion cannot loop (at most one token
-        // frame), but the guard is fed for a uniform `emit_frames` contract.
-        let mut guard = LoopGuard::new();
-        let mut last_token_at: Option<MonotonicInstant> = None;
         let parsed_at = MonotonicInstant::now();
         match parse_plain_completion(&body) {
             Ok((content, usage)) => {
-                let mut frames = Vec::with_capacity(2);
-                if let Some(text) = content {
-                    frames.push(ParsedFrame {
-                        chunk: Chunk::Content(text),
-                        t_nanos: 0,
-                        done: false,
-                    });
-                }
-                if let Some(u) = usage {
-                    frames.push(ParsedFrame {
-                        chunk: Chunk::Usage(u),
-                        t_nanos: 0,
-                        done: false,
-                    });
-                }
-                // `emit_frames` stamps `t_nanos` and sets T3 on the first
-                // token (content) frame. A non-streamed blob is a single
-                // frame, so its frame count is not a meaningful token count
-                // — the server's `usage` is. Report `0` observed frames so the
-                // downstream rate falls back to `usage.completion_tokens`.
-                let tokens = match self
-                    .emit_frames(&frames, &parsed_at, ts, tx, &mut guard, &mut last_token_at)
-                    .await
-                {
-                    Ok(_) => 0,
-                    Err(_) => {
-                        // Receiver gone before the token count is known: no
-                        // frames are confirmed, so report `0`.
-                        ts.t_end = Some(parsed_at);
-                        return self
-                            .finish_complete(tx, ts, usage, None, true, 0, (false, 0), 0)
-                            .await;
-                    }
-                };
-                ts.t_end = Some(MonotonicInstant::now());
-                self.log_stream_end(ts, tokens, usage, last_token_at, false);
-                // A complete plain-JSON response is a normal completion, not
-                // a premature one (there is no `[DONE]` to expect). The
-                // plain-JSON path does not parse the CF-02 detail fields, so
-                // `usage_details` is `None` (honest "not reported").
-                self.finish_complete(tx, ts, usage, None, false, 0, (false, 0), tokens)
+                self.emit_completion_frames(content, usage, parsed_at, ts, tx)
                     .await
             }
             Err(msg) => {
@@ -1004,6 +980,140 @@ impl StreamWorker {
                     .await
             }
         }
+    }
+
+    /// Emit the frames of a complete non-streaming JSON completion and return
+    /// the terminal [`StreamOutcome`].
+    ///
+    /// Shared by [`run_plain_json`] (the content-type-routed path) and the SSE
+    /// path's end-of-stream rescue (a JSON body that reached [`run_sse`]
+    /// because the content type was absent/ambiguous).
+    ///
+    /// **CF-44 — these results are E2E-only, not streaming measurements.**
+    /// The whole body is parsed *after* it has fully arrived, so `T3` (the
+    /// "first token") is stamped at `parsed_at` — the *total* response
+    /// latency, not a first-token latency. A single blob frame yields no ITL
+    /// deltas and a zero decode span, so the result is labeled E2E-only via
+    /// [`StreamOutcome::is_e2e_only`] and kept out of the ITL / decode
+    /// distributions. The plain-JSON path does not parse the CF-02 detail
+    /// fields, so `usage_details` is `None` (honest "not reported").
+    async fn emit_completion_frames(
+        &self,
+        content: Option<String>,
+        usage: Option<Usage>,
+        parsed_at: MonotonicInstant,
+        ts: &mut StreamTimestamps,
+        tx: &mut mpsc::Sender<StreamEvent>,
+    ) -> StreamOutcome {
+        // A single non-streaming completion cannot loop (at most one token
+        // frame), but the guard is fed for a uniform `emit_frames` contract.
+        let mut guard = LoopGuard::new();
+        let mut last_token_at: Option<MonotonicInstant> = None;
+        let mut frames = Vec::with_capacity(2);
+        if let Some(text) = content {
+            frames.push(ParsedFrame {
+                chunk: Chunk::Content(text),
+                t_nanos: 0,
+                done: false,
+            });
+        }
+        if let Some(u) = usage {
+            frames.push(ParsedFrame {
+                chunk: Chunk::Usage(u),
+                t_nanos: 0,
+                done: false,
+            });
+        }
+        // `emit_frames` stamps `t_nanos` and sets T3 on the first token
+        // (content) frame. A non-streamed blob is a single frame, so its frame
+        // count is not a meaningful token count — the server's `usage` is.
+        // Report `0` observed frames so the downstream rate falls back to
+        // `usage.completion_tokens`.
+        let tokens = match self
+            .emit_frames(&frames, &parsed_at, ts, tx, &mut guard, &mut last_token_at)
+            .await
+        {
+            Ok(_) => 0,
+            Err(_) => {
+                // Receiver gone before the token count is known: no frames are
+                // confirmed, so report `0`.
+                ts.t_end = Some(parsed_at);
+                return self
+                    .finish_complete(tx, ts, usage, None, true, 0, (false, 0), 0)
+                    .await;
+            }
+        };
+        ts.t_end = Some(MonotonicInstant::now());
+        self.log_stream_end(ts, tokens, usage, last_token_at, false);
+        // A complete plain-JSON response is a normal completion, not a
+        // premature one (there is no `[DONE]` to expect).
+        self.finish_complete(tx, ts, usage, None, false, 0, (false, 0), tokens)
+            .await
+    }
+
+    /// Resolve the terminal outcome when an SSE stream ends (clean `[DONE]`,
+    /// EOF, premature close, or the receiver going away).
+    ///
+    /// A stream with at least one valid `data:` frame is a normal completion —
+    /// `premature` reflects whether `[DONE]` was seen. A stream with *zero*
+    /// valid frames is not usable SSE, so we first try to read the retained
+    /// body as a non-streaming JSON completion (a server that ignored
+    /// `stream: true` while we defaulted to SSE because the content type was
+    /// absent/ambiguous). Only if that also fails do we surface a real
+    /// [`StreamError::InvalidTransport`] — never a silent retrieval miss
+    /// (Issue #1).
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_sse_end(
+        &self,
+        tx: &mut mpsc::Sender<StreamEvent>,
+        ts: &mut StreamTimestamps,
+        premature: bool,
+        parser: &SseParser,
+        pending_body: &[u8],
+        body_dropped: bool,
+        loop_state: (bool, u64),
+        tokens: u64,
+        last_token_at: &Option<MonotonicInstant>,
+    ) -> StreamOutcome {
+        if parser.has_valid_frame() {
+            self.log_stream_end(ts, tokens, parser.usage(), *last_token_at, premature);
+            return self
+                .finish_complete(
+                    tx,
+                    ts,
+                    parser.usage(),
+                    parser.usage().map(|_| parser.details()),
+                    premature,
+                    parser.malformed_frames(),
+                    loop_state,
+                    tokens,
+                )
+                .await;
+        }
+
+        // Zero valid `data:` frames — not usable SSE. Try the JSON rescue:
+        // the body may be a non-streaming completion that reached `run_sse`
+        // because the content type was absent/ambiguous.
+        if !body_dropped && !pending_body.is_empty() {
+            if let Ok((content, usage)) = parse_plain_completion(pending_body) {
+                let parsed_at = MonotonicInstant::now();
+                return self
+                    .emit_completion_frames(content, usage, parsed_at, ts, tx)
+                    .await;
+            }
+        }
+
+        // Genuinely neither valid SSE nor valid JSON: a real transport fault.
+        let detail = if body_dropped {
+            "body exceeded the inspection cap and no valid SSE frame parsed".to_string()
+        } else {
+            format!(
+                "no valid data: frame and the body is not JSON ({} bytes)",
+                pending_body.len()
+            )
+        };
+        self.finish_failed(tx, *ts, StreamError::InvalidTransport(detail), false, 0)
+            .await
     }
 
     /// The chat-completion request body. Gains a `response_format`
@@ -1320,14 +1430,53 @@ impl StreamWorker {
     }
 }
 
-/// True when `bytes` begin an SSE `data:` frame (BOM tolerated).
-fn looks_like_sse(bytes: &[u8]) -> bool {
-    strip_bom(bytes).starts_with(b"data:")
+/// Decide the response shape from the `Content-Type` header and our request
+/// intent — NOT from sniffing the first data byte.
+///
+/// Sniffing the first byte broke on SSE keep-alive `:comment` preambles: a
+/// stream that opens with `:keep-alive\n\n` before its first `data:` frame
+/// starts with `:`, not `data:`, so it was misrouted to the non-streaming JSON
+/// path and a valid retrieval looked like a "retrieval miss" (Issue #1). The
+/// `Content-Type` header is the authoritative signal:
+///
+/// * `text/event-stream` → SSE (the spec's mandatory content type for SSE).
+/// * `application/json` → the non-streaming completion object.
+/// * absent / unrecognized → we always request `stream: true`, so default to
+///   SSE. The SSE path then resolves a misrouted JSON body (the end-of-stream
+///   rescue in [`run_sse`]) and surfaces a real
+///   [`StreamError::InvalidTransport`] when the body is genuinely neither.
+fn route_is_sse(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("text/event-stream") {
+        return true;
+    }
+    if ct.contains("application/json") {
+        return false;
+    }
+    // Absent or an unrecognized content type: we asked for `stream: true`, so
+    // treat the response as SSE. This is what keeps a keep-alive-prefixed
+    // stream (first byte `:`, not `data:`) from being misrouted to JSON.
+    true
 }
 
 /// Strip a leading UTF-8 BOM, if present.
 fn strip_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(&BOM).unwrap_or(bytes)
+}
+
+/// Append `chunk` to the retained SSE-path body until [`PENDING_BODY_CAP`];
+/// once over the cap, drop the buffer and set `*dropped` so the caller knows
+/// the body can no longer be inspected (a body that large cannot be a JSON
+/// completion, so a zero-valid-frame stream is a genuine transport fault).
+fn extend_pending_body(pending: &mut Vec<u8>, dropped: &mut bool, chunk: &[u8]) {
+    if *dropped {
+        return;
+    }
+    pending.extend_from_slice(chunk);
+    if pending.len() > PENDING_BODY_CAP {
+        *dropped = true;
+        pending.clear();
+    }
 }
 
 /// Parse a non-streaming chat-completion object: extract the single content
@@ -1525,13 +1674,21 @@ mod tests {
     }
 
     #[test]
-    fn sse_detection_with_and_without_bom() {
-        assert!(looks_like_sse(b"data: {\"a\":1}\n\n"));
-        assert!(looks_like_sse(&[
-            0xEF, 0xBB, 0xBF, b'd', b'a', b't', b'a', b':'
-        ]));
-        assert!(!looks_like_sse(b"{\"choices\":[]}"));
-        assert!(!looks_like_sse(b"ev"));
+    fn route_is_sse_by_content_type_and_request_intent() {
+        // The authoritative signal: `text/event-stream` → SSE (case-insensitive,
+        // parameters tolerated).
+        assert!(route_is_sse("text/event-stream"));
+        assert!(route_is_sse("Text/Event-Stream; charset=utf-8"));
+        assert!(route_is_sse("text/event-stream;charset=UTF-8"));
+        // An explicit JSON content type → the non-streaming path.
+        assert!(!route_is_sse("application/json"));
+        assert!(!route_is_sse("Application/JSON; charset=utf-8"));
+        // Absent / unrecognized content type: we requested `stream: true`, so
+        // default to SSE. This is the Issue #1 guarantee — a keep-alive-prefixed
+        // stream (first byte `:`, not `data:`) must NOT fall through to JSON.
+        assert!(route_is_sse(""));
+        assert!(route_is_sse("text/plain"));
+        assert!(route_is_sse("application/octet-stream"));
     }
 
     #[test]
