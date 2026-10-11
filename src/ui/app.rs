@@ -432,6 +432,29 @@ impl App {
         self
     }
 
+    /// `true` when the NIAH context sizes are the `chars/4` estimate —
+    /// i.e. no `--tokenizer` was supplied (Issue #4).
+    ///
+    /// The NIAH grid (View 3) and the Live view's Long Context capability
+    /// bar label sizes with the `(approx.)` qualifier in that case — the
+    /// same qualifier the headless run log and the `--json` `niah` section
+    /// render via the shared `context_size_label`, so a no-tokenizer run is
+    /// never presented as exact anywhere. The NIAH engine consumes
+    /// [`niah_config`](Self::niah_config) (its `tokenizer` field is the
+    /// source of truth); before the entry point attaches one, the editable
+    /// form's tokenizer field is the fallback.
+    #[must_use]
+    pub fn niah_approximate(&self) -> bool {
+        match &self.niah_config {
+            Some(c) => c.tokenizer.is_none(),
+            None => self
+                .config
+                .tokenizer
+                .as_deref()
+                .map_or(true, |t| t.trim().is_empty()),
+        }
+    }
+
     /// Attach the hardware telemetry poller (Chunk 17). The entry point
     /// spawns the 100 ms task that drives `hw.tick(&app.metrics)`; the
     /// render path only ever reads the resulting snapshot.
