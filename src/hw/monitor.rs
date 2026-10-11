@@ -699,7 +699,9 @@ impl GpuPowerMonitor {
     fn record_trace_point(&mut self, agg: &GpuSample) {
         let sample = HwSample {
             t: MonotonicInstant::now(),
-            power_mw: agg.power_watts.map(|w| (w * 1000.0).round().max(0.0) as u64),
+            power_mw: agg
+                .power_watts
+                .map(|w| (w * 1000.0).round().max(0.0) as u64),
             cpu_power_mw: (self.cpu_power_w > 0.0)
                 .then_some((self.cpu_power_w * 1000.0).round().max(0.0) as u64),
             ..HwSample::default()
@@ -1958,12 +1960,18 @@ mod tests {
         m.has_power = true;
         m.end_load();
         // No fallback: the sub-second window held ≥2 trace samples…
-        assert!(!m.prefill_uses_fallback(), "sub-second TTFT resolves at 100 ms");
+        assert!(
+            !m.prefill_uses_fallback(),
+            "sub-second TTFT resolves at 100 ms"
+        );
         // …and the prefill power is the real ~150 W phase draw, NOT the
         // overall average (which the 600 W decode sample pulls up).
         let prefill = m.avg_prefill_power().unwrap();
         let overall = m.avg_power_w().unwrap();
-        assert!((prefill - 150.0).abs() < 1e-9, "real prefill power: {prefill}");
+        assert!(
+            (prefill - 150.0).abs() < 1e-9,
+            "real prefill power: {prefill}"
+        );
         assert!(
             prefill < overall,
             "prefill ({prefill}) below overall avg ({overall}) — not the fallback"
@@ -1981,19 +1989,22 @@ mod tests {
         let mut m = GpuPowerMonitor::default();
         m.begin_run();
         // A high-draw sample *before* the load window (idle).
-        m.trace.push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
         // Open the load window.
         m.start_load();
         let load_start = m.load_started.unwrap();
         // Two in-window samples ~50 ms apart at 100 W → ~5 J.
         m.trace.push(trace_sample(load_start, 100.0, 0.0));
         std::thread::sleep(std::time::Duration::from_millis(50));
-        m.trace.push(trace_sample(MonotonicInstant::now(), 100.0, 0.0));
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 100.0, 0.0));
         // Close the window.
         m.end_load();
         // A high-draw sample *after* the window closes.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        m.trace.push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
         m.has_power = true;
 
         // The in-window 100 W samples integrate to ~5 J; the 999 W idle /
