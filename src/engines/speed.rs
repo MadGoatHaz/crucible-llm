@@ -30,6 +30,11 @@
 //! both, clearly labeled, plus a pointer to C1's 2k→128k prefill-degradation
 //! curve for the full scaling picture. Decode / ITL / MTP are intact.
 //!
+//! **CF-11 — the real warmup.** [`SpeedEngine::run`] performs one
+//! **discarded** warmup iteration before the measured ones, so
+//! cold-start / KV-cache effects don't pollute the first measured sample.
+//! The methodology block (`metrics/methodology.rs`) documents exactly this.
+//!
 //! **CF-12 — the canonical MTP η (the contract siblings consume).**
 //! `mtp_eta = completion_tokens / total_token_frames`, where
 //! `total_token_frames` is the count of **all** token frames observed in the
@@ -714,12 +719,32 @@ impl SpeedEngine {
 
     /// All `iterations` runs (sequential — single-stream engine).
     ///
+    /// **CF-11 (the real warmup):** before the first measured iteration,
+    /// one **discarded** warmup run goes out on the same prompt. It
+    /// absorbs the cold-start effects — first-request socket setup,
+    /// server wake-up, a cold KV / prefix cache — so they don't pollute
+    /// the first measured sample. The warmup is logged (its worker tags
+    /// the HTTP / SSE lines `A:warmup-…`) and thrown away: it appears in
+    /// no [`SpeedResult`], no summary, no progress count, and no storage
+    /// row.
+    ///
     /// While a [`ProgressBus`] is attached, each iteration publishes
     /// `Iteration {i}/{total}` plus the running token count — the
     /// Benchmark Sequence mirrors it into the TUI's progress bar.
     pub async fn run(&self) -> (GeneratedPrompt, Vec<SpeedResult>) {
         let prompt = self.generate_prompt();
         let iterations = self.cfg.iterations.max(1) as usize;
+        // CF-11: the discarded warmup (see the method docs). A warmup
+        // failure is not special-cased: the measured iterations that
+        // follow report the truth (all_failed → exit 1, as before).
+        if let Some(l) = &self.logger {
+            l.info(
+                Context::EngineA,
+                "Warmup: 1 discarded run before the measured iterations (cold-start / KV-cache)"
+                    .to_string(),
+            );
+        }
+        let _warmup = self.run_iteration_events_tagged(&prompt, "A:warmup").await.0;
         let mut results = Vec::with_capacity(iterations);
         let mut tokens = 0u64;
         for i in 0..iterations {

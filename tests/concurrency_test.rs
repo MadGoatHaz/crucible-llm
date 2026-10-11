@@ -62,19 +62,33 @@ const DONE_FRAME: &str = r#"data: [DONE]"#;
 
 /// Start a mock that accepts an unbounded number of *concurrent*
 /// connections, serving each one a vLLM-style SSE stream: role opener,
-/// `content_frames` token frames (spaced by `frame_delay`), usage, `[DONE]`.
+/// `content_frames` token frames (spaced by `frame_delay`), usage,
+/// `[DONE]`.
+///
+/// CF-11: the returned [`AtomicUsize`] counts every connection served, so
+/// a test can prove the sweep's discarded warmup hit the wire (warmup
+/// streams + measured-level streams) while no warmup level appears in the
+/// result.
 async fn start_mock_sse(
     content_frames: usize,
     frame_delay: Duration,
-) -> (String, tokio::task::JoinHandle<()>) {
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_counter = served.clone();
     let handle = tokio::spawn(async move {
         loop {
             let (sock, _) = match listener.accept().await {
                 Ok(c) => c,
                 Err(_) => return,
             };
+            task_counter.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut sock = sock;
                 drain_request(&mut sock).await;
@@ -82,7 +96,7 @@ async fn start_mock_sse(
             });
         }
     });
-    (format!("http://{addr}"), handle)
+    (format!("http://{addr}"), handle, served)
 }
 
 /// Serve a ladder-level stream: role opener, `content_frames` token
@@ -216,10 +230,20 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
 
 #[tokio::test]
 async fn sweep_produces_one_record_per_ladder_step() {
-    let (url, server) = start_mock_sse(3, Duration::from_millis(5)).await;
+    let (url, server, served) = start_mock_sse(3, Duration::from_millis(5)).await;
     let sweep = Sweep::new(test_pool(&url), [1, 2, 4]);
     let result = sweep.run().await;
     server.abort();
+
+    // CF-11: the discarded warmup (1 stream, the first ladder level) hit
+    // the wire together with the measured levels (1 + 2 + 4 streams = 8
+    // connections total) — but it is not counted: the result carries
+    // exactly one level per measured ladder step.
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        1 + 1 + 2 + 4,
+        "1 warmup stream + 1 + 2 + 4 measured streams"
+    );
 
     // One (concurrency, aggregate_tps, p90_tpot) record per ladder step.
     assert_eq!(result.levels.len(), 3);
@@ -256,10 +280,21 @@ async fn sweep_produces_one_record_per_ladder_step() {
 
 #[tokio::test]
 async fn aggregate_metrics_span_all_concurrent_streams() {
-    let (url, server) = start_mock_sse(4, Duration::from_millis(10)).await;
+    let (url, server, _served) = start_mock_sse(4, Duration::from_millis(10)).await;
     let sweep = Sweep::new(test_pool(&url), [4]);
     let result = sweep.run().await;
     server.abort();
+
+    // CF-11: the discarded warmup runs at the first level's own
+    // concurrency (4 streams — it warms exactly what gets measured) +
+    // the 4 measured streams reached the mock; the measured level is the
+    // only one in the result.
+    assert_eq!(
+        _served.load(std::sync::atomic::Ordering::SeqCst),
+        8,
+        "4 warmup + 4 measured"
+    );
+    assert_eq!(result.levels.len(), 1);
 
     let lvl = &result.levels[0];
     assert_eq!(lvl.concurrency, 4);
@@ -287,7 +322,7 @@ async fn aggregate_metrics_span_all_concurrent_streams() {
 
 #[tokio::test]
 async fn no_fd_leaks_after_sweep_shutdown() {
-    let (url, server) = start_mock_sse(2, Duration::from_millis(5)).await;
+    let (url, server, _served) = start_mock_sse(2, Duration::from_millis(5)).await;
     // Our mock's port — the leak check is scoped to it, so sibling tests
     // (each binding their own port) can never contaminate the count.
     let port: u16 = url
@@ -575,7 +610,7 @@ fn view2_curve_survives_small_terminals() {
 
 #[tokio::test]
 async fn pool_fan_in_delivers_every_worker_and_closes() {
-    let (url, server) = start_mock_sse(2, Duration::from_millis(2)).await;
+    let (url, server, _served) = start_mock_sse(2, Duration::from_millis(2)).await;
     let (mut rx, supervisor) = test_pool(&url).spawn(3);
 
     // Drain to closure: the channel must close (None) once all 3 workers

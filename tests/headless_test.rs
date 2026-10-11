@@ -10,6 +10,9 @@
 //! * a dead endpoint yields exit code 1 (all runs failed);
 //! * `--nocache` changes the sent prefix.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
@@ -30,29 +33,45 @@ enum Mock {
     Echo,
 }
 
-async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
+/// CF-11: the mock now accepts **many** sequential connections (the
+/// engine performs one discarded warmup run before its measured
+/// iterations) and counts every request it serves in the returned
+/// [`AtomicUsize`] — the tests assert the warmup hit the wire but was
+/// thrown away.
+async fn start_mock(
+    mock: Mock,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let served = Arc::new(AtomicUsize::new(0));
+    let task_counter = served.clone();
     let handle = tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        match mock {
-            Mock::Sse => {
-                drain_request(&mut sock).await;
-                sse_response(&mut sock).await;
-            }
-            Mock::PlainJson => {
-                drain_request(&mut sock).await;
-                serve_json(&mut sock, "HTTP/1.1 200 OK", PLAIN_JSON_BODY).await;
-            }
-            Mock::Echo => {
-                let (_, body) = read_request(&mut sock).await;
-                sse_response(&mut sock).await;
-                // Park the body where the test can read it.
-                ECHO_BODIES.lock().unwrap().push(body);
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(c) => c,
+                // The test aborted the server (or the listener closed).
+                Err(_) => return,
+            };
+            task_counter.fetch_add(1, Ordering::SeqCst);
+            match &mock {
+                Mock::Sse => {
+                    drain_request(&mut sock).await;
+                    sse_response(&mut sock).await;
+                }
+                Mock::PlainJson => {
+                    drain_request(&mut sock).await;
+                    serve_json(&mut sock, "HTTP/1.1 200 OK", PLAIN_JSON_BODY).await;
+                }
+                Mock::Echo => {
+                    let (_, body) = read_request(&mut sock).await;
+                    sse_response(&mut sock).await;
+                    // Park the body where the test can read it.
+                    ECHO_BODIES.lock().unwrap().push(body);
+                }
             }
         }
     });
-    (format!("http://{addr}"), handle)
+    (format!("http://{addr}"), handle, served)
 }
 
 /// Recorded request bodies from `Mock::Echo`.
@@ -77,11 +96,20 @@ fn cfg(url: &str) -> Config {
 
 #[tokio::test]
 async fn sse_run_produces_prototype_metrics() {
-    let (url, _server) = start_mock(Mock::Sse).await;
+    let (url, server, served) = start_mock(Mock::Sse).await;
     let engine = SpeedEngine::new(&cfg(&url)).unwrap();
     let (prompt, results) = engine.run().await;
+    server.abort();
 
-    assert_eq!(results.len(), 1);
+    // CF-11: the discarded warmup hit the wire (1 warmup + 1 measured
+    // iteration = 2 requests), but it is not counted: `results` holds
+    // exactly the measured iterations.
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "1 warmup + 1 measured iteration reached the server"
+    );
+    assert_eq!(results.len(), 1, "the warmup run is discarded, not counted");
     let r = &results[0];
     assert!(r.error.is_none(), "unexpected error: {:?}", r.error);
     assert!(!r.is_failed());
@@ -115,10 +143,16 @@ async fn sse_run_produces_prototype_metrics() {
 
 #[tokio::test]
 async fn json_report_matches_prototype_key_set() {
-    let (url, _server) = start_mock(Mock::Sse).await;
+    let (url, server, served) = start_mock(Mock::Sse).await;
     let c = cfg(&url);
     let engine = SpeedEngine::new(&c).unwrap();
     let (_prompt, results) = engine.run().await;
+    server.abort();
+
+    // CF-11: warmup + one measured iteration reached the wire; only the
+    // measured iteration is in the report.
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert_eq!(results.len(), 1);
 
     let v = json_report(&c, &results);
     let top = v.as_object().unwrap();
@@ -227,7 +261,7 @@ async fn dead_endpoint_yields_all_failed_exit_1() {
 #[tokio::test]
 async fn nocache_prefix_reaches_the_server_and_varies() {
     ECHO_BODIES.lock().unwrap().clear();
-    let (url, _server) = start_mock(Mock::Echo).await;
+    let (url, _server, _served) = start_mock(Mock::Echo).await;
     let mut c = cfg(&url);
     c.nocache = true;
 
@@ -263,9 +297,15 @@ async fn nocache_prefix_reaches_the_server_and_varies() {
 
 #[tokio::test]
 async fn plain_json_fallback_runs_through_the_engine() {
-    let (url, _server) = start_mock(Mock::PlainJson).await;
+    let (url, server, served) = start_mock(Mock::PlainJson).await;
     let engine = SpeedEngine::new(&cfg(&url)).unwrap();
     let (_prompt, results) = engine.run().await;
+    server.abort();
+
+    // CF-11: the discarded warmup is the 2nd request on the wire; the
+    // plain-JSON fallback path counts only the measured run.
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert_eq!(results.len(), 1);
     let r = &results[0];
     assert!(r.error.is_none(), "unexpected error: {:?}", r.error);
     // usage (42/7) wins; one content chunk + one usage frame.
@@ -280,10 +320,10 @@ async fn plain_json_fallback_runs_through_the_engine() {
 
 #[tokio::test]
 async fn multiple_iterations_run_sequentially() {
-    // The mock serves one connection; run a single iteration twice via
-    // two engines to verify the iteration loop contract without
-    // re-implementing a multi-accept mock.
-    let (url, _server) = start_mock(Mock::Sse).await;
+    // Run a single iteration against the (multi-accept) mock to verify
+    // the iteration contract. `run_iteration` is a single request — the
+    // CF-11 warmup lives in `run()`, not here.
+    let (url, _server, _served) = start_mock(Mock::Sse).await;
     let c = cfg(&url);
     let engine = SpeedEngine::new(&c).unwrap();
     let prompt = engine.generate_prompt();

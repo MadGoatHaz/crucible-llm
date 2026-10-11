@@ -28,6 +28,14 @@
 //! optional [`MetricsState`] publisher (the TUI seam) reads the same events
 //! the sweep consumes and publishes in batches, so the render loop never
 //! touches the timing path.
+//!
+//! **CF-11 — the real warmup.** [`Sweep::run`] performs one **discarded**
+//! warmup level (at the first, smallest ladder concurrency) before the
+//! first measured level, so cold-start / KV-cache effects don't pollute
+//! the first measured sample. The warmup is logged (workers tagged
+//! `B:warmup-…`) and bounded by the same step budget the first measured
+//! level gets — it appears in no [`SweepLevel`], no summary, and no
+//! storage row.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -740,6 +748,18 @@ impl Sweep {
     ///    sweep continues to the next step. The sweep can never hang on
     ///    one bad level again.
     pub async fn run(&self) -> SweepResult {
+        // CF-11: one **discarded** warmup level before the first measured
+        // level, on both the single-context ladder and the 2D matrix path
+        // (the matrix's first measured level is its first leg's first
+        // level, so one warmup on that leg's context covers the sweep).
+        if !self.ladder.is_empty() {
+            let warmup_context = if self.contexts.len() > 1 {
+                self.contexts[0]
+            } else {
+                self.context_tokens
+            };
+            self.run_warmup(warmup_context).await;
+        }
         // v0.1.1: a multi-context axis runs the full 2D matrix.
         if self.contexts.len() > 1 {
             return self.run_matrix().await;
@@ -799,6 +819,64 @@ impl Sweep {
             levels.push(level);
         }
         levels
+    }
+
+    /// CF-11: the **discarded warmup** — one run at the first (smallest)
+    /// ladder level, before any level is measured, so cold-start /
+    /// KV-cache effects (connection setup, server wake-up, a cold prefix
+    /// cache) don't pollute the first measured sample.
+    ///
+    /// The warmup's streams are spawned on the same pool the first
+    /// measured level uses (for `context`, via [`Self::pool_for_context`]),
+    /// drained, and thrown away: the run produces no [`SweepLevel`], no
+    /// summary line, and no storage row. It is logged (workers tagged
+    /// `B:warmup-{id}`), and it is bounded by **2× the first measured
+    /// level's step budget** ([`Self::effective_step_budget`] with no
+    /// previous step) — a hung server can never hang the warmup longer
+    /// than it would hang level 1, and a timeout simply aborts the
+    /// discarded run and continues.
+    async fn run_warmup(&self, context: u32) {
+        let n = self.ladder.first().copied().unwrap_or(1);
+        self.logi(
+            Context::EngineB,
+            format!(
+                "Warmup: concurrency={n} — 1 discarded run before the first measured level (cold-start / KV-cache){}",
+                if context == 0 {
+                    String::new()
+                } else {
+                    format!(", context={context} tok")
+                }
+            ),
+        );
+        let start = MonotonicInstant::now();
+        let (mut rx, supervisor) = self.pool_for_context(context).spawn_tagged(n, "B:warmup");
+        // Drain (discarding) until every warmup worker ends — bounded the
+        // same way the first measured level is bounded (2× its budget).
+        let budget = self.effective_step_budget(0);
+        let bound = budget * 2;
+        let drain = async {
+            while let Some(_event) = rx.recv().await {}
+        };
+        if tokio::time::timeout(bound, drain).await.is_err() {
+            self.logw(
+                Context::EngineB,
+                format!(
+                    "Warmup: past its {:.0}s bound — aborting the discarded run (the measured levels proceed)",
+                    bound.as_secs_f64()
+                ),
+            );
+            supervisor.abort();
+        }
+        // The supervisor owns the worker tasks; awaiting it is the true
+        // end of the warmup (a no-op once they all finished on their own).
+        let _outcomes = supervisor.await.ok();
+        self.logi(
+            Context::EngineB,
+            format!(
+                "Warmup complete in {:.1}s (discarded — not counted in any level)",
+                start.elapsed().as_secs_f64()
+            ),
+        );
     }
 
     /// The v0.1.1 **2D matrix** run: one full ladder per context size.
