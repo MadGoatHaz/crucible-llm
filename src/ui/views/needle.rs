@@ -15,13 +15,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
-use crate::engines::capability::{NiahCellState, NIAH_DEPTHS, NIAH_SIZES};
+use crate::engines::capability::{context_size_label, NiahCellState, NIAH_DEPTHS, NIAH_SIZES};
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
 
-/// Context token sizes, 2k…128k (blueprint §5, Engine C1) — labels for the
-/// grid rows (the engine's `NIAH_SIZES` are the values).
-const SIZE_LABELS: [&str; 7] = ["2k", "4k", "8k", "16k", "32k", "64k", "128k"];
 /// Needle depths, 0%…100% in 10% steps (the engine's `NIAH_DEPTHS`).
 const DEPTHS: [u8; 11] = NIAH_DEPTHS;
 
@@ -51,12 +48,21 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     header.push(Cell::from("PASS %"));
     let mut rows: Vec<Row> = vec![Row::new(header).style(style::muted_title(th))];
 
-    let mut widths = vec![Constraint::Percentage(9)];
+    // The SIZE column is a fixed length wide enough for the longest
+    // qualified label (`128k (approx.)` = 14 chars + margin); the depth
+    // columns and the pass-rate column keep their percentages.
+    let mut widths = vec![Constraint::Length(16)];
     widths.extend(std::iter::repeat_n(Constraint::Percentage(6), DEPTHS.len()));
     widths.push(Constraint::Percentage(11));
 
-    for (i, label) in SIZE_LABELS.iter().enumerate() {
-        let mut cells = vec![Cell::from(*label).style(style::value(th))];
+    // Issue #4: the row labels come from the shared `context_size_label`
+    // (the same fn the headless run log and the `--json` `niah` section
+    // use) — with no `--tokenizer` the `chars/4` sizes read
+    // `128k (approx.)`, with one they read plain `128k`.
+    let approx = app.niah_approximate();
+    for (i, _) in NIAH_SIZES.iter().enumerate() {
+        let label = context_size_label(NIAH_SIZES[i], approx);
+        let mut cells = vec![Cell::from(label).style(style::value(th))];
         for &depth in &DEPTHS {
             let (glyph, st) = match result.as_ref().and_then(|r| r.cell(NIAH_SIZES[i], depth)) {
                 Some(cell) => match cell.state {
