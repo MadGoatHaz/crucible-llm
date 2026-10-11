@@ -26,7 +26,8 @@ use crucible_llm::client::StreamEvent;
 use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
 use crucible_llm::engines::hardware::{joules_per_token, profile};
 use crucible_llm::engines::speed::{
-    all_failed, format_result_box, format_summary, json_report, SpeedEngine, MAX_GEN_TOKENS,
+    all_failed, format_result_box, format_summary, json_report, SpeedEngine, SpeedResult,
+    MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{
     build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StreamCountSource,
@@ -186,6 +187,18 @@ fn run_headless(
     gpu: Option<Arc<dyn GpuBackend>>,
     cpu_power: Option<Box<CpuPowerBackend>>,
 ) -> i32 {
+    // Empty-selection guard (mirrors the TUI's `App::start_run`): a run
+    // with no engines selected has nothing to do. `--engine` names a
+    // *complete* selection, so an explicit empty list is an operator
+    // mistake we surface, not a silent no-op.
+    if cfg.engines.is_empty() {
+        eprintln!(
+            "crucible-llm: no engines selected — use --engine all, or select some in the Config view (View 6)"
+        );
+        logger.warn(Context::Setup, "no engines selected — nothing to run");
+        return 0;
+    }
+
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .enable_io() // the stream worker does real network I/O
@@ -197,143 +210,159 @@ fn run_headless(
             return 1;
         }
     };
-    // Chunk 17: the 100 ms hardware sampler (blueprint §4.3) runs for the
-    // whole headless run; its power trace is sliced per-iteration into the
-    // Silicon Efficiency Metric (Joules/Token). The detected backend (any
-    // vendor) drives the GPU fields; the CPU power backend drives the CPU
-    // draw (the system total = GPU + CPU); a driverless host simply yields
-    // N/A and the run proceeds normally.
-    let hw = Arc::new(Mutex::new(
-        HwPoller::with_backend(gpu)
-            .with_cpu_power(cpu_power)
-            .with_rate(cfg.rate_per_kwh),
-    ));
-    rt.spawn({
-        let hw = hw.clone();
-        async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
-            loop {
-                interval.tick().await;
-                if let Ok(mut p) = hw.lock() {
-                    p.poll();
+    // Chunk 17 / DO-08: the 100 ms hardware sampler runs for the whole
+    // headless run **only when Engine D (hardware/energy) is selected**.
+    // Its power trace is sliced into the Silicon Efficiency Metric
+    // (Joules/Token). `--no-hardware` (or a selection that omits D) now
+    // actually stops the poller — previously it was spawned
+    // unconditionally, ignoring `--no-hardware`. The detected backend
+    // (any vendor) drives the GPU fields; the CPU power backend drives the
+    // CPU draw; a driverless host yields N/A and the run proceeds.
+    let hw: Option<Arc<Mutex<HwPoller>>> = if cfg.hardware {
+        let h = Arc::new(Mutex::new(
+            HwPoller::with_backend(gpu)
+                .with_cpu_power(cpu_power)
+                .with_rate(cfg.rate_per_kwh),
+        ));
+        rt.spawn({
+            let hw = h.clone();
+            async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
+                loop {
+                    interval.tick().await;
+                    if let Ok(mut p) = hw.lock() {
+                        p.poll();
+                    }
                 }
             }
-        }
-    });
+        });
+        Some(h)
+    } else {
+        None
+    };
 
     rt.block_on(async {
-        let engine = match SpeedEngine::new(cfg) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("crucible-llm: {e}");
-                logger.error(Context::EngineA, format!("Engine A init failed: {e}"));
-                return 1;
-            }
-        };
-        let engine = engine.logger(logger.clone());
-        logger.info(
-            Context::EngineA,
-            format!(
-                "Engine A (Speed) started — {} iteration(s), {} max tokens",
-                cfg.iterations, MAX_GEN_TOKENS
-            ),
-        );
-
         let term = Term {
             color: !cfg.no_color && std::io::stdout().is_terminal(),
             tty: std::io::stderr().is_terminal(),
         };
 
-        let prompt = engine.generate_prompt();
-        let iterations = cfg.iterations.max(1) as usize;
-
-        if !cfg.json {
-            term.info(&format!(
-                "Mode: {} | Prompt: {} chars (~{} tok) | Target: {}",
-                cfg.mode.label(),
-                prompt.text.chars().count(),
-                prompt.token_count,
-                cfg.url
-            ));
-            if cfg.nocache {
-                term.dim("  KV-cache bypass enabled");
-            }
-            if iterations > 1 {
-                term.dim(&format!("  Running {iterations} iterations"));
-            }
-            if let Some(fmt) = cfg.export {
-                term.dim(&format!("  --export {} enabled", fmt.label()));
-            }
-        }
-
-        // Keep each iteration's raw worker events (Chunk 13 CSV export +
-        // Chunk 17 energy windows): the per-packet arrival timestamps the
-        // CSV dumps, and the (T0, Tn) lifecycle window that slices the
-        // hardware power trace into per-iteration Joules/Token.
-        let capture_packets = cfg.export.is_some();
-        let mut results = Vec::with_capacity(iterations);
+        // Engine A (speed) — gated on the selection (R1). `--engine niah`
+        // runs *only* C1; a selection that omits `speed` skips Engine A
+        // entirely (previously A always ran). The results/packets/windows
+        // are declared outside the gate so the persistence + export below
+        // can use them (they stay empty when A did not run).
+        let mut results: Vec<SpeedResult> = Vec::new();
         let mut packets: Vec<PacketSample> = Vec::new();
-        let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> =
-            Vec::with_capacity(iterations);
-        for i in 0..iterations {
-            if !cfg.json && iterations > 1 {
-                term.progress(&format!("  [{}/{}] Running...", i + 1, iterations));
-            }
-            let (result, events) = engine.run_iteration_events(&prompt).await;
-            if capture_packets {
-                packets.extend(export::samples_from_events(&events, (i + 1) as u64));
-            }
-            windows.push(run_window(&events));
-            if cfg.verbose && !cfg.json {
-                term.dim(&format!(
-                    "  chunks={} content={} reasoning={}",
-                    result.total_chunks, result.content_chunks, result.reasoning_chunks
+        let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> = Vec::new();
+
+        if cfg.engines.speed {
+            let engine = match SpeedEngine::new(cfg) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("crucible-llm: {e}");
+                    logger.error(Context::EngineA, format!("Engine A init failed: {e}"));
+                    return 1;
+                }
+            };
+            let engine = engine.logger(logger.clone());
+            logger.info(
+                Context::EngineA,
+                format!(
+                    "Engine A (Speed) started — {} iteration(s), {} max tokens",
+                    cfg.iterations, MAX_GEN_TOKENS
+                ),
+            );
+
+            let prompt = engine.generate_prompt();
+            let iterations = cfg.iterations.max(1) as usize;
+
+            if !cfg.json {
+                term.info(&format!(
+                    "Mode: {} | Prompt: {} chars (~{} tok) | Target: {}",
+                    cfg.mode.label(),
+                    prompt.text.chars().count(),
+                    prompt.token_count,
+                    cfg.url
                 ));
+                if cfg.nocache {
+                    term.dim("  KV-cache bypass enabled");
+                }
+                if iterations > 1 {
+                    term.dim(&format!("  Running {iterations} iterations"));
+                }
+                if let Some(fmt) = cfg.export {
+                    term.dim(&format!("  --export {} enabled", fmt.label()));
+                }
             }
-            results.push(result);
+
+            // Keep each iteration's raw worker events (Chunk 13 CSV export
+            // + Chunk 17 energy windows): the per-packet arrival timestamps
+            // the CSV dumps, and the (T0, Tn) lifecycle window that slices
+            // the hardware power trace into per-iteration Joules/Token.
+            let capture_packets = cfg.export.is_some();
+            results = Vec::with_capacity(iterations);
+            for i in 0..iterations {
+                if !cfg.json && iterations > 1 {
+                    term.progress(&format!("  [{}/{}] Running...", i + 1, iterations));
+                }
+                let (result, events) = engine.run_iteration_events(&prompt).await;
+                if capture_packets {
+                    packets.extend(export::samples_from_events(&events, (i + 1) as u64));
+                }
+                windows.push(run_window(&events));
+                if cfg.verbose && !cfg.json {
+                    term.dim(&format!(
+                        "  chunks={} content={} reasoning={}",
+                        result.total_chunks, result.content_chunks, result.reasoning_chunks
+                    ));
+                }
+                results.push(result);
+            }
+            if !cfg.json && iterations > 1 {
+                term.clear_progress();
+            }
+            logger.info(
+                Context::EngineA,
+                format!(
+                    "Engine A complete — {}/{} run(s) succeeded",
+                    results.iter().filter(|r| !r.is_failed()).count(),
+                    results.len()
+                ),
+            );
         }
-        if !cfg.json && iterations > 1 {
-            term.clear_progress();
-        }
-        logger.info(
-            Context::EngineA,
-            format!(
-                "Engine A complete — {}/{} run(s) succeeded",
-                results.iter().filter(|r| !r.is_failed()).count(),
-                results.len()
-            ),
-        );
 
         // Chunk 17: harvest the sampler's power trace (brief lock on the
         // run-completion path — never on the stream workers' timing path).
+        // Empty / `None` when Engine D was not selected (the poller is off).
         let hw_trace = hw
-            .lock()
-            .ok()
+            .as_ref()
+            .and_then(|h| h.lock().ok())
             .map(|g| g.trace().to_vec())
             .unwrap_or_default();
         let gpu_name = hw
-            .lock()
-            .ok()
+            .as_ref()
+            .and_then(|h| h.lock().ok())
             .and_then(|g| g.gpu_name().map(str::to_string));
 
-        // The `--json` document: Engine A's results now, the `flat_out`
-        // object appended once Engine F has run (the document is printed
-        // *after* the additional-engine block below, so the flat_out
-        // object is included in one JSON document on stdout). Non-JSON
-        // mode prints the result box(es) + summary.
+        // The `--json` document: Engine A's results (empty when A was not
+        // selected), with the `flat_out` object appended once Engine F has
+        // run (the document is printed *after* the additional-engine block
+        // below, so `flat_out` is included in one JSON document on stdout).
         let mut json_doc = if cfg.json {
             Some(json_report(cfg, &results))
         } else {
             None
         };
-        if !cfg.json {
+        if !cfg.json && !results.is_empty() {
             for (i, r) in results.iter().enumerate() {
-                match format_result_box(r, i + 1, iterations, term.color) {
+                match format_result_box(r, i + 1, results.len(), term.color) {
                     Some(box_) => print!("{box_}"),
                     None => term.error(&format!(
                         "Test {}/{} FAILED: {}",
                         i + 1,
-                        iterations,
+                        results.len(),
                         r.error.as_deref().unwrap_or("unknown error")
                     )),
                 }
@@ -346,14 +375,14 @@ fn run_headless(
             if let Some(summary) = format_summary(&results, term.color) {
                 print!("{summary}");
             }
-            // Chunk 17: run-level energy summary (blueprint §5D) — shown
-            // only when power telemetry was present (a driverless host
-            // prints nothing: the N/A rule, never a spurious 0.0).
-            let energy = profile(
-                &hw_trace,
-                None,
-                results.iter().map(|r| r.completion_tokens).sum(),
-            );
+        }
+        // Engine D (hardware/energy) run-level summary (blueprint §5D) —
+        // printed only when D is selected AND power telemetry was present
+        // (a driverless host prints nothing: the N/A rule, never a
+        // spurious 0.0). DO-08: this is now gated on the selection.
+        if cfg.hardware && !cfg.json {
+            let total_tokens: u64 = results.iter().map(|r| r.completion_tokens).sum();
+            let energy = profile(&hw_trace, None, total_tokens);
             if let Some(jpt) = energy.joules_per_token {
                 let peak = energy
                     .peak_power_w

@@ -452,6 +452,77 @@ fn binary_headless_json_and_export_end_to_end() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+// ── 2b. R1: the selection gates Engine A in headless ─────────────────────
+
+/// `--engine niah` runs **only** C1: Engine A (speed) must not run. The
+/// run is pointed at a dead local endpoint so the NIAH requests fail fast
+/// (connection refused) and the headless run completes in milliseconds —
+/// no mock server needed. The `--json` document's `iterations`/`results`
+/// are then empty, which is the observable proof that A was skipped.
+#[test]
+fn binary_engine_niah_only_does_not_run_engine_a() {
+    let tmp = temp_dir();
+    let out = Command::new(binary())
+        .args([
+            "--engine",
+            "niah",
+            "--url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "dead-model",
+            "--timeout",
+            "5",
+            "--json",
+            "--no-color",
+        ])
+        .env_clear()
+        .env("HOME", &tmp)
+        .output()
+        .expect("spawn the crucible-llm binary");
+
+    // The run completes (a failed NIAH is still a *completed* run; A
+    // never ran, so the all-failed exit-1 rule does not trip).
+    assert!(
+        out.status.success(),
+        "exit: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout is pure JSON with no Engine A results.
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    assert_eq!(
+        report["iterations"].as_u64(),
+        Some(0),
+        "Engine A must not run for --engine niah: {report}"
+    );
+    assert!(
+        report["results"].as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "no speed results: {report}"
+    );
+    // No `flat_out` object (Engine F was not selected).
+    assert!(report.get("flat_out").is_none(), "no flat_out: {report}");
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+/// `--engine all` selects every engine: the binary accepts it and the
+/// resolved selection turns on all seven (asserted here at the config
+/// layer, since running all seven headless against a live endpoint is out
+/// of scope for the offline suite).
+#[test]
+fn engine_all_selects_every_engine() {
+    let args = ["crucible-llm", "--engine", "all", "--url", "http://127.0.0.1:1/v1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let cfg = Config::from_args(&args).expect("resolve --engine all");
+    use crucible_llm::config::EngineSelection;
+    assert_eq!(cfg.engines, EngineSelection::all());
+    assert!(cfg.engines_explicit);
+}
+
 // ── 3. Chunk 20 dispatch: the TUI is the default ─────────────────────────
 
 #[test]
