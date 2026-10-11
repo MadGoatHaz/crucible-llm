@@ -405,17 +405,62 @@ impl StructuredResult {
         }
     }
 
-    /// One-line summary for the sequence header / headless output
-    /// (`+30.0% penalty · 2/3 compliant · [json_object hint …]`).
+    /// CF-17: the two distinct compliance signals, kept separate because a
+    /// response can parse as JSON yet violate the schema.
     ///
-    /// CF-08: the constraint mode is flagged inline so a ~0% penalty on a
-    /// backend that drops `response_format` is never misread as "constrained
-    /// decoding is free" (the old code's silent false-negative).
+    /// Returns `(valid_json_rate, schema_correct_rate)` as fractions in
+    /// `[0.0, 1.0]` over the scored cases:
+    /// * `valid_json_rate` — the fraction whose output parses as JSON
+    ///   (Compliant + Partial);
+    /// * `schema_correct_rate` — the fraction that are fully Compliant (valid
+    ///   JSON *and* every schema / field / type check passes).
+    ///
+    /// The old single "compliance" number conflated these; with a real
+    /// `json_schema` in place (CF-08) they are two different capabilities
+    /// (a decoder/model that emits JSON vs. one that emits *schema-correct*
+    /// JSON) and are now reported separately.
+    #[must_use]
+    pub fn compliance_rates(&self) -> (f64, f64) {
+        let total = self.cases.len();
+        if total == 0 {
+            return (0.0, 0.0);
+        }
+        let valid_json = self.cases.iter().filter(|c| c.is_valid_json()).count();
+        let schema_correct = self.cases.iter().filter(|c| c.is_compliant()).count();
+        (
+            valid_json as f64 / total as f64,
+            schema_correct as f64 / total as f64,
+        )
+    }
+
+    /// CF-17: a two-part compliance label that keeps "valid JSON" and
+    /// "schema-correct" distinct (e.g. `valid JSON 3/3 · schema-correct
+    /// 2/3`), so a response that parses as JSON yet violates the schema is
+    /// reported as valid-JSON but *not* schema-correct — never one blended
+    /// number.
+    #[must_use]
+    pub fn compliance_label(&self) -> String {
+        let total = self.cases.len();
+        let valid_json = self.cases.iter().filter(|c| c.is_valid_json()).count();
+        let schema_correct = self.cases.iter().filter(|c| c.is_compliant()).count();
+        format!(
+            "valid JSON {valid_json}/{total} · schema-correct {schema_correct}/{total}"
+        )
+    }
+
+    /// One-line summary for the sequence header / headless output.
+    ///
+    /// CF-17: the compliance part is the *split* `valid JSON … / schema-
+    /// correct …` label (a response can parse as JSON yet violate the
+    /// schema). CF-08: the constraint mode is flagged inline so a ~0%
+    /// penalty on a backend that drops `response_format` is never misread as
+    /// "constrained decoding is free" (the old code's silent false-negative).
+    #[must_use]
     pub fn summary_line(&self) -> String {
         format!(
             "{:+.1}% penalty · {} · [{}]",
             self.penalty_pct,
-            self.score_label(),
+            self.compliance_label(),
             self.constraint_mode().label()
         )
     }
@@ -1179,10 +1224,36 @@ mod tests {
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false}]"#,
             r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
         );
-        // 2 compliant (simple, complex), 1 partial (medium: 2 not 3).
+        // 2 compliant (simple, complex), 1 partial (medium: 2 not 3) — but all
+        // three are *valid* JSON, so the CF-17 split reports them distinctly.
         assert_eq!(r.score(), (2, 1, 0));
         assert!(r.summary_line().contains("+5.2% penalty"));
-        assert!(r.summary_line().contains("2/3 compliant"));
+        assert!(r.summary_line().contains("valid JSON 3/3"));
+        assert!(r.summary_line().contains("schema-correct 2/3"));
+    }
+
+    #[test]
+    fn compliance_rates_split_valid_json_from_schema_correct() {
+        // CF-17: a response can parse as JSON yet violate the schema. Here all
+        // three cases are *valid* JSON, but only one is *schema-correct*
+        // (Medium has 2 elements, not 3; Complex's orders is free text).
+        let r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false}]"#,
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":"free text"}"#,
+        );
+        let (valid, correct) = r.compliance_rates();
+        assert!(
+            (valid - 1.0).abs() < 1e-9,
+            "all three parse as JSON: {valid}"
+        );
+        assert!(
+            (correct - (1.0 / 3.0)).abs() < 1e-9,
+            "only Simple is schema-correct: {correct}"
+        );
+        assert!(valid > correct, "valid-JSON must exceed schema-correct");
+        assert!(r.compliance_label().contains("valid JSON 3/3"));
+        assert!(r.compliance_label().contains("schema-correct 1/3"));
     }
 
     // ── CF-08: real constrained decoding (mode selection + flagging) ─────
