@@ -1031,11 +1031,14 @@ fn build_capability_scores(
     }
 
     // Structured Out (C3) — the score across the three schema cases
-    // (compliant / partial / failed), with the practical verdict carried by
-    // the detail sub-section below.
+    // (compliant / partial / failed), plus the distinct R2
+    // `truncated_by_reasoning` bucket (budget exhausted in CoT, no content
+    // committed — inconclusive, not a capability failure), with the
+    // practical verdict carried by the detail sub-section below.
     if sel.structured {
         if let Some(r) = app.structured_slot.load().as_ref() {
             let (c, _p, _f) = r.score();
+            let t = r.truncated_count();
             let total = r.cases.len();
             let pct = if total > 0 {
                 c as f64 / total as f64 * 100.0
@@ -1046,8 +1049,12 @@ fn build_capability_scores(
                 label: "Structured Out",
                 pct: Some(pct),
                 detail: r.score_label(),
+                // R2: an all-truncated result is *inconclusive (budget)* —
+                // amber (warn), never red (a capability failure).
                 detail_style: if c == total {
                     style::value_ok(th)
+                } else if c == 0 && t == total {
+                    style::value_warn(th)
                 } else if c == 0 {
                     style::value_err(th)
                 } else {
@@ -1055,7 +1062,11 @@ fn build_capability_scores(
                 },
                 color: score_color(th, Some(pct)),
                 info: "JSON schema adherence (3 cases). Required for API / agent tool-calling.",
-                warn: (c < total).then_some("See the detail below for which cases fail."),
+                warn: if t > 0 {
+                    Some("truncated by reasoning (CoT-only) — see detail below")
+                } else {
+                    (c < total).then_some("See the detail below for which cases fail.")
+                },
             });
         }
     }
@@ -1209,6 +1220,16 @@ fn build_structured_detail_lines(
             ),
             Span::styled(glyph.to_string(), Style::default().fg(color)),
         ];
+        // R2: a distinct marker for a case whose stream was all-CoT /
+        // zero content — the `truncated_by_reasoning` outcome (budget
+        // exhausted in chain-of-thought). Amber, not red: it is
+        // inconclusive, not a failure.
+        if case.truncated_by_reasoning {
+            spans.push(Span::styled(
+                "  ⚠ truncated by reasoning (CoT-only, no content committed)".to_string(),
+                style::value_warn(th),
+            ));
+        }
         spans.extend(case_check_spans(case, th));
         lines.push(Line::from(spans));
         // Show the actual output (truncated to 3 lines) for any case that is
@@ -2159,6 +2180,143 @@ mod tests {
         assert!(
             text.contains("≤ 8k (approx.) reliable"),
             "reliable-up-to shown in the panel: {text}"
+        );
+    }
+
+    // ── R2 hybrid reasoning: `truncated_by_reasoning` in the C3 display ──
+
+    /// One truncated C3 case (all-CoT / zero content on a completed
+    /// stream) — the `truncated_by_reasoning` outcome.
+    fn truncated_case(name: &str) -> crate::engines::capability::StructuredCaseResult {
+        crate::engines::capability::StructuredCaseResult {
+            name: name.to_string(),
+            checks: vec![crate::engines::capability::CaseCheck {
+                label: "Valid JSON".to_string(),
+                passed: false,
+            }],
+            verdict: crate::engines::capability::CaseVerdict::Truncated,
+            output: String::new(),
+            repeats: 1,
+            compliant_repeats: 0,
+            truncated_by_reasoning: true,
+        }
+    }
+
+    #[test]
+    fn structured_bar_warns_when_a_case_is_truncated() {
+        // R2: the C3 bar breaks the truncated case out of the score — the
+        // detail shows the distinct bucket and the warning names the reason
+        // (not the generic "which cases fail").
+        let app = App::new();
+        app.structured_slot.store(crate::engines::capability::StructuredResult {
+            free_tps: 100.0,
+            constrained_tps: 98.0,
+            penalty_pct: -0.3,
+            free_ttft: 0.1,
+            constrained_ttft: 0.101,
+            cases: vec![
+                crate::engines::capability::evaluate_case(
+                    "Simple",
+                    r#"{"name": "Ada", "age": 36}"#,
+                ),
+                crate::engines::capability::evaluate_case(
+                    "Medium",
+                    r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+                ),
+                truncated_case("Complex"),
+            ],
+            constrained_body: String::new(),
+            free_body: "hi".into(),
+        });
+        let m = crate::metrics::state::MetricsSnapshot::default();
+        let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
+        let s = scores
+            .iter()
+            .find(|s| s.label == "Structured Out")
+            .expect("structured score");
+        assert!(
+            s.detail.contains("truncated"),
+            "the detail breaks out the truncated bucket: {}",
+            s.detail
+        );
+        assert!(
+            s.warn.is_some_and(|w| w.contains("truncated by reasoning")),
+            "the warning names the truncation: {:?}",
+            s.warn
+        );
+    }
+
+    #[test]
+    fn structured_bar_all_truncated_is_warn_not_err() {
+        // R2: every case exhausted its budget in CoT (no content
+        // committed) — the bar reads *inconclusive (budget)* (amber warn),
+        // never a capability failure (red err).
+        let app = App::new();
+        app.structured_slot.store(crate::engines::capability::StructuredResult {
+            free_tps: 100.0,
+            constrained_tps: 98.0,
+            penalty_pct: 0.0,
+            free_ttft: 0.1,
+            constrained_ttft: 0.101,
+            cases: vec![
+                truncated_case("Simple"),
+                truncated_case("Medium"),
+                truncated_case("Complex"),
+            ],
+            constrained_body: String::new(),
+            free_body: "hi".into(),
+        });
+        let m = crate::metrics::state::MetricsSnapshot::default();
+        let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
+        let s = scores
+            .iter()
+            .find(|s| s.label == "Structured Out")
+            .expect("structured score");
+        assert_eq!(s.pct, Some(0.0), "no compliant cases ⇒ empty bar");
+        assert_eq!(
+            s.detail_style,
+            style::value_warn(Theme::default()),
+            "all-truncated is amber (inconclusive), not red"
+        );
+        assert!(s.warn.is_some(), "truncated carries the warning");
+    }
+
+    #[test]
+    fn live_view_structured_detail_marks_truncated_case() {
+        // R2 render-level (TestBackend): the STRUCTURED DETAIL sub-section
+        // carries the distinct truncated marker on the case line —
+        // "truncated by reasoning (CoT-only, no content committed)" — an
+        // inconclusive outcome, never a red failure.
+        let app = App::new();
+        app.structured_slot.store(crate::engines::capability::StructuredResult {
+            free_tps: 100.0,
+            constrained_tps: 98.0,
+            penalty_pct: -0.3,
+            free_ttft: 0.1,
+            constrained_ttft: 0.101,
+            cases: vec![
+                crate::engines::capability::evaluate_case(
+                    "Simple",
+                    r#"{"name": "Ada", "age": 36}"#,
+                ),
+                crate::engines::capability::evaluate_case("Medium", "not json"),
+                truncated_case("Complex"),
+            ],
+            constrained_body: "{}".into(),
+            free_body: "hi".into(),
+        });
+        let text = render_live_text(&app, 120, 60);
+        assert!(
+            text.contains("STRUCTURED DETAIL"),
+            "detail section present: {text}"
+        );
+        assert!(
+            text.contains("truncated by reasoning"),
+            "the distinct marker is rendered: {text}"
+        );
+        assert!(
+            text.contains("CoT-only, no content committed"),
+            "the marker explains the outcome: {text}"
         );
     }
 
