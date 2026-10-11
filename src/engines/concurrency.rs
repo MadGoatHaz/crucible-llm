@@ -163,6 +163,43 @@ impl SweepLevel {
     pub fn degraded(&self) -> bool {
         self.timed_out_streams > 0 || self.aborted
     }
+
+    /// CF-04 (**capacity view**): aggregate t/s ÷ **completed** streams.
+    ///
+    /// How much throughput the *healthy* streams actually got — the number
+    /// that reflects the server's real capacity under load. (Shared name
+    /// with Engine F / P2-D.)
+    #[must_use]
+    pub fn tps_per_completed_stream(&self) -> f64 {
+        self.aggregate_tps / self.completed_streams.max(1) as f64
+    }
+
+    /// CF-04 (**user-experience view**): aggregate t/s ÷ **requested**
+    /// streams.
+    ///
+    /// What each of the `concurrency` users the level *asked* for got — a
+    /// failed stream dilutes this (the user whose stream failed gets 0).
+    /// Equals the existing `per_stream_tps` (aggregate ÷ concurrency).
+    /// (Shared name with Engine F / P2-D.)
+    #[must_use]
+    pub fn tps_per_requested_stream(&self) -> f64 {
+        self.aggregate_tps / self.concurrency.max(1) as f64
+    }
+
+    /// CF-04: the fraction of the level's requested streams that failed
+    /// (`failed_streams / concurrency`).
+    #[must_use]
+    pub fn failed_stream_ratio(&self) -> f64 {
+        self.failed_streams as f64 / self.concurrency.max(1) as f64
+    }
+
+    /// CF-04: `true` when **more than** [`FAILED_STREAM_RATIO_THRESHOLD`]
+    /// (20%) of the level's requested streams failed — such a level is not
+    /// a healthy capacity measurement and is flagged.
+    #[must_use]
+    pub fn high_failure(&self) -> bool {
+        self.failed_stream_ratio() > FAILED_STREAM_RATIO_THRESHOLD
+    }
 }
 
 /// One cell of the v0.1.1 2D concurrency × context matrix: the
@@ -178,6 +215,18 @@ pub struct MatrixCell {
     pub aggregate_tps: f64,
     /// Per-stream tokens/sec (`aggregate_tps / concurrency`).
     pub per_stream_tps: f64,
+    /// CF-04 (capacity view): aggregate t/s ÷ **completed** streams.
+    #[serde(default)]
+    pub tps_per_completed_stream: f64,
+    /// CF-04 (user-experience view): aggregate t/s ÷ **requested** streams.
+    #[serde(default)]
+    pub tps_per_requested_stream: f64,
+    /// CF-04: `failed_streams / concurrency` (the requested-stream count).
+    #[serde(default)]
+    pub failed_stream_ratio: f64,
+    /// CF-04: `true` when `failed_stream_ratio > 0.20`.
+    #[serde(default)]
+    pub high_failure: bool,
     /// TTFT p50 (ns).
     pub ttft_p50_ns: u64,
     /// ITL p50 (ns).
@@ -446,6 +495,11 @@ pub const KNEE_GAIN_THRESHOLD: f64 = 0.05;
 /// p90-TPOT growth factor (vs the previous level) at or above which a
 /// level is considered to be *spiking* (the knee's latency condition).
 pub const KNEE_SPIKE_THRESHOLD: f64 = 2.0;
+
+/// The failed-stream ratio at or above which a sweep level is flagged
+/// (CF-04): a level where **more than 20%** of its requested streams
+/// failed is not a healthy capacity measurement.
+pub const FAILED_STREAM_RATIO_THRESHOLD: f64 = 0.20;
 
 /// The detected saturation knee: the first concurrency level where
 /// aggregate throughput plateaus while p90 TPOT spikes (blueprint §5
@@ -789,6 +843,10 @@ impl Sweep {
                     concurrency: level.concurrency,
                     aggregate_tps: level.aggregate_tps,
                     per_stream_tps: level.per_stream_tps,
+                    tps_per_completed_stream: level.tps_per_completed_stream(),
+                    tps_per_requested_stream: level.tps_per_requested_stream(),
+                    failed_stream_ratio: level.failed_stream_ratio(),
+                    high_failure: level.high_failure(),
                     ttft_p50_ns: level.ttft_p50_ns,
                     itl_p50_ns: level.p50_tpot_ns,
                     itl_p99_ns: level.p99_tpot_ns,
@@ -2669,6 +2727,10 @@ mod tests {
             concurrency: 4,
             aggregate_tps: 120.5,
             per_stream_tps: 30.125,
+            tps_per_completed_stream: 40.166,
+            tps_per_requested_stream: 30.125,
+            failed_stream_ratio: 0.25,
+            high_failure: true,
             ttft_p50_ns: 5_000_000,
             itl_p50_ns: 10_000_000,
             itl_p99_ns: 30_000_000,
@@ -2691,6 +2753,98 @@ mod tests {
         assert_eq!(back, matrix);
         assert_eq!(back.cells.len(), 3, "one row per context");
         assert_eq!(back.cells[0].len(), 3, "one column per concurrency");
+    }
+
+    // ── CF-04: the dual-denominator per-stream throughput + failure flag ──
+
+    /// A level with `n` requested streams, `failed` of them failed, and the
+    /// given aggregate t/s.
+    fn level_with_failures(n: usize, failed: usize, tps: f64) -> SweepLevel {
+        SweepLevel {
+            concurrency: n,
+            context: 0,
+            aggregate_tps: tps,
+            per_stream_tps: tps / n.max(1) as f64,
+            p50_tpot_ns: 0,
+            p90_tpot_ns: 0,
+            p99_tpot_ns: 0,
+            ttft_p50_ns: 0,
+            ttft_p90_ns: 0,
+            total_tokens: 0,
+            completed_streams: n - failed,
+            failed_streams: failed,
+            timed_out_streams: 0,
+            aborted: false,
+            wall_ns: 1_000_000_000,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+            streams: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn dual_denominators_completed_vs_requested() {
+        // 4 requested, 3 completed, 1 failed; aggregate 120 t/s.
+        // Capacity view (÷completed): 120 / 3 = 40.
+        // User-experience view (÷requested): 120 / 4 = 30.
+        let level = level_with_failures(4, 1, 120.0);
+        assert!((level.tps_per_completed_stream() - 40.0).abs() < 1e-9);
+        assert!((level.tps_per_requested_stream() - 30.0).abs() < 1e-9);
+        // The user-experience view equals the existing per_stream_tps.
+        assert!((level.tps_per_requested_stream() - level.per_stream_tps).abs() < 1e-9);
+        // 1 failed of 4 requested = 25%.
+        assert!((level.failed_stream_ratio() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn failure_flag_fires_only_above_the_20_percent_threshold() {
+        // 30% failed (3/10) → flagged; 10% (1/10) → not; exactly 20%
+        // (2/10) is NOT flagged (the contract is strictly `> 0.20`).
+        assert!(level_with_failures(10, 3, 100.0).high_failure());
+        assert!(!level_with_failures(10, 1, 100.0).high_failure());
+        assert!(!level_with_failures(10, 2, 100.0).high_failure());
+        // 25% (1/4) → flagged.
+        assert!(level_with_failures(4, 1, 100.0).high_failure());
+    }
+
+    #[test]
+    fn matrix_cell_json_carries_the_dual_denominator_fields() {
+        // The JSON export's `matrix` block must expose the exact shared
+        // field names (P2-D / Engine F uses the same names).
+        let cell = MatrixCell {
+            context: 0,
+            concurrency: 4,
+            aggregate_tps: 120.0,
+            per_stream_tps: 30.0,
+            tps_per_completed_stream: 40.0,
+            tps_per_requested_stream: 30.0,
+            failed_stream_ratio: 0.25,
+            high_failure: true,
+            ttft_p50_ns: 0,
+            itl_p50_ns: 0,
+            itl_p99_ns: 0,
+            total_tokens: 0,
+            wall_ns: 1_000_000_000,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+        };
+        let v = serde_json::to_value(&cell).unwrap();
+        assert_eq!(v["tps_per_completed_stream"], 40.0);
+        assert_eq!(v["tps_per_requested_stream"], 30.0);
+        assert_eq!(v["failed_stream_ratio"], 0.25);
+        assert!(v["high_failure"].as_bool().unwrap());
+        // `#[serde(default)]`: an old JSON document without the new fields
+        // still deserializes (they default to 0 / false).
+        let legacy = r#"{
+            "context": 0, "concurrency": 4, "aggregate_tps": 120.0,
+            "per_stream_tps": 30.0, "ttft_p50_ns": 0, "itl_p50_ns": 0,
+            "itl_p99_ns": 0, "total_tokens": 0, "wall_ns": 1,
+            "loop_excluded_streams": 0, "loop_excluded_tokens": 0
+        }"#;
+        let back: MatrixCell = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.tps_per_completed_stream, 0.0);
+        assert_eq!(back.tps_per_requested_stream, 0.0);
+        assert!(!back.high_failure);
     }
 
     #[tokio::test]
