@@ -2252,20 +2252,21 @@ mod tests {
         // committed) — the bar reads *inconclusive (budget)* (amber warn),
         // never a capability failure (red err).
         let app = App::new();
-        app.structured_slot.store(crate::engines::capability::StructuredResult {
-            free_tps: 100.0,
-            constrained_tps: 98.0,
-            penalty_pct: 0.0,
-            free_ttft: 0.1,
-            constrained_ttft: 0.101,
-            cases: vec![
-                truncated_case("Simple"),
-                truncated_case("Medium"),
-                truncated_case("Complex"),
-            ],
-            constrained_body: String::new(),
-            free_body: "hi".into(),
-        });
+        app.structured_slot
+            .store(crate::engines::capability::StructuredResult {
+                free_tps: 100.0,
+                constrained_tps: 98.0,
+                penalty_pct: 0.0,
+                free_ttft: 0.1,
+                constrained_ttft: 0.101,
+                cases: vec![
+                    truncated_case("Simple"),
+                    truncated_case("Medium"),
+                    truncated_case("Complex"),
+                ],
+                constrained_body: String::new(),
+                free_body: "hi".into(),
+            });
         let m = crate::metrics::state::MetricsSnapshot::default();
         let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
         let s = scores
@@ -2288,23 +2289,24 @@ mod tests {
         // "truncated by reasoning (CoT-only, no content committed)" — an
         // inconclusive outcome, never a red failure.
         let app = App::new();
-        app.structured_slot.store(crate::engines::capability::StructuredResult {
-            free_tps: 100.0,
-            constrained_tps: 98.0,
-            penalty_pct: -0.3,
-            free_ttft: 0.1,
-            constrained_ttft: 0.101,
-            cases: vec![
-                crate::engines::capability::evaluate_case(
-                    "Simple",
-                    r#"{"name": "Ada", "age": 36}"#,
-                ),
-                crate::engines::capability::evaluate_case("Medium", "not json"),
-                truncated_case("Complex"),
-            ],
-            constrained_body: "{}".into(),
-            free_body: "hi".into(),
-        });
+        app.structured_slot
+            .store(crate::engines::capability::StructuredResult {
+                free_tps: 100.0,
+                constrained_tps: 98.0,
+                penalty_pct: -0.3,
+                free_ttft: 0.1,
+                constrained_ttft: 0.101,
+                cases: vec![
+                    crate::engines::capability::evaluate_case(
+                        "Simple",
+                        r#"{"name": "Ada", "age": 36}"#,
+                    ),
+                    crate::engines::capability::evaluate_case("Medium", "not json"),
+                    truncated_case("Complex"),
+                ],
+                constrained_body: "{}".into(),
+                free_body: "hi".into(),
+            });
         let text = render_live_text(&app, 120, 60);
         assert!(
             text.contains("STRUCTURED DETAIL"),

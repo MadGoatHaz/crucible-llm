@@ -2001,8 +2001,7 @@ mod tests {
             !outcome.is_truncated_by_reasoning(&events),
             "content>0 ⇒ not truncated"
         );
-        let r =
-            evaluate_case_with("Simple", r#"{"name": "Ada", "age": "thirty-six"}"#, false);
+        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": "thirty-six"}"#, false);
         assert_eq!(
             r.verdict,
             CaseVerdict::Partial,
@@ -2028,8 +2027,10 @@ mod tests {
         // reports it as NOT truncated, and the case scores the plain
         // `Failed` verdict (empty body), never `Truncated`.
         let events = vec![frame_event(Chunk::Reasoning("thinking…".into()))];
-        let outcome =
-            outcome_with(1, Some(crate::client::StreamError::Connection("refused".into())));
+        let outcome = outcome_with(
+            1,
+            Some(crate::client::StreamError::Connection("refused".into())),
+        );
         assert!(!outcome.is_ok());
         assert!(
             !outcome.is_truncated_by_reasoning(&events),
@@ -2077,10 +2078,7 @@ mod tests {
             "the summary breaks out the truncated case: {s}"
         );
         assert!(s.contains("valid JSON 2/3"), "CF-17 split intact: {s}");
-        assert!(
-            s.contains("schema-correct 2/3"),
-            "CF-17 split intact: {s}"
-        );
+        assert!(s.contains("schema-correct 2/3"), "CF-17 split intact: {s}");
     }
 
     #[test]
@@ -2104,7 +2102,10 @@ mod tests {
             free_body: String::new(),
         };
         let v = r.verdict_line();
-        assert!(v.starts_with("⚠"), "inconclusive (⚠), not a failure (✗): {v}");
+        assert!(
+            v.starts_with("⚠"),
+            "inconclusive (⚠), not a failure (✗): {v}"
+        );
         assert!(v.contains("truncated by reasoning"), "{v}");
         assert!(!v.starts_with('✗'));
         let s = r.summary_line();
@@ -2116,10 +2117,7 @@ mod tests {
             s.contains("penalty N/A (case-0 truncated by reasoning)"),
             "{s}"
         );
-        assert!(
-            s.contains("0/3 schema, 3 truncated_by_reasoning"),
-            "{s}"
-        );
+        assert!(s.contains("0/3 schema, 3 truncated_by_reasoning"), "{s}");
     }
 
     #[test]
@@ -2207,11 +2205,9 @@ mod tests {
         assert_eq!(d["cases"][2]["valid_json"], false);
         assert_eq!(d["cases"][0]["truncated_by_reasoning"], false);
         assert_eq!(d["cases"][0]["verdict"], "compliant");
-        assert!(
-            d["summary"]
-                .as_str()
-                .unwrap()
-                .contains("truncated_by_reasoning")
-        );
+        assert!(d["summary"]
+            .as_str()
+            .unwrap()
+            .contains("truncated_by_reasoning"));
     }
 }
