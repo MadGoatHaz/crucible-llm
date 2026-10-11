@@ -843,6 +843,11 @@ pub struct NiahEngine {
     /// net). This is the budget a verbose reasoner must fit its
     /// chain-of-thought *and* the answer into.
     max_gen_tokens: u32,
+    /// The best-effort `disable_thinking` suppression (R3). On by default
+    /// (a speed optimization); `--no-disable-thinking` turns it off so the
+    /// model thinks by default — the force-test path for the
+    /// `truncated_by_reasoning` safety net.
+    disable_thinking: bool,
     sizes: Vec<u32>,
     depths: Vec<u8>,
     /// Optional sequence seam: publish `Size …, Depth …` to the
@@ -893,6 +898,7 @@ impl NiahEngine {
             timeout: cfg.timeout,
             tokenizer,
             max_gen_tokens: cfg.niah_max_tokens,
+            disable_thinking: cfg.disable_thinking,
             sizes,
             depths,
             progress: None,
@@ -906,6 +912,12 @@ impl NiahEngine {
     #[must_use]
     pub fn max_gen_tokens(&self) -> u32 {
         self.max_gen_tokens
+    }
+
+    /// The configured `disable_thinking` suppression (R3; on by default).
+    #[must_use]
+    pub fn disable_thinking(&self) -> bool {
+        self.disable_thinking
     }
 
     /// Override the context sizes (tests / custom matrices).
@@ -1043,13 +1055,14 @@ impl NiahEngine {
         // chain-of-thought so the generation budget goes to the visible
         // answer. This is a *speed* optimization, **not** a correctness
         // dependency: a config-only server may silently drop the per-request
-        // switch (the raised `NIAH_MAX_GEN_TOKENS` budget is then the safety
-        // net), and Qwen3.5+ `/no_think` is not a reliable switch. Non-
-        // reasoning models and backends without a switch are unaffected; and
-        // when suppression is ignored, an all-CoT / zero-content cell is
-        // flagged `truncated_by_reasoning` (below) instead of a false
-        // capability failure (Strawberry Issue 1).
-        worker = worker.disable_thinking(true);
+        // switch (the raised budget is then the safety net), and Qwen3.5+
+        // `/no_think` is not a reliable switch. Non-reasoning models and
+        // backends without a switch are unaffected; and when suppression is
+        // ignored (or off via `--no-disable-thinking`, the R3 force-test
+        // path), an all-CoT / zero-content cell is flagged
+        // `truncated_by_reasoning` (below) instead of a false capability
+        // failure (Strawberry Issue 1).
+        worker = worker.disable_thinking(self.disable_thinking);
 
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
@@ -1235,6 +1248,8 @@ pub struct NiahEngineConfig {
     /// The per-cell generation budget in tokens (R3; default
     /// [`NIAH_MAX_GEN_TOKENS`]).
     pub max_gen_tokens: u32,
+    /// The best-effort `disable_thinking` suppression (R3; on by default).
+    pub disable_thinking: bool,
 }
 
 impl NiahEngineConfig {
@@ -1250,6 +1265,7 @@ impl NiahEngineConfig {
             niah_depths: cfg.niah_depths.clone(),
             niah_custom: cfg.niah_custom,
             max_gen_tokens: cfg.niah_max_tokens,
+            disable_thinking: cfg.disable_thinking,
         }
     }
 
@@ -1276,6 +1292,7 @@ impl NiahEngineConfig {
             timeout: self.timeout,
             tokenizer,
             max_gen_tokens: self.max_gen_tokens,
+            disable_thinking: self.disable_thinking,
             sizes,
             depths,
             progress: None,
@@ -1986,6 +2003,22 @@ mod tests {
         assert_eq!(nec.max_gen_tokens, 4096);
         let engine = nec.engine().unwrap();
         assert_eq!(engine.max_gen_tokens(), 4096);
+    }
+
+    #[test]
+    fn engine_honors_the_disable_thinking_switch() {
+        // R3: the resolved suppression switch reaches the engine (on by
+        // default; `--no-disable-thinking` → off, the force-test path).
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            disable_thinking: false,
+            ..Config::default()
+        };
+        let engine = NiahEngine::new(&cfg).unwrap();
+        assert!(!engine.disable_thinking());
+        // The default config keeps suppression on.
+        let engine = NiahEngine::new(&Config::default()).unwrap();
+        assert!(engine.disable_thinking());
     }
 
     #[test]

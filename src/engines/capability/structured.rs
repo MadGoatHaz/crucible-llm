@@ -774,6 +774,11 @@ pub struct StructuredEngine {
     /// the config file > the built-in [`STRUCTURED_MAX_GEN_TOKENS`]
     /// hybrid-reasoning safety net).
     max_gen_tokens: u32,
+    /// The best-effort `disable_thinking` suppression (R3). On by default
+    /// (a speed optimization); `--no-disable-thinking` turns it off so the
+    /// model thinks by default — the force-test path for the
+    /// `truncated_by_reasoning` safety net.
+    disable_thinking: bool,
     /// Optional sequence seam: publish `Run {n}/{total}` to the
     /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
     progress: Option<Arc<ProgressBus>>,
@@ -808,6 +813,7 @@ impl StructuredEngine {
             repeats: 1,
             tokenizer,
             max_gen_tokens: cfg.structured_max_tokens,
+            disable_thinking: cfg.disable_thinking,
             progress: None,
             metrics: None,
             pause: None,
@@ -819,6 +825,12 @@ impl StructuredEngine {
     #[must_use]
     pub fn max_gen_tokens(&self) -> u32 {
         self.max_gen_tokens
+    }
+
+    /// The configured `disable_thinking` suppression (R3; on by default).
+    #[must_use]
+    pub fn disable_thinking(&self) -> bool {
+        self.disable_thinking
     }
 
     /// CF-51: set how many times each constrained case is repeated. The
@@ -894,20 +906,22 @@ impl StructuredEngine {
             worker = worker.logger(logger.clone());
         }
         // CF-18 (hybrid, R2): suppress the model's chain-of-thought so the
-        // 2048-token budget goes to the JSON answer. This is a **best-effort
-        // speed optimization, not a correctness dependency** (R1): a
-        // config-only server silently drops the per-request fields and the
-        // model thinks by default — the *raised budget* is what then lets it
-        // finish its CoT and still commit content, and a stream that
-        // exhausts the budget in CoT with zero content is reported as the
-        // distinct `truncated_by_reasoning` outcome (not a false "not valid
-        // JSON" failure of a structured capability the model has). The
-        // suppression is per-backend and graceful (see
-        // `StreamWorker::disable_thinking`), so non-reasoning models and
-        // backends without a switch are unaffected. Set on the free-form
-        // baseline too, so both legs of the penalty measurement judge
-        // content on equal footing.
-        worker = worker.disable_thinking(true);
+        // budget goes to the JSON answer. This is a **best-effort speed
+        // optimization, not a correctness dependency** (R1): a config-only
+        // server silently drops the per-request fields and the model thinks
+        // by default — the *raised budget* is what then lets it finish its
+        // CoT and still commit content, and a stream that exhausts the
+        // budget in CoT with zero content is reported as the distinct
+        // `truncated_by_reasoning` outcome (not a false "not valid JSON"
+        // failure of a structured capability the model has). The suppression
+        // is per-backend and graceful (see `StreamWorker::disable_thinking`),
+        // so non-reasoning models and backends without a switch are
+        // unaffected. Set on the free-form baseline too, so both legs of
+        // the penalty measurement judge content on equal footing.
+        // `--no-disable-thinking` (R3) turns this off to force-test the
+        // safety net: with thinking on and a tiny budget, the model runs
+        // out mid-CoT and the run is reported `truncated_by_reasoning`.
+        worker = worker.disable_thinking(self.disable_thinking);
         if constrained {
             // CF-08 (activated): the transport encodes the full object, so a
             // constrained run sends the case's strict `json_schema`
@@ -2324,6 +2338,22 @@ mod tests {
             evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
         ];
         assert_eq!(fold_case_repeats("Simple", evals).reasoning_tokens, None);
+    }
+
+    #[test]
+    fn engine_honors_the_disable_thinking_switch() {
+        // R3: the resolved suppression switch reaches the engine (on by
+        // default; `--no-disable-thinking` → off, the force-test path).
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            disable_thinking: false,
+            ..Config::default()
+        };
+        let engine = StructuredEngine::new(&cfg).unwrap();
+        assert!(!engine.disable_thinking());
+        // The default config keeps suppression on.
+        let engine = StructuredEngine::new(&Config::default()).unwrap();
+        assert!(engine.disable_thinking());
     }
 
     #[test]

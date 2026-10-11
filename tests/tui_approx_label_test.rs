@@ -66,6 +66,7 @@ fn app_with_tokenizer() -> App {
         niah_depths: NIAH_DEPTHS.to_vec(),
         niah_custom: None,
         max_gen_tokens: NIAH_MAX_GEN_TOKENS,
+        disable_thinking: true,
     });
     app
 }

@@ -569,6 +569,16 @@ pub struct Cli {
     /// chain-of-thought *and* commit the JSON answer.
     #[arg(long, value_name = "N")]
     pub structured_max_tokens: Option<u32>,
+    /// Disable the C1/C3 best-effort `disable_thinking` suppression
+    /// (R3 calibration). The capability engines normally ask the server to
+    /// suppress chain-of-thought (a speed optimization); a config-only
+    /// server may silently drop that field, in which case the model thinks
+    /// by default and the generation budget is the correctness guarantee.
+    /// This flag makes the *client* stop requesting suppression, so the
+    /// `truncated_by_reasoning` safety net can be force-tested live
+    /// (tiny budget + thinking on → the model runs out mid-CoT).
+    #[arg(long)]
+    pub no_disable_thinking: bool,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -672,6 +682,14 @@ pub struct Config {
     /// commit the answer within the budget). Overridden by
     /// `--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config file.
     pub niah_max_tokens: u32,
+    /// The C1/C3 best-effort `disable_thinking` suppression (R3). On by
+    /// default (a speed optimization: the budget then rarely needs to
+    /// carry a chain-of-thought). `--no-disable-thinking` turns it off so
+    /// the model thinks by default — the force-test path for the
+    /// `truncated_by_reasoning` safety net (a tiny budget then cuts the
+    /// CoT off before any content is committed). CLI-only: this is a
+    /// calibration tool, not a persisted preference.
+    pub disable_thinking: bool,
     /// The C3 (structured) per-run generation budget in tokens (R3).
     /// Default [`STRUCTURED_MAX_GEN_TOKENS`] — the hybrid-reasoning safety
     /// net for the JSON answer. Overridden by `--structured-max-tokens` /
@@ -714,6 +732,7 @@ impl Default for Config {
             niah_custom: None,
             niah_max_tokens: NIAH_MAX_GEN_TOKENS,
             structured_max_tokens: STRUCTURED_MAX_GEN_TOKENS,
+            disable_thinking: true,
         }
     }
 }
@@ -1248,6 +1267,13 @@ pub fn layer(
     .unwrap_or(STRUCTURED_MAX_GEN_TOKENS)
     .max(1);
 
+    // ── C1/C3 thinking suppression (R3 calibration) ─────────────────────
+    // `--no-disable-thinking` is a hard switch (like `--no-hardware`): the
+    // flag's presence turns the best-effort suppression off, so the model
+    // thinks by default and a tiny generation budget can force-test the
+    // `truncated_by_reasoning` safety net. CLI-only (no env / file layer).
+    let disable_thinking = !cli.no_disable_thinking;
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -1345,6 +1371,7 @@ pub fn layer(
         niah_custom,
         niah_max_tokens,
         structured_max_tokens,
+        disable_thinking,
     })
 }
 
@@ -2508,6 +2535,18 @@ mod tests {
         assert_eq!(cfg.niah_max_tokens, 1);
         let cfg = resolve_bare(&["crucible-llm", "--structured-max-tokens", "0"]);
         assert_eq!(cfg.structured_max_tokens, 1);
+    }
+
+    #[test]
+    fn disable_thinking_is_on_by_default_and_the_flag_turns_it_off() {
+        // The C1/C3 best-effort suppression is on by default (a speed
+        // optimization); `--no-disable-thinking` is a hard off switch (the
+        // R3 force-test path for `truncated_by_reasoning`).
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert!(cfg.disable_thinking, "suppression on by default");
+        let cfg = resolve_bare(&["crucible-llm", "--no-disable-thinking"]);
+        assert!(!cfg.disable_thinking, "the flag turns it off");
+        assert!(Config::default().disable_thinking);
     }
 
     #[test]
