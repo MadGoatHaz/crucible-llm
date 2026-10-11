@@ -10,7 +10,9 @@
 //!   almost universally exactly 1 BPE token); without one: pad to
 //!   `target_tokens * 4` chars using the sentence-rotation filler from
 //!   `llmspeedtest.py`, which the `chars/4` heuristic reads as
-//!   `target_tokens`.
+//!   `target_tokens`. Both strategies are **unbounded** (Issue #5): they
+//!   scale to 256k / 500k / 1M+ tokens — a 1M-token prompt is a ~4–6 MB
+//!   string, built in linear time (a few hundred ms).
 //! - **nocache** — prepend a unique 32-char hex (uuid v4) prefix, matching
 //!   `llmspeedtest.py`'s `[{uuid4().hex}]` scheme, so the server's KV cache
 //!   cannot be reused.
@@ -94,6 +96,12 @@ impl PromptGenerator {
 
     /// A prompt padded to `target_tokens` (see module docs for the two
     /// padding strategies). Targets below the base size return the base as-is.
+    ///
+    /// **Scales to arbitrarily large targets (Issue #5):** both strategies
+    /// are unbounded — the `" apple"` filler repeats to the exact count and
+    /// the sentence rotation fills to `target_tokens * 4` chars — so
+    /// 256k / 500k / 1M+ prompts build the same way a 10k one does (a
+    /// 1M-token prompt is a ~4–6 MB string; build time is linear in the size).
     pub fn long(&self, target_tokens: u32) -> GeneratedPrompt {
         let target = target_tokens.max(1);
         match self.tokenizer.as_deref() {
@@ -181,8 +189,15 @@ impl PromptGenerator {
 
 /// The `llmspeedtest.py` long-prompt strategy: rotate the sentence bank until
 /// `target_tokens * 4` chars are reached (1 token ≈ 4 chars for English).
+///
+/// **Scales to arbitrarily large targets (Issue #5):** the loop is a plain
+/// `chars/4` fill with no fixed ceiling, so a 256k / 500k / 1M+ prompt is
+/// just more rotated sentences. Practical limits: the result is ~`4 bytes /
+/// token`, so a 1M-token prompt is a ~4 MB string (~90k rotated sentences);
+/// build time is linear in the size (a few hundred ms at 1M). The `u64`
+/// intermediate keeps `target * 4` overflow-safe for any `u32` target.
 fn long_sentence_rotation(target_tokens: u32) -> String {
-    let target_chars = (target_tokens * 4) as usize;
+    let target_chars = (target_tokens as u64 * 4) as usize;
     let mut parts: Vec<&str> = Vec::new();
     let mut total: usize = 0;
     let mut i = 0;
