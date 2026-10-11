@@ -1198,6 +1198,9 @@ fn build_structured_detail_lines(
             CaseVerdict::Compliant => (glyph::DONE, th.success()),
             CaseVerdict::Partial => (glyph::WARN, th.warn()),
             CaseVerdict::Failed => (glyph::ERR, th.danger()),
+            // R2: the distinct `truncated_by_reasoning` outcome — an
+            // inconclusive (budget) marker, not a failure (amber, not red).
+            CaseVerdict::Truncated => (glyph::WARN, th.warn()),
         };
         let mut spans = vec![
             Span::styled(
