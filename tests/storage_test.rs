@@ -431,6 +431,7 @@ fn speed_result(tg_speed: f64) -> SpeedResult {
         ttft: 0.125,
         prompt_tokens: 128,
         completion_tokens: 64,
+        reasoning_tokens: None,
         pp_speed: 1024.0,
         tg_speed,
         mtp_efficiency: 1.84,

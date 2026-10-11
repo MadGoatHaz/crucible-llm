@@ -458,6 +458,7 @@ impl WorkerPool {
                                     StreamOutcome {
                                         timestamps: StreamTimestamps::default(),
                                         usage: None,
+                                        usage_details: None,
                                         premature: false,
                                         malformed_frames: 0,
                                         error: Some(StreamError::WorkerTimeout(d)),
@@ -493,6 +494,7 @@ impl WorkerPool {
                     Err(_) => StreamOutcome {
                         timestamps: StreamTimestamps::default(),
                         usage: None,
+                        usage_details: None,
                         premature: false,
                         malformed_frames: 0,
                         error: Some(StreamError::Read("worker task panicked".to_string())),

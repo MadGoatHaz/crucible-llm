@@ -58,7 +58,7 @@ use tokio::sync::mpsc;
 
 use crate::log::{Context, Level, RunLogger};
 use crate::prompt::{count_tokens, Tokenizer};
-use crate::sse::{Chunk, ParsedFrame, SseParser, Usage};
+use crate::sse::{Chunk, ParsedFrame, SseParser, Usage, UsageDetails};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 use super::loop_guard::LoopGuard;
@@ -170,6 +170,12 @@ pub struct StreamOutcome {
     pub timestamps: StreamTimestamps,
     /// Server-reported usage, if the stream provided it.
     pub usage: Option<Usage>,
+    /// The CF-02 `usage` detail fields (reasoning / cached tokens) when the
+    /// stream reported a `usage` block, else `None` (a backend that does not
+    /// report the details — the honest "not reported" case). This is the seam
+    /// that lets Engine A's `aggregate()` split the decode window (CF-26) and
+    /// let persistence populate `stream_metrics.reasoning_tokens`.
+    pub usage_details: Option<UsageDetails>,
     /// `true` when the stream ended without a `[DONE]` terminator.
     pub premature: bool,
     /// Malformed-JSON frames the parser skipped.
@@ -546,6 +552,7 @@ impl StreamWorker {
                         tx,
                         &ts,
                         None,
+                        None,
                         false,
                         parser.malformed_frames(),
                         (false, 0),
@@ -663,6 +670,7 @@ impl StreamWorker {
                         tx,
                         ts,
                         parser.usage(),
+                        parser.usage().map(|_| parser.details()),
                         true,
                         parser.malformed_frames(),
                         (looping, excluded),
@@ -698,6 +706,7 @@ impl StreamWorker {
                             tx,
                             ts,
                             parser.usage(),
+                            parser.usage().map(|_| parser.details()),
                             true,
                             parser.malformed_frames(),
                             (looping, excluded),
@@ -731,6 +740,7 @@ impl StreamWorker {
                                 tx,
                                 ts,
                                 parser.usage(),
+                                parser.usage().map(|_| parser.details()),
                                 true,
                                 parser.malformed_frames(),
                                 (looping, excluded),
@@ -771,6 +781,7 @@ impl StreamWorker {
                                     tx,
                                     ts,
                                     parser.usage(),
+                                    parser.usage().map(|_| parser.details()),
                                     !done,
                                     parser.malformed_frames(),
                                     (looping, excluded),
@@ -791,6 +802,7 @@ impl StreamWorker {
             tx,
             ts,
             parser.usage(),
+            parser.usage().map(|_| parser.details()),
             false,
             parser.malformed_frames(),
             (looping, excluded),
@@ -973,15 +985,17 @@ impl StreamWorker {
                         // frames are confirmed, so report `0`.
                         ts.t_end = Some(parsed_at);
                         return self
-                            .finish_complete(tx, ts, usage, true, 0, (false, 0), 0)
+                            .finish_complete(tx, ts, usage, None, true, 0, (false, 0), 0)
                             .await;
                     }
                 };
                 ts.t_end = Some(MonotonicInstant::now());
                 self.log_stream_end(ts, tokens, usage, last_token_at, false);
                 // A complete plain-JSON response is a normal completion, not
-                // a premature one (there is no `[DONE]` to expect).
-                self.finish_complete(tx, ts, usage, false, 0, (false, 0), tokens)
+                // a premature one (there is no `[DONE]` to expect). The
+                // plain-JSON path does not parse the CF-02 detail fields, so
+                // `usage_details` is `None` (honest "not reported").
+                self.finish_complete(tx, ts, usage, None, false, 0, (false, 0), tokens)
                     .await
             }
             Err(msg) => {
@@ -1062,6 +1076,7 @@ impl StreamWorker {
         tx: &mut mpsc::Sender<StreamEvent>,
         ts: &StreamTimestamps,
         usage: Option<Usage>,
+        usage_details: Option<UsageDetails>,
         premature: bool,
         malformed_frames: u64,
         loop_state: (bool, u64),
@@ -1080,6 +1095,7 @@ impl StreamWorker {
         StreamOutcome {
             timestamps: *ts,
             usage,
+            usage_details,
             premature,
             malformed_frames,
             error: None,
@@ -1113,6 +1129,7 @@ impl StreamWorker {
         StreamOutcome {
             timestamps: ts,
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(error),
@@ -1142,6 +1159,7 @@ pub async fn run_worker(worker: StreamWorker, tx: mpsc::Sender<StreamEvent>) -> 
         Err(join) => StreamOutcome {
             timestamps: StreamTimestamps::default(),
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Read(format!("worker task failed: {join}"))),
@@ -1178,6 +1196,7 @@ pub async fn join_worker(handle: tokio::task::JoinHandle<StreamOutcome>) -> Stre
         Err(join) => StreamOutcome {
             timestamps: StreamTimestamps::default(),
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Read(format!("worker task failed: {join}"))),
@@ -1817,6 +1836,7 @@ mod tests {
         StreamOutcome {
             timestamps: StreamTimestamps::default(),
             usage,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error,

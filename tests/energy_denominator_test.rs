@@ -32,6 +32,7 @@ fn speed_with_tokens(completion_tokens: u64) -> SpeedResult {
         ttft: 0.2,
         prompt_tokens: 100,
         completion_tokens,
+        reasoning_tokens: None,
         pp_speed: 500.0,
         tg_speed: 50.0,
         mtp_efficiency: 1.0,

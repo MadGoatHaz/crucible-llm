@@ -87,6 +87,14 @@ pub struct SpeedResult {
     pub ttft: f64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// The server-reported reasoning (chain-of-thought) token count (CF-02),
+    /// when the backend included it in the `usage` block. `None` when the
+    /// backend did not report the detail field (the honest "not reported"
+    /// case — distinct from a reported `0`, which means thinking was
+    /// suppressed). This is the value persisted to
+    /// `stream_metrics.reasoning_tokens` and the one that drives the CF-26
+    /// decode-window split.
+    pub reasoning_tokens: Option<u64>,
     /// Prefill bandwidth, tokens/s (`prompt_tokens / TTFT`).
     pub pp_speed: f64,
     /// Decode speed, tokens/s. CF-26: the **answer-phase** rate (content
@@ -483,13 +491,15 @@ impl SpeedEngine {
                 &outcome,
                 &events,
                 self.generator.tokenizer().as_deref(),
-                // CF-26: the SSE parser (CF-02) captures `UsageDetails`
-                // (reasoning / cached tokens), but the worker
-                // (`client/stream.rs`) does not yet propagate them into the
-                // `StreamOutcome` — a P2-A seam. Until that lands, Engine A
-                // passes `None`: the decode split falls back to the
-                // full-window blended rate and `cache_hit` stays unset.
-                None,
+                // CF-02 / CF-26: the worker now propagates the SSE parser's
+                // `UsageDetails` (reasoning / cached tokens) into the
+                // `StreamOutcome` (the P2-A seam, closed). Engine A passes it
+                // through: the decode window splits at the
+                // reasoning→content transition and the result carries
+                // `reasoning_tokens` for persistence. `None` (a backend that
+                // does not report the detail) keeps the historical
+                // full-window blended rate.
+                outcome.usage_details,
             ),
             events,
         )
@@ -868,10 +878,11 @@ impl SpeedEngine {
 ///
 /// `usage_details` is the CF-02 `UsageDetails` (reasoning / cached tokens)
 /// for the run. It drives the CF-26 decode-window split (answer vs. thinking
-/// phase) and the CF-26 `cache_hit` derivation. `None` keeps the historical
-/// full-window blended decode rate — the current production path, since the
-/// SSE parser captures the detail but `client/stream.rs` (P2-A) does not yet
-/// propagate it into the [`StreamOutcome`].
+/// phase) and the CF-26 `cache_hit` derivation, and is published on the
+/// result as [`SpeedResult::reasoning_tokens`] for persistence. `None` (a
+/// backend that does not report the detail — the `client/stream.rs` seam is
+/// closed and propagates the parser's `UsageDetails` when present) keeps the
+/// historical full-window blended decode rate.
 #[must_use]
 pub fn aggregate(
     cfg: &Config,
@@ -1038,6 +1049,10 @@ pub fn aggregate(
         ttft,
         prompt_tokens,
         completion_tokens,
+        // CF-02 seam: the server-reported reasoning token count (the value
+        // persisted to `stream_metrics.reasoning_tokens`). `None` when the
+        // backend did not report the detail field.
+        reasoning_tokens: usage_details.map(|d| d.reasoning_tokens),
         pp_speed,
         tg_speed,
         mtp_efficiency,
@@ -1613,6 +1628,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,
@@ -1695,6 +1711,7 @@ mod tests {
         let outcome = StreamOutcome {
             timestamps: ts,
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: None,
@@ -1720,6 +1737,7 @@ mod tests {
         let outcome = StreamOutcome {
             timestamps: ts,
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Http {
@@ -1746,6 +1764,7 @@ mod tests {
         let outcome = StreamOutcome {
             timestamps: ts,
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
@@ -2016,6 +2035,7 @@ mod tests {
                 ..StreamTimestamps::default()
             },
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
@@ -2068,6 +2088,7 @@ mod tests {
                 ..StreamTimestamps::default()
             },
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("refused".into())),
@@ -2099,6 +2120,7 @@ mod tests {
                 ..StreamTimestamps::default()
             },
             usage: None,
+            usage_details: None,
             premature: false,
             malformed_frames: 0,
             error: Some(StreamError::Connection("x".into())),
@@ -2346,6 +2368,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,
@@ -2426,6 +2449,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,
@@ -2509,6 +2533,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,
@@ -2575,6 +2600,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,
@@ -2668,6 +2694,7 @@ mod tests {
             let outcome = StreamOutcome {
                 timestamps: ts,
                 usage: Some(usage),
+                usage_details: None,
                 premature: false,
                 malformed_frames: 0,
                 error: None,

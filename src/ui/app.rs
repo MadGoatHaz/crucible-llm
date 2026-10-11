@@ -2149,6 +2149,7 @@ mod tests {
             ttft: 0.25,
             prompt_tokens: 100,
             completion_tokens: 50,
+            reasoning_tokens: None,
             pp_speed: 400.0,
             tg_speed: 20.0,
             mtp_efficiency: 1.0,
