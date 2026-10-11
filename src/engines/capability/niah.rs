@@ -1429,7 +1429,10 @@ mod tests {
         // chars/4 estimate is flagged `estimated` (the "approx" label).
         let needle = Needle::random();
         let doc = build_document(200_000, 50, &needle, None);
-        assert!(doc.estimated, "no tokenizer → the size is a chars/4 estimate");
+        assert!(
+            doc.estimated,
+            "no tokenizer → the size is a chars/4 estimate"
+        );
         assert_eq!(doc.target_tokens, 200_000);
         // The achieved count lands within ±10% of the 200k target.
         assert!(

@@ -1128,7 +1128,10 @@ pub fn layer(
     } else {
         env_get(env_vars::NIAH_CONTEXTS)
             .and_then(|s| parse_niah_contexts(&s))
-            .or_else(|| file.and_then(|f| f.niah_contexts.clone()).filter(|v| !v.is_empty()))
+            .or_else(|| {
+                file.and_then(|f| f.niah_contexts.clone())
+                    .filter(|v| !v.is_empty())
+            })
             .unwrap_or_else(|| NIAH_SIZES.to_vec())
     };
 
@@ -1141,7 +1144,10 @@ pub fn layer(
     } else {
         env_get(env_vars::NIAH_DEPTHS)
             .and_then(|s| parse_niah_depths(&s))
-            .or_else(|| file.and_then(|f| f.niah_depths.clone()).filter(|v| !v.is_empty()))
+            .or_else(|| {
+                file.and_then(|f| f.niah_depths.clone())
+                    .filter(|v| !v.is_empty())
+            })
             .unwrap_or_else(|| NIAH_DEPTHS.to_vec())
     };
 
@@ -2315,10 +2321,7 @@ mod tests {
 
     #[test]
     fn parse_niah_depths_rejects_out_of_range() {
-        assert_eq!(
-            parse_niah_depths("0,25,50,100"),
-            Some(vec![0, 25, 50, 100])
-        );
+        assert_eq!(parse_niah_depths("0,25,50,100"), Some(vec![0, 25, 50, 100]));
         assert_eq!(parse_niah_depths("0,101"), None, "depths are 0..=100");
         assert_eq!(parse_niah_depths("a,b"), None);
     }

@@ -33,9 +33,9 @@ use crate::engines::speed::{
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, human_size, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine,
-    NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine,
-    StructuredResult, SweepResult,
+    build_sweep, human_size, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, NiahResult,
+    ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult,
+    SweepResult,
 };
 use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crate::log::{Context, RunLogger};
@@ -601,10 +601,8 @@ pub fn run_headless(
                             .unwrap_or_default();
                         for n in &needles {
                             if let Err(e) = db.insert_needle_evaluation(n) {
-                                logger.warn(
-                                    Context::EngineC1,
-                                    format!("persist needle failed: {e}"),
-                                );
+                                logger
+                                    .warn(Context::EngineC1, format!("persist needle failed: {e}"));
                                 break;
                             }
                         }
