@@ -854,9 +854,7 @@ impl Sweep {
         // same way the first measured level is bounded (2× its budget).
         let budget = self.effective_step_budget(0);
         let bound = budget * 2;
-        let drain = async {
-            while let Some(_event) = rx.recv().await {}
-        };
+        let drain = async { while let Some(_event) = rx.recv().await {} };
         if tokio::time::timeout(bound, drain).await.is_err() {
             self.logw(
                 Context::EngineB,

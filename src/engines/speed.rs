@@ -744,7 +744,10 @@ impl SpeedEngine {
                     .to_string(),
             );
         }
-        let _warmup = self.run_iteration_events_tagged(&prompt, "A:warmup").await.0;
+        let _warmup = self
+            .run_iteration_events_tagged(&prompt, "A:warmup")
+            .await
+            .0;
         let mut results = Vec::with_capacity(iterations);
         let mut tokens = 0u64;
         for i in 0..iterations {

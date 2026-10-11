@@ -90,7 +90,10 @@ mod tests {
         assert!(v["method"].as_str().unwrap().contains("quanta"));
         // CF-09: the published method says per-frame stamping (the code's
         // reality), not the old "per token" claim.
-        assert!(v["method"].as_str().unwrap().contains("per parsed token frame"));
+        assert!(v["method"]
+            .as_str()
+            .unwrap()
+            .contains("per parsed token frame"));
         assert!(v["isolation"].as_str().unwrap().contains("wait-free"));
     }
 
@@ -132,7 +135,10 @@ mod tests {
         assert_ne!(v["prefill_throughput"], v["decode_throughput"]);
         assert_ne!(v["decode_throughput"], v["e2e_throughput"]);
         // CF-06: the TTFT line names the honest T1 (headers received).
-        assert!(v["ttft"].as_str().unwrap().contains("response headers arrive"));
+        assert!(v["ttft"]
+            .as_str()
+            .unwrap()
+            .contains("response headers arrive"));
     }
 
     /// CF-11: the **per-stream** line documents the CF-04 dual
@@ -158,10 +164,7 @@ mod tests {
         use crate::engines::speed::mtp_eta;
         let v = methodology_block(42);
         let s = v["mtp_eta"].as_str().unwrap();
-        assert!(
-            s.contains("completion_tokens / total_token_frames"),
-            "{s}"
-        );
+        assert!(s.contains("completion_tokens / total_token_frames"), "{s}");
         assert!(s.contains("Reasoning + Content"), "{s}");
         assert!(s.contains("η > 1 is legitimate"), "{s}");
         // The documented arithmetic, checked against the function:

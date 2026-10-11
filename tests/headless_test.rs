@@ -38,9 +38,7 @@ enum Mock {
 /// iterations) and counts every request it serves in the returned
 /// [`AtomicUsize`] — the tests assert the warmup hit the wire but was
 /// thrown away.
-async fn start_mock(
-    mock: Mock,
-) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let served = Arc::new(AtomicUsize::new(0));
