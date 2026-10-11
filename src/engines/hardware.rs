@@ -61,6 +61,26 @@ pub struct EnergyResult {
     pub vendor: Option<String>,
     /// The GPU's model / driver label, when known.
     pub model: Option<String>,
+    /// `true` when the CPU component of the system draw is the fixed
+    /// estimate (no RAPL / Super-I-O sensor), so the energy total includes a
+    /// constant, not a measurement (CF-53). The pure trace math never knows
+    /// the CPU power method — the caller sets this from
+    /// [`crate::hw::cpu_power::CpuPowerBackend::is_estimated`] so the
+    /// `--json` energy object and the methodology block can flag it.
+    pub cpu_power_estimated: bool,
+}
+
+impl EnergyResult {
+    /// Mark the CPU component as the fixed estimate (CF-53). The pure trace
+    /// math never knows the CPU power method, so the caller that holds the
+    /// [`crate::hw::cpu_power::CpuPowerBackend`] sets this from
+    /// [`CpuPowerBackend::is_estimated`] before the result reaches the
+    /// `--json` energy object / methodology block.
+    #[must_use]
+    pub fn with_cpu_power_estimated(mut self, estimated: bool) -> Self {
+        self.cpu_power_estimated = estimated;
+        self
+    }
 }
 
 /// True when `t` lies within the closed window `[start, end]`.
@@ -222,6 +242,9 @@ pub fn profile(
         // produced the samples) — the pure trace math never knows them.
         vendor: None,
         model: None,
+        // The CPU "estimated" flag is set by the caller from the CPU power
+        // backend (the pure trace math never knows it) — default `false`.
+        cpu_power_estimated: false,
     }
 }
 
