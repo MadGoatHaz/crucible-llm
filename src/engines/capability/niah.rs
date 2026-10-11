@@ -1645,6 +1645,117 @@ mod tests {
         assert!(interp.contains("For RAG"), "{interp}");
     }
 
+    // ── Option C: three-way classification (pass / truncated / fail) ─────
+
+    #[test]
+    fn truncated_cell_is_inconclusive_not_a_failure() {
+        // A cell whose stream completed OK but was all-CoT / zero-content is
+        // `truncated_by_reasoning`: not a clean pass, and NOT a capability
+        // failure (the model was generating; we just never saw an answer).
+        let mut r = NiahResult::new(vec![2000], vec![0]);
+        r.cells[0] = truncated_cell(2000, 0, 0.1);
+
+        assert!(!r.cells[0].retrieved, "no content → not retrieved");
+        assert!(r.cells[0].truncated_by_reasoning);
+
+        // Counted as truncated, not as a fail.
+        assert_eq!(r.truncated_count(), 1);
+        assert_eq!(r.failed_count(), 0, "a truncated cell is not a failure");
+        // The headline breaks it out separately from the pass/total figure.
+        assert_eq!(
+            r.accuracy_label(),
+            "0/1 retrieved, 1 truncated-by-reasoning (0.0%)"
+        );
+        // The capability pass rate excludes it (an all-truncated row → None,
+        // not a false 0%).
+        assert_eq!(r.size_pass_rate(2000), None);
+        // …and an unmeasurable size is never "reliable up to".
+        assert_eq!(r.reliable_up_to(80.0), None);
+    }
+
+    #[test]
+    fn content_but_no_needle_is_a_genuine_fail() {
+        // A cell with visible content but the needle absent is a genuine
+        // retrieval failure — distinct from a truncated (zero-content) cell.
+        let mut r = NiahResult::new(vec![2000], vec![0]);
+        r.cells[0] = cell(2000, 0, false, 0.1); // retrieved=false, truncated=false
+
+        assert_eq!(r.failed_count(), 1);
+        assert_eq!(
+            r.truncated_count(),
+            0,
+            "a content-present fail is not truncated"
+        );
+        assert_eq!(r.accuracy_label(), "0/1 retrieved, 1 failed (0.0%)");
+        // The capability pass rate counts it as a non-pass (denominator 1).
+        assert_eq!(r.size_pass_rate(2000), Some(0.0));
+    }
+
+    #[test]
+    fn needle_in_content_is_a_clean_pass() {
+        // A cell with the needle in the content is a pass — and a clean run's
+        // label reads exactly as before the Option C change (no clauses).
+        let mut r = NiahResult::new(vec![2000], vec![0]);
+        r.cells[0] = cell(2000, 0, true, 0.1); // retrieved=true
+
+        assert_eq!(r.accuracy(), (1, 1));
+        assert_eq!(r.failed_count(), 0);
+        assert_eq!(r.truncated_count(), 0);
+        assert_eq!(r.accuracy_label(), "1/1 retrieved (100.0%)");
+        assert_eq!(r.size_pass_rate(2000), Some(100.0));
+    }
+
+    #[test]
+    fn aggregate_label_reads_74_of_77_with_3_truncated() {
+        // The headline format from REASONING_DESIGN.md: `74/77 pass, 3
+        // truncated_by_reasoning` (pass/total, truncated broken out; no
+        // genuine fails in this case).
+        let sizes = vec![2000, 4000, 8000, 16000, 32000, 64000, 128000];
+        let depths: Vec<u8> = (0..=100).step_by(10).collect(); // 11 depths
+        let mut r = NiahResult::new(sizes, depths);
+        assert_eq!(r.cells.len(), 77, "7 sizes × 11 depths");
+        // 74 pass, 3 truncated, 0 fail.
+        for (i, c) in r.cells.iter_mut().enumerate() {
+            c.target_tokens = r.sizes[i / r.depths.len()];
+            c.ttft_s = 0.1;
+            if i < 74 {
+                c.retrieved = true;
+            } else {
+                c.truncated_by_reasoning = true;
+            }
+        }
+        assert_eq!(r.accuracy(), (74, 77));
+        assert_eq!(r.truncated_count(), 3);
+        assert_eq!(r.failed_count(), 0);
+        assert_eq!(
+            r.accuracy_label(),
+            "74/77 retrieved, 3 truncated-by-reasoning (96.1%)"
+        );
+    }
+
+    #[test]
+    fn to_dict_carries_truncated_flag_per_cell_and_aggregate() {
+        // Option C: the `--json` niah section carries the per-cell flag and the
+        // aggregate three-way split.
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        r.cells[0] = cell(2000, 0, true, 0.1); // pass
+        r.cells[1] = truncated_cell(2000, 100, 0.1); // truncated
+        r.cells[2] = cell(4000, 0, true, 0.2); // pass
+        r.cells[3] = cell(4000, 100, false, 0.2); // genuine fail
+        let v = r.to_dict();
+        // Aggregate split.
+        assert_eq!(v["retrieved"], 2);
+        assert_eq!(v["total"], 4);
+        assert_eq!(v["truncated_by_reasoning"], 1);
+        assert_eq!(v["failed"], 1);
+        // Per-cell flags.
+        let cells = v["cells"].as_array().expect("cells array");
+        assert_eq!(cells[0]["truncated_by_reasoning"], false);
+        assert_eq!(cells[1]["truncated_by_reasoning"], true);
+        assert_eq!(cells[2]["truncated_by_reasoning"], false);
+        assert_eq!(cells[3]["truncated_by_reasoning"], false);
+    }
+
     // ── Slot ──────────────────────────────────────────────────────────────
 
     #[test]
