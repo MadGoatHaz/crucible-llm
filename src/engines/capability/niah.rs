@@ -377,22 +377,46 @@ impl NiahResult {
         Some(&self.cells[si * self.depths.len() + di])
     }
 
-    /// `(retrieved, total)` over all cells.
+    /// `(retrieved, run)` over the cells that actually *ran*.
+    ///
+    /// Unrun cells (the [`NiahCell::unrun`] placeholder, `target_tokens == 0`)
+    /// are excluded from the denominator — exactly like
+    /// [`size_pass_rate`]. This keeps the headline honest on a partial /
+    /// interrupted matrix: it reports the pass rate over the cells evaluated,
+    /// not one diluted by cells that never ran (CF-31 — the old version
+    /// counted every grid slot, so an unrun cell read as a failure and the
+    /// two "pass rate" numbers disagreed).
     pub fn accuracy(&self) -> (usize, usize) {
-        let total = self.cells.len();
-        let retrieved = self.cells.iter().filter(|c| c.retrieved).count();
+        let total = self.cells.iter().filter(|c| c.target_tokens > 0).count();
+        let retrieved = self
+            .cells
+            .iter()
+            .filter(|c| c.target_tokens > 0 && c.retrieved)
+            .count();
         (retrieved, total)
     }
 
-    /// `71/77 retrieved (92.2%)` — the headline accuracy figure.
+    /// The headline accuracy figure, e.g. `71/77 retrieved (92.2%)`.
+    ///
+    /// Over a *partial* matrix (some cells never ran) the denominator is the
+    /// run cells only, and the label makes that explicit — `30/42 of 77 run
+    /// (71.4%)` — so an interrupted run is never read as a fleet of failures
+    /// (CF-31, consistent with [`size_pass_rate`]).
     pub fn accuracy_label(&self) -> String {
         let (r, t) = self.accuracy();
+        let grid = self.cells.len();
         let pct = if t > 0 {
             r as f64 / t as f64 * 100.0
         } else {
             0.0
         };
-        format!("{r}/{t} retrieved ({pct:.1}%)")
+        if t == 0 {
+            "No cells run yet".to_string()
+        } else if t == grid {
+            format!("{r}/{t} retrieved ({pct:.1}%)")
+        } else {
+            format!("{r}/{t} of {grid} run ({pct:.1}%)")
+        }
     }
 
     /// The pass rate (0..=100) for one context size across all its depths —
@@ -1034,17 +1058,40 @@ mod tests {
         assert!(r.cell(8000, 0).is_none(), "absent size → None");
         assert!(r.cell(2000, 70).is_none(), "absent depth → None");
 
-        for c in r.cells.iter_mut() {
+        // Mark every slot as *run* (target_tokens set) and retrieved, then
+        // make 4000 @ 50 (row 1, col 1) miss.
+        for (i, c) in r.cells.iter_mut().enumerate() {
+            c.target_tokens = r.sizes[i / r.depths.len()];
             c.retrieved = true;
             c.ttft_s = 0.1;
         }
-        // 4000 @ 50 (row 1, col 1) misses.
         r.cells[4].retrieved = false;
 
+        // All 6 slots ran, so the headline is the classic full-matrix form.
         assert_eq!(r.accuracy(), (5, 6));
         assert_eq!(r.accuracy_label(), "5/6 retrieved (83.3%)");
         assert!(!r.cell(4000, 50).unwrap().retrieved);
         assert!(r.cell(2000, 100).unwrap().retrieved);
+    }
+
+    #[test]
+    fn accuracy_counts_only_run_cells_cf31() {
+        // 2 sizes × 3 depths = 6 grid slots.
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 50, 100]);
+        // 2k row: 2 of 3 ran (2k @ 100 never ran); 1 of the 2 run retrieved.
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        r.cells[1] = cell(2000, 50, false, 0.1);
+        // r.cells[2] (2k @ 100) stays an unrun placeholder (target_tokens 0).
+        // 4k row: nothing ran.
+
+        // CF-31: the denominator is the 2 run cells, not all 6 — so the
+        // headline now agrees with size_pass_rate(2000) (both 1/2 = 50%).
+        assert_eq!(r.accuracy(), (1, 2));
+        assert!((r.size_pass_rate(2000).unwrap() - 50.0).abs() < 0.1);
+        assert_eq!(r.size_pass_rate(4000), None);
+        // The label is honest about the partial run: 1 of the 2 that ran,
+        // out of the 6-cell grid (50.0%).
+        assert_eq!(r.accuracy_label(), "1/2 of 6 run (50.0%)");
     }
 
     #[test]
