@@ -54,9 +54,18 @@ use crate::timing::StreamTimestamps;
 /// Bounded worker→engine channel capacity (same as Engine A / C2).
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Max generation tokens per cell: the answer is the value only, so a
-/// short budget keeps the matrix fast.
-pub const NIAH_MAX_GEN_TOKENS: u32 = 64;
+/// Max generation tokens per cell.
+///
+/// **Hybrid reasoning (Option C):** the *budget* is the correctness
+/// guarantee. `disable_thinking` is best-effort — a speed optimization a
+/// config-only server may silently drop — so a reasoning model that ignores
+/// it would spend a tiny budget entirely on chain-of-thought and emit no
+/// answer (the v0.1.4 false failure, C1 ≈ 5/77). 1024 gives an over-thinker
+/// room to finish its CoT *and* emit the answer (the needle value is a single
+/// ~15-token string). On a suppression-honoring server the answer arrives in
+/// ~15 tokens and the ceiling is rarely hit, so the matrix stays fast — the
+/// budget is a ceiling, not a target.
+pub const NIAH_MAX_GEN_TOKENS: u32 = 1024;
 
 /// The context token sizes of the N×M matrix (blueprint §5 C1:
 /// 2k/4k/8k/16k/32k/64k/128k).
@@ -902,13 +911,16 @@ impl NiahEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
-        // CF-01: suppress the model's chain-of-thought so the 64-token budget
-        // goes to the visible answer. Without this, a reasoning model spends
-        // the *entire* budget on CoT (`content = 0`, `finish_reason = length`)
-        // and never emits the needle value — a false failure of a retrieval
-        // capability it actually has (Strawberry Issue 1). The suppression is
-        // per-backend and graceful (see `StreamWorker::disable_thinking`), so
-        // non-reasoning models and backends without a switch are unaffected.
+        // CF-01 (best-effort, Option C hybrid): suppress the model's
+        // chain-of-thought so the generation budget goes to the visible
+        // answer. This is a *speed* optimization, **not** a correctness
+        // dependency: a config-only server may silently drop the per-request
+        // switch (the raised `NIAH_MAX_GEN_TOKENS` budget is then the safety
+        // net), and Qwen3.5+ `/no_think` is not a reliable switch. Non-
+        // reasoning models and backends without a switch are unaffected; and
+        // when suppression is ignored, an all-CoT / zero-content cell is
+        // flagged `truncated_by_reasoning` (below) instead of a false
+        // capability failure (Strawberry Issue 1).
         worker = worker.disable_thinking(true);
 
         // Spawn without awaiting: drain the channel concurrently to avoid
