@@ -262,7 +262,7 @@ The C1 matrix's context sizes and needle depths are **runtime-configurable** (de
   --niah-contexts 16k,64k --niah-depths 0,50,100
 ```
 
-**Reading the sizes:** without a `--tokenizer`, haystack sizes are `chars/4` estimates and are labeled `(approx.)` everywhere they appear — the headless header (`[C1] NIAH (2 sizes 16k (approx.)→64k (approx.) × 3 depths)…`), the per-cell tags (`C1:256k (approx.)-d50`), and the `--json` `niah` section. Supply `--tokenizer <path>` for exact counts (plain labels).
+**Reading the sizes:** without a `--tokenizer`, haystack sizes are `chars/4` estimates and are labeled `(approx.)` everywhere they appear — the headless header (`[C1] NIAH (2 sizes 16k (approx.)→64k (approx.) × 3 depths)…`), the per-cell tags (`C1:256k (approx.)-d50`), the TUI NIAH grid (row labels like `128k (approx.)`), the Live view's Long Context bar (`≤ 128k (approx.) reliable`), and the `--json` `niah` section. Supply `--tokenizer <path>` for exact counts (plain labels).
 
 **If a size exceeds the server's max context:** the cells are *not* pre-clamped — each request is sent and the server's HTTP 400 is recorded as a labeled per-cell error (summary `0/N retrieved`, exit code stays 0 — never a silent zero). A size the server supports (e.g. 256k on an 851,968-token model) simply runs.
 
