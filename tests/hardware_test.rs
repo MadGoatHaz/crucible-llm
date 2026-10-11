@@ -257,7 +257,8 @@ fn sub_second_ttft_prefill_power_is_the_real_trace_not_the_fallback() {
     // apart — a ~300 ms TTFT (each is a fresh `now()`, all landing inside
     // the `[load_started, first_token)` window)…
     for mw in [140_000u64, 150_000, 160_000] {
-        m.trace.push(sample(MonotonicInstant::now(), Some(mw), None));
+        m.trace
+            .push(sample(MonotonicInstant::now(), Some(mw), None));
         std::thread::sleep(Duration::from_millis(100));
     }
     // …then the first token lands (the prefill window closes) and a
@@ -277,7 +278,10 @@ fn sub_second_ttft_prefill_power_is_the_real_trace_not_the_fallback() {
     // …and the prefill power is the *real* ~150 W phase draw (the mean of
     // the three in-window samples)…
     let prefill = m.avg_prefill_power().expect("prefill power present");
-    assert!((prefill - 150.0).abs() < 1e-9, "real prefill power: {prefill}");
+    assert!(
+        (prefill - 150.0).abs() < 1e-9,
+        "real prefill power: {prefill}"
+    );
     // …NOT the overall average, which the 600 W decode sample pulls up.
     let overall = m.avg_power_w().expect("overall average power present");
     assert!(
@@ -327,7 +331,10 @@ fn no_hardware_disables_poller_and_energy_engine_in_both_paths() {
     assert!(!h_poller, "headless poller off under --no-hardware");
     assert!(!h_energy, "headless energy engine off under --no-hardware");
     assert!(!t_poller, "TUI poller off under --no-hardware");
-    assert!(!t_engine_d, "TUI Engine D off under --no-hardware (no starved N/A)");
+    assert!(
+        !t_engine_d,
+        "TUI Engine D off under --no-hardware (no starved N/A)"
+    );
 
     // The symmetry the CF-20 bug broke: the headless poller and the
     // headless energy engine read the *same* `cfg.hardware` field, so they

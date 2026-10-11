@@ -16,11 +16,11 @@
 
 use std::time::Duration;
 
-use crucible_llm::engines::{
-    FlatOutResult, NiahResult, NIAH_MAX_GEN_TOKENS, ReasoningResult, ReasoningScore, SpeedResult,
-    StructuredResult, StreamCountSource, SweepLevel, SweepResult,
-};
 use crucible_llm::engines::hardware::profile;
+use crucible_llm::engines::{
+    FlatOutResult, NiahResult, ReasoningResult, ReasoningScore, SpeedResult, StreamCountSource,
+    StructuredResult, SweepLevel, SweepResult, NIAH_MAX_GEN_TOKENS,
+};
 use crucible_llm::hw::HwSample;
 use crucible_llm::timing::MonotonicInstant;
 
@@ -171,7 +171,11 @@ fn all_engines_tokens(
     total += (chars / 4) as u64;
     // Engine C3 (Structured) — estimate: chars/4 over free + constrained.
     let chars: usize = structured.free_body.chars().count()
-        + structured.cases.iter().map(|c| c.output.chars().count()).sum::<usize>();
+        + structured
+            .cases
+            .iter()
+            .map(|c| c.output.chars().count())
+            .sum::<usize>();
     total += (chars / 4) as u64;
     // Engine F (Flat Out) — real total tokens.
     total += flatout.total_tokens;
