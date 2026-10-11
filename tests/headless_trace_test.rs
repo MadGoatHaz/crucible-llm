@@ -98,7 +98,7 @@ fn extract_needle(prompt: &str) -> String {
         .find("the secret code is ")
         .map(|i| {
             let rest = &prompt[i + "the secret code is ".len()..];
-            rest.split(|c| c == ' ' || c == '.')
+            rest.split([' ', '.'])
                 .next()
                 .unwrap_or("")
                 .to_string()
