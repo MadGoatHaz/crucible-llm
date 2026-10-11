@@ -203,21 +203,63 @@ impl StreamOutcome {
         self.error.is_none()
     }
 
+    /// **CF-10 — usage-vs-frames plausibility guard.**
+    ///
+    /// `true` when the server's self-reported `usage.completion_tokens`
+    /// exceeds ~4× the token frames actually observed on the wire. Some
+    /// backends (notably certain Unsloth / llama.cpp GGUF builds) report
+    /// `completion_tokens` as the *requested* `max_tokens` target rather than
+    /// the tokens they generated — trusting that figure inflates a
+    /// `completion_tokens / decode-window` rate by up to ~400×. When the guard
+    /// trips, [`effective_completion`](Self::effective_completion) and
+    /// [`authoritative_tokens`] prefer the observed frame count (the wire
+    /// truth) over the inflated usage.
+    ///
+    /// `false` when no usage arrived, when the usage is plausible relative to
+    /// the frames, or when no token frames were observed (nothing to compare
+    /// against).
+    #[must_use]
+    pub fn has_usage_discrepancy(&self) -> bool {
+        let Some(u) = &self.usage else {
+            return false;
+        };
+        self.frames > 0 && u.completion_tokens > self.frames.saturating_mul(4)
+    }
+
+    /// **CF-44 — non-streaming (plain-JSON) results are E2E-only.**
+    ///
+    /// `true` for a result that came from the non-streaming fallback
+    /// ([`run_plain_json`]): a server that ignored `stream: true` and returned
+    /// a single completion object. The tell is `frames == 0` (a plain-JSON
+    /// blob is one frame, not a token count) with a `usage` present and no
+    /// error. Such a result's "TTFT" (`T3 − T1`) is really the *total*
+    /// response latency — `T3` is stamped only after the whole body has been
+    /// read — so it must be labeled E2E-only and kept out of the ITL / decode
+    /// distributions (a single blob frame produces no inter-token deltas and
+    /// a zero decode span).
+    #[must_use]
+    pub fn is_e2e_only(&self) -> bool {
+        self.frames == 0 && self.usage.is_some() && self.error.is_none()
+    }
+
     /// The authoritative completion-token count for a decode-rate
     /// measurement: the server-reported [`Usage::completion_tokens`] when it
-    /// arrived (the **primary** source — the server's own count), else the
-    /// frames observed on the wire as a last-resort estimate.
+    /// arrived and is plausible (the **primary** source — the server's own
+    /// count), else the frames observed on the wire as a last-resort
+    /// estimate.
     ///
     /// The server's `usage` is authoritative because backends that batch
     /// several tokens into one SSE frame (vLLM MTP / speculative decoding)
     /// make the raw frame count understate the true output by 30–40 %. The
-    /// frame count is used only when no `usage` chunk arrived at all (an
-    /// aborted stream from a non-compliant proxy).
+    /// frame count is used when no `usage` chunk arrived at all (an aborted
+    /// stream from a non-compliant proxy) **or** when the usage fails the
+    /// CF-10 plausibility guard (it exceeds ~4× the observed frames — a
+    /// max_tokens-inflating backend).
     #[must_use]
     pub fn effective_completion(&self) -> u64 {
         match self.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
-            Some(n) => n,
-            None => self.frames,
+            Some(n) if !self.has_usage_discrepancy() => n,
+            _ => self.frames,
         }
     }
 }
@@ -854,6 +896,18 @@ impl StreamWorker {
     /// The non-SSE plain-JSON fallback: a server that ignored `stream: true`
     /// and returned a single completion object. Extract usage + one content
     /// chunk (plan Chunk 5).
+    ///
+    /// **CF-44 — these results are E2E-only, not streaming measurements.**
+    /// The whole body is read *before* it is parsed, so `T3` (the "first
+    /// token") is stamped at `parsed_at` — after the entire response has
+    /// arrived. The resulting "TTFT" (`T3 − T1`) is therefore the *total*
+    /// response latency, not a first-token latency. The outcome is labeled
+    /// E2E-only via [`StreamOutcome::is_e2e_only`] (a plain-JSON blob reports
+    /// `frames == 0` with a `usage` and no error). It is kept out of the ITL /
+    /// decode distributions automatically: a single blob frame produces no
+    /// inter-token deltas (ITL needs ≥2 token frames) and a zero decode span
+    /// (`first == last`), so there is nothing to pool into the ITL histogram
+    /// or the decode rate.
     async fn run_plain_json(
         &self,
         head: impl AsRef<[u8]>,
@@ -1171,6 +1225,19 @@ impl StreamWorker {
     /// `(done, token_frames)`: `true` when a terminal `[DONE]` frame was
     /// among them, plus the number of token frames emitted in this call
     /// (the worker's log-milestone counter).
+    ///
+    /// **CF-09 — one `now()` per parsed frame (MTP-batch de-pollution).**
+    /// Each frame is stamped with a fresh [`MonotonicInstant::now`] as it is
+    /// emitted, NOT a single shared `at` for the whole `read_chunk` batch. A
+    /// batch of N MTP / speculative-decoding tokens arriving in one read would
+    /// otherwise all carry the same arrival instant, producing N−1 *zero*
+    /// inter-token deltas that clamp to ~1 ns and drive the ITL p50 toward ~0
+    /// exactly when speculative decoding is active. Per-frame `now()` gives
+    /// each frame its own monotonic stamp, so the intra-batch deltas are the
+    /// real (sub-µs) client processing cadence — not a clamped-to-zero
+    /// artifact. The `at` parameter (the batch arrival instant) is retained in
+    /// the signature as the reference the callers already compute; the
+    /// per-frame stamp is what is recorded on each [`StreamEvent::Frame`].
     async fn emit_frames(
         &self,
         frames: &[ParsedFrame],
@@ -1182,9 +1249,25 @@ impl StreamWorker {
     ) -> Result<(bool, u64), ()> {
         let mut done_seen = false;
         let mut token_frames = 0u64;
+        let mut first = true;
         for frame in frames {
+            // CF-09: one `now()` per parsed frame. The first frame of the
+            // batch uses the read's arrival instant `at` (the true moment the
+            // bytes landed); each subsequent frame stamps a fresh
+            // `MonotonicInstant::now()`. A batch of N MTP / speculative
+            // tokens arriving in a single read would otherwise all share one
+            // arrival instant, producing N−1 *zero* inter-token deltas that
+            // clamp to ~1 ns and drag the ITL p50 toward ~0 exactly when
+            // speculative decoding is active. Per-frame stamps keep those
+            // intra-batch deltas a real (sub-µs) positive cadence.
+            let frame_at = if first {
+                first = false;
+                *at
+            } else {
+                MonotonicInstant::now()
+            };
             let mut frame = frame.clone();
-            frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(at));
+            frame.t_nanos = ts.t0.map_or(0, |t0| t0.delta_nanos(&frame_at));
             if frame.chunk.is_token() {
                 token_frames += 1;
                 if let Some(text) = frame.chunk.token_text() {
@@ -1200,16 +1283,16 @@ impl StreamWorker {
                     }
                 }
                 if ts.t3.is_none() {
-                    ts.t3 = Some(*at);
+                    ts.t3 = Some(frame_at);
                 }
-                *last_token_at = Some(*at);
+                *last_token_at = Some(frame_at);
             }
             if frame.done {
                 done_seen = true;
             }
             tx.send(StreamEvent::Frame {
                 frame,
-                at: *at,
+                at: frame_at,
                 timestamps: *ts,
             })
             .await
@@ -1327,6 +1410,15 @@ pub fn stream_text(events: &[StreamEvent]) -> String {
 ///    servers that batch several tokens into one frame (vLLM MTP /
 ///    speculative decoding) make the frame count understate the true output
 ///    by 30–40 %.
+///
+/// **CF-10 note:** the *plausibility* of a server's `usage` relative to the
+/// frames it actually sent is a *decode-rate* concern, handled one layer up by
+/// [`StreamOutcome::has_usage_discrepancy`] /
+/// [`StreamOutcome::effective_completion`] — not here. This counting
+/// primitive keeps its "usage is primary" contract intact (the engines and
+/// their fixtures rely on it); the CF-10 override lives where the count is
+/// used as a decode-rate numerator, so it cannot silently re-scale a shared
+/// counting function.
 ///
 /// Returns `(tokens, estimated)`.
 #[must_use]
@@ -1711,5 +1803,150 @@ mod tests {
             "premature marker missing: {latest}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- P2-A: CF-09 (ITL de-pollution) + CF-10 (usage plausibility) +
+    //      CF-44 (E2E-only) tests ----
+
+    fn test_outcome(
+        frames: u64,
+        usage: Option<Usage>,
+        error: Option<StreamError>,
+    ) -> StreamOutcome {
+        StreamOutcome {
+            timestamps: StreamTimestamps::default(),
+            usage,
+            premature: false,
+            malformed_frames: 0,
+            error,
+            looping: false,
+            loop_excluded_tokens: 0,
+            frames,
+        }
+    }
+
+    /// CF-09: a batch of token frames that arrive in a single read must each
+    /// get its own monotonic stamp, not one shared arrival instant. A shared
+    /// instant yields zero inter-token deltas (clamped to ~1 ns) that drag the
+    /// ITL p50 toward ~0 exactly when speculative decoding is active; a
+    /// per-frame `now()` keeps the intra-batch span a real positive value.
+    #[tokio::test]
+    async fn emit_frames_stamps_one_now_per_batched_frame() {
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        );
+        let (mut tx, mut rx) = mpsc::channel(16);
+        let mut ts = StreamTimestamps {
+            t0: Some(MonotonicInstant::now()),
+            ..StreamTimestamps::default()
+        };
+        // Three token frames arriving in ONE read (the same batch `at`).
+        let at = MonotonicInstant::now();
+        let frames = vec![
+            ParsedFrame {
+                chunk: Chunk::Content("a".into()),
+                t_nanos: 0,
+                done: false,
+            },
+            ParsedFrame {
+                chunk: Chunk::Content("b".into()),
+                t_nanos: 0,
+                done: false,
+            },
+            ParsedFrame {
+                chunk: Chunk::Content("c".into()),
+                t_nanos: 0,
+                done: false,
+            },
+        ];
+        let mut guard = LoopGuard::new();
+        let mut last = None;
+        w.emit_frames(&frames, &at, &mut ts, &mut tx, &mut guard, &mut last)
+            .await
+            .unwrap();
+        drop(tx);
+        let mut ats = Vec::new();
+        while let Some(StreamEvent::Frame { at, .. }) = rx.recv().await {
+            ats.push(at);
+        }
+        assert_eq!(ats.len(), 3, "all three batched frames are emitted");
+        // The span from the first to the last frame is positive: each frame
+        // got its own stamp, so the intra-batch deltas are not the zero
+        // (→1 ns) artifacts that pollute the ITL p50.
+        let span = ats.first().unwrap().delta_nanos(ats.last().unwrap());
+        assert!(span > 0, "batched frames must have a positive span, got {span}");
+        // The stamps are monotonically non-decreasing.
+        for w in ats.windows(2) {
+            assert!(w[0].delta_nanos(&w[1]) >= 0);
+        }
+    }
+
+    /// CF-10: a server-reported `completion_tokens` that exceeds ~4× the
+    /// observed token frames marks a max_tokens-inflating backend. The flag
+    /// trips and the effective count falls back to the wire truth.
+    #[test]
+    fn usage_exceeding_4x_frames_is_flagged_and_ignored() {
+        let o =
+            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 500 }), None);
+        assert!(o.has_usage_discrepancy(), "500 > 4×10 must be flagged");
+        // The effective count is the observed frames, not the inflated usage.
+        assert_eq!(o.effective_completion(), 10);
+    }
+
+    /// CF-10: a plausible usage (within ~4× the frames) is trusted.
+    #[test]
+    fn plausible_usage_is_trusted() {
+        let o =
+            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 12 }), None);
+        assert!(!o.has_usage_discrepancy(), "12 ≤ 4×10 must not be flagged");
+        assert_eq!(o.effective_completion(), 12);
+    }
+
+    /// CF-10: exactly 4× is *not* a discrepancy ("exceeds" is strict).
+    #[test]
+    fn exactly_4x_frames_is_not_a_discrepancy() {
+        let o =
+            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 40 }), None);
+        assert!(!o.has_usage_discrepancy(), "40 == 4×10 is not *exceeding*");
+        assert_eq!(o.effective_completion(), 40);
+    }
+
+    /// CF-10: no observed frames (nothing to compare) → no discrepancy, the
+    /// usage is trusted.
+    #[test]
+    fn no_frames_means_no_discrepancy() {
+        let o =
+            test_outcome(0, Some(Usage { prompt_tokens: 5, completion_tokens: 500 }), None);
+        assert!(!o.has_usage_discrepancy(), "no frames → nothing to compare");
+        assert_eq!(o.effective_completion(), 500);
+    }
+
+    /// CF-44: a plain-JSON (non-streaming) result — `frames == 0` with a usage
+    /// and no error — is labeled E2E-only.
+    #[test]
+    fn plain_json_result_is_e2e_only() {
+        let o =
+            test_outcome(0, Some(Usage { prompt_tokens: 42, completion_tokens: 7 }), None);
+        assert!(o.is_e2e_only(), "frames==0 + usage + no error = E2E-only");
+    }
+
+    /// CF-44: a normal streaming result (observed token frames) is NOT
+    /// E2E-only.
+    #[test]
+    fn streaming_result_is_not_e2e_only() {
+        let o =
+            test_outcome(10, Some(Usage { prompt_tokens: 42, completion_tokens: 10 }), None);
+        assert!(!o.is_e2e_only(), "frames>0 = a real streaming result");
+    }
+
+    /// CF-44: a failed result (no usage) is not E2E-only either.
+    #[test]
+    fn failed_result_is_not_e2e_only() {
+        let o = test_outcome(0, None, Some(StreamError::Connection("refused".into())));
+        assert!(!o.is_e2e_only(), "an error is not a plain-JSON completion");
     }
 }
