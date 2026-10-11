@@ -101,13 +101,13 @@ async fn sse_run_produces_prototype_metrics() {
     assert_eq!(r.other_chunks, 2);
     assert_eq!(r.total_chunks, 6);
 
-    // §7 formulas: TTFT / PP / TG all positive; MTP = 34 completion / 2
-    // content frames = 17.
+    // §7 formulas: TTFT / PP / TG all positive; MTP η (CF-12) = 34
+    // completion / 4 total token frames (2 reasoning + 2 content) = 8.5.
     assert!(r.ttft > 0.0);
     assert!(r.stream_time > r.ttft);
     assert!(r.pp_speed > 0.0);
     assert!(r.tg_speed > 0.0);
-    assert!((r.mtp_efficiency - 17.0).abs() < 1e-9);
+    assert!((r.mtp_efficiency - 8.5).abs() < 1e-9);
     assert_eq!(r.model, "test-model");
     assert_eq!(r.mode, "short");
     assert!(!prompt.nocache);
@@ -144,9 +144,10 @@ async fn json_report_matches_prototype_key_set() {
     assert_eq!(top["url"], url);
     assert_eq!(top["iterations"], 1);
 
-    // Per-run keys: the prototype `to_dict` set + v0.1.1 `looping`.
+    // Per-run keys: the prototype `to_dict` set + v0.1.1 `looping` +
+    // CF-25 `degraded`.
     let rj = top["results"][0].as_object().unwrap();
-    assert_eq!(rj.len(), 15);
+    assert_eq!(rj.len(), 16);
     for key in [
         "ttft_s",
         "prompt_tokens",
@@ -163,6 +164,7 @@ async fn json_report_matches_prototype_key_set() {
         "mode",
         "error",
         "looping",
+        "degraded",
     ] {
         assert!(rj.contains_key(key), "missing {key}");
     }
