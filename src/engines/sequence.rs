@@ -36,6 +36,7 @@ use arc_swap::ArcSwapOption;
 use crate::config::Config;
 use crate::engines::capability::{
     NiahEngine, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
+    NIAH_MAX_GEN_TOKENS,
 };
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::StreamCountSource;
@@ -48,7 +49,7 @@ use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
 use crate::storage::db::Database;
 use crate::storage::models::{
-    BenchmarkSession, ConcurrencySummary, EngineResults, EnergySummary, FlatOutSummary,
+    BenchmarkSession, ConcurrencySummary, EnergySummary, EngineResults, FlatOutSummary,
     NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredSummary,
 };
 
@@ -733,8 +734,6 @@ impl BenchmarkSequence {
         // (5 s earlier, mid-idle-window).
         self.metrics.mark_run_started();
 
-        let mut total_tokens = 0u64;
-
         for (i, engine) in self.engines.iter().enumerate() {
             self.current.store(i, Ordering::Relaxed);
             self.bus.reset();
@@ -763,16 +762,14 @@ impl BenchmarkSequence {
                 Engine::Niah => self.run_niah().await,
                 Engine::Reasoning => self.run_reasoning().await,
                 Engine::Structured => self.run_structured().await,
-                // Engine D runs last in the canonical order, so the
-                // cumulative token count is final when it samples.
-                Engine::Hardware => self.run_hardware(total_tokens).await,
+                // Engine D samples the whole-run power trace; its J/token
+                // denominator spans every engine that has produced tokens by
+                // this point (A+B+C1+C2+C3). Engine F runs *after* D, so its
+                // tokens are not yet known here — the whole-run figure that
+                // includes F is computed in `persist_results` (CF-03/CF-54).
+                Engine::Hardware => self.run_hardware().await,
                 // Engine F (Flat Out) runs after D: the max decode speed finale.
                 Engine::FlatOut => self.run_flatout().await,
-            };
-            total_tokens += match engine {
-                Engine::Speed => summary_tokens_speed(&self.slots.speed),
-                Engine::Concurrency => summary_tokens_sweep(&self.slots.concurrency),
-                _ => 0u64,
             };
 
             self.bus.reset();
@@ -868,16 +865,16 @@ impl BenchmarkSequence {
         // Engine D is continuous telemetry (no result slot), so its profile
         // is recomputed here from the poller's trace (the same N/A rule as
         // `run_hardware` / the headless path).
-        let d_energy: Option<EnergyResult> = self.hw.as_ref().and_then(|h| h.lock().ok())
-            .and_then(|g| {
+        let d_energy: Option<EnergyResult> =
+            self.hw.as_ref().and_then(|h| h.lock().ok()).and_then(|g| {
                 let trace = g.trace().to_vec();
                 if trace.is_empty() {
                     return None;
                 }
-                let total_tokens = (*self.slots.speed.load())
-                    .as_ref()
-                    .map(|rs| rs.iter().map(|r| r.completion_tokens).sum())
-                    .unwrap_or(0);
+                // CF-03: the persisted (whole-run) J/token denominator spans
+                // every engine that ran — by persist time all slots (A..F) are
+                // filled, matching the full power trace the numerator uses.
+                let total_tokens = self.all_engines_tokens();
                 let mut e = profile(&trace, None, total_tokens);
                 if let Some(b) = g.backend() {
                     e.vendor = Some(b.vendor().to_string());
@@ -1193,14 +1190,73 @@ impl BenchmarkSequence {
         }
     }
 
+    /// CF-03: the cumulative **output-token** count across every engine that
+    /// has produced tokens so far (A+B+C1+C2+C3+F), read from the result
+    /// slots. This is the honest J/token denominator: the power trace the
+    /// numerator integrates spans the whole run, so the denominator must span
+    /// the same engine set. The old code divided by **A+B only** (the
+    /// `_ => 0` branch dropped C1/C2/C3), inflating the headline J/token by
+    /// excluding the tokens of the most energy-hungry work (C1's 77
+    /// long-context prefill cells).
+    ///
+    /// **Real counts** are used where the result type carries them:
+    /// A `completion_tokens`, B `levels[].total_tokens`, F `total_tokens`.
+    /// C1/C2 (and C3's bodies) carry no output count in their result types
+    /// and are sibling-owned, so they contribute a clearly-labeled
+    /// **estimate**: C1 = run cells × the 64-token gen cap, C2 = `chars/4`
+    /// over the response text, C3 = `chars/4` over the free + constrained
+    /// bodies (the codebase's standard no-tokenizer estimate).
+    ///
+    /// Slots that have not run yet contribute `0`, so calling this at D's
+    /// sampling point (before F) and at `persist_results` (after F) each stay
+    /// consistent with the power trace they pair with.
+    fn all_engines_tokens(&self) -> u64 {
+        let mut total = 0u64;
+        // Engine A — real completion tokens.
+        total += summary_tokens_speed(&self.slots.speed);
+        // Engine B — real sweep total tokens.
+        total += summary_tokens_sweep(&self.slots.concurrency);
+        // Engine C1 (NIAH) — estimate: run cells × the 64-token gen cap.
+        if let Some(niah) = (*self.slots.niah.load()).as_ref() {
+            let run_cells = niah.cells.iter().filter(|c| c.target_tokens > 0).count();
+            total += (run_cells as u64) * NIAH_MAX_GEN_TOKENS as u64;
+        }
+        // Engine C2 (Reasoning) — estimate: chars/4 over the response text.
+        if let Some(r) = (*self.slots.reasoning.load()).as_ref() {
+            let chars: usize = r.responses.iter().map(|s| s.chars().count()).sum();
+            total += (chars / 4) as u64;
+        }
+        // Engine C3 (Structured) — estimate: chars/4 over free + constrained.
+        if let Some(s) = (*self.slots.structured.load()).as_ref() {
+            let chars: usize = s.free_body.chars().count()
+                + s.cases
+                    .iter()
+                    .map(|c| c.output.chars().count())
+                    .sum::<usize>();
+            total += (chars / 4) as u64;
+        }
+        // Engine F (Flat Out) — real total tokens.
+        if let Some(f) = (*self.slots.flatout.load()).as_ref() {
+            total += f.total_tokens;
+        }
+        total
+    }
+
     /// Engine D — the continuous energy profiler: a short final sampling
     /// window (the 100 ms poller keeps running underneath), then the
     /// Silicon Efficiency Metric over the whole trace. Returns the
     /// one-line summary (`J/token`, or `N/A` on a driverless host).
-    async fn run_hardware(&self, total_tokens: u64) -> String {
+    async fn run_hardware(&self) -> String {
+        // CF-03: the J/token denominator spans every engine that has produced
+        // tokens by the time D samples (A+B+C1+C2+C3; F runs after D). This
+        // matches the power trace the numerator integrates, so numerator and
+        // denominator span the same engine set (no more A+B-only inflation).
+        let total_tokens = self.all_engines_tokens();
         self.logger.info(
             Context::EngineD,
-            format!("Engine D (Energy) started — 3s sampling window over {total_tokens} tokens"),
+            format!(
+                "Engine D (Energy) started — 3s sampling window over {total_tokens} tokens (all engines)"
+            ),
         );
         const WINDOW: Duration = Duration::from_secs(3);
         let start = std::time::Instant::now();
@@ -1381,6 +1437,8 @@ fn summary_tokens_sweep(slot: &ResultSlot<SweepResult>) -> u64 {
 mod tests {
     use super::*;
     use crate::config::EngineSelection;
+    use crate::engines::capability::{NiahResult, ReasoningScore};
+    use crate::engines::concurrency::SweepLevel;
 
     fn config_with(sel: EngineSelection) -> Config {
         Config {
@@ -1811,6 +1869,132 @@ mod tests {
         assert!(line.contains("practical sweet spot 2 users"), "{line}");
         assert!(line.contains("~175 t/s each"), "{line}");
         assert_eq!(summarize_sweep(&SweepResult::default()), "no usable levels");
+    }
+
+    // ── CF-03: the J/token denominator spans every engine, not just A+B ──
+
+    fn sweep_with_total_tokens(tokens: u64) -> SweepResult {
+        let level = SweepLevel {
+            concurrency: 1,
+            aggregate_tps: 100.0,
+            p50_tpot_ns: 1_000_000,
+            p90_tpot_ns: 2_000_000,
+            p99_tpot_ns: 3_000_000,
+            ttft_p50_ns: 10_000_000,
+            ttft_p90_ns: 20_000_000,
+            total_tokens: tokens,
+            completed_streams: 1,
+            failed_streams: 0,
+            timed_out_streams: 0,
+            aborted: false,
+            wall_ns: 1_000_000_000,
+            streams: Vec::new(),
+            context: 0,
+            per_stream_tps: 100.0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+        };
+        SweepResult::from_levels(vec![level], None)
+    }
+
+    fn niah_with_run_cells(run: usize) -> NiahResult {
+        let mut r = NiahResult::new(vec![2000], vec![50, 60]);
+        for c in r.cells.iter_mut().take(run) {
+            c.target_tokens = 2000; // mark the cell as run (an unrun cell is 0)
+        }
+        r
+    }
+
+    fn reasoning_with_response_chars(chars: usize) -> ReasoningResult {
+        ReasoningResult {
+            responses: vec!["x".repeat(chars)],
+            ttfts: vec![0.2],
+            tg_speeds: vec![50.0],
+            score: ReasoningScore {
+                total: 1,
+                solved: 1,
+                by_category: [(1, 1), (0, 0), (0, 0)],
+            },
+        }
+    }
+
+    fn structured_with_body_chars(chars: usize) -> StructuredResult {
+        StructuredResult {
+            free_tps: 65.2,
+            constrained_tps: 61.8,
+            penalty_pct: 5.2,
+            free_ttft: 0.2,
+            constrained_ttft: 0.21,
+            cases: vec![],
+            constrained_body: String::new(),
+            free_body: "x".repeat(chars),
+        }
+    }
+
+    fn flatout_with_total_tokens(tokens: u64) -> FlatOutResult {
+        FlatOutResult {
+            stream_count: 3,
+            stream_count_source: StreamCountSource::Default,
+            total_tokens: tokens,
+            duration_secs: 60.0,
+            aggregate_tps: tokens as f64 / 60.0,
+            per_stream_tps: tokens as f64 / 180.0,
+            ttft_avg_ms: 100.0,
+            itl_p50_ms: 20.0,
+            itl_p99_ms: 40.0,
+        }
+    }
+
+    #[test]
+    fn all_engines_tokens_spans_every_engine_not_just_a_b() {
+        let s = seq(EngineSelection {
+            speed: true,
+            concurrency: true,
+            niah: true,
+            reasoning: true,
+            structured: true,
+            hardware: true,
+            flatout: true,
+        });
+
+        // Populate every result slot with a known token contribution:
+        //   A: 256 (real)  B: 1000 (real)  C1: 1 run cell (est.)
+        //   C2: 400 chars (est.)  C3: 800 chars (est.)  F: 5000 (real)
+        s.slots
+            .speed
+            .store(vec![speed_result(100.0, 0.2, 256, false)]);
+        s.slots.concurrency.store(sweep_with_total_tokens(1000));
+        s.slots.niah.store(niah_with_run_cells(1));
+        s.slots.reasoning.store(reasoning_with_response_chars(400));
+        s.slots.structured.store(structured_with_body_chars(800));
+        s.slots.flatout.store(flatout_with_total_tokens(5000));
+
+        // The old A+B-only denominator would be 256 + 1000 = 1256.
+        let a_b_only = 256u64 + 1000;
+        // The honest all-engine denominator:
+        //   256 + 1000 + (1×64) + (400/4) + (800/4) + 5000 = 6620.
+        let all = s.all_engines_tokens();
+        assert_eq!(all, 6620, "denominator spans A+B+C1+C2+C3+F, not just A+B");
+        assert!(
+            all > a_b_only,
+            "the all-engine denominator ({all}) must exceed the old A+B-only ({a_b_only})"
+        );
+    }
+
+    #[test]
+    fn all_engines_tokens_is_zero_when_no_engine_has_run() {
+        // An empty selection → every slot empty → the denominator is 0
+        // (the N/A rule: `profile` yields `None` J/token, never a spurious 0.0).
+        let s = seq(EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        });
+        assert_eq!(s.all_engines_tokens(), 0);
     }
 
     // ── the sequence run itself (no network: empty engines no-op) ───────
