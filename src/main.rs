@@ -15,6 +15,10 @@
 //!
 //! A non-TTY stdout (pipe / CI) also falls back to the headless run
 //! unless `--tui` is given explicitly.
+//!
+//! CF-42: the headless orchestration itself lives in the library
+//! ([`crucible_llm::run_headless`]); this binary is a thin dispatch + a
+//! thin TUI wrapper.
 
 use std::io::IsTerminal;
 use std::panic;
@@ -22,27 +26,14 @@ use std::process;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crucible_llm::client::StreamEvent;
-use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
-use crucible_llm::engines::hardware::{joules_per_token, profile, EnergyResult};
-use crucible_llm::engines::speed::{
-    all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
-    PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
-};
-use crucible_llm::engines::{
-    build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, ReasoningEngine,
-    ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult, SweepResult,
-};
+use crucible_llm::config::{Config, ConfigError, DEFAULT_MODEL};
 use crucible_llm::hw::{
     detect_gpu, gpu_display_name, CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS,
 };
 use crucible_llm::log::{Context, RunLogger};
-use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
-use crucible_llm::storage::{
-    BenchmarkSession, ConcurrencySummary, Database, EnergySummary, EngineResults, FlatOutSummary,
-    ReasoningSummary, StreamMetricRow, StructuredSummary,
-};
-use crucible_llm::timing::MonotonicInstant;
+// CF-42: the headless orchestration is a public lib function — `main` is a
+// thin caller.
+use crucible_llm::run_headless;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
 use crucible_llm::ui::theme::Theme;
@@ -126,12 +117,20 @@ fn main() {
         }
     }
 
-    // Detection-based Engine D default: on when a GPU is present, off
-    // when not — applied *only* when the user did not pick engines
-    // explicitly (CLI `--engine` / env / config file win over detection).
-    if !cfg.engines_explicit {
-        cfg.engines.hardware = gpu.is_some();
-    }
+    // CF-39: unify the two independent hardware booleans (the poller
+    // toggle `cfg.hardware` and the Engine D *selection*
+    // `cfg.engines.hardware`) into one derived rule so they can never
+    // disagree. The energy engine runs only when the poller is enabled
+    // **and** a GPU is present — so `--no-hardware` (poller off) and a
+    // driverless host (no GPU) both turn Engine D off. An explicit
+    // `--engine` selection wins over detection (the operator named Engine
+    // D on purpose, so we respect it). See [`resolve_engine_d`].
+    cfg.engines.hardware = resolve_engine_d(
+        cfg.hardware,
+        gpu.is_some(),
+        cfg.engines_explicit,
+        cfg.engines.hardware,
+    );
 
     // Chunk 20 — the TUI is the default mode. The run goes headless when
     // an explicit headless marker is present (`--headless`, or `--json`
@@ -188,579 +187,41 @@ fn main() {
     }
 }
 
-/// The headless (non-TUI) path: run N single-stream iterations (Engine A)
-/// and print the prototype's result box(es) / summary — or `--json` on
-/// stdout. Returns the process exit code (1 iff every run failed).
-fn run_headless(
-    cfg: &Config,
-    logger: Arc<RunLogger>,
-    gpu: Option<Arc<dyn GpuBackend>>,
-    cpu_power: Option<Box<CpuPowerBackend>>,
-    session_id: String,
-) -> i32 {
-    // Empty-selection guard (mirrors the TUI's `App::start_run`): a run
-    // with no engines selected has nothing to do. `--engine` names a
-    // *complete* selection, so an explicit empty list is an operator
-    // mistake we surface, not a silent no-op.
-    if cfg.engines.is_empty() {
-        eprintln!(
-            "crucible-llm: no engines selected — use --engine all, or select some in the Config view (View 6)"
-        );
-        logger.warn(Context::Setup, "no engines selected — nothing to run");
-        return 0;
-    }
-
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .enable_io() // the stream worker does real network I/O
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("crucible-llm: failed to build runtime: {e}");
-            return 1;
-        }
-    };
-    // Chunk 17 / DO-08: the 100 ms hardware sampler runs for the whole
-    // headless run **only when Engine D (hardware/energy) is selected**.
-    // Its power trace is sliced into the Silicon Efficiency Metric
-    // (Joules/Token). `--no-hardware` (or a selection that omits D) now
-    // actually stops the poller — previously it was spawned
-    // unconditionally, ignoring `--no-hardware`. The detected backend
-    // (any vendor) drives the GPU fields; the CPU power backend drives the
-    // CPU draw; a driverless host yields N/A and the run proceeds.
-    let hw: Option<Arc<Mutex<HwPoller>>> = if cfg.hardware {
-        let h = Arc::new(Mutex::new(
-            HwPoller::with_backend(gpu)
-                .with_cpu_power(cpu_power)
-                .with_rate(cfg.rate_per_kwh),
-        ));
-        rt.spawn({
-            let hw = h.clone();
-            async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
-                loop {
-                    interval.tick().await;
-                    if let Ok(mut p) = hw.lock() {
-                        p.poll();
-                    }
-                }
-            }
-        });
-        Some(h)
-    } else {
-        None
-    };
-
-    rt.block_on(async {
-        let term = Term {
-            color: !cfg.no_color && std::io::stdout().is_terminal(),
-            tty: std::io::stderr().is_terminal(),
-        };
-
-        // Engine A (speed) — gated on the selection (R1). `--engine niah`
-        // runs *only* C1; a selection that omits `speed` skips Engine A
-        // entirely (previously A always ran). The results/packets/windows
-        // are declared outside the gate so the persistence + export below
-        // can use them (they stay empty when A did not run).
-        let mut results: Vec<SpeedResult> = Vec::new();
-        // CF-05: the per-run client-perceived first-token latency (T3−T0) for
-        // the short-prompt runs, alongside the server-side value in each
-        // `SpeedResult.ttft`.
-        let mut perceived: Vec<f64> = Vec::new();
-        // CF-05: the long-prompt pre-fill throughput (the bandwidth half).
-        // Filled after the short-prompt loop; an empty/invalid metric when
-        // every short run failed (a dead server) so no wasted prefill.
-        let mut prefill = PrefillMetric {
-            tok_s: 0.0,
-            prompt_tokens: 0,
-            server_ttft_s: 0.0,
-            estimated: false,
-        };
-        let mut packets: Vec<PacketSample> = Vec::new();
-        let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> = Vec::new();
-
-        if cfg.engines.speed {
-            let engine = match SpeedEngine::new(cfg) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("crucible-llm: {e}");
-                    logger.error(Context::EngineA, format!("Engine A init failed: {e}"));
-                    return 1;
-                }
-            };
-            let engine = engine.logger(logger.clone());
-            logger.info(
-                Context::EngineA,
-                format!(
-                    "Engine A (Speed) started — {} iteration(s), {} max tokens",
-                    cfg.iterations, MAX_GEN_TOKENS
-                ),
-            );
-
-            let prompt = engine.generate_prompt();
-            let iterations = cfg.iterations.max(1) as usize;
-
-            if !cfg.json {
-                term.info(&format!(
-                    "Mode: {} | Prompt: {} chars (~{} tok) | Target: {}",
-                    cfg.mode.label(),
-                    prompt.text.chars().count(),
-                    prompt.token_count,
-                    cfg.url
-                ));
-                if cfg.nocache {
-                    term.dim("  KV-cache bypass enabled");
-                }
-                if iterations > 1 {
-                    term.dim(&format!("  Running {iterations} iterations"));
-                }
-                if let Some(fmt) = cfg.export {
-                    term.dim(&format!("  --export {} enabled", fmt.label()));
-                }
-            }
-
-            // Keep each iteration's raw worker events (Chunk 13 CSV export
-            // + Chunk 17 energy windows): the per-packet arrival timestamps
-            // the CSV dumps, and the (T0, Tn) lifecycle window that slices
-            // the hardware power trace into per-iteration Joules/Token.
-            let capture_packets = cfg.export.is_some();
-            results = Vec::with_capacity(iterations);
-            for i in 0..iterations {
-                if !cfg.json && iterations > 1 {
-                    term.progress(&format!("  [{}/{}] Running...", i + 1, iterations));
-                }
-                let (result, events) = engine.run_iteration_events(&prompt).await;
-                if capture_packets {
-                    packets.extend(export::samples_from_events(&events, (i + 1) as u64));
-                }
-                windows.push(run_window(&events));
-                perceived.push(perceived_ttft_seconds(&events));
-                if cfg.verbose && !cfg.json {
-                    term.dim(&format!(
-                        "  chunks={} content={} reasoning={}",
-                        result.total_chunks, result.content_chunks, result.reasoning_chunks
-                    ));
-                }
-                results.push(result);
-            }
-            if !cfg.json && iterations > 1 {
-                term.clear_progress();
-            }
-            // CF-05: the pre-fill *throughput* half — a long-prompt
-            // measurement, distinct from the short-prompt latency above.
-            // Skipped when every short run failed (a dead server would only
-            // waste a multi-thousand-token prefill).
-            if !all_failed(&results) {
-                if !cfg.json {
-                    term.info(&format!(
-                        "Measuring pre-fill throughput on a {}-token long prompt…",
-                        cfg.tokens
-                    ));
-                }
-                prefill = engine.run_prefill().await;
-            }
-            logger.info(
-                Context::EngineA,
-                format!(
-                    "Engine A complete — {}/{} run(s) succeeded; pre-fill {:.1} tok/s ({} tok)",
-                    results.iter().filter(|r| !r.is_failed()).count(),
-                    results.len(),
-                    prefill.tok_s,
-                    prefill.prompt_tokens
-                ),
-            );
-        }
-
-        // Chunk 17: harvest the sampler's power trace (brief lock on the
-        // run-completion path — never on the stream workers' timing path).
-        // Empty / `None` when Engine D was not selected (the poller is off).
-        let hw_trace = hw
-            .as_ref()
-            .and_then(|h| h.lock().ok())
-            .map(|g| g.trace().to_vec())
-            .unwrap_or_default();
-        let gpu_name = hw
-            .as_ref()
-            .and_then(|h| h.lock().ok())
-            .and_then(|g| g.gpu_name().map(str::to_string));
-
-        // The `--json` document: Engine A's results (empty when A was not
-        // selected), with the `flat_out` object appended once Engine F has
-        // run (the document is printed *after* the additional-engine block
-        // below, so `flat_out` is included in one JSON document on stdout).
-        let mut json_doc = if cfg.json {
-            Some(json_report_split(cfg, &results, &perceived, &prefill))
-        } else {
-            None
-        };
-        if !cfg.json && !results.is_empty() {
-            if all_failed(&results) {
-                for (i, r) in results.iter().enumerate() {
-                    term.error(&format!(
-                        "Test {}/{} FAILED: {}",
-                        i + 1,
-                        results.len(),
-                        r.error.as_deref().unwrap_or("unknown error")
-                    ));
-                }
-            } else {
-                // CF-05: the two distinct, labeled metrics (first-token
-                // latency from the short prompt; pre-fill throughput from the
-                // long prompt) plus the intact decode numbers.
-                print!(
-                    "{}",
-                    format_split_report(&results, &perceived, &prefill, term.color)
-                );
-                for r in results.iter() {
-                    if let Some(note) = &r.error {
-                        if r.completion_tokens > 0 {
-                            term.warning(&format!("Note: {note}"));
-                        }
-                    }
-                }
-            }
-            if let Some(summary) = format_summary(&results, term.color) {
-                print!("{summary}");
-            }
-        }
-        // Engine D (hardware/energy) — the silicon-efficiency profile over
-        // the whole run. Computed once and reused for: the (non-JSON)
-        // display, the `--json` energy object (DO-09/CF-21), and the
-        // `engine_results` column. DO-08: only when D is selected. A
-        // driverless host yields the N/A rule (no spurious 0.0).
-        let energy_result: Option<EnergyResult> = if cfg.hardware {
-            let total_tokens: u64 = results.iter().map(|r| r.completion_tokens).sum();
-            Some(profile(&hw_trace, None, total_tokens))
-        } else {
-            None
-        };
-        if let Some(energy) = &energy_result {
-            if !cfg.json {
-                if let Some(jpt) = energy.joules_per_token {
-                    let peak = energy
-                        .peak_power_w
-                        .map(|w| format!(" · peak {w:.0} W"))
-                        .unwrap_or_default();
-                    term.dim(&format!(
-                        "  Energy: {:.1} J ({:.3} J/token{peak})",
-                        energy.joules, jpt
-                    ));
-                }
-                if let Some(w) = &energy.fragmentation_warning {
-                    term.warning(&format!("VRAM: {w}"));
-                }
-            }
-            // DO-09/CF-21: the `--json` document carries the energy object
-            // (the serializable summary, not the non-`Serialize` raw
-            // `EnergyResult`).
-            if let Some(v) = &mut json_doc {
-                v["energy"] = serde_json::to_value(EnergySummary::from_energy(energy))
-                    .unwrap_or(serde_json::Value::Null);
-            }
-        }
-
-        // ── Result capture (R2: the B/C2/C3/F headline numbers) ──
-        // The additional engines publish their results here so the
-        // persistence block (after them) can fold them into the session's
-        // `engine_results` column (CF-14: they used to be lost — only A +
-        // C1 were persisted).
-        let mut sweep_result: Option<SweepResult> = None;
-        let mut reasoning_result: Option<ReasoningResult> = None;
-        let mut structured_result: Option<StructuredResult> = None;
-        let mut flatout_result: Option<FlatOutResult> = None;
-
-        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
-        // C3 / F) and report a one-line summary for each. Engine A (speed)
-        // is the run above; Engine D (hardware) is the continuous poller
-        // started earlier. A selection of only `speed` skips this block
-        // entirely.
-        let extra = cfg.engines;
-        if extra.concurrency || extra.niah || extra.reasoning || extra.structured || extra.flatout {
-            if !cfg.json {
-                term.dim(&format!(
-                    "  running selected engines: {}",
-                    extra.iter_labels().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            // Engine F (Flat Out) reads Engine B's sweet spot as its
-            // stream count (the real-world full-load number); captured
-            // here because the sweep result is scoped to the block.
-            let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
-            if extra.concurrency {
-                if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
-                    if !cfg.json {
-                        term.dim(&format!(
-                            "  [B] concurrency sweep [{}]…",
-                            cfg.ladder
-                                .iter()
-                                .map(|n| n.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
-                    }
-                    let r = sweep.run().await;
-                    flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
-                    // FIX 3: the headless summary leads with the
-                    // practical (per-stream usability) sweet spot, with
-                    // the pure-throughput knee as reference.
-                    if r.is_empty() {
-                        term.warning("  [B] sweep produced no usable levels");
-                    } else {
-                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
-                    }
-                    sweep_result = Some(r);
-                }
-            }
-            if extra.niah {
-                match NiahEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!("  [C1] {}", r.accuracy_label()));
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C1] niah init failed: {e}"));
-                        logger.error(Context::EngineC1, format!("niah init failed: {e}"));
-                    }
-                }
-            }
-            if extra.reasoning {
-                match ReasoningEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C2] reasoning bank (13 challenges)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!(
-                            "  [C2] {} · avg {:.1} t/s",
-                            r.score.label(),
-                            r.avg_tg_speed()
-                        ));
-                        reasoning_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C2] reasoning init failed: {e}"));
-                        logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
-                    }
-                }
-            }
-            if extra.structured {
-                match StructuredEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C3] structured output (free-form vs constrained)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!("  [C3] {}", r.summary_line()));
-                        structured_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C3] structured init failed: {e}"));
-                        logger.error(Context::EngineC3, format!("structured init failed: {e}"));
-                    }
-                }
-            }
-            if extra.flatout {
-                match FlatOutEngine::new(cfg) {
-                    Ok(mut engine) => {
-                        // The stream count is Engine B's sweet spot when
-                        // the sweep ran (real-world full load), else the
-                        // built-in default.
-                        if let Some((n, source)) = flatout_streams {
-                            engine = engine.stream_count(n, source);
-                        }
-                        if !cfg.json {
-                            term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        // The `--json` document carries the flat_out
-                        // result object.
-                        if let Some(v) = &mut json_doc {
-                            v["flat_out"] = r.to_dict();
-                        }
-                        term.info(&format!("  [F] {}", r.summary_line()));
-                        flatout_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[F] flat out init failed: {e}"));
-                        logger.error(Context::EngineF, format!("flat out init failed: {e}"));
-                    }
-                }
-            }
-        }
-
-        // R2 (traceability): fold the non-stream engine results
-        // (B/C2/C3/D/F) into the session's `engine_results` JSON column
-        // (CF-14: they used to be lost — only A + C1 were persisted).
-        let engine_results = EngineResults {
-            b_concurrency: sweep_result.as_ref().map(ConcurrencySummary::from_sweep),
-            c2_reasoning: reasoning_result
-                .as_ref()
-                .map(ReasoningSummary::from_reasoning),
-            c3_structured: structured_result
-                .as_ref()
-                .map(StructuredSummary::from_structured),
-            d_energy: energy_result.as_ref().map(EnergySummary::from_energy),
-            f_flatout: flatout_result.as_ref().map(FlatOutSummary::from_flatout),
-        }
-        .to_json();
-
-        // Persist the completed run (Chunk 12): one `benchmark_sessions`
-        // row + one `stream_metrics` row per iteration, in the platform
-        // data dir. A storage failure degrades gracefully — it must never
-        // break (or change the exit code of) a benchmark run.
-        // R2: the session id is the one generated up front in `main` and
-        // stamped into the run-log — so the DB row and the log join on it.
-        let session = BenchmarkSession {
-            session_id,
-            timestamp: None, // SQLite `DEFAULT CURRENT_TIMESTAMP` fills it
-            target_url: cfg.url.clone(),
-            model_name: cfg.model.clone(),
-            backend_type: None,
-            quantization: None,
-            system_gpu: gpu_name,
-            total_duration_sec: Some(results.iter().map(|r| r.stream_time).sum()),
-            // R2 (traceability): record which engines this run selected so
-            // a stored session joins back to its run / log / export.
-            engines: Some(cfg.engines.selected_names_json()),
-            // R2: the B/C2/C3/D/F headline results (CF-14).
-            engine_results,
-        };
-        // Single-stream headless engine: every iteration runs at
-        // concurrency level 1. Chunk 17: each row carries the
-        // Silicon Efficiency Metric for that iteration's (T0, Tn) window
-        // (N/A when no power telemetry was available).
-        let rows: Vec<StreamMetricRow> = results
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let mut row = StreamMetricRow::from_speed_result(r, &session.session_id, 1);
-                row.joules_per_token = windows[i]
-                    .and_then(|w| joules_per_token(&hw_trace, Some(w), r.completion_tokens));
-                row
-            })
-            .collect();
-        match Database::open_default() {
-            Ok(mut db) => {
-                match db.persist_run(&session, &rows) {
-                    Ok(()) => {
-                        let id = &session.session_id;
-                        term.dim(&format!(
-                            "  saved → {} (session {})",
-                            db.path().display(),
-                            &id[..8]
-                        ))
-                    }
-                    Err(e) => term.warning(&format!("persist failed: {e}")),
-                }
-                // `--export` (Chunk 13): consume the run back from the
-                // SQLite storage layer and write the requested format.
-                if let Some(fmt) = cfg.export {
-                    // v0.1.1: the JSON export's `loop_guard` block comes
-                    // from the runs the decode-loop guard excluded.
-                    let loop_guard = {
-                        let detected = results.iter().filter(|r| r.looping).count();
-                        let excluded: u64 = results
-                            .iter()
-                            .filter(|r| r.looping)
-                            .map(|r| r.completion_tokens)
-                            .sum();
-                        (detected > 0).then_some(crucible_llm::metrics::LoopGuardSummary {
-                            detected_streams: detected,
-                            excluded_tokens: excluded,
-                        })
-                    };
-                    run_export(
-                        &db,
-                        &session,
-                        &packets,
-                        fmt,
-                        cfg.export_path.as_deref(),
-                        &term,
-                        loop_guard,
-                    );
-                }
-            }
-            Err(e) => term.warning(&format!("persist failed: {e}")),
-        }
-
-        // The `--json` document (printed after the additional engines so
-        // the `flat_out` + `energy` objects are included): stdout stays
-        // pure JSON.
-        if let Some(v) = json_doc {
-            println!("{v}");
-        }
-
-        // Prototype exit-code rule: all runs failed → exit 1.
-        if all_failed(&results) {
-            if !cfg.json {
-                term.error("All test runs failed.");
-            }
-            return 1;
-        }
-        0
-    })
+/// CF-39: the unified Engine D (energy) selection rule. The energy engine
+/// runs only when the hardware telemetry **poller** is enabled **and** a
+/// GPU is present — so the two booleans (`Config.hardware` and
+/// `EngineSelection.hardware`) can never disagree:
+/// * `--no-hardware` (poller off) → Engine D off (no starved N/A);
+/// * a driverless host (no GPU) → Engine D off (the README's "no GPU →
+///   off" rule — a remote user gets N/A anyway).
+#[must_use]
+fn unified_hardware(hardware: bool, gpu_present: bool) -> bool {
+    hardware && gpu_present
 }
 
-/// Chunk 17: the (T0, Tn) lifecycle window of one iteration, extracted
-/// from its worker events — the slice of the hardware power trace over
-/// which the Silicon Efficiency Metric integrates. `None` when the run
-/// never recorded a full window (e.g. it failed before both milestones).
-fn run_window(events: &[StreamEvent]) -> Option<(MonotonicInstant, MonotonicInstant)> {
-    let t0 = events.iter().find_map(|e| match e {
-        StreamEvent::Frame { timestamps, .. } => timestamps.t0,
-        _ => None,
-    });
-    let t_end = events.iter().rev().find_map(|e| match e {
-        StreamEvent::Complete { timestamps, .. } | StreamEvent::Failed { timestamps, .. } => {
-            timestamps.t_end
-        }
-        _ => None,
-    });
-    match (t0, t_end) {
-        (Some(start), Some(end)) => Some((start, end)),
-        _ => None,
-    }
-}
-
-/// Chunk 13: write the `--export` file for a just-persisted run,
-/// consuming the data back from the SQLite storage layer (session row +
-/// `stream_metrics` rows), plus the live per-packet samples for the CSV.
+/// CF-39: resolve the Engine D (energy) selection for a run, respecting an
+/// explicit `--engine` choice.
 ///
-/// Destination: `--export-path`, or
-/// `data_dir()/exports/crucible-<session-id[:8]>.<ext>` by default.
-/// Degrades gracefully — an export failure never breaks (or changes the
-/// exit code of) a benchmark run.
-fn run_export(
-    db: &Database,
-    session: &BenchmarkSession,
-    packets: &[PacketSample],
-    format: ExportFormat,
-    path: Option<&std::path::Path>,
-    term: &Term,
-    loop_guard: Option<crucible_llm::metrics::LoopGuardSummary>,
-) {
-    let mut payload = match ExportPayload::from_stored(db, &session.session_id) {
-        Ok(p) => p,
-        Err(e) => {
-            term.warning(&format!("export failed: {e}"));
-            return;
-        }
-    };
-    payload.packets = packets.to_vec();
-    if let Some(lg) = loop_guard {
-        payload = payload.with_loop_guard(lg);
-    }
-    let dest = path
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| export::default_path(&session.session_id, format));
-    match export::write(&dest, format, &payload) {
-        Ok(p) => term.dim(&format!("  exported → {}", p.display())),
-        Err(e) => term.warning(&format!("export failed: {e}")),
+/// When the operator named their engines explicitly (`engines_explicit` —
+/// CLI `--engine` / env / config file), the selection is left exactly as
+/// they set it (`explicit_engine_d`): we respect what they asked for, even
+/// if it names Engine D on a host where the poller would turn it off.
+///
+/// Otherwise it is derived as [`unified_hardware`] (the poller toggle AND
+/// GPU presence), so `--no-hardware` and a driverless host both turn
+/// Engine D off — closing the two-boolean ambiguity (DO-10/CF-39) and the
+/// headless/TUI `--no-hardware` asymmetry (DO-08/CF-20).
+#[must_use]
+fn resolve_engine_d(
+    hardware: bool,
+    gpu_present: bool,
+    engines_explicit: bool,
+    explicit_engine_d: bool,
+) -> bool {
+    if engines_explicit {
+        explicit_engine_d
+    } else {
+        unified_hardware(hardware, gpu_present)
     }
 }
 
@@ -820,29 +281,36 @@ fn run_tui(
             } else if needs_setup {
                 app = app.with_setup(cfg);
             }
-            // The 100 ms hardware telemetry task (blueprint §4.3): it
-            // polls and merges into the `ArcSwap<MetricsSnapshot>` the
-            // views read lock-free. It never touches the stream
-            // workers' quanta timing path (measurement isolation,
-            // blueprint §4); a lock failure is a no-op. Chunk 18: only
-            // spawned (and only attached to the App) when the
-            // hardware/energy telemetry is enabled — `app.hw.is_some()`
-            // then means "the poller is live", which the views use to
-            // decide whether an Energy line belongs on screen.
+            // The 100 ms hardware telemetry (blueprint §4.3): it polls and
+            // merges into the `ArcSwap<MetricsSnapshot>` the views read
+            // lock-free. It never touches the stream workers' quanta
+            // timing path (measurement isolation, blueprint §4); a lock
+            // failure is a no-op. Chunk 18: only spawned (and only
+            // attached to the App) when the hardware/energy telemetry is
+            // enabled — `app.hw.is_some()` then means "the poller is
+            // live", which the views use to decide whether an Energy line
+            // belongs on screen.
             if cfg.hardware {
                 app = app.with_hw(hw.clone());
                 let state = app.metrics.clone();
                 let poller = hw;
-                tokio::spawn(async move {
-                    let mut interval =
-                        tokio::time::interval(Duration::from_millis(HW_POLL_INTERVAL_MS));
+                // CF-40: the 100 ms telemetry poller runs on a **dedicated
+                // OS thread**, not a `tokio::spawn` task on the
+                // `current_thread` runtime that also drives the 60 Hz render
+                // loop. A task on that single thread only ticks when the
+                // render loop yields, so the cadence was best-effort and the
+                // power trace (and the View 4 energy integral) slipped under
+                // load. A dedicated thread decouples it — the "four
+                // decoupled rings" the blueprint promises — without stealing
+                // time from the measured streams.
+                std::thread::spawn(move || {
                     loop {
-                        interval.tick().await;
+                        std::thread::sleep(Duration::from_millis(HW_POLL_INTERVAL_MS));
                         // FIX 2: the run is over (the metrics pipeline
                         // is frozen) → the poller stops: no hardware
-                        // reads, no snapshot updates. The task goes
-                        // idle (one atomic load per tick) until a new
-                        // run re-arms the pipeline (`unfreeze()`).
+                        // reads, no snapshot updates. The thread idles
+                        // (one atomic load per tick) until a new run
+                        // re-arms the pipeline (`unfreeze()`).
                         if state.is_frozen() {
                             continue;
                         }
@@ -891,54 +359,51 @@ fn print_banner() {
     println!("  llmspeedtest.py / llmspeedtest2.py).");
 }
 
-/// TTY-aware output handler (parity with the prototype's `Output`):
-/// `ℹ`/`⚠`/`✗` markers on stderr, bold lines on stdout, live progress
-/// only on a TTY.
-struct Term {
-    color: bool,
-    tty: bool,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Term {
-    fn info(&self, msg: &str) {
-        self.emit("36", "ℹ ", msg);
+    // CF-39: the poller toggle AND GPU presence derive the Engine D
+    // selection, so the two booleans can never disagree.
+
+    #[test]
+    fn no_gpu_turns_engine_d_off_even_if_the_poller_is_on() {
+        assert!(!unified_hardware(true, false), "no GPU → Engine D off");
+        assert!(
+            unified_hardware(true, true),
+            "poller on + GPU → Engine D on"
+        );
     }
 
-    fn warning(&self, msg: &str) {
-        self.emit("33", "⚠ ", msg);
+    #[test]
+    fn no_hardware_turns_engine_d_off_even_if_a_gpu_is_present() {
+        assert!(
+            !unified_hardware(false, true),
+            "`--no-hardware` → Engine D off"
+        );
+        assert!(!unified_hardware(false, false), "both off → Engine D off");
     }
 
-    fn error(&self, msg: &str) {
-        self.emit("31", "✗ ", msg);
+    #[test]
+    fn a_detection_based_run_derives_engine_d_from_poller_and_gpu() {
+        // Not explicit → derive. GPU present + poller on → on.
+        assert!(resolve_engine_d(true, true, false, false));
+        // Not explicit → derive. No GPU → off (the README "no GPU → off"),
+        // even if a stale selection said on.
+        assert!(!resolve_engine_d(true, false, false, true));
+        // Not explicit → derive. `--no-hardware` (poller off) → off, even
+        // with a GPU (the starved-N/A case CF-39 closes).
+        assert!(!resolve_engine_d(false, true, false, true));
     }
 
-    fn dim(&self, msg: &str) {
-        self.emit("2", "", msg);
-    }
-
-    /// Live progress (stderr, overwrites the line; skipped off-TTY).
-    fn progress(&self, msg: &str) {
-        if self.tty {
-            let s = if self.color {
-                format!("\u{1b}[2m{msg}\u{1b}[0m")
-            } else {
-                msg.to_string()
-            };
-            eprintln!("\r\u{1b}[K{s}");
-        }
-    }
-
-    fn clear_progress(&self) {
-        if self.tty {
-            eprint!("\r\u{1b}[K");
-        }
-    }
-
-    fn emit(&self, code: &str, prefix: &str, msg: &str) {
-        if self.color {
-            eprintln!("\u{1b}[{code}m{prefix}{msg}\u{1b}[0m");
-        } else {
-            eprintln!("{prefix}{msg}");
-        }
+    #[test]
+    fn an_explicit_engine_selection_is_respected_not_overridden() {
+        // `--engine hardware` (explicit) on a no-GPU, no-poller host: we
+        // respect the operator's explicit choice (Engine D stays on — it
+        // will simply report N/A without a poller).
+        assert!(resolve_engine_d(false, false, true, true));
+        // `--engine niah` (explicit, omits D): Engine D stays off even with
+        // a GPU + poller on.
+        assert!(!resolve_engine_d(true, true, true, false));
     }
 }
