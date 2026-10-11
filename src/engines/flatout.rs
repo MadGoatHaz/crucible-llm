@@ -27,7 +27,13 @@
 //! * **authoritative token counting** — each stream's count is the
 //!   server's `usage.completion_tokens` when it arrives, else the
 //!   re-tokenized text ([`authoritative_tokens`]) — never the raw frame
-//!   tally, which undercounts batched servers (vLLM MTP) by 30–40 %.
+//!   tally, which undercounts batched servers (vLLM MTP) by 30–40 %;
+//! * **an honest headline** — the 60 s window aborts each stream before
+//!   its terminal `usage` frame arrives, so by default the count falls to
+//!   the `chars/4` text estimate. [`FlatOutResult`] flags that:
+//!   `tokens_estimated` + `counting_method`, and the terminal summary
+//!   prefixes the headline `≈ … (est., …)` — an estimate is never
+//!   presented as a precise measurement.
 //!
 //! The result records the **aggregate t/s** (the headline), the
 //! **per-stream t/s** (aggregate ÷ streams — ≈ 30 confirms the sweet
@@ -130,6 +136,23 @@ pub struct FlatOutResult {
     pub itl_p50_ms: f64,
     /// Inter-token latency p99, pooled across all streams (milliseconds).
     pub itl_p99_ms: f64,
+    /// `true` when the headline token total (and therefore the t/s) relies
+    /// on at least one *estimated* per-stream count — a stream had no
+    /// `usage` frame and no exact tokenizer, so it fell back to the
+    /// `chars/4` text estimate. This is the **default** configuration: the
+    /// 60 s window aborts each stream before its terminal `usage` frame
+    /// arrives. `false` when every stream's count is authoritative (the
+    /// server's `usage` or an exact re-tokenization).
+    #[serde(default)]
+    pub tokens_estimated: bool,
+    /// How the headline tokens were counted: `"usage"` (the server's
+    /// `usage.completion_tokens` — authoritative), `"tokenizer"` (exact
+    /// re-tokenization when `--tokenizer` is supplied), `"chars/4"` (the
+    /// flagged text estimate), `"mixed"` (a blend across streams), or
+    /// `"none"` (no stream produced a count). The provenance marker that
+    /// makes `tokens_estimated` actionable.
+    #[serde(default)]
+    pub counting_method: String,
 }
 
 impl FlatOutResult {
@@ -143,6 +166,13 @@ impl FlatOutResult {
     /// one is supplied, else `chars/4`). Counting SSE frames is never
     /// used: batched servers (vLLM MTP) pack multiple tokens into one
     /// frame, which is the 30–40 % undercount this engine used to show.
+    ///
+    /// The result records **how** the total was counted
+    /// ([`FlatOutResult::counting_method`]) and flags it
+    /// ([`FlatOutResult::tokens_estimated`]) whenever any stream fell to
+    /// the `chars/4` estimate — the default case, since the 60 s window
+    /// aborts each stream before its terminal `usage` frame arrives. An
+    /// estimate is never presented as a precise measurement.
     ///
     /// The **aggregate t/s** is the total over the *wall* window
     /// (`total_tokens / duration_secs`) — prefill and any trailing gap
@@ -158,12 +188,21 @@ impl FlatOutResult {
     ) -> Self {
         let stream_count = per_stream.len().max(1);
         let mut total_tokens = 0u64;
+        let mut tokens_estimated = false;
+        let mut methods: Vec<&'static str> = Vec::new();
         let mut ttfts_ms: Vec<f64> = Vec::new();
         let mut itl = LatencyHistogram::default();
         for events in per_stream {
-            // The stream's authoritative count (usage → text estimate).
-            let (tokens, _) = authoritative_tokens(events, stream_usage(events), tokenizer);
+            // The stream's authoritative count (usage → text estimate),
+            // with the `estimated` flag that separates the server's
+            // `usage` / an exact tokenizer from the `chars/4` fallback.
+            let usage = stream_usage(events);
+            let (tokens, estimated) = authoritative_tokens(events, usage, tokenizer);
             total_tokens += tokens;
+            if estimated {
+                tokens_estimated = true;
+            }
+            methods.push(counting_method(usage, estimated));
             // Pooled ITL: the gaps between this stream's consecutive
             // token frames.
             let mut prev: Option<MonotonicInstant> = None;
@@ -210,14 +249,26 @@ impl FlatOutResult {
             ttft_avg_ms,
             itl_p50_ms,
             itl_p99_ms,
+            tokens_estimated,
+            counting_method: summarize_methods(&methods),
         }
     }
 
     /// The one-line summary for the sequence header / headless report.
+    ///
+    /// When the token total is an estimate (no `usage` frame and no exact
+    /// tokenizer — the default configuration), the headline t/s is
+    /// prefixed with `≈` and annotated `(est., <method>)`, so the number
+    /// is never read as a precise measurement.
     #[must_use]
     pub fn summary_line(&self) -> String {
+        let (agg_prefix, est_note) = if self.tokens_estimated {
+            ("≈", format!(" (est., {})", self.counting_method))
+        } else {
+            ("", String::new())
+        };
         format!(
-            "{agg:.1} t/s aggregate ({n} streams) · {ps:.1} t/s per stream · {tok} tok in {d:.0}s",
+            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {ps:.1} t/s per stream · {tok} tok in {d:.0}s",
             agg = self.aggregate_tps,
             n = self.stream_count,
             ps = self.per_stream_tps,
@@ -239,6 +290,12 @@ impl FlatOutResult {
             "ttft_avg_ms": self.ttft_avg_ms,
             "itl_p50_ms": self.itl_p50_ms,
             "itl_p99_ms": self.itl_p99_ms,
+            // CF-07: provenance of the headline token count. `true` when
+            // the total relies on a `chars/4` text estimate (the default —
+            // the 60 s window aborts each stream before its terminal
+            // `usage` frame arrives); `counting_method` names the source.
+            "tokens_estimated": self.tokens_estimated,
+            "counting_method": self.counting_method,
         })
     }
 }
@@ -247,6 +304,39 @@ impl FlatOutResult {
 /// same histogram Engine A uses for its ITL distribution).
 fn itl_percentiles_ms(h: &LatencyHistogram) -> (f64, f64) {
     (h.p50() / 1e6, h.p99() / 1e6)
+}
+
+/// The per-stream counting-method label: the server's `usage` when it
+/// carries a positive completion count, an exact re-tokenization when a
+/// tokenizer was supplied (no usage), else the `chars/4` text estimate
+/// (the only case [`authoritative_tokens`] flags `estimated`).
+fn counting_method(usage: Option<Usage>, estimated: bool) -> &'static str {
+    if estimated {
+        "chars/4"
+    } else if usage.is_some_and(|u| u.completion_tokens > 0) {
+        "usage"
+    } else {
+        "tokenizer"
+    }
+}
+
+/// Collapse the per-stream method labels into one aggregate label: a
+/// single label when every stream agrees, `"mixed"` when they differ,
+/// `"none"` when no stream produced a count.
+fn summarize_methods(methods: &[&'static str]) -> String {
+    if methods.is_empty() {
+        return "none".to_string();
+    }
+    let distinct: Vec<&'static str> = methods
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    match distinct.as_slice() {
+        [only] => only.to_string(),
+        _ => "mixed".to_string(),
+    }
 }
 
 /// A stream's authoritative `usage` (the last usage frame, or the
@@ -553,10 +643,18 @@ impl FlatOutEngine {
             });
         }
         if let Some(l) = &self.logger {
+            // CF-07: never log the headline as precise when it is an
+            // estimate (the default — the window aborts each stream before
+            // its terminal `usage` frame arrives).
+            let est_note = if result.tokens_estimated {
+                format!(" [token count estimated: {}]", result.counting_method)
+            } else {
+                String::new()
+            };
             l.info(
                 Context::EngineF,
                 format!(
-                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms)",
+                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
                     result.total_tokens,
                     result.duration_secs,
                     result.aggregate_tps,
@@ -920,6 +1018,8 @@ mod tests {
             let r = FlatOutResult::from_events(&[events], 10.0, None, StreamCountSource::Default);
             assert_eq!(r.stream_count, 1);
             assert_eq!(r.total_tokens, 100_000, "server usage is authoritative");
+            assert!(!r.tokens_estimated, "usage present → not an estimate");
+            assert_eq!(r.counting_method, "usage");
             assert!(
                 (r.aggregate_tps - 10_000.0).abs() < 1.0,
                 "aggregate: {}",
@@ -957,6 +1057,11 @@ mod tests {
             let r = FlatOutResult::from_events(&[s0, s1], 10.0, None, StreamCountSource::Default);
             assert_eq!(r.stream_count, 2);
             assert_eq!(r.total_tokens, 3, "1 + 1 + 1 token per 4-char frame");
+            assert!(
+                r.tokens_estimated,
+                "no usage + no tokenizer → chars/4 estimate"
+            );
+            assert_eq!(r.counting_method, "chars/4");
             assert!(
                 (r.aggregate_tps - 0.3).abs() < 1e-9,
                 "aggregate: {}",
@@ -996,6 +1101,8 @@ mod tests {
                 r.total_tokens, 2,
                 "no usage + no tokenizer → chars/4 estimate"
             );
+            assert!(r.tokens_estimated, "the chars/4 fallback is flagged");
+            assert_eq!(r.counting_method, "chars/4");
             assert!(
                 (r.aggregate_tps - 0.2).abs() < 1e-9,
                 "aggregate: {}",
@@ -1026,6 +1133,8 @@ mod tests {
             let r =
                 FlatOutResult::from_events(&[events], 10.0, Some(&tok), StreamCountSource::Default);
             assert_eq!(r.total_tokens, 2, "re-tokenized count (apple apple)");
+            assert!(!r.tokens_estimated, "exact tokenizer → not an estimate");
+            assert_eq!(r.counting_method, "tokenizer");
         });
     }
 
@@ -1207,6 +1316,8 @@ mod tests {
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
+            tokens_estimated: false,
+            counting_method: "usage".into(),
         };
         let line = r.summary_line();
         assert!(line.contains("285.4 t/s aggregate (8 streams)"), "{line}");
@@ -1226,6 +1337,8 @@ mod tests {
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
+            tokens_estimated: false,
+            counting_method: "usage".into(),
         };
         let v = r.to_dict();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
@@ -1240,7 +1353,9 @@ mod tests {
                 "per_stream_tps",
                 "ttft_avg_ms",
                 "itl_p50_ms",
-                "itl_p99_ms"
+                "itl_p99_ms",
+                "tokens_estimated",
+                "counting_method"
             ]
         );
         assert_eq!(v["stream_count"], 8);
@@ -1248,5 +1363,134 @@ mod tests {
         assert_eq!(v["total_tokens"], 17_124);
         assert!((v["aggregate_tps"].as_f64().unwrap() - 285.4).abs() < 1e-9);
         assert!((v["per_stream_tps"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        // CF-07: the JSON carries the token-count provenance.
+        assert_eq!(v["tokens_estimated"], false);
+        assert_eq!(v["counting_method"], "usage");
+    }
+
+    #[test]
+    fn cf07_usage_present_uses_real_tokens_unflagged() {
+        // CF-07 (a): when the server's `usage` frame is present, the
+        // headline uses the real `completion_tokens` and is NOT flagged as
+        // an estimate — in the terminal summary or the JSON.
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            let events = vec![
+                content_frame_text("abcd", t1, ts),
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Usage(Usage {
+                            prompt_tokens: 15,
+                            completion_tokens: 42,
+                        }),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t1,
+                    timestamps: ts,
+                },
+            ];
+            let r = FlatOutResult::from_events(&[events], 10.0, None, StreamCountSource::Default);
+            assert_eq!(
+                r.total_tokens, 42,
+                "usage.completion_tokens is the real count"
+            );
+            assert!(!r.tokens_estimated, "usage present → not an estimate");
+            assert_eq!(r.counting_method, "usage");
+            // Terminal: no estimate marker.
+            let line = r.summary_line();
+            assert!(!line.starts_with("≈"), "no ≈ when authoritative: {line}");
+            assert!(
+                !line.contains("(est.,"),
+                "no (est.) when authoritative: {line}"
+            );
+            // JSON: explicit that the count is real.
+            let v = r.to_dict();
+            assert_eq!(v["tokens_estimated"], false);
+            assert_eq!(v["counting_method"], "usage");
+        });
+    }
+
+    #[test]
+    fn cf07_no_usage_flags_the_estimate_terminal_and_json() {
+        // CF-07 (b): when no `usage` frame arrives (the default — the 60 s
+        // window aborts each stream first) and no tokenizer is supplied,
+        // the count is a `chars/4` estimate and MUST be flagged in both the
+        // terminal summary and the JSON — never presented as a precise
+        // measurement.
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            // No usage frame; 8 chars of content → chars/4 = 2 tokens.
+            let events = vec![content_frame_text("abcdefgh", t1, ts)];
+            let r = FlatOutResult::from_events(&[events], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.total_tokens, 2, "8 chars → chars/4 = 2 tokens");
+            assert!(r.tokens_estimated, "no usage + no tokenizer → estimate");
+            assert_eq!(r.counting_method, "chars/4");
+            // Terminal: the headline is prefixed ≈ and names the estimate.
+            let line = r.summary_line();
+            assert!(
+                line.starts_with("≈"),
+                "terminal headline must carry ≈: {line}"
+            );
+            assert!(
+                line.contains("(est., chars/4)"),
+                "terminal must name the estimate: {line}"
+            );
+            // JSON: explicit provenance marker.
+            let v = r.to_dict();
+            assert_eq!(v["tokens_estimated"], true);
+            assert_eq!(v["counting_method"], "chars/4");
+        });
+    }
+
+    #[test]
+    fn cf07_mixed_streams_report_mixed_and_flagged() {
+        // One stream with a real `usage` count, one without (chars/4): the
+        // aggregate is flagged and the method reads "mixed".
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            // Stream 0: usage present (real count 42).
+            let s0 = vec![
+                content_frame_text("abcd", t1, ts),
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Usage(Usage {
+                            prompt_tokens: 15,
+                            completion_tokens: 42,
+                        }),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t1,
+                    timestamps: ts,
+                },
+            ];
+            // Stream 1: no usage (chars/4 → 2 tokens from 8 chars).
+            let s1 = vec![content_frame_text("abcdefgh", t1, ts)];
+            let r = FlatOutResult::from_events(&[s0, s1], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.total_tokens, 44, "42 (usage) + 2 (chars/4)");
+            assert!(r.tokens_estimated, "one estimated stream taints the total");
+            assert_eq!(r.counting_method, "mixed");
+            assert!(
+                r.summary_line().starts_with("≈"),
+                "mixed is flagged in the terminal: {}",
+                r.summary_line()
+            );
+            let v = r.to_dict();
+            assert_eq!(v["tokens_estimated"], true);
+            assert_eq!(v["counting_method"], "mixed");
+        });
     }
 }
