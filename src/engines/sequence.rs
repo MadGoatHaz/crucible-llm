@@ -49,7 +49,7 @@ use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
 use crate::storage::db::Database;
 use crate::storage::models::{
-    BenchmarkSession, ConcurrencySummary, EngineResults, EnergySummary, FlatOutSummary,
+    BenchmarkSession, ConcurrencySummary, EnergySummary, EngineResults, FlatOutSummary,
     NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredSummary,
 };
 
@@ -865,8 +865,8 @@ impl BenchmarkSequence {
         // Engine D is continuous telemetry (no result slot), so its profile
         // is recomputed here from the poller's trace (the same N/A rule as
         // `run_hardware` / the headless path).
-        let d_energy: Option<EnergyResult> = self.hw.as_ref().and_then(|h| h.lock().ok())
-            .and_then(|g| {
+        let d_energy: Option<EnergyResult> =
+            self.hw.as_ref().and_then(|h| h.lock().ok()).and_then(|g| {
                 let trace = g.trace().to_vec();
                 if trace.is_empty() {
                     return None;
@@ -1229,7 +1229,10 @@ impl BenchmarkSequence {
         // Engine C3 (Structured) — estimate: chars/4 over free + constrained.
         if let Some(s) = (*self.slots.structured.load()).as_ref() {
             let chars: usize = s.free_body.chars().count()
-                + s.cases.iter().map(|c| c.output.chars().count()).sum::<usize>();
+                + s.cases
+                    .iter()
+                    .map(|c| c.output.chars().count())
+                    .sum::<usize>();
             total += (chars / 4) as u64;
         }
         // Engine F (Flat Out) — real total tokens.
@@ -1957,7 +1960,9 @@ mod tests {
         // Populate every result slot with a known token contribution:
         //   A: 256 (real)  B: 1000 (real)  C1: 1 run cell (est.)
         //   C2: 400 chars (est.)  C3: 800 chars (est.)  F: 5000 (real)
-        s.slots.speed.store(vec![speed_result(100.0, 0.2, 256, false)]);
+        s.slots
+            .speed
+            .store(vec![speed_result(100.0, 0.2, 256, false)]);
         s.slots.concurrency.store(sweep_with_total_tokens(1000));
         s.slots.niah.store(niah_with_run_cells(1));
         s.slots.reasoning.store(reasoning_with_response_chars(400));
