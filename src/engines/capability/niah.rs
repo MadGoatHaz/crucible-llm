@@ -402,6 +402,16 @@ pub fn classify(
     }
 }
 
+/// The JSON string form of a cell's prefill state (the `--json` NIAH section).
+#[must_use]
+fn state_name(state: NiahCellState) -> &'static str {
+    match state {
+        NiahCellState::Nominal => "nominal",
+        NiahCellState::Throttled => "throttled",
+        NiahCellState::Failed => "failed",
+    }
+}
+
 /// One size×depth cell of the matrix.
 #[derive(Debug, Clone)]
 pub struct NiahCell {
@@ -627,6 +637,63 @@ impl NiahResult {
                 latency_ms: Some(c.ttft_s * 1000.0),
             })
             .collect()
+    }
+
+    /// The `--json` document for this matrix (additive NIAH section, Issue #6).
+    ///
+    /// Carries the per-size recall, the `reliable_up_to` threshold, and the
+    /// full per-cell detail — each cell labeled via [`NiahCell::context_label`],
+    /// so the `(approx.)` qualifier is present when no tokenizer was supplied.
+    /// This makes a headless `--json` run self-contained: the NIAH recall no
+    /// longer lives only in the run log + DB. Pure and testable.
+    #[must_use]
+    pub fn to_dict(&self) -> serde_json::Value {
+        let (retrieved, total) = self.accuracy();
+        let sizes = self
+            .sizes
+            .iter()
+            .enumerate()
+            .map(|(si, s)| {
+                let start = si * self.depths.len();
+                let row = &self.cells[start..start + self.depths.len()];
+                let run = row.iter().filter(|c| c.target_tokens > 0).count();
+                let got = row.iter().filter(|c| c.retrieved).count();
+                let approx = row.iter().any(|c| c.approximate);
+                serde_json::json!({
+                    "size": s,
+                    "label": context_size_label(*s, approx),
+                    "pass_rate": self.size_pass_rate(*s),
+                    "retrieved": got,
+                    "run": run,
+                })
+            })
+            .collect::<Vec<_>>();
+        let cells = self
+            .cells
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "size": c.target_tokens,
+                    "label": c.context_label(),
+                    "depth": c.depth_percent,
+                    "retrieved": c.retrieved,
+                    "ttft_s": c.ttft_s,
+                    "prefill_tps": c.prefill_tps,
+                    "state": state_name(c.state),
+                    "no_baseline": c.no_baseline,
+                    "approximate": c.approximate,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "accuracy": self.accuracy_label(),
+            "retrieved": retrieved,
+            "total": total,
+            "reliable_up_to": self.reliable_up_to(80.0),
+            "sizes": sizes,
+            "depths": self.depths,
+            "cells": cells,
+        })
     }
 }
 
@@ -1337,6 +1404,48 @@ mod tests {
         assert_eq!(row.depth_percent, Some(50.0));
         assert_eq!(row.retrieved_successfully, Some(true));
         assert_eq!(row.latency_ms, Some(250.0));
+    }
+
+    #[test]
+    fn to_dict_includes_niah_results_for_json() {
+        // Issue #6: the `--json` NIAH section is self-contained — per-size
+        // recall, `reliable_up_to`, and the per-cell detail (each labeled via
+        // `context_label`, so the `(approx.)` qualifier is present when no
+        // tokenizer was supplied).
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 50, 100]);
+        // 2k: all 3 retrieved. 4k: 2 of 3 retrieved.
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        r.cells[1] = cell(2000, 50, true, 0.1);
+        r.cells[2] = cell(2000, 100, true, 0.1);
+        r.cells[3] = cell(4000, 0, true, 0.2);
+        r.cells[4] = cell(4000, 50, true, 0.2);
+        r.cells[5] = cell(4000, 100, false, 0.2);
+        // No tokenizer → the sizes are the `chars/4` estimate (approximate).
+        for c in r.cells.iter_mut() {
+            c.approximate = true;
+        }
+        let v = r.to_dict();
+        // Headline + raw counts.
+        assert!(v["accuracy"].is_string(), "accuracy label present");
+        assert_eq!(v["retrieved"], 5);
+        assert_eq!(v["total"], 6);
+        // Only 2k (100%) clears the 80% bar → reliable up to 2000.
+        assert_eq!(v["reliable_up_to"], 2000);
+        // Per-size recall, with the approx label.
+        let sizes = v["sizes"].as_array().expect("sizes array");
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes[0]["size"], 2000);
+        assert_eq!(sizes[0]["label"], "2k (approx.)");
+        assert_eq!(sizes[0]["pass_rate"], 100.0);
+        assert_eq!(sizes[1]["label"], "4k (approx.)");
+        assert_eq!(sizes[1]["retrieved"], 2);
+        assert_eq!(sizes[1]["run"], 3);
+        // Per-cell detail (the custom-size result lives here too).
+        let cells = v["cells"].as_array().expect("cells array");
+        assert_eq!(cells.len(), 6);
+        assert_eq!(cells[0]["label"], "2k (approx.)");
+        assert_eq!(cells[0]["retrieved"], true);
+        assert_eq!(cells[5]["retrieved"], false);
     }
 
     // ── Per-size pass rate / reliable threshold ───────────────────────────

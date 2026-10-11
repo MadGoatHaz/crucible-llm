@@ -436,6 +436,14 @@ pub fn run_headless(
                             term.dim(&niah_size_desc(cfg));
                         }
                         let r = engine.logger(logger.clone()).run().await;
+                        // Issue #6: the `--json` document carries the NIAH
+                        // result (per-size recall, `reliable_up_to`, per-cell
+                        // detail with the `context_label` qualifier) so a
+                        // headless `--json` run is self-contained. Additive —
+                        // the Engine-A JSON shape is untouched.
+                        if let Some(v) = &mut json_doc {
+                            v["niah"] = r.to_dict();
+                        }
                         term.info(&format!("  [C1] {}", r.accuracy_label()));
                         niah_result = Some(r);
                     }
