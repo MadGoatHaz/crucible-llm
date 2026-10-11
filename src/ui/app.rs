@@ -41,6 +41,7 @@ use ratatui::Frame;
 
 use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
+use crate::engines::hardware::profile;
 use crate::engines::{
     fragmentation_warning, queue_for, BenchmarkSequence, EngineProgress, NiahEngineConfig,
     NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState,
@@ -52,7 +53,10 @@ use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
-use crate::storage::models::{BenchmarkSession, StreamMetricRow};
+use crate::storage::models::{
+    BenchmarkSession, ConcurrencySummary, EngineResults, EnergySummary, FlatOutSummary,
+    NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredSummary,
+};
 use crate::ui::theme::{self, glyph, style, Theme};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
@@ -1430,83 +1434,142 @@ impl App {
         }
     }
 
-    /// The `e` key (blueprint §6 footer, Chunk 13): export the current
-    /// metrics snapshot to `data_dir()/exports/` in the configured format
-    /// and log the destination.
+    /// URC-5: build the [`ExportPayload`] from the **completed result
+    /// slots** (the final per-engine results), *not* the last live
+    /// [`MetricsSnapshot`] (a mid-run / last-frame sample that drifts once
+    /// the run ends). The session carries the run's `session_id` (so it
+    /// joins to the run-log), the target/model from the Config form, the
+    /// selected `engines`, and the B/C2/C3/D/F `engine_results`.
     ///
-    /// The TUI has no persisted session to re-read, so the payload is built
-    /// **live** from the lock-free [`MetricsSnapshot`] (the headless path
-    /// instead consumes the SQLite layer after persistence — same
-    /// [`ExportPayload`] shape). Per-packet CSV detail only exists on the
-    /// headless path, where the raw stream events are captured; a TUI CSV
-    /// export carries the metrics rows only.
-    pub fn export(&mut self) -> Result<std::path::PathBuf, String> {
-        let th = self.active_theme;
-        let snap = self.metrics.load();
-        // Chunk 17: with the hardware poller attached, the export rows
-        // carry the live silicon-efficiency reading (cumulative joules ÷
-        // tokens generated so far) and the session carries the GPU name.
-        // A poisoned/absent poller degrades to N/A (`None`) — never a
-        // failure of the export itself. The guard is scoped so it drops
-        // before the `push_log` below reborrows `self` mutably.
-        let (live_jpt, gpu_name) = {
+    /// Pure (no file I/O) so it is unit-testable; [`Self::export`] writes
+    /// the result. Per-packet CSV detail only exists on the headless path;
+    /// a TUI CSV export carries the metric rows only.
+    fn build_export_payload(&self) -> ExportPayload {
+        let cfg = self.config.to_config();
+
+        // Engine D energy + the GPU name: recomputed from the poller's
+        // trace (the same N/A rule as the headless / sequence paths). A
+        // poisoned/absent poller degrades to `None` — never an export
+        // failure.
+        let (energy, gpu_name) = {
             let poller = self.hw.as_ref().and_then(|h| h.lock().ok());
-            (
-                poller
-                    .as_ref()
-                    .and_then(|g| g.live_joules_per_token(snap.completion_tokens)),
-                poller
-                    .as_ref()
-                    .and_then(|g| g.gpu_name().map(str::to_string)),
-            )
+            match poller {
+                Some(g) => {
+                    let trace = g.trace().to_vec();
+                    let e = (!trace.is_empty()).then(|| {
+                        let total_tokens = (*self.speed_slot.load())
+                            .as_ref()
+                            .map(|rs| rs.iter().map(|r| r.completion_tokens).sum())
+                            .unwrap_or(0);
+                        let mut e = profile(&trace, None, total_tokens);
+                        if let Some(b) = g.backend() {
+                            e.vendor = Some(b.vendor().to_string());
+                            e.model = b.model().map(str::to_string);
+                        }
+                        e
+                    });
+                    (e, g.gpu_name().map(str::to_string))
+                }
+                None => (None, None),
+            }
         };
+        let energy_summary = energy.as_ref().map(EnergySummary::from_energy);
+
+        // R2: the `engine_results` object (B/C2/C3/D/F) from the slots.
+        let engine_results = EngineResults {
+            b_concurrency: (*self.sweep.load())
+                .clone()
+                .as_ref()
+                .map(ConcurrencySummary::from_sweep),
+            c2_reasoning: (*self.reasoning_slot.load())
+                .clone()
+                .as_ref()
+                .map(ReasoningSummary::from_reasoning),
+            c3_structured: (*self.structured_slot.load())
+                .clone()
+                .as_ref()
+                .map(StructuredSummary::from_structured),
+            d_energy: energy_summary.clone(),
+            f_flatout: (*self.flatout_slot.load())
+                .clone()
+                .as_ref()
+                .map(FlatOutSummary::from_flatout),
+        };
+        let engine_results_json = engine_results.to_json();
+        let has_engine_results = engine_results_json.is_some();
+
         let session = BenchmarkSession {
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: self.session_id.clone(),
             timestamp: None,
-            target_url: snap.endpoint.clone(),
-            model_name: snap.model.clone(),
-            backend_type: (!snap.backend.is_empty()).then(|| snap.backend.clone()),
+            target_url: cfg.url.clone(),
+            model_name: cfg.model.clone(),
+            backend_type: None,
             quantization: None,
             system_gpu: gpu_name,
             total_duration_sec: None,
-            // R2 (traceability): the engines selected in the Config form.
-            engines: Some(self.config.to_config().engines.selected_names_json()),
-            // R2: filled from the result slots in the URC-5 rework.
-            engine_results: None,
+            // R2 (traceability): the engines this run selected + the
+            // B/C2/C3/D/F headline results.
+            engines: Some(cfg.engines.selected_names_json()),
+            engine_results: engine_results_json,
         };
-        let metrics: Vec<StreamMetricRow> = snap
-            .streams
-            .iter()
-            .map(|s| StreamMetricRow {
-                metric_id: None,
-                session_id: session.session_id.clone(),
-                concurrency_level: Some(self.concurrency_target as i64),
-                prompt_tokens: s.pp_tokens.map(|v| v as i64),
-                completion_tokens: s.tg_tokens.map(|v| v as i64),
-                reasoning_tokens: None,
-                ttft_ms: s.ttft_s.map(|v| v * 1000.0),
-                tpot_ms: s.gen_tps.filter(|v| *v > 0.0).map(|v| 1000.0 / v),
-                mtp_efficiency: s.mtp,
-                joules_per_token: live_jpt,
-                cache_hit: None,
+
+        // Engine A: the speed slot's per-iteration results → metric rows
+        // (each carries the run's silicon-efficiency reading when a
+        // poller produced one).
+        let metrics: Vec<StreamMetricRow> = (*self.speed_slot.load())
+            .as_ref()
+            .map(|rs| {
+                rs.iter()
+                    .map(|r| {
+                        let mut row =
+                            StreamMetricRow::from_speed_result(r, &session.session_id, 1);
+                        row.joules_per_token = energy.as_ref().and_then(|e| e.joules_per_token);
+                        row
+                    })
+                    .collect()
             })
-            .collect();
-        let mut payload = ExportPayload::from_live(session, metrics, Vec::new(), Vec::new());
-        // v0.1.1: carry the decode-loop guard verdict and the 2D
-        // concurrency × context matrix (when Engine B ran one) into the
-        // JSON export's `loop_guard` / `matrix` blocks.
-        if snap.loop_excluded_streams > 0 || snap.loop_excluded_tokens > 0 {
-            payload = payload.with_loop_guard(crate::metrics::LoopGuardSummary {
-                detected_streams: snap.loop_excluded_streams,
-                excluded_tokens: snap.loop_excluded_tokens,
-            });
-        }
+            .unwrap_or_default();
+
+        // Engine C1: the NIAH slot's cells → needle rows.
+        let needles: Vec<NeedleEvaluation> = (*self.niah.load())
+            .as_ref()
+            .map(|n| {
+                n.cells
+                    .iter()
+                    .map(|cell| NeedleEvaluation {
+                        eval_id: None,
+                        session_id: session.session_id.clone(),
+                        context_length: Some(cell.target_tokens as i64),
+                        depth_percent: Some(cell.depth_percent as f64),
+                        retrieved_successfully: Some(cell.retrieved),
+                        latency_ms: Some(cell.ttft_s * 1000.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut payload = ExportPayload::from_live(session, metrics, Vec::new(), needles);
+        // R2: attach the B/C2/C3/D/F results + the energy object.
+        payload.engine_results = has_engine_results.then_some(engine_results);
+        payload.energy = energy_summary;
+        // v0.1.1: carry the 2D concurrency × context matrix (when Engine B
+        // ran one) into the JSON export's `matrix` block.
         if let Some(matrix) = (*self.sweep.load())
             .as_ref()
             .and_then(|r| r.matrix.as_ref())
         {
             payload = payload.with_matrix(matrix.clone());
         }
+        payload
+    }
+
+    /// The `e` key (blueprint §6 footer, Chunk 13): export the run's
+    /// results (built from the result slots, URC-5) to
+    /// `data_dir()/exports/` in the configured format and log the
+    /// destination.
+    pub fn export(&mut self) -> Result<std::path::PathBuf, String> {
+        let th = self.active_theme;
+        let payload = self.build_export_payload();
         let dest = export::default_path_live(self.export_format);
         let path = export::write(&dest, self.export_format, &payload).map_err(|e| e.to_string())?;
         self.push_log(
@@ -2068,6 +2131,80 @@ mod tests {
 
     fn char_key(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    // ── URC-5: the TUI export builds from the result slots, not the
+    //     last live snapshot ─────────────────────────────────────────────
+
+    #[test]
+    fn tui_export_builds_from_result_slots_not_live_snapshot() {
+        let mut app = App::new();
+        // The live [`MetricsSnapshot`] is left at its default (no streams),
+        // so an export that (wrongly) read the snapshot would be empty.
+        // The result slots carry the real, distinct data.
+        app.config.url = "http://slot-target:9999/v1".to_string();
+        app.config.model = "slot-model".to_string();
+        app.config.engine_speed = true;
+        app.speed_slot.store(vec![SpeedResult {
+            ttft: 0.25,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            pp_speed: 400.0,
+            tg_speed: 20.0,
+            mtp_efficiency: 1.0,
+            stream_time: 2.5,
+            total_chunks: 50,
+            content_chunks: 50,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "slot-model".into(),
+            mode: "short".into(),
+            error: None,
+            looping: false,
+        }]);
+        // A C2 reasoning result in its slot (no dedicated table → it lives
+        // in `engine_results`).
+        app.reasoning_slot.store(ReasoningResult {
+            responses: vec!["42".into()],
+            ttfts: vec![0.1],
+            tg_speeds: vec![10.0],
+            score: crate::engines::ReasoningScore {
+                total: 13,
+                solved: 9,
+                by_category: [(4, 5), (3, 5), (2, 3)],
+            },
+        });
+
+        let payload = app.build_export_payload();
+
+        // The session carries the Config form's target/model + the run's
+        // session id (not the live snapshot's identity).
+        assert_eq!(payload.session.target_url, "http://slot-target:9999/v1");
+        assert_eq!(payload.session.model_name, "slot-model");
+        assert_eq!(payload.session.session_id, app.session_id);
+        // R2: the selected engines are recorded on the session.
+        assert!(
+            payload
+                .session
+                .engines
+                .as_deref()
+                .unwrap()
+                .contains("speed"),
+            "engines recorded"
+        );
+
+        // URC-5: the metric rows come from the speed SLOT (one row) — the
+        // (empty) live snapshot would yield zero rows.
+        assert_eq!(payload.metrics.len(), 1, "metrics from the speed slot");
+        assert_eq!(payload.metrics[0].completion_tokens, Some(50));
+
+        // URC-5: the C2 result is captured in `engine_results`.
+        let er = payload
+            .engine_results
+            .as_ref()
+            .expect("engine_results present");
+        assert_eq!(er.c2_reasoning.as_ref().unwrap().solved, 9);
     }
 
     // ── status-bar server address (never a backend name) ────────────────

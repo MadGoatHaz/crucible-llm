@@ -72,6 +72,15 @@ pub struct ExportPayload {
     /// the JSON export) when Engine B ran with a multi-context axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<crate::engines::ConcurrencyMatrix>,
+    /// R2 (traceability): the B/C2/C3/D/F headline results (parsed from
+    /// the session's `engine_results` column on the stored path, or built
+    /// from the result slots on the live/TUI path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_results: Option<super::models::EngineResults>,
+    /// R2: the Engine D energy object (a convenience copy of
+    /// `engine_results.d_energy`, so consumers don't have to nest-dig).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy: Option<super::models::EnergySummary>,
     /// The measured timestamp overhead (ns) captured when this payload
     /// was built — kept out of the serialized shape (`skip`) so that
     /// `to_json()` is deterministic: the `timing.overhead_ns` it publishes
@@ -104,6 +113,16 @@ impl ExportPayload {
             .ok_or_else(|| ExportError::MissingSession(session_id.to_string()))?;
         let metrics = db.get_stream_metrics(session_id)?;
         let needles = db.get_needle_evaluations(session_id)?;
+        // R2: the B/C2/C3/D/F headline results are parsed back from the
+        // session's `engine_results` column (the energy object is a
+        // convenience copy of its `d_energy` member).
+        let engine_results = session
+            .engine_results
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok());
+        let energy = engine_results
+            .as_ref()
+            .and_then(|er: &super::models::EngineResults| er.d_energy.clone());
         Ok(Self {
             session,
             metrics,
@@ -111,6 +130,8 @@ impl ExportPayload {
             needles,
             loop_guard: None,
             matrix: None,
+            engine_results,
+            energy,
             timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
         })
     }
@@ -130,6 +151,10 @@ impl ExportPayload {
             needles,
             loop_guard: None,
             matrix: None,
+            // R2: the live path sets these from the result slots after
+            // construction (URC-5); they start empty.
+            engine_results: None,
+            energy: None,
             timing_overhead_ns: crate::timing::measure_timestamp_overhead(),
         }
     }
@@ -277,6 +302,8 @@ impl ExportPayload {
             md_cell(or_dash(&s.quantization))
         ));
         out.push_str(&format!("- **GPU:** {}\n", md_cell(or_dash(&s.system_gpu))));
+        // R2 (traceability): which engines this run selected.
+        out.push_str(&format!("- **Engines:** {}\n", md_cell(or_dash(&s.engines))));
         out.push_str(&format!(
             "- **Duration:** {}\n\n",
             md_cell(&match s.total_duration_sec {
