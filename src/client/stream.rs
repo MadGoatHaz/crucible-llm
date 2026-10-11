@@ -228,6 +228,40 @@ impl StreamOutcome {
         self.error.is_none()
     }
 
+    /// **Hybrid-reasoning detection (R1) — `truncated_by_reasoning`.**
+    ///
+    /// `true` when the stream **completed OK** ([`is_ok`](Self::is_ok) — not a
+    /// transport / HTTP / read / parse failure) but the model spent its entire
+    /// generation budget on chain-of-thought: it emitted at least one
+    /// [`Chunk::Reasoning`] frame and **zero** [`Chunk::Content`] frames.
+    ///
+    /// This is the "budget exhausted in CoT, no answer produced" condition.
+    /// The frame split is read from the stream's `events` — the wire truth the
+    /// SSE parser already classifies into [`Chunk::Reasoning`] /
+    /// [`Chunk::Content`] — via [`count_reasoning_content_frames`]. It works on
+    /// **every** server with no `usage` dependency, unlike
+    /// `UsageDetails::is_reasoning_dominated` (which needs the server to report
+    /// `reasoning_tokens`; config-only servers may omit it).
+    ///
+    /// The [`is_ok`](Self::is_ok) gate is essential: a genuine transport
+    /// failure is a *fail*, not a `truncated_by_reasoning`. Only a *completed*
+    /// stream that produced all-CoT / zero-content is the distinct, non-fail
+    /// outcome the C1/C3 capability engines report (Option C,
+    /// `work/plans/REASONING_DESIGN.md`) — an honest "inconclusive (budget)"
+    /// instead of a false capability failure.
+    ///
+    /// `events` is the run's drained `Vec<StreamEvent>` (the same collection
+    /// the engines already keep alongside this outcome — see
+    /// `speed.rs::aggregate`, which takes both).
+    #[must_use]
+    pub fn is_truncated_by_reasoning(&self, events: &[StreamEvent]) -> bool {
+        if !self.is_ok() {
+            return false;
+        }
+        let (reasoning, content) = count_reasoning_content_frames(events);
+        reasoning > 0 && content == 0
+    }
+
     /// **CF-10 — usage-vs-frames plausibility guard.**
     ///
     /// `true` when the server's self-reported `usage.completion_tokens`
@@ -1601,6 +1635,46 @@ pub fn authoritative_tokens(
     }
     let c = count_tokens(&stream_text(events), tokenizer);
     (c.tokens as u64, c.estimated)
+}
+
+/// Count the [`Chunk::Reasoning`] and [`Chunk::Content`] frames in a
+/// stream's events — the **wire-truth** frame split.
+///
+/// This is the primary signal for hybrid-reasoning
+/// [`truncated_by_reasoning`](StreamOutcome::is_truncated_by_reasoning)
+/// detection (Option C, `work/plans/REASONING_DESIGN.md`). The C1/C3
+/// capability engines drain a run's events into a `Vec<StreamEvent>` and call
+/// this to apply the rule
+///
+/// ```text
+/// truncated_by_reasoning =
+///     outcome.is_ok()          // a completed stream, not a transport fault
+///     && reasoning_frames > 0   // the model was thinking
+///     && content_frames == 0     // …and committed nothing visible
+/// ```
+///
+/// It counts frames by the SSE classifier's [`Chunk`] kind, matching the
+/// [`Chunk::is_token`] convention: a `Control` / `Usage` frame is neither a
+/// reasoning nor a content token, so it is counted in neither. It works on
+/// **every** server with no `usage` dependency — unlike
+/// `UsageDetails::is_reasoning_dominated`, which needs the server to report
+/// `reasoning_tokens` (config-only servers may omit it).
+///
+/// Returns `(reasoning_frames, content_frames)`.
+#[must_use]
+pub fn count_reasoning_content_frames(events: &[StreamEvent]) -> (u64, u64) {
+    let mut reasoning = 0u64;
+    let mut content = 0u64;
+    for e in events {
+        if let StreamEvent::Frame { frame, .. } = e {
+            match &frame.chunk {
+                Chunk::Reasoning(_) => reasoning += 1,
+                Chunk::Content(_) => content += 1,
+                _ => {}
+            }
+        }
+    }
+    (reasoning, content)
 }
 
 #[cfg(test)]
