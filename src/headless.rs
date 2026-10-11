@@ -480,6 +480,18 @@ pub fn run_headless(
                             term.dim("  [C3] structured output (free-form vs constrained)…");
                         }
                         let r = engine.logger(logger.clone()).run().await;
+                        // R2: the `--json` document carries the C3
+                        // structured result (the score split incl. the
+                        // distinct `truncated_by_reasoning` count, the
+                        // per-case `truncated_by_reasoning` flags, the
+                        // CF-17 compliance label, the CF-36-gated penalty,
+                        // the constraint mode) so a headless `--json` run
+                        // is self-contained. Additive — the Engine-A JSON
+                        // shape is untouched (same pattern as the `niah` /
+                        // `flat_out` sections).
+                        if let Some(v) = &mut json_doc {
+                            v["structured"] = r.to_dict();
+                        }
                         term.info(&format!("  [C3] {}", r.summary_line()));
                         structured_result = Some(r);
                     }

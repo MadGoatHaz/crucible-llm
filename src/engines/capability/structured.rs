@@ -11,7 +11,11 @@
 //!    classified [`CaseVerdict`]:
 //!    * **Compliant** — every check passes;
 //!    * **Partial** — valid JSON, but one or more checks fail;
-//!    * **Failed** — the output is not valid JSON (cannot be evaluated).
+//!    * **Failed** — the output is not valid JSON (cannot be evaluated);
+//!    * **Truncated** (R2, `truncated_by_reasoning`) — the stream completed
+//!      OK but the budget was exhausted in chain-of-thought: all-CoT, zero
+//!      content. A distinct "inconclusive (budget)" outcome, reported
+//!      separately from the compliance score (never a capability failure).
 //!
 //!    **What the directive actually is (CF-08).** Each constrained run
 //!    sends a real `response_format: { "type": "json_schema",
@@ -36,16 +40,22 @@
 //!    measures the cost of a prompt hint (≈0 where the backend drops the
 //!    field).
 //!
-//! **Reasoning-model suppression (CF-18).** Every run sets
+//! **Reasoning-model handling (hybrid, R2 — Option C).** Every run sets
 //! `disable_thinking` on the shared worker (per-backend and graceful —
-//! `StreamWorker::disable_thinking`, CF-01). Without it, a reasoning model
-//! spends the 256-token budget on chain-of-thought, which the content-only
-//! accumulation deliberately excludes, and emits *empty* content — a false
-//! "not valid JSON" failure of a structured capability the model has.
-//! Once the CoT no longer competes for the budget, the existing 256-token
-//! budget is ample for the JSON answers: the largest case (Complex) needs
-//! well under half of it, and in `json_schema` mode the decoder is
-//! constrained to the case's exact shape (no rambling).
+//! `StreamWorker::disable_thinking`, CF-01/CF-18) as a **best-effort speed
+//! optimization, not a correctness dependency**: on servers that honor it
+//! (vLLM/SGLang/LM Studio/Ollama) the model answers without CoT and the
+//! budget is a rarely-hit ceiling. A *config-only* server silently drops the
+//! per-request fields (OpenAI-spec graceful degradation) and the model
+//! thinks by default — which is why **the 2048-token budget is the
+//! correctness guarantee** (`max_tokens` is honored by every server). It
+//! leaves headroom for chain-of-thought *before* the JSON, so a
+//! suppression-ignoring model can finish its CoT and still commit the
+//! answer, while the content-only accumulation keeps judging the visible
+//! span. A stream that exhausts the budget in CoT with zero content is the
+//! distinct [`CaseVerdict::Truncated`] (`truncated_by_reasoning`) outcome —
+//! an honest "inconclusive (budget)", never a false capability failure
+//! (`work/plans/REASONING_DESIGN.md` §5).
 //!
 //! **Checker hardening (Phase 3, CF-17/36/50/51).** With a real
 //! `json_schema` in place (CF-08), the scoring was hardened to report what it
@@ -69,11 +79,14 @@
 //!   planned McNemar/Wilson A/B comparator.
 //!
 //! The [`StructuredResult`] carries the per-case checks, the overall score
-//! (N/3 compliant / partial / failed), the split compliance rates, the speed
-//! penalty (gated on the constraint being effective), the stability rate, the
-//! constraint mode, and an auto-generated practical **verdict** — the TUI
-//! renders the full compliance detail in the Live capability panel and a
-//! summary line in the sequence header / headless output.
+//! (N/3 compliant / partial / failed, plus the distinct R2
+//! `truncated_by_reasoning` bucket via [`StructuredResult::truncated_count`]),
+//! the split compliance rates, the speed penalty (gated on the constraint
+//! being effective — a truncated case is never penalized as a compliance
+//! failure), the stability rate, the constraint mode, and an
+//! auto-generated practical **verdict** — the TUI renders the full
+//! compliance detail in the Live capability panel and a summary line in the
+//! sequence header / headless output.
 //!
 //! Measurement-isolation note: every run reuses the Chunk 5 `StreamWorker`
 //! (quanta `T0..Tn` live in the worker); this module only takes deltas of
@@ -96,8 +109,19 @@ use crate::timing::StreamTimestamps;
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Max generation tokens per structured run (a small JSON value).
-pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 256;
+/// Max generation tokens per structured run.
+///
+/// **Hybrid reasoning (R2, Option C):** 2048 is the *correctness
+/// guarantee*. The JSON answer itself is small (the largest case, Complex,
+/// needs well under 200 tokens) and is further constrained by the case's
+/// strict `json_schema`; 2048 is headroom for a reasoning model's
+/// chain-of-thought *before* the JSON on a server that ignores our
+/// best-effort `disable_thinking` suppression (R1: the budget carries
+/// correctness, suppression is only a speed optimization). A stream that
+/// exhausts the budget in CoT with zero content is the distinct
+/// `truncated_by_reasoning` outcome ([`CaseVerdict::Truncated`]), not a
+/// capability failure.
+pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 2048;
 
 /// CF-51: how many times each constrained case is repeated. The stability
 /// rate (the fraction of repeats that are fully compliant) turns C3's old
@@ -307,14 +331,25 @@ fn case_schema(i: usize) -> serde_json::Value {
 }
 
 /// The per-case compliance verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CaseVerdict {
     /// Every check passed.
     Compliant,
     /// Valid JSON, but one or more checks failed.
     Partial,
-    /// Not valid JSON — cannot be evaluated.
+    /// Not valid JSON — cannot be evaluated. The conservative `Default`
+    /// (a missing/unknown verdict in a persisted summary must never read
+    /// as compliant).
+    #[default]
     Failed,
+    /// **R2 hybrid reasoning (`truncated_by_reasoning`).** The stream
+    /// completed OK but the model spent the entire generation budget on
+    /// chain-of-thought — all-CoT, zero content committed. A distinct
+    /// "inconclusive (budget)" outcome: *not* a schema/compliance failure
+    /// (there is no content to fail a check against) and *not* a pass (we
+    /// cannot verify a capability we never saw committed).
+    Truncated,
 }
 
 /// One compliance check within a case (the `✓`/`✗` items in the UI).
@@ -342,6 +377,14 @@ pub struct StructuredCaseResult {
     pub repeats: usize,
     /// CF-51: how many of those repeats were fully compliant.
     pub compliant_repeats: usize,
+    /// **R2 hybrid reasoning:** `true` when a repeat's stream completed OK
+    /// but committed no content — the budget was exhausted in
+    /// chain-of-thought (`truncated_by_reasoning`, the distinct non-fail
+    /// outcome). For a single-shot case this equals
+    /// [`verdict`](Self::verdict) == [`CaseVerdict::Truncated`]; for a
+    /// repeated case it marks that *any* repeat was truncated (the folded
+    /// verdict is `Truncated` only when *all* repeats were).
+    pub truncated_by_reasoning: bool,
 }
 
 impl StructuredCaseResult {
@@ -404,6 +447,12 @@ impl StructuredResult {
     }
 
     /// `(compliant, partial, failed)` counts over the cases.
+    ///
+    /// **R2:** the distinct [`CaseVerdict::Truncated`] bucket
+    /// (`truncated_by_reasoning`) is *not* counted in any of these three —
+    /// a case whose budget was exhausted in CoT is neither compliant,
+    /// partially compliant, nor a compliance failure. It is reported
+    /// separately via [`truncated_count`](Self::truncated_count).
     pub fn score(&self) -> (usize, usize, usize) {
         let (mut c, mut p, mut f) = (0, 0, 0);
         for case in &self.cases {
@@ -411,9 +460,23 @@ impl StructuredResult {
                 CaseVerdict::Compliant => c += 1,
                 CaseVerdict::Partial => p += 1,
                 CaseVerdict::Failed => f += 1,
+                CaseVerdict::Truncated => {}
             }
         }
         (c, p, f)
+    }
+
+    /// **R2 hybrid reasoning:** the number of cases whose folded verdict is
+    /// [`CaseVerdict::Truncated`] — the stream completed OK but the budget
+    /// was exhausted in chain-of-thought (all-CoT, zero content). The
+    /// distinct "inconclusive (budget)" bucket, kept out of
+    /// [`score`](Self::score) and out of every compliance penalty.
+    #[must_use]
+    pub fn truncated_count(&self) -> usize {
+        self.cases
+            .iter()
+            .filter(|c| c.verdict == CaseVerdict::Truncated)
+            .count()
     }
 
     /// `true` when *every* case is fully compliant (the old boolean flag).
@@ -423,30 +486,55 @@ impl StructuredResult {
             .all(|c| c.verdict == CaseVerdict::Compliant)
     }
 
-    /// A compact score label (`2/3 compliant, 1 partial, 0 failed`).
+    /// A compact score label (`2/3 compliant, 1 partial, 0 failed`, with
+    /// the distinct R2 truncated bucket appended when present:
+    /// `2/3 compliant, 0 partial, 0 failed, 1 truncated`).
     pub fn score_label(&self) -> String {
         let (c, p, f) = self.score();
+        let t = self.truncated_count();
         let total = self.cases.len();
-        if p == 0 && f == 0 {
+        if p == 0 && f == 0 && t == 0 {
             format!("{c}/{total} compliant")
-        } else if f == 0 {
+        } else if f == 0 && t == 0 {
             format!("{c}/{total} compliant, {p} partial")
         } else {
-            format!("{c}/{total} compliant, {p} partial, {f} failed")
+            format!("{c}/{total} compliant, {p} partial, {f} failed, {t} truncated")
         }
     }
 
     /// The auto-generated practical verdict (based on the compliant count):
     /// 3/3 → API/agent-ready; 2/3 → simple-only; 1/3 → trivial only;
     /// 0/3 → not suitable.
+    ///
+    /// **R2:** a case that was [`CaseVerdict::Truncated`] (budget exhausted
+    /// in CoT, no content committed) is *inconclusive*, not a failure — so
+    /// when every case is truncated the verdict says "inconclusive (budget)"
+    /// instead of "not suitable", and a zero-compliant result whose
+    /// non-compliant cases are all truncated (no real schema failures) reads
+    /// as inconclusive too.
     pub fn verdict_line(&self) -> String {
-        let (c, _, _) = self.score();
+        let (c, _p, f) = self.score();
+        let t = self.truncated_count();
+        let total = self.cases.len();
+        if t == total {
+            return format!(
+                "⚠ Inconclusive — all {total} cases truncated by reasoning (budget exhausted in CoT; no content committed to score)"
+            );
+        }
         match c {
             3 => "✓ Fully suitable for API/agent use".to_string(),
             2 => "⚠ Suitable for simple structures, unreliable for complex schemas".to_string(),
             1 => "⚠ Limited use — only trivial key-value extraction".to_string(),
-            _ => "✗ Not suitable for structured output. Requires output parsing/fallback."
-                .to_string(),
+            _ => {
+                if f == 0 && t > 0 {
+                    format!(
+                        "⚠ Inconclusive — {c} compliant, {t} case(s) truncated by reasoning (no content committed to score)"
+                    )
+                } else {
+                    "✗ Not suitable for structured output. Requires output parsing/fallback."
+                        .to_string()
+                }
+            }
         }
     }
 
@@ -543,18 +631,38 @@ impl StructuredResult {
     /// correct …` label (a response can parse as JSON yet violate the
     /// schema). CF-36: the penalty is reported only when the constraint was
     /// *effective* (the constrained run produced valid JSON); otherwise it is
-    /// flagged "constraint not effective". CF-51: a `stability …` figure is
-    /// added when the cases were repeated. CF-08: the constraint mode is
-    /// flagged inline so a ~0% penalty on a backend that drops
-    /// `response_format` is never misread as "constrained decoding is free".
+    /// flagged "constraint not effective" — and, **R2**, when the
+    /// case-0 run was `truncated_by_reasoning` (no content to measure) it is
+    /// flagged as such: a truncated case is never penalized as a compliance
+    /// failure. CF-51: a `stability …` figure is added when the cases were
+    /// repeated. CF-08: the constraint mode is flagged inline so a ~0%
+    /// penalty on a backend that drops `response_format` is never misread as
+    /// "constrained decoding is free". **R2:** the schema score and the
+    /// distinct truncated bucket are broken out (`2/3 schema, 1
+    /// truncated_by_reasoning`).
     #[must_use]
     pub fn summary_line(&self) -> String {
+        let (c, _p, _f) = self.score();
+        let t = self.truncated_count();
+        let total = self.cases.len();
         let penalty = if self.constraint_effective() {
             format!("{:+.1}% penalty", self.penalty_pct)
+        } else if self
+            .cases
+            .first()
+            .is_some_and(|first| first.truncated_by_reasoning)
+        {
+            // CF-36 (R2): the speed pair has no content to measure because
+            // the constrained case-0 run exhausted its budget in CoT.
+            "penalty N/A (case-0 truncated by reasoning)".to_string()
         } else {
             "penalty N/A (constraint not effective)".to_string()
         };
-        let mut parts = vec![penalty, self.compliance_label()];
+        let mut parts = vec![
+            penalty,
+            self.compliance_label(),
+            format!("{c}/{total} schema, {t} truncated_by_reasoning"),
+        ];
         let stability = self.stability_label();
         if !stability.is_empty() {
             parts.push(stability);
@@ -562,6 +670,72 @@ impl StructuredResult {
         parts.push(format!("[{}]", self.constraint_mode().label()));
         parts.join(" · ")
     }
+
+    /// The `--json` `structured` section (R2; the C3 face of the
+    /// traceability pattern the `niah` / `flat_out` sections use): the
+    /// score split — compliant / partial / failed plus the distinct
+    /// `truncated_by_reasoning` count — the CF-17 compliance label, the
+    /// CF-36-gated penalty, the constraint mode, the stability rate, and
+    /// the **per-case** detail with each case's `truncated_by_reasoning`
+    /// flag. Additive — the Engine-A `--json` shape is untouched.
+    #[must_use]
+    pub fn to_dict(&self) -> serde_json::Value {
+        let (c, p, f) = self.score();
+        let t = self.truncated_count();
+        let cases: Vec<serde_json::Value> = self
+            .cases
+            .iter()
+            .map(|case| {
+                serde_json::json!({
+                    "name": case.name,
+                    "verdict": case.verdict,
+                    "truncated_by_reasoning": case.truncated_by_reasoning,
+                    "valid_json": case.is_valid_json(),
+                    "compliant": case.is_compliant(),
+                    "repeats": case.repeats,
+                    "compliant_repeats": case.compliant_repeats,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "score": {
+                "compliant": c,
+                "partial": p,
+                "failed": f,
+                "truncated_by_reasoning": t,
+                "total": self.cases.len(),
+            },
+            "compliance_label": self.compliance_label(),
+            "score_label": self.score_label(),
+            "penalty_pct": self.penalty_pct,
+            "constraint_effective": self.constraint_effective(),
+            "constraint_mode": self.constraint_mode().label(),
+            "stability_rate": self.stability_rate(),
+            "free_tps": self.free_tps,
+            "constrained_tps": self.constrained_tps,
+            "cases": cases,
+            "summary": self.summary_line(),
+            "verdict": self.verdict_line(),
+        })
+    }
+}
+
+/// One `run_once` result: the judged body, the §7 timing metrics, and the
+/// hybrid `truncated_by_reasoning` flag (R2).
+struct RunOutput {
+    /// The content-only accumulated body (the judged span — `Chunk::Content`
+    /// deltas only; empty when nothing was committed).
+    body: String,
+    /// Time to first token, seconds.
+    ttft: f64,
+    /// Decode speed, tokens/s (the authoritative count over the decode
+    /// window).
+    tps: f64,
+    /// `true` when the stream completed OK but the model spent the entire
+    /// budget on chain-of-thought (all-CoT, zero content) — the distinct
+    /// `truncated_by_reasoning` outcome (R1 seam:
+    /// `StreamOutcome::is_truncated_by_reasoning`).
+    truncated_by_reasoning: bool,
 }
 
 /// The live runner: a free-form baseline plus the three constrained cases.
@@ -665,10 +839,12 @@ impl StructuredEngine {
 
     /// One run: spawn a worker (optionally with the case's `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
-    /// Thinking is suppressed on every run (CF-18) so the 256-token budget
-    /// goes to the JSON answer, and only `Chunk::Content` deltas are
-    /// accumulated into the judged body.
-    async fn run_once(&self, case_idx: usize, constrained: bool) -> (String, f64, f64) {
+    /// Thinking is suppressed on every run (CF-18, best-effort speed) so the
+    /// 2048-token budget mostly goes to the JSON answer, and only
+    /// `Chunk::Content` deltas are accumulated into the judged body. The
+    /// run also reports the hybrid `truncated_by_reasoning` flag (R2) via
+    /// [`RunOutput`].
+    async fn run_once(&self, case_idx: usize, constrained: bool) -> RunOutput {
         let case = &STRUCTURED_CASES[case_idx];
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
@@ -690,13 +866,16 @@ impl StructuredEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
-        // CF-18: suppress the model's chain-of-thought so the 256-token
-        // budget goes to the JSON answer. Without this, a reasoning model
-        // spends the *entire* budget on CoT (which the content-only
-        // accumulation below deliberately excludes) and emits *empty*
-        // content → "not valid JSON" → a false failure of a structured
-        // capability the model has (the C3 face of the C1 root cause,
-        // CF-01). The suppression is per-backend and graceful (see
+        // CF-18 (hybrid, R2): suppress the model's chain-of-thought so the
+        // 2048-token budget goes to the JSON answer. This is a **best-effort
+        // speed optimization, not a correctness dependency** (R1): a
+        // config-only server silently drops the per-request fields and the
+        // model thinks by default — the *raised budget* is what then lets it
+        // finish its CoT and still commit content, and a stream that
+        // exhausts the budget in CoT with zero content is reported as the
+        // distinct `truncated_by_reasoning` outcome (not a false "not valid
+        // JSON" failure of a structured capability the model has). The
+        // suppression is per-backend and graceful (see
         // `StreamWorker::disable_thinking`), so non-reasoning models and
         // backends without a switch are unaffected. Set on the free-form
         // baseline too, so both legs of the penalty measurement judge
@@ -781,6 +960,14 @@ impl StructuredEngine {
         // Channel closed: collect the outcome.
         let outcome = join_worker(handle).await;
 
+        // R2 hybrid reasoning: a *completed* (OK) stream that spent the
+        // whole budget on chain-of-thought — all-CoT, zero content — is the
+        // distinct `truncated_by_reasoning` outcome (R1 seam:
+        // `StreamOutcome::is_truncated_by_reasoning`, the frame-based wire
+        // truth). A transport failure is NOT truncated (the seam's
+        // `is_ok()` gate) — it stays a plain run failure.
+        let truncated_by_reasoning = outcome.is_truncated_by_reasoning(&events);
+
         // §7 timing deltas (the worker owns the quanta stamps).
         let ts: StreamTimestamps = outcome.timestamps;
         let stream_time = ts.total_nanos().unwrap_or(0) as f64 / 1e9;
@@ -816,7 +1003,12 @@ impl StructuredEngine {
             _ => (stream_time - ttft).max(0.001),
         };
         let tps = completion as f64 / generation_time;
-        (body, ttft, tps)
+        RunOutput {
+            body,
+            ttft,
+            tps,
+            truncated_by_reasoning,
+        }
     }
 
     /// The full evaluation: a free-form baseline (case 0), then the three
@@ -855,7 +1047,8 @@ impl StructuredEngine {
                 total: total_runs,
             });
         }
-        let (free_body, free_ttft, free_tps) = self.run_once(0, false).await;
+        let free = self.run_once(0, false).await;
+        let (free_body, free_ttft, free_tps) = (free.body, free.ttft, free.tps);
 
         // Constrained cases, each repeated N× (CF-51). Case 0's *first* repeat
         // carries the speed-pair numbers; every repeat is evaluated for the
@@ -879,13 +1072,20 @@ impl StructuredEngine {
                         total: total_runs,
                     });
                 }
-                let (body, ttft, tps) = self.run_once(case_idx, true).await;
+                let out = self.run_once(case_idx, true).await;
                 if case_idx == 0 && rep == 0 {
-                    constrained_tps = tps;
-                    constrained_ttft = ttft;
-                    constrained_body = body.clone();
+                    constrained_tps = out.tps;
+                    constrained_ttft = out.ttft;
+                    constrained_body = out.body.clone();
                 }
-                evals.push(evaluate_case(case.name, &body));
+                // R2: the distinct `truncated_by_reasoning` outcome (all-CoT,
+                // zero content on a completed stream) is marked on the case
+                // — not folded into the compliance failure buckets.
+                evals.push(evaluate_case_with(
+                    case.name,
+                    &out.body,
+                    out.truncated_by_reasoning,
+                ));
             }
             case_evals.push(evals);
         }
@@ -945,6 +1145,37 @@ fn is_int(v: &serde_json::Value) -> bool {
 /// (a ` ```json ` fence is stripped first), and each case checks its own
 /// schema shape, fields, and types.
 pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
+    evaluate_case_with(name, body, false)
+}
+
+/// `evaluate_case` with the hybrid-reasoning flag (R2).
+///
+/// `truncated` is `true` when the run's stream **completed OK** but the
+/// model spent the entire budget on chain-of-thought — all-CoT, zero
+/// content (the R1 seam `StreamOutcome::is_truncated_by_reasoning`). Such a
+/// case has no committed span to judge, so it is the distinct
+/// [`CaseVerdict::Truncated`] (`truncated_by_reasoning`) outcome: *not* a
+/// schema/compliance failure (there is nothing to fail a check against) and
+/// *not* a pass (the capability was never demonstrated). A stream that
+/// *failed* (transport / HTTP / read) with an empty body is **not**
+/// truncated — the seam's `is_ok()` gate keeps it a plain [`Failed`]
+/// verdict, and `truncated` must only ever be `true` for a completed
+/// all-CoT stream.
+fn evaluate_case_with(name: &str, body: &str, truncated: bool) -> StructuredCaseResult {
+    if truncated {
+        return StructuredCaseResult {
+            name: name.to_string(),
+            checks: vec![CaseCheck {
+                label: "Valid JSON".to_string(),
+                passed: false,
+            }],
+            verdict: CaseVerdict::Truncated,
+            output: String::new(),
+            repeats: 1,
+            compliant_repeats: 0,
+            truncated_by_reasoning: true,
+        };
+    }
     let normalized = strip_json_fence(body);
     let value = serde_json::from_str::<serde_json::Value>(normalized).ok();
     let valid = value.is_some();
@@ -1108,6 +1339,7 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
         } else {
             0
         },
+        truncated_by_reasoning: false,
     }
 }
 
@@ -1119,8 +1351,13 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
 /// its `verdict` is derived from the stability across all repeats so the
 /// headline reflects reliability, not a single flake:
 /// * all N repeats compliant → `Compliant`;
-/// * no repeat compliant → the first repeat's verdict (`Failed` / `Partial`);
-/// * a mixed result → `Partial` (unstable).
+/// * no repeat compliant, **all** repeats truncated (R2) → `Truncated`
+///   (the distinct `truncated_by_reasoning` outcome — a budget
+///   exhaustion, not a compliance failure);
+/// * no repeat compliant (and not all truncated) → the first repeat's
+///   verdict (`Failed` / `Partial`);
+/// * a mixed result → `Partial` (unstable — a truncated repeat among
+///   compliant ones marks the case, but never reads as a pass).
 ///
 /// A dedicated `Stability (x/N)` check is appended (never inserted first, so
 /// [`StructuredCaseResult::is_valid_json`] keeps reading the `Valid JSON`
@@ -1128,12 +1365,17 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
 fn fold_case_repeats(name: &str, evals: Vec<StructuredCaseResult>) -> StructuredCaseResult {
     let repeats = evals.len();
     let compliant_repeats = evals.iter().filter(|e| e.is_compliant()).count();
+    let truncated_repeats = evals.iter().filter(|e| e.truncated_by_reasoning).count();
     let mut rep = match evals.into_iter().next() {
         Some(r) => r,
         None => return evaluate_case(name, ""),
     };
     rep.verdict = if repeats > 0 && compliant_repeats == repeats {
         CaseVerdict::Compliant
+    } else if compliant_repeats == 0 && truncated_repeats == repeats {
+        // R2: every repeat exhausted the budget in CoT (no content
+        // committed) — the distinct `truncated_by_reasoning` outcome.
+        CaseVerdict::Truncated
     } else if compliant_repeats == 0 {
         rep.verdict
     } else {
@@ -1147,6 +1389,9 @@ fn fold_case_repeats(name: &str, evals: Vec<StructuredCaseResult>) -> Structured
     }
     rep.repeats = repeats;
     rep.compliant_repeats = compliant_repeats;
+    // R2: mark the case when *any* repeat was truncated (the folded verdict
+    // above is `Truncated` only when *all* repeats were).
+    rep.truncated_by_reasoning = truncated_repeats > 0;
     rep
 }
 
@@ -1189,6 +1434,19 @@ fn strip_json_fence(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── hybrid reasoning (R2): the budget is the correctness guarantee ──
+
+    #[test]
+    fn budget_is_raised_to_2048_for_reasoning_headroom() {
+        // R2 (Option C, `work/plans/REASONING_DESIGN.md` §5.1): the 2048
+        // generation budget is the *correctness guarantee* — headroom for a
+        // reasoning model's chain-of-thought before the JSON on a server
+        // that ignores our best-effort `disable_thinking` suppression. The
+        // JSON body itself is still constrained by the case's strict schema
+        // (the largest case needs well under 200 tokens).
+        assert_eq!(STRUCTURED_MAX_GEN_TOKENS, 2048);
+    }
 
     // ── is_json_compliant (general helper) ───────────────────────────────
 
@@ -1662,5 +1920,294 @@ mod tests {
             ConstraintMode::JsonSchema.label()
         );
         assert_eq!(ConstraintMode::FreeForm.label(), "free-form");
+    }
+
+    // ── R2 hybrid reasoning: `truncated_by_reasoning` ───────────────────
+
+    /// One `StreamEvent::Frame` carrying a single `chunk` — the wire-truth
+    /// fixture for the frame-based `truncated_by_reasoning` detection
+    /// (mirrors the R1 seam tests in `client/stream.rs`).
+    fn frame_event(chunk: Chunk) -> StreamEvent {
+        StreamEvent::Frame {
+            frame: crate::sse::ParsedFrame {
+                chunk,
+                t_nanos: 0,
+                done: false,
+            },
+            at: crate::timing::MonotonicInstant::now(),
+            timestamps: StreamTimestamps::default(),
+        }
+    }
+
+    /// The `StreamOutcome` shape `run_once` hands to
+    /// `is_truncated_by_reasoning` after the drain loop.
+    fn outcome_with(
+        frames: u64,
+        error: Option<crate::client::StreamError>,
+    ) -> crate::client::StreamOutcome {
+        crate::client::StreamOutcome {
+            timestamps: StreamTimestamps::default(),
+            usage: None,
+            usage_details: None,
+            premature: false,
+            malformed_frames: 0,
+            error,
+            looping: false,
+            loop_excluded_tokens: 0,
+            frames,
+        }
+    }
+
+    #[test]
+    fn all_cot_zero_content_ok_stream_is_truncated_not_failed() {
+        // (a) A *completed* stream (OK) that spent the whole budget on
+        // chain-of-thought — all-CoT, zero content — marks the case
+        // `Truncated`: not non-compliant (no content to fail a schema
+        // check against) and not penalized as a compliance failure.
+        let events = vec![
+            frame_event(Chunk::Reasoning("let me think…".into())),
+            frame_event(Chunk::Reasoning("…".into())),
+        ];
+        let outcome = outcome_with(2, None);
+        assert!(outcome.is_ok());
+        assert!(
+            outcome.is_truncated_by_reasoning(&events),
+            "reasoning>0 && content==0 && is_ok ⇒ truncated (R1 seam)"
+        );
+        let r = evaluate_case_with("Simple", "", true);
+        assert_eq!(
+            r.verdict,
+            CaseVerdict::Truncated,
+            "the distinct outcome — not Failed, not Partial"
+        );
+        assert!(r.truncated_by_reasoning);
+        assert!(!r.is_compliant());
+        assert!(!r.is_valid_json());
+    }
+
+    #[test]
+    fn content_present_bad_schema_is_non_compliant_not_truncated() {
+        // (b) The other half of the three-way split: content was committed
+        // but violates the schema → non-compliant (Partial). A content
+        // frame on the wire means the R1 seam reports *not* truncated.
+        let events = vec![
+            frame_event(Chunk::Reasoning("thinking…".into())),
+            frame_event(Chunk::Content(
+                r#"{"name": "Ada", "age": "thirty-six"}"#.into(),
+            )),
+        ];
+        let outcome = outcome_with(2, None);
+        assert!(
+            !outcome.is_truncated_by_reasoning(&events),
+            "content>0 ⇒ not truncated"
+        );
+        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": "thirty-six"}"#, false);
+        assert_eq!(
+            r.verdict,
+            CaseVerdict::Partial,
+            "content present but schema-wrong ⇒ non-compliant"
+        );
+        assert!(!r.truncated_by_reasoning);
+    }
+
+    #[test]
+    fn compliant_case_passes_and_is_not_truncated() {
+        // (c) A case with committed, schema-correct content → Compliant,
+        // never marked truncated.
+        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false);
+        assert_eq!(r.verdict, CaseVerdict::Compliant);
+        assert!(!r.truncated_by_reasoning);
+        assert!(r.is_compliant());
+    }
+
+    #[test]
+    fn transport_failure_with_empty_body_is_failed_not_truncated() {
+        // The `is_ok()` gate: a stream that *failed* (connection refused)
+        // after emitting only CoT is a genuine failure — the R1 seam
+        // reports it as NOT truncated, and the case scores the plain
+        // `Failed` verdict (empty body), never `Truncated`.
+        let events = vec![frame_event(Chunk::Reasoning("thinking…".into()))];
+        let outcome = outcome_with(
+            1,
+            Some(crate::client::StreamError::Connection("refused".into())),
+        );
+        assert!(!outcome.is_ok());
+        assert!(
+            !outcome.is_truncated_by_reasoning(&events),
+            "an error is a fail, not a truncation"
+        );
+        let r = evaluate_case_with("Simple", "", false);
+        assert_eq!(r.verdict, CaseVerdict::Failed);
+        assert!(!r.truncated_by_reasoning);
+    }
+
+    #[test]
+    fn score_counts_truncated_as_its_own_bucket() {
+        // R2: a truncated case sits in its own bucket — out of
+        // compliant/partial/failed (the `score()` three-tuple) and out of
+        // every compliance penalty.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            "nope",
+        );
+        r.cases[2] = evaluate_case_with("Complex", "", true);
+        assert_eq!(
+            r.score(),
+            (2, 0, 0),
+            "truncated is not in the three compliance buckets"
+        );
+        assert_eq!(r.truncated_count(), 1);
+        assert!(!r.fully_compliant());
+    }
+
+    #[test]
+    fn summary_line_breaks_out_truncated_cases() {
+        // R2 terminal surfacing: the C3 summary breaks the truncated cases
+        // out of the schema score (`2/3 schema, 1 truncated_by_reasoning`),
+        // alongside the intact CF-17 split.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            "nope",
+        );
+        r.cases[2] = evaluate_case_with("Complex", "", true);
+        let s = r.summary_line();
+        assert!(
+            s.contains("2/3 schema, 1 truncated_by_reasoning"),
+            "the summary breaks out the truncated case: {s}"
+        );
+        assert!(s.contains("valid JSON 2/3"), "CF-17 split intact: {s}");
+        assert!(s.contains("schema-correct 2/3"), "CF-17 split intact: {s}");
+    }
+
+    #[test]
+    fn verdict_line_all_truncated_is_inconclusive_not_a_failure() {
+        // R2: every case exhausted the budget in CoT (no content
+        // committed) → the practical verdict is *inconclusive (budget)*,
+        // not "not suitable" — and the penalty is N/A: a truncated case is
+        // never penalized as a compliance failure (CF-36, R2 face).
+        let r = StructuredResult {
+            free_tps: 65.2,
+            constrained_tps: 61.8,
+            penalty_pct: 5.2,
+            free_ttft: 0.2,
+            constrained_ttft: 0.21,
+            cases: vec![
+                evaluate_case_with("Simple", "", true),
+                evaluate_case_with("Medium", "", true),
+                evaluate_case_with("Complex", "", true),
+            ],
+            constrained_body: String::new(),
+            free_body: String::new(),
+        };
+        let v = r.verdict_line();
+        assert!(
+            v.starts_with("⚠"),
+            "inconclusive (⚠), not a failure (✗): {v}"
+        );
+        assert!(v.contains("truncated by reasoning"), "{v}");
+        assert!(!v.starts_with('✗'));
+        let s = r.summary_line();
+        assert!(
+            !s.contains("% penalty"),
+            "no numeric penalty for an all-truncated run: {s}"
+        );
+        assert!(
+            s.contains("penalty N/A (case-0 truncated by reasoning)"),
+            "{s}"
+        );
+        assert!(s.contains("0/3 schema, 3 truncated_by_reasoning"), "{s}");
+    }
+
+    #[test]
+    fn penalty_label_names_truncation_when_case_zero_truncated() {
+        // CF-36 (R2 face): a truncated case-0 has no content to measure —
+        // the penalty is N/A for a *distinct* reason (budget exhaustion in
+        // CoT), not "constraint not effective".
+        let mut r = result_with(
+            "this is not json at all",
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+        );
+        r.cases[0] = evaluate_case_with("Simple", "", true);
+        assert!(!r.constraint_effective(), "no content ⇒ not effective");
+        let s = r.summary_line();
+        assert!(
+            s.contains("penalty N/A (case-0 truncated by reasoning)"),
+            "the distinct truncation reason is named: {s}"
+        );
+        assert!(!s.contains("constraint not effective"), "{s}");
+    }
+
+    #[test]
+    fn fold_case_repeats_all_truncated_is_truncated_verdict() {
+        // R2: every repeat all-CoT / zero content → the folded case keeps
+        // the distinct `Truncated` verdict (not `Failed`), flagged
+        // `truncated_by_reasoning`, and never reads as a pass.
+        let evals = vec![
+            evaluate_case_with("Simple", "", true),
+            evaluate_case_with("Simple", "", true),
+            evaluate_case_with("Simple", "", true),
+        ];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(
+            folded.verdict,
+            CaseVerdict::Truncated,
+            "all repeats truncated ⇒ the distinct outcome"
+        );
+        assert!(folded.truncated_by_reasoning);
+        assert!(!folded.is_compliant());
+        assert_eq!(folded.compliant_repeats, 0);
+    }
+
+    #[test]
+    fn fold_case_repeats_mixed_truncated_is_partial_and_flagged() {
+        // R2: a truncated repeat among compliant ones is *unstable*
+        // (Partial) and the case carries the truncation flag — but it never
+        // reads as a compliance failure.
+        let evals = vec![
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false),
+            evaluate_case_with("Simple", "", true),
+        ];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(
+            folded.verdict,
+            CaseVerdict::Partial,
+            "a mixed result is unstable (Partial) — not a pass, not a fail"
+        );
+        assert!(
+            folded.truncated_by_reasoning,
+            "the flag marks that a repeat was truncated"
+        );
+        assert_eq!(folded.compliant_repeats, 1);
+    }
+
+    #[test]
+    fn to_dict_carries_the_truncated_flag_for_json() {
+        // R2 `--json` surfacing: the `structured` section carries the score
+        // split (with the distinct `truncated_by_reasoning` count) and the
+        // per-case `truncated_by_reasoning` flag.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            "nope",
+        );
+        r.cases[2] = evaluate_case_with("Complex", "", true);
+        let d = r.to_dict();
+        assert_eq!(d["score"]["compliant"], 2);
+        assert_eq!(d["score"]["failed"], 0);
+        assert_eq!(d["score"]["truncated_by_reasoning"], 1);
+        assert_eq!(d["score"]["total"], 3);
+        // Per-case flags: the truncated case carries it, the others don't.
+        assert_eq!(d["cases"][2]["truncated_by_reasoning"], true);
+        assert_eq!(d["cases"][2]["verdict"], "truncated");
+        assert_eq!(d["cases"][2]["valid_json"], false);
+        assert_eq!(d["cases"][0]["truncated_by_reasoning"], false);
+        assert_eq!(d["cases"][0]["verdict"], "compliant");
+        assert!(d["summary"]
+            .as_str()
+            .unwrap()
+            .contains("truncated_by_reasoning"));
     }
 }
