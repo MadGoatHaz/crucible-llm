@@ -246,6 +246,24 @@ pub struct StreamWorker {
     /// not know the field (vLLM, LM Studio, …) ignore it per the OpenAI
     /// spec, so the request degrades to the model's natural behavior.
     ignore_eos: bool,
+    /// When `true`, the request asks a reasoning model to answer without a
+    /// chain-of-thought monologue (CF-01 — the reasoning-model blind spot).
+    /// The mechanism is **per-backend and graceful** (each backend honors the
+    /// one it knows and ignores the rest per the OpenAI spec, so a backend
+    /// with no switch degrades to the model's natural behavior):
+    ///
+    /// * `chat_template_kwargs: {"enable_thinking": false}` — vLLM / SGLang /
+    ///   LM Studio (the Jinja chat template turns off CoT);
+    /// * `think: false` — Ollama's extension field;
+    /// * a trailing `/no_think` in the user message — llama.cpp (Qwen3's
+    ///   native template checks for it).
+    ///
+    /// Engine C1 sets this on its 64-token NIAH probe: without it, a
+    /// reasoning model spends the *entire* budget on CoT (`content = 0`,
+    /// `finish_reason = length`) and never emits the needle value — a false
+    /// failure of a retrieval capability the model actually has
+    /// (Strawberry Issue 1).
+    disable_thinking: bool,
     /// Optional run-log writer: when present, the worker logs its HTTP /
     /// SSE lifecycle (request, TTFB, first token, every 50th token,
     /// completion / failure) to the file-based [`RunLogger`].
@@ -277,6 +295,7 @@ impl StreamWorker {
             retries: 0,
             response_format: None,
             ignore_eos: false,
+            disable_thinking: false,
             logger: None,
             tag: "stream".to_string(),
         }
@@ -316,6 +335,22 @@ impl StreamWorker {
     /// 60-second window, not the model, is the only stop.
     pub fn ignore_eos(mut self, v: bool) -> Self {
         self.ignore_eos = v;
+        self
+    }
+
+    /// Ask a reasoning model to suppress its chain-of-thought so the
+    /// generation budget goes to the visible answer (CF-01).
+    ///
+    /// Injects the per-backend switches (see the `disable_thinking` field
+    /// doc): `chat_template_kwargs.enable_thinking=false` (vLLM / SGLang /
+    /// LM Studio), `think=false` (Ollama), and a trailing `/no_think` in the
+    /// user message (llama.cpp). Backends without a switch ignore the unknown
+    /// fields per the OpenAI spec, so non-reasoning models and unsupported
+    /// backends are unaffected (the same graceful-degradation pattern as
+    /// [`ignore_eos`](Self::ignore_eos)). Engine C1 sets this on its NIAH
+    /// probe.
+    pub fn disable_thinking(mut self, v: bool) -> Self {
+        self.disable_thinking = v;
         self
     }
 
@@ -881,6 +916,30 @@ impl StreamWorker {
         if self.ignore_eos {
             body["ignore_eos"] = serde_json::json!(true);
         }
+        if self.disable_thinking {
+            // CF-01 — per-backend thinking suppression. Each backend honors
+            // the mechanism it knows and ignores the rest (unknown top-level
+            // fields are dropped per the OpenAI spec), so the request degrades
+            // gracefully to the model's natural behavior where no switch
+            // exists:
+            //   * `chat_template_kwargs.enable_thinking=false` → vLLM / SGLang /
+            //     LM Studio (the Jinja chat template turns off CoT);
+            //   * `think=false` → Ollama's extension field;
+            //   * a trailing `/no_think` in the user message → llama.cpp
+            //     (Qwen3's native template checks for it).
+            // Together they stop a reasoning model from spending the whole
+            // generation budget on chain-of-thought (Strawberry Issue 1).
+            body["chat_template_kwargs"] =
+                serde_json::json!({ "enable_thinking": false });
+            body["think"] = serde_json::json!(false);
+            let base = self.prompt.trim_end_matches(['\n', '\r']);
+            let prompt = if base.is_empty() {
+                "/no_think".to_string()
+            } else {
+                format!("{base}\n/no_think")
+            };
+            body["messages"] = serde_json::json!([{ "role": "user", "content": prompt }]);
+        }
         body
     }
 
@@ -1409,6 +1468,45 @@ mod tests {
         assert_eq!(body["ignore_eos"], true);
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn request_body_disable_thinking_is_opt_in_and_per_backend() {
+        // Default: no suppression fields (Engine A / B / C2 / C3 bodies are
+        // byte-identical to before) — a no-op for every backend.
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "Answer with the value only.",
+            64,
+        );
+        let body = w.request_body();
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body.get("think").is_none());
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Answer with the value only."
+        );
+
+        // Opt-in (Engine C1): all three per-backend mechanisms are present,
+        // and the `/no_think` prompt suffix is appended (llama.cpp).
+        let w = w.disable_thinking(true);
+        let body = w.request_body();
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"], false,
+            "vLLM / SGLang / LM Studio"
+        );
+        assert_eq!(body["think"], false, "Ollama");
+        assert_eq!(
+            body["messages"][0]["content"],
+            "Answer with the value only.\n/no_think",
+            "llama.cpp /no_think suffix"
+        );
+        // The rest of the body is untouched.
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(body["model"], "m");
     }
 
     #[test]

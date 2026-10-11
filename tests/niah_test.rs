@@ -43,6 +43,17 @@ enum Mock {
     /// small contexts, super-linearly longer for large ones (simulates
     /// prefill degradation → the throttled classification).
     SlowPrefill,
+    /// A reasoning model: a chain-of-thought monologue (no needle) followed
+    /// by the visible answer (the needle). Content-only matching (CF-01)
+    /// must retrieve it — a model that thinks *then* answers is judged on
+    /// its answer (closes CF-23: the suite never exercised a reasoning
+    /// delta before).
+    Reasons,
+    /// A reasoning model that mentions the needle value *only* in its
+    /// chain-of-thought and emits no visible answer. Content-only matching
+    /// (CF-01 / CF-15) must NOT pass this cell — the old combined
+    /// reasoning+content match would have false-passed it.
+    ReasonsOnly,
 }
 
 async fn start_mock(mock: Mock) -> (String, tokio::task::JoinHandle<()>) {
@@ -89,22 +100,54 @@ async fn respond(sock: &mut TcpStream, mock: Mock, prompt: String) {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
 
-    let answer = match mock {
-        Mock::Retrieves | Mock::SlowPrefill => {
-            // A well-behaved model answers with the value it found.
-            extract_needle_value(&prompt).unwrap_or_else(|| "I don't know.".to_string())
-        }
-        Mock::Hallucinates => "I don't know.".to_string(),
-    };
-
     let role = "data: {\"id\":\"cmpl-n\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n".to_string();
-    let content = format!(
-        "data: {{\"id\":\"cmpl-n\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
-        serde_json::to_string(&answer).unwrap()
-    );
     let usage = "data: {\"id\":\"cmpl-n\",\"choices\":[],\"usage\":{\"prompt_tokens\":4096,\"completion_tokens\":8}}\n\n".to_string();
     let done = "data: [DONE]\n\n".to_string();
-    for frame in [role, content, usage, done] {
+    let content_frame = |text: &str| {
+        format!(
+            "data: {{\"id\":\"cmpl-n\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    };
+    let reasoning_frame = |text: &str| {
+        format!(
+            "data: {{\"id\":\"cmpl-n\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{}}}}}]}}\n\n",
+            serde_json::to_string(text).unwrap()
+        )
+    };
+
+    let mut frames: Vec<String> = vec![role.clone()];
+    match mock {
+        Mock::Retrieves | Mock::SlowPrefill => {
+            // A well-behaved model answers with the value it found.
+            let answer =
+                extract_needle_value(&prompt).unwrap_or_else(|| "I don't know.".to_string());
+            frames.push(content_frame(&answer));
+        }
+        Mock::Hallucinates => {
+            frames.push(content_frame("I don't know."));
+        }
+        // CF-23: think (CoT, no needle) → then answer (content, the needle).
+        Mock::Reasons => {
+            let answer =
+                extract_needle_value(&prompt).unwrap_or_else(|| "I don't know.".to_string());
+            frames.push(reasoning_frame("Let me think about where the secret code is…"));
+            frames.push(reasoning_frame("Scanning the document… I believe I found it."));
+            frames.push(content_frame(&answer));
+        }
+        // CF-15: the needle appears ONLY in the CoT; no visible answer.
+        Mock::ReasonsOnly => {
+            if let Some(value) = extract_needle_value(&prompt) {
+                frames.push(reasoning_frame(&format!("The secret code is {value}.")));
+                frames.push(reasoning_frame("…but I'm not sure, let me stop."));
+            } else {
+                frames.push(reasoning_frame("I don't know."));
+            }
+        }
+    }
+    frames.push(usage);
+    frames.push(done);
+    for frame in &frames {
         write_chunk(sock, frame.as_bytes()).await;
     }
     write_chunk(sock, b"").await; // terminating chunk
@@ -209,6 +252,54 @@ async fn superlinear_prefill_is_classified_throttled() {
             "super-linear prefill must throttle"
         );
     }
+}
+
+// ── CF-01 / CF-15 / CF-23: reasoning-model matching ──────────────────────
+
+#[tokio::test]
+async fn reasoning_then_content_is_retrieved_content_only() {
+    // CF-23 (closes the suite gap): the mock emits `reasoning` deltas (no
+    // needle) THEN a `content` delta (the needle). A reasoning model that
+    // thinks and then answers must be judged on its *answer* — content-only
+    // matching (CF-01) retrieves the needle. Before CF-01 the suite never
+    // exercised a reasoning delta at all.
+    let (url, _server) = start_mock(Mock::Reasons).await;
+    let engine = crucible_llm::engines::NiahEngine::new(&test_config(&url))
+        .unwrap()
+        .sizes(vec![2000])
+        .depths(vec![0, 100]);
+    let result = engine.run().await;
+    assert_eq!(
+        result.accuracy(),
+        (2, 2),
+        "reasoning-then-content must retrieve (content-only verdict)"
+    );
+}
+
+#[tokio::test]
+async fn needle_only_in_cot_does_not_false_pass() {
+    // CF-15 (the latent false-positive): the mock mentions the needle value
+    // *only* in its chain-of-thought and emits no visible answer. Content-only
+    // matching must NOT pass the cell — the old combined reasoning+content
+    // substring match would have false-passed a model that never answered.
+    let (url, _server) = start_mock(Mock::ReasonsOnly).await;
+    let engine = crucible_llm::engines::NiahEngine::new(&test_config(&url))
+        .unwrap()
+        .sizes(vec![2000])
+        .depths(vec![0, 100]);
+    let result = engine.run().await;
+    assert_eq!(
+        result.accuracy(),
+        (0, 2),
+        "a needle mentioned only in the CoT is not a retrieval"
+    );
+    assert!(
+        result
+            .cells
+            .iter()
+            .all(|c| c.state == NiahCellState::Failed),
+        "CoT-only needle cells must be failed (red)"
+    );
 }
 
 // ── View 3 (blueprint §6) ────────────────────────────────────────────────

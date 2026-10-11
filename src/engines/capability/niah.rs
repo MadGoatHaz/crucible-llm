@@ -672,18 +672,36 @@ impl NiahEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
+        // CF-01: suppress the model's chain-of-thought so the 64-token budget
+        // goes to the visible answer. Without this, a reasoning model spends
+        // the *entire* budget on CoT (`content = 0`, `finish_reason = length`)
+        // and never emits the needle value — a false failure of a retrieval
+        // capability it actually has (Strawberry Issue 1). The suppression is
+        // per-backend and graceful (see `StreamWorker::disable_thinking`), so
+        // non-reasoning models and backends without a switch are unaffected.
+        worker = worker.disable_thinking(true);
 
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
         let handle = spawn_worker(worker, tx);
-        let mut response = String::new();
+        // CF-01: the visible answer only. Reasoning deltas are deliberately
+        // NOT accumulated into the retrieval check (see the loop below).
+        let mut content_text = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
             if let StreamEvent::Frame { frame, .. } = &event {
                 if !frame.done {
-                    if let Chunk::Content(text) | Chunk::Reasoning(text) = &frame.chunk {
-                        response.push_str(text);
+                    // Content-only matching (CF-01 / CF-15): the retrieval
+                    // verdict is the model's *visible answer*, not its
+                    // chain-of-thought. Judging on the content span means a
+                    // model that thinks then answers is graded on its answer,
+                    // and a model that merely *mentions* the needle value in
+                    // its CoT cannot false-pass a cell it never answered.
+                    // (Reasoning deltas are still forwarded for the live
+                    // snapshot / metrics, just not accumulated here.)
+                    if let Chunk::Content(text) = &frame.chunk {
+                        content_text.push_str(text);
                     }
                 }
             }
@@ -726,7 +744,9 @@ impl NiahEngine {
         // Channel closed: collect the outcome.
         let outcome = join_worker(handle).await;
 
-        let retrieved = needle.is_retrieved(&response);
+        // Content-only verdict (CF-01): the needle is retrieved iff it appears
+        // in the model's visible answer, not in its chain-of-thought.
+        let retrieved = needle.is_retrieved(&content_text);
         // §7 timing deltas (the worker owns the quanta stamps).
         let ts: StreamTimestamps = outcome.timestamps;
         let ttft = ts.ttft_nanos().map(|n| n as f64 / 1e9).unwrap_or(0.0);
