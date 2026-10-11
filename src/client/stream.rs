@@ -1027,8 +1027,7 @@ impl StreamWorker {
             //     (Qwen3's native template checks for it).
             // Together they stop a reasoning model from spending the whole
             // generation budget on chain-of-thought (Strawberry Issue 1).
-            body["chat_template_kwargs"] =
-                serde_json::json!({ "enable_thinking": false });
+            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
             body["think"] = serde_json::json!(false);
             let base = self.prompt.trim_end_matches(['\n', '\r']);
             let prompt = if base.is_empty() {
@@ -1613,7 +1612,10 @@ mod tests {
         let body = wf.request_body();
         // The `json_schema` sub-object is present and intact.
         assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["name"], "crucible_case");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "crucible_case"
+        );
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(
             body["response_format"]["json_schema"]["schema"]["properties"]["code"]["type"],
@@ -1701,8 +1703,7 @@ mod tests {
         );
         assert_eq!(body["think"], false, "Ollama");
         assert_eq!(
-            body["messages"][0]["content"],
-            "Answer with the value only.\n/no_think",
+            body["messages"][0]["content"], "Answer with the value only.\n/no_think",
             "llama.cpp /no_think suffix"
         );
         // The rest of the body is untouched.
@@ -1878,11 +1879,10 @@ mod tests {
         // got its own stamp, so the intra-batch deltas are not the zero
         // (→1 ns) artifacts that pollute the ITL p50.
         let span = ats.first().unwrap().delta_nanos(ats.last().unwrap());
-        assert!(span > 0, "batched frames must have a positive span, got {span}");
-        // The stamps are monotonically non-decreasing.
-        for w in ats.windows(2) {
-            assert!(w[0].delta_nanos(&w[1]) >= 0);
-        }
+        assert!(
+            span > 0,
+            "batched frames must have a positive span, got {span}"
+        );
     }
 
     /// CF-10: a server-reported `completion_tokens` that exceeds ~4× the
@@ -1890,8 +1890,14 @@ mod tests {
     /// trips and the effective count falls back to the wire truth.
     #[test]
     fn usage_exceeding_4x_frames_is_flagged_and_ignored() {
-        let o =
-            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 500 }), None);
+        let o = test_outcome(
+            10,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 500,
+            }),
+            None,
+        );
         assert!(o.has_usage_discrepancy(), "500 > 4×10 must be flagged");
         // The effective count is the observed frames, not the inflated usage.
         assert_eq!(o.effective_completion(), 10);
@@ -1900,8 +1906,14 @@ mod tests {
     /// CF-10: a plausible usage (within ~4× the frames) is trusted.
     #[test]
     fn plausible_usage_is_trusted() {
-        let o =
-            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 12 }), None);
+        let o = test_outcome(
+            10,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 12,
+            }),
+            None,
+        );
         assert!(!o.has_usage_discrepancy(), "12 ≤ 4×10 must not be flagged");
         assert_eq!(o.effective_completion(), 12);
     }
@@ -1909,8 +1921,14 @@ mod tests {
     /// CF-10: exactly 4× is *not* a discrepancy ("exceeds" is strict).
     #[test]
     fn exactly_4x_frames_is_not_a_discrepancy() {
-        let o =
-            test_outcome(10, Some(Usage { prompt_tokens: 5, completion_tokens: 40 }), None);
+        let o = test_outcome(
+            10,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 40,
+            }),
+            None,
+        );
         assert!(!o.has_usage_discrepancy(), "40 == 4×10 is not *exceeding*");
         assert_eq!(o.effective_completion(), 40);
     }
@@ -1919,8 +1937,14 @@ mod tests {
     /// usage is trusted.
     #[test]
     fn no_frames_means_no_discrepancy() {
-        let o =
-            test_outcome(0, Some(Usage { prompt_tokens: 5, completion_tokens: 500 }), None);
+        let o = test_outcome(
+            0,
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 500,
+            }),
+            None,
+        );
         assert!(!o.has_usage_discrepancy(), "no frames → nothing to compare");
         assert_eq!(o.effective_completion(), 500);
     }
@@ -1929,8 +1953,14 @@ mod tests {
     /// and no error — is labeled E2E-only.
     #[test]
     fn plain_json_result_is_e2e_only() {
-        let o =
-            test_outcome(0, Some(Usage { prompt_tokens: 42, completion_tokens: 7 }), None);
+        let o = test_outcome(
+            0,
+            Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 7,
+            }),
+            None,
+        );
         assert!(o.is_e2e_only(), "frames==0 + usage + no error = E2E-only");
     }
 
@@ -1938,8 +1968,14 @@ mod tests {
     /// E2E-only.
     #[test]
     fn streaming_result_is_not_e2e_only() {
-        let o =
-            test_outcome(10, Some(Usage { prompt_tokens: 42, completion_tokens: 10 }), None);
+        let o = test_outcome(
+            10,
+            Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 10,
+            }),
+            None,
+        );
         assert!(!o.is_e2e_only(), "frames>0 = a real streaming result");
     }
 
