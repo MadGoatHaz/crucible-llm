@@ -539,12 +539,45 @@ impl NiahResult {
         (retrieved, total)
     }
 
+    /// The number of *run* cells that were `truncated_by_reasoning` (Option C):
+    /// the stream completed OK but the model spent its whole generation budget
+    /// on chain-of-thought (all-CoT / zero-content). These are **not**
+    /// capability failures (the model was generating) and **not** verified
+    /// passes (no answer was committed to grade) — an honest *inconclusive
+    /// (budget)*. They are reported separately from the pass/total figure.
+    #[must_use]
+    pub fn truncated_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| c.target_tokens > 0 && c.truncated_by_reasoning)
+            .count()
+    }
+
+    /// The number of *run* cells that are genuine retrieval **failures**: the
+    /// stream completed, produced visible content, and the needle is absent —
+    /// the model got it wrong (or hallucinated). Distinct from
+    /// [`truncated_count`] (no content at all) and from a transport failure.
+    #[must_use]
+    pub fn failed_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|c| c.target_tokens > 0 && !c.retrieved && !c.truncated_by_reasoning)
+            .count()
+    }
+
     /// The headline accuracy figure, e.g. `71/77 retrieved (92.2%)`.
     ///
     /// Over a *partial* matrix (some cells never ran) the denominator is the
     /// run cells only, and the label makes that explicit — `30/42 of 77 run
     /// (71.4%)` — so an interrupted run is never read as a fleet of failures
     /// (CF-31, consistent with [`size_pass_rate`]).
+    ///
+    /// **Hybrid reasoning (Option C):** the headline is `pass/total` with the
+    /// `truncated_by_reasoning` count **broken out** (and genuine fails, when
+    /// any), e.g. `74/77 retrieved, 3 truncated-by-reasoning (96.1%)`. A
+    /// truncated cell is *not* a capability failure, so it is reported
+    /// separately rather than folded silently into the fail count; when there
+    /// are none, the label reads exactly as before.
     pub fn accuracy_label(&self) -> String {
         let (r, t) = self.accuracy();
         let grid = self.cells.len();
@@ -553,18 +586,44 @@ impl NiahResult {
         } else {
             0.0
         };
+        // The Option C breakdown, each clause omitted when its count is zero
+        // so a clean run reads exactly as today.
+        let truncated = self.truncated_count();
+        let trunc_note = if truncated > 0 {
+            format!(", {truncated} truncated-by-reasoning")
+        } else {
+            String::new()
+        };
+        let failed = self.failed_count();
+        let fail_note = if failed > 0 {
+            format!(", {failed} failed")
+        } else {
+            String::new()
+        };
         if t == 0 {
             "No cells run yet".to_string()
         } else if t == grid {
-            format!("{r}/{t} retrieved ({pct:.1}%)")
+            format!("{r}/{t} retrieved{trunc_note}{fail_note} ({pct:.1}%)")
         } else {
-            format!("{r}/{t} of {grid} run ({pct:.1}%)")
+            format!("{r}/{t} of {grid} run{trunc_note}{fail_note} ({pct:.1}%)")
         }
     }
 
     /// The pass rate (0..=100) for one context size across all its depths —
     /// the per-row percentage View 3 shows in its `PASS %` column. `None`
     /// when the size has no *run* cells (an unrun row shows `--`).
+    ///
+    /// **Hybrid reasoning (Option C) — exact treatment of truncated cells:**
+    /// a `truncated_by_reasoning` cell is *inconclusive (budget)*, **not** a
+    /// retrieval failure. It is therefore **excluded from the capability
+    /// denominator** — the pass rate is computed over the cells that produced
+    /// a verifiable answer (ran and were *not* truncated). Counting a
+    /// truncated cell as a non-pass would re-introduce the false negative this
+    /// design eliminates (an over-thinker reading as a broken retriever).
+    /// Consequently a row that is *entirely* truncated has **no** measurable
+    /// pass rate (`None` → `--`), and a row's rate is unaffected by how many
+    /// of its cells were truncated. This is the same split the headline
+    /// [`accuracy_label`] makes explicit.
     pub fn size_pass_rate(&self, size: u32) -> Option<f64> {
         let si = self.sizes.iter().position(|s| *s == size)?;
         let start = si * self.depths.len();
@@ -574,13 +633,26 @@ impl NiahResult {
         if run == 0 {
             return None;
         }
+        // Option C: truncate the denominator to the *measurable* cells (ran
+        // and not truncated-by-reasoning). An all-truncated row → `None`.
+        let measurable =
+            run - cells.iter().filter(|c| c.truncated_by_reasoning).count();
+        if measurable == 0 {
+            return None;
+        }
         let retrieved = cells.iter().filter(|c| c.retrieved).count();
-        Some(retrieved as f64 / run as f64 * 100.0)
+        Some(retrieved as f64 / measurable as f64 * 100.0)
     }
 
     /// The largest context size whose pass rate is >= `min_pct` — the
     /// "reliable up to ~Xk" threshold for the practical interpretation line.
     /// `None` when no size clears the bar.
+    ///
+    /// **Option C:** because [`size_pass_rate`] excludes `truncated_by_reasoning`
+    /// cells from the denominator, a size that is *entirely* truncated has no
+    /// pass rate and can never be "reliable up to" — an unmeasurable size is
+    /// not declared reliable. A size whose measurable cells clear the bar is
+    /// reported normally, truncated or not.
     pub fn reliable_up_to(&self, min_pct: f64) -> Option<u32> {
         self.sizes
             .iter()
@@ -1343,8 +1415,10 @@ mod tests {
         r.cells[4].retrieved = false;
 
         // All 6 slots ran, so the headline is the classic full-matrix form.
+        // The one non-retrieved cell is a genuine fail (not truncated), so the
+        // Option C breakdown reports it separately.
         assert_eq!(r.accuracy(), (5, 6));
-        assert_eq!(r.accuracy_label(), "5/6 retrieved (83.3%)");
+        assert_eq!(r.accuracy_label(), "5/6 retrieved, 1 failed (83.3%)");
         assert!(!r.cell(4000, 50).unwrap().retrieved);
         assert!(r.cell(2000, 100).unwrap().retrieved);
     }
@@ -1365,8 +1439,9 @@ mod tests {
         assert!((r.size_pass_rate(2000).unwrap() - 50.0).abs() < 0.1);
         assert_eq!(r.size_pass_rate(4000), None);
         // The label is honest about the partial run: 1 of the 2 that ran,
-        // out of the 6-cell grid (50.0%).
-        assert_eq!(r.accuracy_label(), "1/2 of 6 run (50.0%)");
+        // out of the 6-cell grid (50.0%). The other run cell is a genuine
+        // fail (not truncated), reported separately (Option C).
+        assert_eq!(r.accuracy_label(), "1/2 of 6 run, 1 failed (50.0%)");
     }
 
     #[test]
