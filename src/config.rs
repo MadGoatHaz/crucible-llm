@@ -29,6 +29,7 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::engines::capability::niah::{NIAH_DEPTHS, NIAH_SIZES};
 use crate::engines::concurrency::DEFAULT_LADDER;
 
 /// Default endpoint.
@@ -84,6 +85,17 @@ pub mod env_vars {
     pub const THEME: &str = "CRUCIBLE_THEME";
     /// The electricity rate for the View 4 cost estimate ($/kWh).
     pub const RATE_KWH: &str = "CRUCIBLE_RATE_KWH";
+    /// Comma-separated NIAH (C1) context sizes (e.g. `16k,64k,128k,256k,1M`).
+    /// Overrides the default 2k→128k ladder (Issue #5).
+    pub const NIAH_CONTEXTS: &str = "CRUCIBLE_NIAH_CONTEXTS";
+    /// Comma-separated NIAH (C1) needle depths, percentages 0–100
+    /// (e.g. `0,25,50,75,100`). Overrides the default 11-depth ladder
+    /// (Issue #5).
+    pub const NIAH_DEPTHS: &str = "CRUCIBLE_NIAH_DEPTHS";
+    /// A single NIAH (C1) context size (e.g. `256k` / `1000000`) for the
+    /// focused "count test" mode: run NIAH at exactly that size across the
+    /// depth ladder (Issue #5 / RoPE·YaRN probing).
+    pub const NIAH_CUSTOM: &str = "CRUCIBLE_NIAH_CUSTOM";
 }
 
 /// The default electricity rate for the View 4 cost estimate ($/kWh).
@@ -518,6 +530,24 @@ pub struct Cli {
     /// prompt as-is"; more than one value enables the matrix sweep.
     #[arg(long, value_name = "CSV")]
     pub matrix_context: Option<String>,
+    /// Context sizes for the NIAH (C1) matrix, as a comma-separated list
+    /// with optional `k`/`M` suffixes (e.g. `--niah-contexts
+    /// 16k,64k,128k,256k,500k,1M`). Overrides the default 2k→128k ladder
+    /// (Issue #5). Every entry is a literal target token count (`0` is not
+    /// allowed — unlike `--matrix-context`).
+    #[arg(long, value_name = "CSV")]
+    pub niah_contexts: Option<String>,
+    /// Needle depths for the NIAH (C1) matrix, as a comma-separated list of
+    /// percentages 0–100 (e.g. `--niah-depths 0,25,50,75,100`). Overrides
+    /// the default 11-depth (0%…100% in 10% steps) ladder (Issue #5).
+    #[arg(long, value_name = "CSV")]
+    pub niah_depths: Option<String>,
+    /// A single NIAH (C1) context size (e.g. `--niah-custom 256k` or
+    /// `--niah-custom 1000000`) for the focused "count test" mode: run NIAH
+    /// at exactly that size across the depth ladder — for probing a
+    /// RoPE/YaRN-extended limit beyond the default 128k top (Issue #5).
+    #[arg(long, value_name = "SIZE")]
+    pub niah_custom: Option<String>,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -600,6 +630,21 @@ pub struct Config {
     /// in $/kWh. Default [`DEFAULT_RATE_KWH`] ($0.16) — editable in the
     /// Config view (tab 6) and layered from env / config file.
     pub rate_per_kwh: f64,
+    /// The NIAH (C1) context-size ladder (target prompt tokens per matrix
+    /// row). Default [`NIAH_SIZES`] (2k→128k). Overridden by
+    /// `--niah-contexts` / `CRUCIBLE_NIAH_CONTEXTS` / the config file
+    /// (Issue #5). Sizes scale to 256k/500k/1M+ for RoPE/YaRN probing.
+    pub niah_contexts: Vec<u32>,
+    /// The NIAH (C1) needle-depth ladder (percentages 0–100, one per
+    /// matrix column). Default [`NIAH_DEPTHS`] (0%…100% in 10% steps).
+    /// Overridden by `--niah-depths` / `CRUCIBLE_NIAH_DEPTHS` / the config
+    /// file (Issue #5).
+    pub niah_depths: Vec<u8>,
+    /// The NIAH (C1) focused "count test" mode: a single context size to run
+    /// across the depth ladder (e.g. 256k for probing a RoPE/YaRN-extended
+    /// limit). When `Some`, it takes precedence over `niah_contexts`
+    /// (the matrix collapses to one row) (Issue #5).
+    pub niah_custom: Option<u32>,
 }
 
 impl Default for Config {
@@ -632,6 +677,9 @@ impl Default for Config {
             theme_explicit: false,
             engines_explicit: false,
             rate_per_kwh: DEFAULT_RATE_KWH,
+            niah_contexts: NIAH_SIZES.to_vec(),
+            niah_depths: NIAH_DEPTHS.to_vec(),
+            niah_custom: None,
         }
     }
 }
@@ -712,6 +760,12 @@ pub struct ConfigFile {
     pub theme: Option<String>,
     /// The electricity rate for the View 4 cost estimate ($/kWh).
     pub rate_per_kwh: Option<f64>,
+    /// The NIAH (C1) context-size ladder (Issue #5).
+    pub niah_contexts: Option<Vec<u32>>,
+    /// The NIAH (C1) needle-depth ladder (percentages 0–100, Issue #5).
+    pub niah_depths: Option<Vec<u8>>,
+    /// The NIAH (C1) focused single-size "count test" mode (Issue #5).
+    pub niah_custom: Option<u32>,
 }
 
 impl ConfigFile {
@@ -790,6 +844,17 @@ impl ConfigFile {
         }
         if let Some(v) = self.rate_per_kwh {
             c.rate_per_kwh = v.max(0.0);
+        }
+        // NIAH (C1) ladders (Issue #5): a file-supplied ladder overrides the
+        // built-in default; a `niah_custom` of 0 is treated as absent.
+        if let Some(v) = &self.niah_contexts {
+            c.niah_contexts = v.clone();
+        }
+        if let Some(v) = &self.niah_depths {
+            c.niah_depths = v.clone();
+        }
+        if let Some(v) = self.niah_custom.filter(|n| *n > 0) {
+            c.niah_custom = Some(v);
         }
         c.target_explicit = self.url.is_some();
         c
@@ -1049,6 +1114,51 @@ pub fn layer(
         .unwrap_or(DEFAULT_RATE_KWH)
         .max(0.0);
 
+    // ── NIAH (C1) ladders (Issue #5) ───────────────────────────────────
+    // Per field: CLI > env > config file > built-in default. An invalid /
+    // empty CLI or env list falls back to the next layer (then the
+    // default), mirroring the `ladder` / `matrix_context` policy — a typo
+    // never silently shrinks the matrix.
+    let niah_contexts = if explicit("niah_contexts") {
+        cli.niah_contexts
+            .as_deref()
+            .and_then(parse_niah_contexts)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| NIAH_SIZES.to_vec())
+    } else {
+        env_get(env_vars::NIAH_CONTEXTS)
+            .and_then(|s| parse_niah_contexts(&s))
+            .or_else(|| file.and_then(|f| f.niah_contexts.clone()).filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| NIAH_SIZES.to_vec())
+    };
+
+    let niah_depths = if explicit("niah_depths") {
+        cli.niah_depths
+            .as_deref()
+            .and_then(parse_niah_depths)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| NIAH_DEPTHS.to_vec())
+    } else {
+        env_get(env_vars::NIAH_DEPTHS)
+            .and_then(|s| parse_niah_depths(&s))
+            .or_else(|| file.and_then(|f| f.niah_depths.clone()).filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| NIAH_DEPTHS.to_vec())
+    };
+
+    // The focused "count test" single size: `Some` only when a valid
+    // (non-zero) size is named in any layer.
+    let niah_custom = if explicit("niah_custom") {
+        cli.niah_custom
+            .as_deref()
+            .and_then(parse_size)
+            .filter(|n| *n > 0)
+    } else {
+        env_get(env_vars::NIAH_CUSTOM)
+            .and_then(|s| parse_size(&s))
+            .or_else(|| file.and_then(|f| f.niah_custom))
+            .filter(|n| *n > 0)
+    };
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -1141,6 +1251,9 @@ pub fn layer(
         theme_explicit,
         engines_explicit,
         rate_per_kwh,
+        niah_contexts,
+        niah_depths,
+        niah_custom,
     })
 }
 
@@ -1152,6 +1265,27 @@ pub fn parse_ladder(s: &str) -> Option<Vec<usize>> {
         .map(|p| p.trim().parse::<usize>().ok())
         .collect::<Option<Vec<_>>>()?;
     Some(v)
+}
+
+/// Parse a single token size such as `"8k"`, `"1M"`, or `"512"` into a
+/// token count.
+///
+/// Accepts a plain number, or a number with a `k` (×1000) / `M`
+/// (×1,000,000) suffix (case-insensitive). `None` when unparseable or when
+/// the multiplication overflows `u32` (a size beyond ~4.29 B tokens is not
+/// representable — far beyond any practical context window).
+pub fn parse_size(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(digits) = s.strip_suffix(['k', 'K']) {
+        digits.parse::<u32>().ok()?.checked_mul(1_000)
+    } else if let Some(digits) = s.strip_suffix(['m', 'M']) {
+        digits.parse::<u32>().ok()?.checked_mul(1_000_000)
+    } else {
+        s.parse::<u32>().ok()
+    }
 }
 
 /// Parse a comma-separated context-size list (v0.1.1 2D matrix) such as
@@ -1168,17 +1302,60 @@ pub fn parse_context_list(s: &str) -> Option<Vec<u32>> {
             if p.is_empty() {
                 return None;
             }
-            let (digits, mult) =
-                if let Some(k) = p.strip_suffix(['k', 'K']).map(|d| d.parse::<u32>().ok()) {
-                    (k?, 1_000u32)
-                } else if let Some(m) = p.strip_suffix(['m', 'M']).map(|d| d.parse::<u32>().ok()) {
-                    (m?, 1_000_000u32)
-                } else {
-                    (p.parse::<u32>().ok()?, 1u32)
-                };
-            digits.checked_mul(mult)
+            parse_size(p)
         })
         .collect::<Option<Vec<_>>>()?;
+    Some(v)
+}
+
+/// Parse a comma-separated NIAH (C1) context-size ladder such as
+/// `"16k,64k,128k,256k,500k,1M"` into target token counts (Issue #5).
+///
+/// Each entry is a plain number or a number with a `k` / `M` suffix
+/// (case-insensitive), parsed via [`parse_size`]. Unlike
+/// [`parse_context_list`], a `0` entry is **rejected** — a NIAH haystack
+/// must be a positive token count (there is no "the configured prompt"
+/// special case for C1). `None` when any entry is unparseable or zero, so
+/// the caller falls back to the default ladder.
+pub fn parse_niah_contexts(s: &str) -> Option<Vec<u32>> {
+    let v: Vec<u32> = s
+        .split(',')
+        .map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            let n = parse_size(p)?;
+            (n > 0).then_some(n)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if v.is_empty() {
+        return None;
+    }
+    Some(v)
+}
+
+/// Parse a comma-separated NIAH (C1) needle-depth ladder such as
+/// `"0,25,50,75,100"` into percentages (Issue #5).
+///
+/// Each entry is an integer percentage in `0..=100`. `None` when any entry
+/// is unparseable or out of range, so the caller falls back to the default
+/// 11-depth ladder.
+pub fn parse_niah_depths(s: &str) -> Option<Vec<u8>> {
+    let v: Vec<u8> = s
+        .split(',')
+        .map(|p| {
+            let p = p.trim();
+            if p.is_empty() {
+                return None;
+            }
+            let n: u8 = p.parse().ok()?;
+            (n <= 100).then_some(n)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if v.is_empty() {
+        return None;
+    }
     Some(v)
 }
 
@@ -1738,6 +1915,9 @@ mod tests {
             "--engine",
             "--no-hardware",
             "--matrix-context",
+            "--niah-contexts",
+            "--niah-depths",
+            "--niah-custom",
         ] {
             assert!(help.contains(flag), "help missing {flag}");
         }

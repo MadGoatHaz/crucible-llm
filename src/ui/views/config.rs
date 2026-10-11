@@ -448,6 +448,12 @@ impl ConfigState {
             // and persisted so it survives into the next launch via the
             // normal CLI > env > file > default resolution.
             rate_per_kwh: Some(parse_rate(&self.rate_text)),
+            // The NIAH (C1) ladders are CLI/env concerns (Issue #5) — the
+            // form has no inputs for them, so they are persisted as absent
+            // (`null` → `None` on reload → the built-in defaults apply).
+            niah_contexts: None,
+            niah_depths: None,
+            niah_custom: None,
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {
