@@ -2265,4 +2265,108 @@ mod tests {
         let o = test_outcome(0, None, Some(StreamError::Connection("refused".into())));
         assert!(!o.is_e2e_only(), "an error is not a plain-JSON completion");
     }
+
+    // ---- R1: hybrid-reasoning `truncated_by_reasoning` detection ----
+
+    /// Build a `StreamEvent::Frame` carrying one `chunk` — the fixture for
+    /// the frame-count / truncation-detection tests below.
+    fn frame_event(chunk: Chunk) -> StreamEvent {
+        StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk,
+                t_nanos: 0,
+                done: false,
+            },
+            at: MonotonicInstant::now(),
+            timestamps: StreamTimestamps::default(),
+        }
+    }
+
+    /// `count_reasoning_content_frames` splits the wire frames by the SSE
+    /// classifier's `Chunk` kind (matching `is_token`: `Control` / `Usage`
+    /// are counted in neither).
+    #[test]
+    fn count_frames_splits_reasoning_and_content() {
+        let events = vec![
+            frame_event(Chunk::Reasoning("a".into())),
+            frame_event(Chunk::Content("b".into())),
+            frame_event(Chunk::Reasoning("c".into())),
+            frame_event(Chunk::Control),
+            frame_event(Chunk::Usage(Usage::default())),
+        ];
+        let (reasoning, content) = count_reasoning_content_frames(&events);
+        assert_eq!(reasoning, 2, "two reasoning frames");
+        assert_eq!(content, 1, "one content frame");
+    }
+
+    /// `count_reasoning_content_frames` is `(0, 0)` for a list with no token
+    /// frames (or an empty list).
+    #[test]
+    fn count_frames_is_zero_for_no_token_events() {
+        let events = vec![
+            frame_event(Chunk::Control),
+            frame_event(Chunk::Usage(Usage::default())),
+        ];
+        assert_eq!(count_reasoning_content_frames(&events), (0, 0));
+        assert_eq!(count_reasoning_content_frames(&[]), (0, 0));
+    }
+
+    /// (a) A **completed** stream (no error) that emitted reasoning frames
+    /// but **zero** content frames is `truncated_by_reasoning` — the budget
+    /// was exhausted in CoT and no answer was produced.
+    #[test]
+    fn reasoning_only_completed_stream_is_truncated() {
+        let events = vec![
+            frame_event(Chunk::Reasoning("thinking…".into())),
+            frame_event(Chunk::Reasoning("more thought…".into())),
+        ];
+        let outcome = test_outcome(2, None, None); // is_ok: no error
+        assert!(outcome.is_ok());
+        assert!(
+            outcome.is_truncated_by_reasoning(&events),
+            "reasoning>0 && content==0 && is_ok ⇒ truncated"
+        );
+    }
+
+    /// (b) A completed stream that emitted **any** content frame is NOT
+    /// `truncated_by_reasoning` — the model committed a visible answer.
+    #[test]
+    fn content_present_stream_is_not_truncated() {
+        let events = vec![
+            frame_event(Chunk::Reasoning("thinking…".into())),
+            frame_event(Chunk::Content("the answer".into())),
+        ];
+        let outcome = test_outcome(2, None, None);
+        assert!(
+            !outcome.is_truncated_by_reasoning(&events),
+            "content>0 ⇒ not truncated"
+        );
+    }
+
+    /// A completed stream with **neither** reasoning nor content (a
+    /// control/usage-only stream) is NOT `truncated_by_reasoning` — the model
+    /// was not "thinking".
+    #[test]
+    fn no_token_frames_is_not_truncated() {
+        let events = vec![
+            frame_event(Chunk::Control),
+            frame_event(Chunk::Usage(Usage::default())),
+        ];
+        let outcome = test_outcome(0, None, None);
+        assert!(!outcome.is_truncated_by_reasoning(&events));
+    }
+
+    /// (c) A **transport-error** stream is NOT `truncated_by_reasoning` — it
+    /// is a genuine failure, not a budget exhaustion. The `is_ok()` gate
+    /// makes a failed all-CoT stream read as a fail, not a truncation.
+    #[test]
+    fn transport_error_stream_is_not_truncated() {
+        let events = vec![frame_event(Chunk::Reasoning("thinking…".into()))];
+        let outcome = test_outcome(1, None, Some(StreamError::Connection("refused".into())));
+        assert!(!outcome.is_ok());
+        assert!(
+            !outcome.is_truncated_by_reasoning(&events),
+            "an error is a fail, not a truncation"
+        );
+    }
 }
