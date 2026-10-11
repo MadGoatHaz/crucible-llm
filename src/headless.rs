@@ -33,9 +33,9 @@ use crate::engines::speed::{
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, NiahResult,
-    ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult,
-    SweepResult,
+    build_sweep, human_size, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine,
+    NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine,
+    StructuredResult, SweepResult,
 };
 use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crate::log::{Context, RunLogger};
@@ -425,7 +425,32 @@ pub fn run_headless(
                 match NiahEngine::new(cfg) {
                     Ok(engine) => {
                         if !cfg.json {
-                            term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
+                            // Issue #3: render the *configured* ladders with
+                            // the shared human_size formatter (was a
+                            // hard-coded "7 sizes × 11 depths", and the
+                            // per-cell worker tags logged `128000k`). Now the
+                            // headline matches the TUI grid (`2k→128k`,
+                            // `1M`, …) and names the count-test mode.
+                            let size_desc = match cfg.niah_custom {
+                                Some(size) => format!("count test at {}", human_size(size)),
+                                None => {
+                                    let sizes = &cfg.niah_contexts;
+                                    if sizes.len() == 1 {
+                                        format!("1 size {}", human_size(sizes[0]))
+                                    } else {
+                                        format!(
+                                            "{} sizes {}→{}",
+                                            sizes.len(),
+                                            human_size(sizes[0]),
+                                            human_size(*sizes.last().unwrap())
+                                        )
+                                    }
+                                }
+                            };
+                            term.dim(&format!(
+                                "  [C1] NIAH ({size_desc} × {} depths)…",
+                                cfg.niah_depths.len()
+                            ));
                         }
                         let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!("  [C1] {}", r.accuracy_label()));
