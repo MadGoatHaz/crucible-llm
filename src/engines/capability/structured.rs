@@ -756,9 +756,15 @@ impl StructuredEngine {
 
 // ── Per-case evaluation ────────────────────────────────────────────────────
 
-/// `true` when `v` is a JSON integer (not a float).
+/// `true` when `v` is a JSON integer — including *integer-valued floats*
+/// (CF-50). Models frequently emit `36.0` for an `integer` field; that parses
+/// to a `serde_json` f64, so the old `as_i64()`-only check false-failed a
+/// semantically-correct integer and downgraded the case to Partial. A number
+/// counts as an integer when it is a native int **or** a finite float with no
+/// fractional part (`3.0` → integer; `3.5` → not).
 fn is_int(v: &serde_json::Value) -> bool {
     v.as_i64().is_some()
+        || v.as_f64().is_some_and(|f| f.is_finite() && f.fract() == 0.0)
 }
 
 /// Score one case's constrained output against its checks and classify it.
@@ -1031,6 +1037,25 @@ mod tests {
     fn simple_case_partial_on_bad_type() {
         // `age` is a string, not an integer → Types fails, rest pass.
         let r = evaluate_case("Simple", r#"{"name": "Ada", "age": "36"}"#);
+        assert_eq!(r.verdict, CaseVerdict::Partial);
+        assert!(!r.checks.iter().find(|c| c.label == "Types").unwrap().passed);
+    }
+
+    #[test]
+    fn integer_valued_float_is_accepted_for_int_fields() {
+        // CF-50: models often emit `36.0` for an `integer` field. That is a
+        // `serde_json` f64, so the old `as_i64()`-only check false-failed it
+        // to Partial. An integer-valued float must count as an integer.
+        let r = evaluate_case("Simple", r#"{"name": "Ada", "age": 36.0}"#);
+        assert_eq!(
+            r.verdict,
+            CaseVerdict::Compliant,
+            "36.0 is an integer-valued float and must be compliant"
+        );
+        assert!(r.checks.iter().find(|c| c.label == "Types").unwrap().passed);
+
+        // A genuinely fractional value is NOT an integer → still Partial.
+        let r = evaluate_case("Simple", r#"{"name": "Ada", "age": 36.5}"#);
         assert_eq!(r.verdict, CaseVerdict::Partial);
         assert!(!r.checks.iter().find(|c| c.label == "Types").unwrap().passed);
     }
