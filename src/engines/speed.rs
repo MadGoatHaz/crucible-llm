@@ -8,7 +8,7 @@
 //!
 //! * `TTFT = T3 − T1` (first token arrival − request dispatched),
 //! * `TG speed = completion_tokens / (stream_time − TTFT)`,
-//! * `MTP η = completion_tokens / content_chunks`,
+//! * `MTP η = completion_tokens / total_token_frames` (Reasoning + Content),
 //!
 //! with the same result-box layout, `--json` field set, and exit-code
 //! semantics as `llmspeedtest.py` (`print_result_box` / `output_json` /
@@ -29,6 +29,18 @@
 //! The headless report ([`format_split_report`] / [`json_report_split`]) shows
 //! both, clearly labeled, plus a pointer to C1's 2k→128k prefill-degradation
 //! curve for the full scaling picture. Decode / ITL / MTP are intact.
+//!
+//! **CF-12 — the canonical MTP η (the contract siblings consume).**
+//! `mtp_eta = completion_tokens / total_token_frames`, where
+//! `total_token_frames` is the count of **all** token frames observed in the
+//! stream (Reasoning + Content combined). This is the single definition
+//! Engine A applies ([`mtp_eta`], [`SpeedResult::mtp_efficiency`], the live
+//! snapshot) and the one Engine B (P2-C) mirrors and the methodology block
+//! (P2-F) documents verbatim. **`η > 1` is legitimate** — it arises from
+//! multi-token / speculative batching (vLLM MTP, EAGLE), where one SSE frame
+//! carries several accepted tokens, not only from true MTP. The old
+//! content-chunks-only denominator (which read `0` on a pure-CoT stream and
+//! undercounted batched servers) is gone.
 //!
 //! Measurement-isolation note: all timing is captured in the worker
 //! (quanta, `T0..Tn`); this module only takes deltas of those records.
@@ -51,7 +63,7 @@ use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
 use crate::prompt::{count_tokens, GeneratedPrompt, PromptGenerator, Tokenizer, TokenizerError};
-use crate::sse::{Chunk, Usage};
+use crate::sse::{Chunk, Usage, UsageDetails};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Max generation tokens per run (parity with the prototype's
@@ -72,9 +84,13 @@ pub struct SpeedResult {
     pub completion_tokens: u64,
     /// Prefill bandwidth, tokens/s (`prompt_tokens / TTFT`).
     pub pp_speed: f64,
-    /// Decode speed, tokens/s.
+    /// Decode speed, tokens/s. CF-26: the **answer-phase** rate (content
+    /// tokens over the content window) when the server reports
+    /// `reasoning_tokens`; the full-window blended rate otherwise.
     pub tg_speed: f64,
-    /// MTP multiplier, tokens per content chunk (`η`).
+    /// MTP acceptance ratio (`η`, CF-12 canonical):
+    /// `completion_tokens / total_token_frames` (Reasoning + Content).
+    /// `> 1` is legitimate (multi-token / speculative batching).
     pub mtp_efficiency: f64,
     /// Full stream duration, seconds (`T_n − T0`).
     pub stream_time: f64,
@@ -102,6 +118,16 @@ impl SpeedResult {
         self.error.is_some() && self.completion_tokens == 0
     }
 
+    /// CF-25: the run is **degraded** when no token frame was ever received
+    /// (a pure control / usage stream, or a failure) — its TTFT is the
+    /// `0.0` N/A sentinel, not a measurement. Derived from the stored chunk
+    /// counts (no new field) so the `SpeedResult` field set stays stable for
+    /// the sibling construction sites.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.content_chunks + self.reasoning_chunks == 0
+    }
+
     /// The `--json` object for this run — **exactly** the key set of the
     /// prototype's `TestResult.to_dict` (note: `other_chunks` is
     /// deliberately absent, matching the prototype).
@@ -122,6 +148,7 @@ impl SpeedResult {
             "mode": self.mode,
             "error": self.error,
             "looping": self.looping,
+            "degraded": self.is_degraded(),
         })
     }
 }
@@ -170,6 +197,65 @@ fn mean_of(values: &[f64]) -> f64 {
     } else {
         values.iter().sum::<f64>() / values.len() as f64
     }
+}
+
+/// The **canonical MTP η** (CF-12) — the speculative / MTP acceptance ratio.
+///
+/// `mtp_eta = completion_tokens / total_token_frames`, where
+/// `total_token_frames` is the count of **all** token frames observed in the
+/// stream (Reasoning + Content combined).
+///
+/// **`η > 1` is legitimate**: it arises from multi-token / speculative
+/// batching (vLLM MTP, EAGLE, …), where a single SSE frame carries several
+/// accepted tokens — not only from true MTP. A server that emits one token
+/// per frame yields `η ≈ 1`; a batching server yields `η > 1`.
+///
+/// This is the single definition Engine A applies ([`SpeedResult::mtp_efficiency`]
+/// and the live snapshot) and the one Engine B (P2-C) mirrors and the
+/// methodology block (P2-F) documents verbatim. `0.0` (N/A) when no token
+/// frame was observed — never a division by zero.
+#[must_use]
+pub fn mtp_eta(completion_tokens: u64, total_token_frames: u64) -> f64 {
+    if total_token_frames == 0 {
+        0.0
+    } else {
+        completion_tokens as f64 / total_token_frames as f64
+    }
+}
+
+/// CF-26: the **cache-hit** flag — `true` when the server reports
+/// `UsageDetails.cached_tokens > 0` (a warm KV / prefix-cache hit). `false`
+/// when the detail is absent (`None`) or reports zero cached tokens.
+///
+/// The CF-02 SSE parser already extracts `cached_tokens`; this is the
+/// canonical derivation. Wiring the live value into a stored
+/// [`crate::storage::models::StreamMetricRow::cache_hit`] needs the parser's
+/// `UsageDetails` to reach the engine — a `client/stream.rs` propagation
+/// seam owned by P2-A (see the module docs and `work/scratch/p2b_report.md`).
+#[must_use]
+pub fn cache_hit(details: Option<&UsageDetails>) -> bool {
+    details.is_some_and(|d| d.cached_tokens > 0)
+}
+
+/// The (first, last) **content** token-arrival instants — the CF-26
+/// **answer-phase decode window** (split at the reasoning→content
+/// transition). It excludes the thinking phase before the first content
+/// frame. `(None, None)` when no content frame arrived (a pure-CoT stream).
+#[must_use]
+fn content_window(events: &[StreamEvent]) -> (Option<MonotonicInstant>, Option<MonotonicInstant>) {
+    let mut first: Option<MonotonicInstant> = None;
+    let mut last: Option<MonotonicInstant> = None;
+    for e in events {
+        if let StreamEvent::Frame { frame, at, .. } = e {
+            if matches!(frame.chunk, Chunk::Content(_)) {
+                if first.is_none() {
+                    first = Some(*at);
+                }
+                last = Some(*at);
+            }
+        }
+    }
+    (first, last)
 }
 
 /// Engine construction errors.
@@ -354,6 +440,13 @@ impl SpeedEngine {
                 &outcome,
                 &events,
                 self.generator.tokenizer().as_deref(),
+                // CF-26: the SSE parser (CF-02) captures `UsageDetails`
+                // (reasoning / cached tokens), but the worker
+                // (`client/stream.rs`) does not yet propagate them into the
+                // `StreamOutcome` — a P2-A seam. Until that lands, Engine A
+                // passes `None`: the decode split falls back to the
+                // full-window blended rate and `cache_hit` stays unset.
+                None,
             ),
             events,
         )
@@ -525,7 +618,10 @@ impl SpeedEngine {
             };
             (prefill, e2e)
         };
-        let mtp = (content_frames > 0).then(|| tokens_received as f64 / content_frames as f64);
+        // CF-12: the canonical MTP η over ALL token frames (Reasoning +
+        // Content), not content-only.
+        let total_token_frames = reasoning_frames + content_frames;
+        let mtp = (total_token_frames > 0).then(|| mtp_eta(tokens_received, total_token_frames));
         let progress = if state == StreamStatus::Done {
             1.0
         } else {
@@ -697,6 +793,13 @@ impl SpeedEngine {
 /// Synthesize one [`SpeedResult`] from a finished worker run plus its
 /// channel events (blueprint §7 formulas; prototype semantics for
 /// token-count fallbacks, chunk counting, and the error surface).
+///
+/// `usage_details` is the CF-02 `UsageDetails` (reasoning / cached tokens)
+/// for the run. It drives the CF-26 decode-window split (answer vs. thinking
+/// phase) and the CF-26 `cache_hit` derivation. `None` keeps the historical
+/// full-window blended decode rate — the current production path, since the
+/// SSE parser captures the detail but `client/stream.rs` (P2-A) does not yet
+/// propagate it into the [`StreamOutcome`].
 #[must_use]
 pub fn aggregate(
     cfg: &Config,
@@ -704,15 +807,18 @@ pub fn aggregate(
     outcome: &StreamOutcome,
     events: &[StreamEvent],
     tokenizer: Option<&Tokenizer>,
+    usage_details: Option<UsageDetails>,
 ) -> SpeedResult {
     let ts: StreamTimestamps = outcome.timestamps;
     let stream_time = ts.total_nanos().unwrap_or(0) as f64 / 1e9;
-    // §7.1: TTFT = T3 − T1. No token frame (e.g. a usage-only stream) →
-    // fall back to the total time, as the prototype does.
-    let ttft = match ts.ttft_nanos() {
-        Some(n) => n as f64 / 1e9,
-        None => stream_time,
-    };
+    // §7.1: TTFT = T3 − T1.
+    //
+    // CF-25 (honest fallback): when **no token frame** ever arrived (a
+    // usage-only stream, a failure, …), TTFT is the `0.0` N/A sentinel —
+    // NOT the total stream time (the old fallback mislabeled total latency
+    // as TTFT and fed `pp_speed` unflagged). The run is then marked
+    // `degraded` ([`SpeedResult::is_degraded`]).
+    let ttft = ts.ttft_nanos().map(|n| n as f64 / 1e9).unwrap_or(0.0);
 
     // Chunk counting: the `[DONE]` terminator is not a chunk; `Usage`
     // frames count as "other" (prototype `__usage__` handling).
@@ -793,27 +899,44 @@ pub fn aggregate(
         0.0
     };
     // §7.2 — the research's **Timing Boundary Rule**: the decode window is
-    // the first content/reasoning token to the last (`T_first` → `T_last`),
-    // which excludes prefill/TTFT and the trailing gap to `[DONE]`. This is
-    // exactly the window vLLM / llama.cpp / SGLang / LM Studio / Ollama /
-    // TGI use for their own decode rate, so `completion_tokens / window`
-    // matches the server's displayed t/s.
+    // the first token to the last (`T_first` → `T_last`), which excludes
+    // prefill/TTFT and the trailing gap to `[DONE]`.
+    //
+    // CF-26 (decode-window split): when the server reports
+    // `reasoning_tokens` (the CF-02 `UsageDetails`), the window is split at
+    // the **reasoning→content transition** so `tg_speed` reflects the
+    // *answer* phase (content tokens / content window), not the *thinking*
+    // phase. Without that detail (the current production path — the parser
+    // captures it, `client/stream.rs` does not yet propagate it), we keep the
+    // historical full-window blended rate.
     let (t_first, t_last) = token_window(events);
-    let generation_time = match (t_first, t_last) {
-        (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
-        _ => (stream_time - ttft).max(0.001), // no token window: legacy fallback
-    };
+    let (t_first_content, t_last_content) = content_window(events);
+    let reasoning_tokens = usage_details.map(|d| d.reasoning_tokens).unwrap_or(0);
+    let content_tokens = completion_tokens.saturating_sub(reasoning_tokens);
     let tg_speed = if looping {
         0.0
+    } else if usage_details.is_some() {
+        // CF-26 answer phase: content tokens over the content window.
+        match (t_first_content, t_last_content) {
+            (Some(fc), Some(lc)) if content_tokens > 0 => {
+                let w = (fc.delta_nanos(&lc) as f64 / 1e9).max(0.001);
+                content_tokens as f64 / w
+            }
+            // Pure CoT (no content frames) or zero content tokens: no answer phase.
+            _ => 0.0,
+        }
     } else {
-        completion_tokens as f64 / generation_time
+        // Fallback (no reasoning-token detail): the full-window blended rate.
+        let w = match (t_first, t_last) {
+            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+            _ => (stream_time - ttft).max(0.001),
+        };
+        completion_tokens as f64 / w
     };
-    // §7.4: MTP η = tokens / content packets.
-    let mtp_efficiency = if content_chunks > 0 {
-        completion_tokens as f64 / content_chunks as f64
-    } else {
-        0.0
-    };
+    // §7.4 — CF-12 canonical: MTP η = completion_tokens / ALL token frames
+    // (Reasoning + Content), not content-only.
+    let total_token_frames = content_chunks + reasoning_chunks;
+    let mtp_efficiency = mtp_eta(completion_tokens, total_token_frames);
 
     // Error surface (prototype wording).
     let error = match &outcome.error {
@@ -1174,7 +1297,14 @@ pub fn format_result_box(
         &result.completion_tokens.to_string(),
     );
     lines.push(format!("╠{}╣", "─".repeat(50)));
-    row(&mut lines, "TTFT:", &format!("{:.4}s", result.ttft));
+    // CF-25: a degraded run (no token frame) shows TTFT as N/A, not the
+    // 0.0000s sentinel.
+    let ttft_display = if result.is_degraded() {
+        "N/A".to_string()
+    } else {
+        format!("{:.4}s", result.ttft)
+    };
+    row(&mut lines, "TTFT:", &ttft_display);
     row(
         &mut lines,
         "PP speed:",
@@ -1307,7 +1437,7 @@ fn stat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse::{ParsedFrame, Usage};
+    use crate::sse::{ParsedFrame, Usage, UsageDetails};
     use crate::timing::MonotonicInstant;
 
     fn cfg() -> Config {
@@ -1402,7 +1532,7 @@ mod tests {
     #[test]
     fn aggregate_computes_section7_formulas() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
 
         // Chunk counting: `[DONE]` excluded; usage → "other".
         assert_eq!(r.content_chunks, 2);
@@ -1424,11 +1554,18 @@ mod tests {
         assert!((39.9..40.1).contains(&stream_ms), "stream {stream_ms}ms");
 
         // PP = prompt / TTFT; TG = completion / decode window (first→last
-        // token = 10→30 ms = 20 ms); MTP = 34 / 2 content chunks.
+        // token = 10→30 ms = 20 ms; `usage_details=None` → the full-window
+        // blended rate); MTP η (CF-12) = 34 / 3 total token frames (1
+        // reasoning + 2 content) = 11.333 — not the old content-only
+        // 34 / 2 = 17.
         assert!((r.pp_speed - 128.0 / r.ttft).abs() < 1e-9);
         let gen = 0.02;
         assert!((r.tg_speed - 34.0 / gen).abs() < 1e-9, "tg {}", r.tg_speed);
-        assert!((r.mtp_efficiency - 17.0).abs() < 1e-9);
+        assert!(
+            (r.mtp_efficiency - 34.0 / 3.0).abs() < 1e-9,
+            "mtp {}",
+            r.mtp_efficiency
+        );
 
         assert_eq!(r.model, "test-model");
         assert_eq!(r.mode, "short");
@@ -1438,7 +1575,7 @@ mod tests {
     fn missing_usage_falls_back_to_text_estimate_and_flags_estimated() {
         let (mut outcome, events) = completed_run();
         outcome.usage = None;
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         // Prompt fallback: the generated prompt's own (estimated) count.
         assert_eq!(r.prompt_tokens, 25);
         // Completion fallback (no usage, no tokenizer): the re-tokenized
@@ -1471,7 +1608,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None, None);
         assert_eq!(r.error.as_deref(), Some("No data received from server"));
         assert_eq!(r.completion_tokens, 0);
         assert!(r.is_failed());
@@ -1499,7 +1636,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None, None);
         assert_eq!(r.error.as_deref(), Some("HTTP 500: boom"));
         assert!(r.is_failed());
     }
@@ -1522,7 +1659,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &[], None, None);
         assert_eq!(
             r.error.as_deref(),
             Some("Connection refused — is the server running?")
@@ -1534,7 +1671,7 @@ mod tests {
     fn malformed_frames_are_a_note_not_a_failure() {
         let (mut outcome, events) = completed_run();
         outcome.malformed_frames = 2;
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         assert_eq!(r.error.as_deref(), Some("2 malformed chunk(s) skipped"));
         // Tokens were produced → not a failed run (prototype semantics).
         assert!(!r.is_failed());
@@ -1544,7 +1681,7 @@ mod tests {
     #[test]
     fn json_report_matches_prototype_shape() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
 
         // One valid run: no summary (the prototype emits one only for
         // >1 valid runs). v0.1.1: the `timing` + `methodology` blocks are
@@ -1569,7 +1706,7 @@ mod tests {
         // Result keys: the prototype `to_dict` set + v0.1.1 `looping`
         // (no `other_chunks`).
         let rj = v["results"][0].as_object().unwrap();
-        assert_eq!(rj.len(), 15);
+        assert_eq!(rj.len(), 16);
         for key in [
             "ttft_s",
             "prompt_tokens",
@@ -1586,6 +1723,7 @@ mod tests {
             "mode",
             "error",
             "looping",
+            "degraded",
         ] {
             assert!(rj.contains_key(key), "missing {key}");
         }
@@ -1616,7 +1754,7 @@ mod tests {
         let (mut outcome, events) = completed_run();
         outcome.looping = true;
         outcome.loop_excluded_tokens = outcome.usage.map(|u| u.completion_tokens).unwrap_or(0);
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         assert!(r.looping, "the flag survives into the result");
         assert_eq!(r.pp_speed, 0.0, "prefill excluded");
         assert_eq!(r.tg_speed, 0.0, "decode excluded");
@@ -1765,7 +1903,7 @@ mod tests {
     #[test]
     fn all_failed_only_when_every_run_failed() {
         let (outcome, events) = completed_run();
-        let ok = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let ok = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         let t0 = MonotonicInstant::now();
         let bad = StreamOutcome {
             timestamps: StreamTimestamps {
@@ -1781,7 +1919,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None);
+        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None, None);
         assert!(!all_failed(&[ok.clone(), failed.clone()]));
         assert!(all_failed(&[failed]));
         assert!(!all_failed(&[]));
@@ -1790,7 +1928,7 @@ mod tests {
     #[test]
     fn result_box_mirrors_prototype_layout() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         let box_ = format_result_box(&r, 1, 3, false).unwrap();
         let lines: Vec<&str> = box_.lines().collect();
 
@@ -1833,15 +1971,15 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let fr = aggregate(&cfg(), &prompt(), &failed, &[], None);
+        let fr = aggregate(&cfg(), &prompt(), &failed, &[], None, None);
         assert!(format_result_box(&fr, 1, 1, false).is_none());
     }
 
     #[test]
     fn summary_renders_for_two_valid_runs() {
         let (outcome, events) = completed_run();
-        let a = aggregate(&cfg(), &prompt(), &outcome, &events, None);
-        let b = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let a = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+        let b = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         let s = format_summary(&[a.clone(), b], false).unwrap();
         assert!(s.contains("── Summary (averaged) "));
         assert!(s.contains("TTFT:"));
@@ -1864,7 +2002,7 @@ mod tests {
             loop_excluded_tokens: 0,
             frames: 0,
         };
-        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None);
+        let failed = aggregate(&cfg(), &prompt(), &bad, &[], None, None);
         assert!(format_summary(&[a.clone(), failed], false).is_none());
     }
 
@@ -1889,7 +2027,7 @@ mod tests {
         assert!((perceived - 0.010).abs() < 1e-6, "perceived {perceived}");
         // The server-side value (SpeedResult.ttft = T3−T1 = 5 ms) is a
         // distinct, smaller number.
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         assert!((r.ttft - 0.005).abs() < 1e-6, "server {}", r.ttft);
         assert!((perceived - r.ttft).abs() > 0.004, "perceived != server");
     }
@@ -1897,7 +2035,7 @@ mod tests {
     #[test]
     fn split_report_labels_latency_and_prefill_as_distinct_metrics() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         let perceived = vec![perceived_ttft_seconds(&events)];
         let prefill = long_prefill();
         let report = format_split_report(std::slice::from_ref(&r), &perceived, &prefill, false);
@@ -1918,7 +2056,7 @@ mod tests {
     #[test]
     fn json_report_split_computes_metrics_from_the_right_inputs() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         let perceived = vec![perceived_ttft_seconds(&events)];
         let prefill = long_prefill();
         let v = json_report_split(&cfg(), std::slice::from_ref(&r), &perceived, &prefill);
@@ -1943,7 +2081,7 @@ mod tests {
     #[test]
     fn short_prompt_run_no_longer_emits_a_single_prefill_bandwidth() {
         let (outcome, events) = completed_run();
-        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
         // The short run's own pp_speed (128 tok / 5 ms server TTFT = 25 600)
         // is the old misleading "bandwidth" — it must NOT be presented as the
         // prefill throughput. The prefill metric comes from the LONG prompt.
@@ -1972,5 +2110,327 @@ mod tests {
         assert!((prefill_tps - 5000.0).abs() < 0.1);
         assert!((run_pp - short_pp).abs() < 1.0);
         assert_ne!(prefill_tps, run_pp, "the two metrics are distinct");
+    }
+
+    // ── CF-12 / CF-25 / CF-26: Phase 2 metric integrity ─────────────────
+
+    /// CF-12: the canonical MTP η is completion tokens over ALL token frames.
+    #[test]
+    fn mtp_eta_canonical_is_completion_over_all_frames() {
+        // 34 completion tokens over 3 token frames (1 reasoning + 2 content)
+        // = 11.333 — the old content-only definition gave 34 / 2 = 17.
+        assert!((mtp_eta(34, 3) - 34.0 / 3.0).abs() < 1e-9);
+        // No token frames → 0.0 (N/A), never a division by zero.
+        assert_eq!(mtp_eta(10, 0), 0.0);
+    }
+
+    /// CF-12: η > 1 is legitimate — multi-token / speculative batching.
+    #[test]
+    fn mtp_eta_above_one_is_legitimate_batching() {
+        // 100 completion tokens delivered in 40 frames = 2.5 tokens/frame:
+        // a batching server (vLLM MTP / EAGLE) emits several accepted tokens
+        // per SSE frame, so η > 1 is expected, not an error.
+        let eta = mtp_eta(100, 40);
+        assert!((eta - 2.5).abs() < 1e-9);
+        assert!(eta > 1.0, "η > 1 is legitimate: {eta}");
+    }
+
+    /// CF-12: the live snapshot uses the same canonical η (all frames).
+    #[test]
+    fn snapshot_mtp_uses_total_token_frames() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(10_000_000);
+            let t1 = MonotonicInstant::now(); // 10 ms
+            mock.increment(10_000_000);
+            // 2 reasoning + 3 content frames = 5 total token frames.
+            let frame_times: Vec<MonotonicInstant> = (0..5)
+                .map(|_| {
+                    let at = MonotonicInstant::now();
+                    mock.increment(10_000_000);
+                    at
+                })
+                .collect();
+            let t3 = frame_times[0]; // first token
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 50,
+                completion_tokens: 10,
+            };
+            let events: Vec<StreamEvent> = frame_times
+                .iter()
+                .enumerate()
+                .map(|(i, at)| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: if i < 2 {
+                            Chunk::Reasoning("r".into())
+                        } else {
+                            Chunk::Content("c".into())
+                        },
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, 256, None);
+            // η = 10 completion / 5 total frames = 2.0 (not 10/3 content-only).
+            assert!((snap.streams[0].mtp.unwrap() - 2.0).abs() < 1e-9);
+        });
+    }
+
+    /// CF-25: a no-token-frame run keeps TTFT = 0.0 (N/A), is `degraded`,
+    /// and does NOT fall back to the total stream time.
+    #[test]
+    fn no_token_frame_yields_na_ttft_and_degraded() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now(); // 5 ms
+            mock.increment(50_000_000);
+            let t_end = MonotonicInstant::now(); // 55 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: None, // no token frame
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 0,
+            };
+            let events = vec![
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Usage(usage),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t_end,
+                    timestamps: ts,
+                },
+                StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+            ];
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 0,
+            };
+            let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+            // CF-25: TTFT is the 0.0 N/A sentinel — NOT the 55 ms stream time.
+            assert_eq!(r.ttft, 0.0, "no token frame → TTFT N/A (0.0)");
+            assert!(r.is_degraded(), "no token frame → degraded");
+            assert_eq!(r.pp_speed, 0.0, "no TTFT → no prefill bandwidth");
+            assert!(!r.is_failed(), "usage-only, no error → not failed");
+        });
+    }
+
+    /// CF-26: with `reasoning_tokens`, the decode window splits at the
+    /// reasoning→content transition (answer phase, not thinking phase).
+    #[test]
+    fn decode_window_excludes_the_reasoning_span() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now(); // 5 ms
+                                              // 3 reasoning frames: 10, 15, 20 ms.
+            mock.increment(5_000_000);
+            let t_r1 = MonotonicInstant::now(); // 10 ms
+            mock.increment(5_000_000);
+            let t_r2 = MonotonicInstant::now(); // 15 ms
+            mock.increment(5_000_000);
+            let t_r3 = MonotonicInstant::now(); // 20 ms
+                                                // 2 content frames: 30, 40 ms.
+            mock.increment(10_000_000);
+            let t_c1 = MonotonicInstant::now(); // 30 ms
+            mock.increment(10_000_000);
+            let t_c2 = MonotonicInstant::now(); // 40 ms
+            mock.increment(10_000_000);
+            let t_end = MonotonicInstant::now(); // 50 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(t_r1),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 5,
+            };
+            let frames = [
+                (Chunk::Reasoning("a".into()), t_r1),
+                (Chunk::Reasoning("b".into()), t_r2),
+                (Chunk::Reasoning("c".into()), t_r3),
+                (Chunk::Content("d".into()), t_c1),
+                (Chunk::Content("e".into()), t_c2),
+            ];
+            let events: Vec<StreamEvent> = frames
+                .iter()
+                .map(|(chunk, at)| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: chunk.clone(),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 5,
+            };
+            // CF-26 (details present): answer phase = 2 content tokens over
+            // the 30→40 ms content window = 200 t/s. The full-window blended
+            // rate (5 / 30 ms ≈ 166.7) is NOT what we report.
+            let details = UsageDetails {
+                reasoning_tokens: 3,
+                cached_tokens: 0,
+            };
+            let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, Some(details));
+            assert!(
+                (r.tg_speed - 200.0).abs() < 1e-6,
+                "answer-phase {}",
+                r.tg_speed
+            );
+            // Without details: the historical full-window blended rate.
+            let r2 = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+            assert!(
+                (r2.tg_speed - 5.0 / 0.03).abs() < 1e-6,
+                "blended {}",
+                r2.tg_speed
+            );
+            assert!((r.tg_speed - r2.tg_speed).abs() > 1.0, "split != blended");
+        });
+    }
+
+    /// CF-26: a pure-CoT run (no content frames) has no answer phase → 0.
+    #[test]
+    fn pure_cot_run_has_no_answer_phase() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(10_000_000);
+            let t1 = MonotonicInstant::now(); // 10 ms
+                                              // 3 reasoning frames, no content.
+            let frame_times: Vec<MonotonicInstant> = (0..3)
+                .map(|_| {
+                    let at = MonotonicInstant::now();
+                    mock.increment(10_000_000);
+                    at
+                })
+                .collect();
+            let t3 = frame_times[0];
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 3,
+            };
+            let events: Vec<StreamEvent> = frame_times
+                .iter()
+                .map(|at| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Reasoning("r".into()),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 3,
+            };
+            // All 3 tokens are reasoning → content_tokens = 0 → no answer phase.
+            let details = UsageDetails {
+                reasoning_tokens: 3,
+                cached_tokens: 0,
+            };
+            let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, Some(details));
+            assert_eq!(r.tg_speed, 0.0, "pure CoT → no answer-phase decode");
+        });
+    }
+
+    /// CF-26: the `cache_hit` flag is `true` iff `cached_tokens > 0`.
+    #[test]
+    fn cache_hit_set_when_cached_tokens_positive() {
+        assert!(cache_hit(Some(&UsageDetails {
+            reasoning_tokens: 0,
+            cached_tokens: 5,
+        })));
+        // Zero cached tokens (a cold cache) → no hit.
+        assert!(!cache_hit(Some(&UsageDetails::default())));
+        // No detail at all (backend doesn't report) → no hit.
+        assert!(!cache_hit(None));
     }
 }
