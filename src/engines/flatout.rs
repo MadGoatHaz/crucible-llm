@@ -36,8 +36,11 @@
 //!   presented as a precise measurement.
 //!
 //! The result records the **aggregate t/s** (the headline), the
-//! **per-stream t/s** (aggregate ÷ streams — ≈ 30 confirms the sweet
-//! spot), the total tokens, and the pooled TTFT / ITL evidence.
+//! **per-stream t/s in two labeled views** (CF-04: `÷ completed
+//! streams` — the capacity view — and `÷ requested streams` — the
+//! user-experience view; the legacy `per_stream_tps` remains the
+//! requested view for back-compat), the total tokens, and the pooled
+//! TTFT / ITL evidence.
 //!
 //! Measurement-isolation note: all timing is captured in the workers
 //! (quanta, `T0..Tn`); this module only takes deltas of those records and
@@ -75,6 +78,12 @@ const WINDOW_NS: u64 = 60 * 1_000_000_000;
 /// The `max_tokens` requested per stream: 100,000 — effectively
 /// unlimited. The 60-second window, not this cap, ends the test.
 pub const MAX_TOKENS: u32 = 100_000;
+
+/// (CF-04) The `failed_stream_ratio` above which the summary line /
+/// run log flags the run: more than a fifth of the requested streams
+/// produced no tokens, so the capacity and user-experience views
+/// differ materially.
+pub const FAILED_STREAM_RATIO_FLAG: f64 = 0.20;
 
 /// The stream count when Engine B did not run (there is no sweet spot to
 /// read): a small, always-valid load.
@@ -127,9 +136,31 @@ pub struct FlatOutResult {
     /// The headline number: `total_tokens / duration_secs` — the
     /// server's real-world maximum throughput at full sweet-spot load.
     pub aggregate_tps: f64,
-    /// `aggregate_tps / stream_count` — what each user gets at the
-    /// recommended load (≈ 30 t/s confirms the sweet spot).
+    /// **Back-compat alias of [`tps_per_requested_stream`](Self::tps_per_requested_stream)**
+    /// — `aggregate_tps / stream_count`: what each *requested* user
+    /// gets at the recommended load (≈ 30 t/s confirms the sweet
+    /// spot). Kept so older JSON/DB consumers keep reading the same
+    /// number; new consumers should use the two labeled CF-04 views.
     pub per_stream_tps: f64,
+    /// **Capacity view** (CF-04): `aggregate_tps / completed_streams`
+    /// — what each *healthy* stream sustains. Failed / zero-token
+    /// streams are excluded from the denominator, so they no longer
+    /// dilute the number. `0.0` when no stream completed.
+    #[serde(default)]
+    pub tps_per_completed_stream: f64,
+    /// **User-experience view** (CF-04): `aggregate_tps /
+    /// requested_streams` — the average per *requested* stream,
+    /// failures included (the honest "per user" number at the
+    /// recommended load; identical to [`per_stream_tps`](Self::per_stream_tps)).
+    #[serde(default)]
+    pub tps_per_requested_stream: f64,
+    /// (CF-04): `failed_streams / requested_streams`. A stream that
+    /// never produced a token (a terminal failure, or a stall before
+    /// any frame) counts as failed. Flagged in the summary line / run
+    /// log when above [`FAILED_STREAM_RATIO_FLAG`] (0.20) — more than a
+    /// fifth of the requested load is not producing tokens.
+    #[serde(default)]
+    pub failed_stream_ratio: f64,
     /// Mean time to first token across the streams (milliseconds).
     pub ttft_avg_ms: f64,
     /// Inter-token latency p50, pooled across all streams (milliseconds).
@@ -179,6 +210,15 @@ impl FlatOutResult {
     /// included, exactly what a full-load deployment sustains. The ITL
     /// percentiles are the gaps between consecutive token frames, pooled
     /// across all streams.
+    ///
+    /// The **per-stream t/s** is reported in two labeled views
+    /// (CF-04): `÷ completed streams` (capacity — failed / zero-token
+    /// streams don't dilute it) and `÷ requested streams`
+    /// (user-experience — the honest per-user average; the legacy
+    /// `per_stream_tps` equals this one). A stream *completed* when it
+    /// produced at least one token frame (the 60 s abort still counts —
+    /// it ran to the window); it *failed* when it has a terminal
+    /// `Failed` event or produced no tokens at all.
     #[must_use]
     pub fn from_events(
         per_stream: &[Vec<StreamEvent>],
@@ -192,6 +232,9 @@ impl FlatOutResult {
         let mut methods: Vec<&'static str> = Vec::new();
         let mut ttfts_ms: Vec<f64> = Vec::new();
         let mut itl = LatencyHistogram::default();
+        // CF-04: the dual-denominator stream classification.
+        let mut completed_streams = 0usize;
+        let mut failed_streams = 0usize;
         for events in per_stream {
             // The stream's authoritative count (usage → text estimate),
             // with the `estimated` flag that separates the server's
@@ -203,6 +246,18 @@ impl FlatOutResult {
                 tokens_estimated = true;
             }
             methods.push(counting_method(usage, estimated));
+            // CF-04: classify the stream for the dual denominators —
+            // *completed* when it produced at least one token frame
+            // (the 60 s abort still counts: it ran to the window), else
+            // *failed* (a terminal error, or a stall before any frame).
+            if events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Frame { frame, .. } if frame.chunk.is_token()))
+            {
+                completed_streams += 1;
+            } else {
+                failed_streams += 1;
+            }
             // Pooled ITL: the gaps between this stream's consecutive
             // token frames.
             let mut prev: Option<MonotonicInstant> = None;
@@ -233,6 +288,18 @@ impl FlatOutResult {
         } else {
             0.0
         };
+        // CF-04: the dual per-stream denominators. `requested` is the
+        // streams the run asked for (the legacy single view);
+        // `completed` excludes the failed / zero-token streams so they
+        // stop diluting the capacity number (no divide-by-zero: an all-
+        // failed run reports 0.0, not ∞).
+        let tps_per_requested_stream = aggregate_tps / stream_count as f64;
+        let tps_per_completed_stream = if completed_streams > 0 {
+            aggregate_tps / completed_streams as f64
+        } else {
+            0.0
+        };
+        let failed_stream_ratio = failed_streams as f64 / stream_count as f64;
         let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&itl);
         let ttft_avg_ms = if ttfts_ms.is_empty() {
             0.0
@@ -245,7 +312,11 @@ impl FlatOutResult {
             total_tokens,
             duration_secs,
             aggregate_tps,
-            per_stream_tps: aggregate_tps / stream_count as f64,
+            // Back-compat alias: the legacy number is the requested view.
+            per_stream_tps: tps_per_requested_stream,
+            tps_per_completed_stream,
+            tps_per_requested_stream,
+            failed_stream_ratio,
             ttft_avg_ms,
             itl_p50_ms,
             itl_p99_ms,
@@ -260,6 +331,13 @@ impl FlatOutResult {
     /// tokenizer — the default configuration), the headline t/s is
     /// prefixed with `≈` and annotated `(est., <method>)`, so the number
     /// is never read as a precise measurement.
+    ///
+    /// The per-stream figure is shown in both labeled views (CF-04):
+    /// `t/s per stream` (÷ requested — the user-experience view) and
+    /// `t/s per completed stream` (÷ completed — the capacity view).
+    /// A run where more than a fifth of the requested streams produced
+    /// no tokens (above [`FAILED_STREAM_RATIO_FLAG`]) carries a `⚠`
+    /// failure-ratio flag.
     #[must_use]
     pub fn summary_line(&self) -> String {
         let (agg_prefix, est_note) = if self.tokens_estimated {
@@ -267,11 +345,22 @@ impl FlatOutResult {
         } else {
             ("", String::new())
         };
+        // CF-04: flag a run where more than a fifth of the requested
+        // streams produced no tokens.
+        let fail_note = if self.failed_stream_ratio > FAILED_STREAM_RATIO_FLAG {
+            format!(
+                " · ⚠ {:.0}% of streams failed",
+                self.failed_stream_ratio * 100.0
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {ps:.1} t/s per stream · {tok} tok in {d:.0}s",
+            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {req:.1} t/s per stream · {comp:.1} t/s per completed stream{fail_note} · {tok} tok in {d:.0}s",
             agg = self.aggregate_tps,
             n = self.stream_count,
-            ps = self.per_stream_tps,
+            req = self.tps_per_requested_stream,
+            comp = self.tps_per_completed_stream,
             tok = self.total_tokens,
             d = self.duration_secs
         )
@@ -287,6 +376,12 @@ impl FlatOutResult {
             "duration_secs": self.duration_secs,
             "aggregate_tps": self.aggregate_tps,
             "per_stream_tps": self.per_stream_tps,
+            // CF-04: the dual per-stream denominators (exact contract
+            // names, shared with Engine B): capacity (÷ completed) and
+            // user-experience (÷ requested), plus the failed ratio.
+            "tps_per_completed_stream": self.tps_per_completed_stream,
+            "tps_per_requested_stream": self.tps_per_requested_stream,
+            "failed_stream_ratio": self.failed_stream_ratio,
             "ttft_avg_ms": self.ttft_avg_ms,
             "itl_p50_ms": self.itl_p50_ms,
             "itl_p99_ms": self.itl_p99_ms,
@@ -654,16 +749,31 @@ impl FlatOutEngine {
             l.info(
                 Context::EngineF,
                 format!(
-                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
+                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (requested), {:.1} t/s per completed stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
                     result.total_tokens,
                     result.duration_secs,
                     result.aggregate_tps,
-                    result.per_stream_tps,
+                    result.tps_per_requested_stream,
+                    result.tps_per_completed_stream,
                     result.ttft_avg_ms,
                     result.itl_p50_ms,
                     result.itl_p99_ms
                 ),
             );
+            // CF-04: a level where more than a fifth of the requested
+            // streams produced no tokens is flagged, not silently
+            // averaged.
+            if result.failed_stream_ratio > FAILED_STREAM_RATIO_FLAG {
+                l.warn(
+                    Context::EngineF,
+                    format!(
+                        "CF-04: {:.0}% of the requested streams produced no tokens (failed-stream ratio {:.2} > {} threshold) — the capacity and user-experience per-stream views differ materially",
+                        result.failed_stream_ratio * 100.0,
+                        result.failed_stream_ratio,
+                        FAILED_STREAM_RATIO_FLAG
+                    ),
+                );
+            }
         }
 
         result
@@ -1313,6 +1423,10 @@ mod tests {
             duration_secs: 60.0,
             aggregate_tps: 285.4,
             per_stream_tps: 35.7,
+            // CF-04: no failures in this fixture — both views agree.
+            tps_per_completed_stream: 35.7,
+            tps_per_requested_stream: 35.7,
+            failed_stream_ratio: 0.0,
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
@@ -1322,7 +1436,11 @@ mod tests {
         let line = r.summary_line();
         assert!(line.contains("285.4 t/s aggregate (8 streams)"), "{line}");
         assert!(line.contains("35.7 t/s per stream"), "{line}");
+        // CF-04: the capacity view is labeled separately.
+        assert!(line.contains("35.7 t/s per completed stream"), "{line}");
         assert!(line.contains("17124 tok in 60s"), "{line}");
+        // No failure flag when nothing failed.
+        assert!(!line.contains("of streams failed"), "{line}");
     }
 
     #[test]
@@ -1334,6 +1452,10 @@ mod tests {
             duration_secs: 60.0,
             aggregate_tps: 285.4,
             per_stream_tps: 35.7,
+            // CF-04: no failures in this fixture — both views agree.
+            tps_per_completed_stream: 35.7,
+            tps_per_requested_stream: 35.7,
+            failed_stream_ratio: 0.0,
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
@@ -1351,6 +1473,11 @@ mod tests {
                 "duration_secs",
                 "aggregate_tps",
                 "per_stream_tps",
+                // CF-04: the dual per-stream denominators (exact
+                // contract names, shared with Engine B).
+                "tps_per_completed_stream",
+                "tps_per_requested_stream",
+                "failed_stream_ratio",
                 "ttft_avg_ms",
                 "itl_p50_ms",
                 "itl_p99_ms",
@@ -1363,6 +1490,9 @@ mod tests {
         assert_eq!(v["total_tokens"], 17_124);
         assert!((v["aggregate_tps"].as_f64().unwrap() - 285.4).abs() < 1e-9);
         assert!((v["per_stream_tps"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert!((v["tps_per_completed_stream"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert!((v["tps_per_requested_stream"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert_eq!(v["failed_stream_ratio"].as_f64().unwrap(), 0.0);
         // CF-07: the JSON carries the token-count provenance.
         assert_eq!(v["tokens_estimated"], false);
         assert_eq!(v["counting_method"], "usage");
@@ -1492,5 +1622,173 @@ mod tests {
             assert_eq!(v["tokens_estimated"], true);
             assert_eq!(v["counting_method"], "mixed");
         });
+    }
+
+    // ── CF-04: the dual per-stream denominators ─────────────────────────
+
+    /// A stream that failed before producing a single token frame.
+    fn failed_stream(t0: MonotonicInstant, status: u16) -> StreamEvent {
+        StreamEvent::Failed {
+            timestamps: ts_at(t0),
+            error: crate::client::StreamError::Http {
+                status,
+                body: "rejected".into(),
+            },
+            looping: false,
+            loop_excluded_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn cf04_dual_denominators_completed_vs_requested() {
+        // 3 requested: two produce tokens (completed — the 60 s abort
+        // still counts), one fails before any frame. The capacity view
+        // divides by 2, the user-experience view by 3 — and the
+        // back-compat `per_stream_tps` equals the requested view.
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            let s0 = vec![content_frame_text("abcd", t1, ts)]; // 1 token
+            let s1 = vec![content_frame_text("efgh", t1, ts)]; // 1 token
+            let s2 = vec![failed_stream(t0, 400)]; // failed, no tokens
+            let r =
+                FlatOutResult::from_events(&[s0, s1, s2], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.stream_count, 3, "requested streams");
+            assert_eq!(r.total_tokens, 2);
+            assert!(
+                (r.aggregate_tps - 0.2).abs() < 1e-9,
+                "aggregate: {}",
+                r.aggregate_tps
+            );
+            // Capacity view: ÷ 2 completed streams.
+            assert!(
+                (r.tps_per_completed_stream - 0.1).abs() < 1e-9,
+                "capacity view: {}",
+                r.tps_per_completed_stream
+            );
+            // User-experience view: ÷ 3 requested streams.
+            assert!(
+                (r.tps_per_requested_stream - 0.2 / 3.0).abs() < 1e-9,
+                "requested view: {}",
+                r.tps_per_requested_stream
+            );
+            // Back-compat alias: the legacy number is the requested view.
+            assert!(
+                (r.per_stream_tps - r.tps_per_requested_stream).abs() < 1e-12,
+                "per_stream_tps must equal the requested view"
+            );
+            // The failed ratio: 1 of 3.
+            assert!(
+                (r.failed_stream_ratio - 1.0 / 3.0).abs() < 1e-9,
+                "ratio: {}",
+                r.failed_stream_ratio
+            );
+            // 33% > 20% → the summary line carries the failure flag.
+            assert!(
+                r.summary_line().contains("⚠ 33% of streams failed"),
+                "{}",
+                r.summary_line()
+            );
+        });
+    }
+
+    #[test]
+    fn cf04_all_failed_no_divide_by_zero_and_full_ratio() {
+        // Every stream failed (a uniform rejection): the capacity view
+        // is 0.0 (not ∞ / NaN), the ratio is 1.0, and the summary flags
+        // it.
+        let t0 = MonotonicInstant::now();
+        let r = FlatOutResult::from_events(
+            &[
+                vec![failed_stream(t0, 400)],
+                vec![failed_stream(t0, 400)],
+                vec![failed_stream(t0, 400)],
+            ],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert_eq!(r.total_tokens, 0);
+        assert_eq!(r.aggregate_tps, 0.0);
+        assert_eq!(
+            r.tps_per_completed_stream, 0.0,
+            "no completed streams → 0.0, never a divide-by-zero"
+        );
+        assert_eq!(r.tps_per_requested_stream, 0.0);
+        assert_eq!(r.failed_stream_ratio, 1.0, "all requested streams failed");
+        assert!(
+            r.summary_line().contains("⚠ 100% of streams failed"),
+            "{}",
+            r.summary_line()
+        );
+    }
+
+    #[test]
+    fn cf04_failure_flag_only_above_20_percent() {
+        // 5 requested, 1 failed → exactly 0.20 → NOT flagged (the flag
+        // is strictly greater than the threshold).
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let ok = || vec![content_frame_text("abcd", t0, ts)];
+        let r5 = FlatOutResult::from_events(
+            &[ok(), ok(), ok(), ok(), vec![failed_stream(t0, 400)]],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert!((r5.failed_stream_ratio - 0.20).abs() < 1e-9);
+        assert!(
+            !r5.summary_line().contains("of streams failed"),
+            "exactly 20% is not flagged: {}",
+            r5.summary_line()
+        );
+        // 4 requested, 1 failed → 0.25 → flagged.
+        let r4 = FlatOutResult::from_events(
+            &[ok(), ok(), ok(), vec![failed_stream(t0, 400)]],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert!((r4.failed_stream_ratio - 0.25).abs() < 1e-9);
+        assert!(
+            r4.summary_line().contains("⚠ 25% of streams failed"),
+            "{}",
+            r4.summary_line()
+        );
+    }
+
+    #[test]
+    fn cf04_to_dict_carries_the_exact_contract_names() {
+        // The JSON export carries the dual denominators under the exact
+        // contract field names (shared with Engine B), and the
+        // back-compat `per_stream_tps` is the requested view.
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let s0 = vec![content_frame_text("abcd", t0, ts)];
+        let s1 = vec![failed_stream(t0, 400)];
+        let r = FlatOutResult::from_events(&[s0, s1], 10.0, None, StreamCountSource::Default);
+        let v = r.to_dict();
+        assert!(
+            (v["tps_per_completed_stream"].as_f64().unwrap() - 0.1).abs() < 1e-9,
+            "÷ 1 completed stream: {}",
+            v["tps_per_completed_stream"]
+        );
+        assert!(
+            (v["tps_per_requested_stream"].as_f64().unwrap() - 0.05).abs() < 1e-9,
+            "÷ 2 requested streams: {}",
+            v["tps_per_requested_stream"]
+        );
+        assert!(
+            (v["failed_stream_ratio"].as_f64().unwrap() - 0.5).abs() < 1e-9,
+            "1 of 2 failed: {}",
+            v["failed_stream_ratio"]
+        );
+        assert_eq!(
+            v["per_stream_tps"].as_f64().unwrap(),
+            v["tps_per_requested_stream"].as_f64().unwrap(),
+        );
     }
 }
