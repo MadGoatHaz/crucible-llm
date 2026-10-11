@@ -217,6 +217,11 @@ pub fn build_sweep(
     // v0.1.1 2D concurrency × context matrix: with more than one context
     // size the sweep runs one ladder per context and collects the grid.
     // A single context (including `[0]`) keeps the classic 1D sweep.
+    //
+    // CF-27: the recommended sweet spot is pinned to the **zero-context**
+    // leg (`context == 0`) regardless of its position in `matrix_contexts`
+    // (see `Sweep::run_matrix`), so reordering the contexts can no longer
+    // silently change the headline decode measurement.
     if cfg.matrix_contexts.len() > 1 {
         sweep = sweep.with_matrix(
             Some(generator),

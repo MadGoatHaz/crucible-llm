@@ -761,6 +761,8 @@ impl Sweep {
         let mut matrix_cells: Vec<Vec<MatrixCell>> =
             vec![Vec::with_capacity(self.ladder.len()); contexts.len()];
         let mut primary_levels: Vec<SweepLevel> = Vec::new();
+        let mut zero_leg_seen = false;
+        let mut first_leg_seen = false;
         for (ci, &ctx) in contexts.iter().enumerate() {
             let mut leg = self.clone();
             leg.pool = self.pool_for_context(ctx);
@@ -768,9 +770,19 @@ impl Sweep {
             let levels = leg
                 .run_ladder(ctx, ci * self.ladder.len() + 1, total_cells)
                 .await;
-            if ci == 0 {
+            // CF-27: pin the primary (sweet-spot) leg to the **zero-context**
+            // measurement REGARDLESS of its position in the contexts list, so
+            // the headline sweet spot is always the decode (`context == 0`)
+            // number. Reordering the contexts can no longer silently change
+            // the recommendation. Falls back to the first leg only when no
+            // zero-context leg is present.
+            if ctx == 0 {
+                primary_levels = levels.clone();
+                zero_leg_seen = true;
+            } else if !zero_leg_seen && !first_leg_seen {
                 primary_levels = levels.clone();
             }
+            first_leg_seen = true;
             for level in &levels {
                 matrix_cells[ci].push(MatrixCell {
                     context: ctx,
@@ -2628,5 +2640,43 @@ mod tests {
         // `with_matrix` with one context stays single-context (no grid).
         let sweep = sweep.with_matrix(None, vec![0], 50);
         assert_eq!(sweep.contexts.len(), 1);
+    }
+
+    // ── CF-27: the sweet-spot leg is pinned to the zero-context measurement ──
+
+    #[tokio::test]
+    async fn sweet_spot_leg_is_pinned_to_zero_context_even_when_listed_second() {
+        // The contexts list has `0` in the *second* slot. The primary curve
+        // (`result.levels` — the one the sweet spot is derived from) must
+        // come from the `context == 0` leg, not the first (`8000`) leg.
+        let pool = WorkerPool::new(reqwest::Client::new(), "http://127.0.0.1:1", "m", "p", 16);
+        let sweep = Sweep::new(pool, vec![1, 4]).with_matrix(None, vec![8000, 0], 50);
+        let result = sweep.run().await;
+        // The primary curve is the zero-context leg's levels.
+        assert_eq!(result.levels.len(), 2);
+        assert_eq!(
+            result.levels[0].context, 0,
+            "sweet-spot leg is pinned to context==0, not the first-listed leg"
+        );
+        assert_eq!(result.levels[1].context, 0);
+        // The matrix still carries both legs in list order (8000 first, 0
+        // second) — only the *primary curve* is re-pinned.
+        let matrix = result.matrix.expect("multi-context sweep carries a matrix");
+        assert_eq!(matrix.contexts, vec![8000, 0]);
+        assert_eq!(matrix.cells[0][0].context, 8000);
+        assert_eq!(matrix.cells[1][0].context, 0);
+    }
+
+    #[tokio::test]
+    async fn sweet_spot_leg_falls_back_to_first_when_no_zero_context() {
+        // No `0` in the contexts list: the primary curve is the first leg
+        // (the pre-CF-27 behavior, preserved for a non-zero-only matrix).
+        let pool = WorkerPool::new(reqwest::Client::new(), "http://127.0.0.1:1", "m", "p", 16);
+        let sweep = Sweep::new(pool, vec![1, 4]).with_matrix(None, vec![8000, 32000], 50);
+        let result = sweep.run().await;
+        assert_eq!(result.levels.len(), 2);
+        assert_eq!(result.levels[0].context, 8000, "no zero-context leg → first leg");
+        let matrix = result.matrix.expect("multi-context sweep carries a matrix");
+        assert_eq!(matrix.contexts, vec![8000, 32000]);
     }
 }
