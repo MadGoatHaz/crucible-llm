@@ -248,6 +248,7 @@ async fn full_pipeline_single_stream_sweep_niah_persist_and_export() {
         quantization: None,
         system_gpu: None,
         total_duration_sec: Some(result.stream_time),
+        ..Default::default()
     };
     let rows = vec![StreamMetricRow::from_speed_result(
         &result,

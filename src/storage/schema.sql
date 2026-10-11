@@ -11,7 +11,16 @@ CREATE TABLE IF NOT EXISTS benchmark_sessions (
     backend_type TEXT,       -- 'vllm', 'llamacpp', 'sglang', 'ollama'
     quantization TEXT,
     system_gpu TEXT,
-    total_duration_sec REAL
+    total_duration_sec REAL,
+    -- R2 (traceability): which engines this run selected, as a JSON name
+    -- list (e.g. ["speed","niah"]). Added in the selection/traceability
+    -- harness; pre-existing rows are back-filled to NULL by the ALTER
+    -- TABLE migration in `Database::migrate`.
+    engines TEXT,
+    -- R2: the headline results of the non-stream engines (B/C2/C3/D/F)
+    -- as a JSON object (the `engine_results` column). A/C1 already have
+    -- their own tables (`stream_metrics` / `needle_evaluations`).
+    engine_results TEXT
 );
 
 CREATE TABLE IF NOT EXISTS stream_metrics (

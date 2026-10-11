@@ -860,6 +860,12 @@ impl BenchmarkSequence {
             quantization: None,
             system_gpu: None,
             total_duration_sec: None,
+            // R2 (traceability): record which engines this run selected so
+            // a stored session joins back to its run / log / export.
+            engines: Some(self.cfg.engines.selected_names_json()),
+            // R2: the B/C2/C3/D/F headline results (populated from the
+            // result slots once they are available).
+            engine_results: None,
         };
 
         // Engine A: speed results → stream_metrics rows.

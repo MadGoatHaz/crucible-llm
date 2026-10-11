@@ -506,6 +506,7 @@ mod tests {
             quantization: Some("Q4_K_M".to_string()),
             system_gpu: Some("RTX 4090".to_string()),
             total_duration_sec: Some(12.34),
+            ..Default::default()
         }
     }
 

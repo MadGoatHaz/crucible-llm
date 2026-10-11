@@ -21,6 +21,7 @@ fn sample_session() -> BenchmarkSession {
         quantization: None,
         system_gpu: None,
         total_duration_sec: Some(3.5),
+        ..Default::default()
     }
 }
 

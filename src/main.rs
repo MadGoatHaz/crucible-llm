@@ -411,6 +411,12 @@ fn run_headless(
             quantization: None,
             system_gpu: gpu_name,
             total_duration_sec: Some(results.iter().map(|r| r.stream_time).sum()),
+            // R2 (traceability): record which engines this run selected so
+            // a stored session joins back to its run / log / export.
+            engines: Some(cfg.engines.selected_names_json()),
+            // R2: the B/C2/C3/D/F headline results (populated below once
+            // the additional engines have run).
+            engine_results: None,
         };
         // Single-stream headless engine: every iteration runs at
         // concurrency level 1. Chunk 17: each row carries the

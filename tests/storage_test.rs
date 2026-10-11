@@ -40,6 +40,7 @@ fn sample_session(id: &str) -> BenchmarkSession {
         quantization: Some("Q4_K_XL".to_string()),
         system_gpu: Some("RTX 4090".to_string()),
         total_duration_sec: Some(12.5),
+        ..Default::default()
     }
 }
 
@@ -73,6 +74,134 @@ fn schema_has_all_three_tables() {
         names.contains(&"needle_evaluations".to_string()),
         "missing needle_evaluations: {names:?}"
     );
+    cleanup(&dir);
+}
+
+// ── R2 (traceability): the `engines` column ──────────────────────────────
+
+#[test]
+fn engines_column_round_trips() {
+    let dir = temp_db_dir("engines-col");
+    let path = dir.join("benchmarks.db");
+    let mut db = Database::open(&path).unwrap();
+
+    let json = r#"["speed","niah"]"#;
+    let s = BenchmarkSession {
+        session_id: "eng-1".into(),
+        target_url: "http://x".into(),
+        model_name: "m".into(),
+        engines: Some(json.to_string()),
+        ..Default::default()
+    };
+    db.persist_run(&s, &[]).unwrap();
+
+    let back = db.get_session("eng-1").unwrap().expect("stored");
+    assert_eq!(back.engines.as_deref(), Some(json));
+    // A session with no engines (e.g. a pre-migration row) reads back None.
+    let s2 = BenchmarkSession {
+        session_id: "eng-2".into(),
+        target_url: "http://x".into(),
+        model_name: "m".into(),
+        ..Default::default()
+    };
+    db.insert_session(&s2).unwrap();
+    assert_eq!(db.get_session("eng-2").unwrap().unwrap().engines, None);
+
+    cleanup(&dir);
+}
+
+/// A `benchmarks.db` created with the *pre-R2* schema (no `engines` /
+/// `engine_results` columns) is upgraded in place by `Database::open`:
+/// the new columns are added and the old row survives with `NULL`s.
+#[test]
+fn migration_upgrades_a_preexisting_db() {
+    use rusqlite::Connection;
+
+    let dir = temp_db_dir("migrate-preexisting");
+    let path = dir.join("benchmarks.db");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Create the OLD schema directly (no engines/engine_results columns).
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE benchmark_sessions (
+            session_id TEXT PRIMARY KEY,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            target_url TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            backend_type TEXT,
+            quantization TEXT,
+            system_gpu TEXT,
+            total_duration_sec REAL
+        );
+        CREATE TABLE stream_metrics (
+            metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT REFERENCES benchmark_sessions(session_id),
+            concurrency_level INTEGER, prompt_tokens INTEGER,
+            completion_tokens INTEGER, reasoning_tokens INTEGER,
+            ttft_ms REAL, tpot_ms REAL, mtp_efficiency REAL,
+            joules_per_token REAL, cache_hit BOOLEAN
+        );
+        CREATE TABLE needle_evaluations (
+            eval_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT REFERENCES benchmark_sessions(session_id),
+            context_length INTEGER, depth_percent REAL,
+            retrieved_successfully BOOLEAN, latency_ms REAL
+        );",
+    )
+    .unwrap();
+    // Seed an old row.
+    conn.execute(
+        "INSERT INTO benchmark_sessions
+            (session_id, target_url, model_name)
+         VALUES ('legacy-1', 'http://old', 'old-model')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    // Reopen through `Database::open` → the migration adds the columns.
+    let mut db = Database::open(&path).unwrap();
+
+    // The new columns now exist. (Scoped so the `db.conn()` borrow ends
+    // before the mutable `persist_run` below.)
+    {
+        let mut stmt = db
+            .conn()
+            .prepare("PRAGMA table_info(benchmark_sessions)")
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains(&"engines".to_string()), "cols: {cols:?}");
+        assert!(
+            cols.contains(&"engine_results".to_string()),
+            "cols: {cols:?}"
+        );
+    }
+
+    // The legacy row survives, with the new columns NULL.
+    let legacy = db.get_session("legacy-1").unwrap().expect("legacy row");
+    assert_eq!(legacy.model_name, "old-model");
+    assert_eq!(legacy.engines, None);
+    assert_eq!(legacy.engine_results, None);
+
+    // And a fresh run with engines set persists + reads back.
+    let s = BenchmarkSession {
+        session_id: "new-1".into(),
+        target_url: "http://new".into(),
+        model_name: "new-model".into(),
+        engines: Some(r#"["all"]"#.to_string()),
+        ..Default::default()
+    };
+    db.persist_run(&s, &[]).unwrap();
+    assert_eq!(
+        db.get_session("new-1").unwrap().unwrap().engines.as_deref(),
+        Some(r#"["all"]"#)
+    );
+
     cleanup(&dir);
 }
 
@@ -319,6 +448,7 @@ fn completed_run_persists_session_and_stream_rows() {
             quantization: None,
             system_gpu: None,
             total_duration_sec: Some(r1.stream_time + r2.stream_time + r3.stream_time),
+            ..Default::default()
         };
         let rows = [
             StreamMetricRow::from_speed_result(&r1, "flow-1", 1),

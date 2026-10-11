@@ -1451,6 +1451,10 @@ impl App {
             quantization: None,
             system_gpu: gpu_name,
             total_duration_sec: None,
+            // R2 (traceability): the engines selected in the Config form.
+            engines: Some(self.config.to_config().engines.selected_names_json()),
+            // R2: filled from the result slots in the URC-5 rework.
+            engine_results: None,
         };
         let metrics: Vec<StreamMetricRow> = snap
             .streams

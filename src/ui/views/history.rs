@@ -912,6 +912,7 @@ mod tests {
             quantization: None,
             system_gpu: None,
             total_duration_sec: Some(10.0),
+            ..Default::default()
         }
     }
 

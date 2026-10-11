@@ -77,6 +77,41 @@ impl Database {
     /// open, which is how migrations get applied.
     pub fn migrate(&self) -> Result<(), StorageError> {
         self.conn.execute_batch(SCHEMA)?;
+        // Graceful migration for pre-existing `benchmarks.db` files that
+        // predate the R2 traceability columns: `CREATE TABLE IF NOT EXISTS`
+        // is a no-op on an existing table, so the new `engines` /
+        // `engine_results` columns are added with `ALTER TABLE … ADD
+        // COLUMN` only when they are absent. Old rows read back as `NULL`
+        // (current users never break).
+        self.migrate_sessions_columns()?;
+        Ok(())
+    }
+
+    /// Add the `benchmark_sessions` traceability columns if a pre-existing
+    /// database lacks them. `PRAGMA table_info` is the version-independent
+    /// way to check (no schema-version table needed); each `ADD COLUMN` is
+    /// guarded so the step is idempotent.
+    fn migrate_sessions_columns(&self) -> Result<(), StorageError> {
+        let mut existing = std::collections::HashSet::new();
+        let mut stmt = self.conn.prepare("PRAGMA table_info(benchmark_sessions)")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for name in names {
+            existing.insert(name);
+        }
+        if !existing.contains("engines") {
+            self.conn.execute(
+                "ALTER TABLE benchmark_sessions ADD COLUMN engines TEXT",
+                [],
+            )?;
+        }
+        if !existing.contains("engine_results") {
+            self.conn.execute(
+                "ALTER TABLE benchmark_sessions ADD COLUMN engine_results TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -140,9 +175,10 @@ impl Database {
     pub fn get_session(&self, session_id: &str) -> Result<Option<BenchmarkSession>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timestamp, target_url, model_name,
-                    backend_type, quantization, system_gpu, total_duration_sec
-             FROM benchmark_sessions
-             WHERE session_id = ?1",
+                    backend_type, quantization, system_gpu, total_duration_sec,
+                    engines, engine_results
+              FROM benchmark_sessions
+              WHERE session_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![session_id], row_to_session)?;
         match rows.next() {
@@ -156,9 +192,10 @@ impl Database {
     pub fn list_sessions(&self) -> Result<Vec<BenchmarkSession>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timestamp, target_url, model_name,
-                    backend_type, quantization, system_gpu, total_duration_sec
-             FROM benchmark_sessions
-             ORDER BY timestamp DESC, session_id DESC",
+                    backend_type, quantization, system_gpu, total_duration_sec,
+                    engines, engine_results
+              FROM benchmark_sessions
+              ORDER BY timestamp DESC, session_id DESC",
         )?;
         let out = stmt
             .query_map([], row_to_session)?
@@ -238,8 +275,9 @@ fn insert_session_conn(conn: &Connection, s: &BenchmarkSession) -> rusqlite::Res
             conn.execute(
                 "INSERT INTO benchmark_sessions
                     (session_id, timestamp, target_url, model_name,
-                     backend_type, quantization, system_gpu, total_duration_sec)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     backend_type, quantization, system_gpu, total_duration_sec,
+                     engines, engine_results)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     s.session_id,
                     ts,
@@ -249,6 +287,8 @@ fn insert_session_conn(conn: &Connection, s: &BenchmarkSession) -> rusqlite::Res
                     s.quantization,
                     s.system_gpu,
                     s.total_duration_sec,
+                    s.engines,
+                    s.engine_results,
                 ],
             )?;
         }
@@ -256,8 +296,9 @@ fn insert_session_conn(conn: &Connection, s: &BenchmarkSession) -> rusqlite::Res
             conn.execute(
                 "INSERT INTO benchmark_sessions
                     (session_id, target_url, model_name,
-                     backend_type, quantization, system_gpu, total_duration_sec)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     backend_type, quantization, system_gpu, total_duration_sec,
+                     engines, engine_results)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     s.session_id,
                     s.target_url,
@@ -266,6 +307,8 @@ fn insert_session_conn(conn: &Connection, s: &BenchmarkSession) -> rusqlite::Res
                     s.quantization,
                     s.system_gpu,
                     s.total_duration_sec,
+                    s.engines,
+                    s.engine_results,
                 ],
             )?;
         }
@@ -325,6 +368,8 @@ fn row_to_session(row: &Row) -> rusqlite::Result<BenchmarkSession> {
         quantization: row.get(5)?,
         system_gpu: row.get(6)?,
         total_duration_sec: row.get(7)?,
+        engines: row.get(8)?,
+        engine_results: row.get(9)?,
     })
 }
 
