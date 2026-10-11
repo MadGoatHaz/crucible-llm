@@ -108,6 +108,14 @@ pub struct StatTriple {
 /// and the total elapsed time. It is built by the writer-side
 /// [`OverallAccumulator`] in [`MetricsState::update`] and copied into every
 /// published [`MetricsSnapshot`] so the render loop reads it lock-free.
+///
+/// **Sampling regimes (CF-30 — one per metric, never mixed within a
+/// metric):** *event-based* (one sample per completed stream, on its
+/// non-terminal→terminal transition): `gen`, `ttft`. *Time-weighted*
+/// (~1 sample/sec): `prompt`, `itl_p50`, `itl_p99`. *Cumulative* (running
+/// sums, not a rate): `total_tokens` / `estimated_tokens` /
+/// `total_prompt_tokens`. The Live view labels each row with its regime so
+/// the two rate regimes are never read as one homogeneous distribution.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverallStats {
     /// Generation throughput (per-stream decode t/s).
@@ -128,6 +136,13 @@ pub struct OverallStats {
     /// `pp_tokens` across every completed stream. The $/1M-*input*-token
     /// cost's denominator (the View 4 COST ANALYSIS panel).
     pub total_prompt_tokens: u64,
+    /// CF-30: the subset of [`Self::total_tokens`] that came from an
+    /// *estimated* source (the `chars/4` fallback — the server sent no
+    /// `usage` frame and no exact `--tokenizer` was supplied). Exposed
+    /// separately so the all-engine blend never presents an estimate as a
+    /// server-authoritative count: the Live view shows `total (est. X)` when
+    /// `X > 0`. `0` when every counted stream used authoritative token counts.
+    pub estimated_tokens: u64,
     /// Average **prefill** (input) throughput over the whole run,
     /// tokens/sec: total input tokens ÷ total prefill time (the sum of
     /// every completed stream's TTFT). The $/1M-*input*-cost's phase rate
@@ -253,6 +268,17 @@ pub struct MetricsSnapshot {
     /// back to `completion_tokens`).
     pub observed_frames: u64,
     pub reasoning_tokens: u64,
+    /// CF-30: `true` when this snapshot's token counts came from an
+    /// *estimated* source (the `chars/4` fallback — the server sent no
+    /// `usage` frame and no exact `--tokenizer` was supplied) rather than the
+    /// authoritative `usage.completion_tokens`. Engine publishers set it from
+    /// their per-stream / per-level `estimated` flags (P2-C
+    /// `SweepLevel.estimated`, Engine F `FlatOutResult.tokens_estimated`,
+    /// Engine A `SpeedResult.estimated`); the [`OverallAccumulator`] uses it to
+    /// tag the estimated portion of the blended token total so an estimate is
+    /// never mixed invisibly with a real count. `false` by default (an engine
+    /// that never estimates stays unflagged).
+    pub estimated: bool,
 
     // ---- decode-loop guard (v0.1.1) ----
     /// Streams excluded from throughput because the loop guard flagged a
@@ -310,6 +336,7 @@ impl Default for MetricsSnapshot {
             completion_tokens: 0,
             observed_frames: 0,
             reasoning_tokens: 0,
+            estimated: false,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
             status: StreamStatus::default(),
@@ -796,6 +823,10 @@ struct OverallAccumulator {
     itl_p99: Vec<f64>,
     total_tokens: u64,
     total_prompt_tokens: u64,
+    /// CF-30: cumulative *estimated* (chars/4) tokens — the portion of
+    /// `total_tokens` that is not a server-authoritative count. Tagged on
+    /// each completed stream whose snapshot carried `estimated: true`.
+    estimated_tokens: u64,
     /// Total prefill (input) time this run, seconds: the sum of every
     /// completed (non-looping) stream's TTFT — the prefill-throughput
     /// denominator.
@@ -897,6 +928,11 @@ impl OverallAccumulator {
                     }
                     if let Some(tok) = st.tg_tokens {
                         self.total_tokens += tok;
+                        // CF-30: tag the estimated portion of the blend so a
+                        // `chars/4` count is never presented as a real one.
+                        if s.estimated {
+                            self.estimated_tokens += tok;
+                        }
                     }
                     if let Some(p) = st.pp_tokens {
                         self.total_prompt_tokens += p;
@@ -960,6 +996,7 @@ impl OverallAccumulator {
             itl_p99: triple(&self.itl_p99),
             total_tokens: self.total_tokens,
             total_prompt_tokens: self.total_prompt_tokens,
+            estimated_tokens: self.estimated_tokens,
             prefill_throughput: if self.total_prefill_time > 0.0 && self.total_prompt_tokens > 0 {
                 self.total_prompt_tokens as f64 / self.total_prefill_time
             } else {
@@ -1448,6 +1485,51 @@ mod tests {
         let o = state.load().overall.clone();
         assert_eq!(o.total_prompt_tokens, 10_000, "sum of pp_tokens");
         assert_eq!(o.total_tokens, 150);
+    }
+
+    #[test]
+    fn overall_tags_estimated_tokens_separately_in_the_blend() {
+        // CF-30: a stream whose tokens came from the `chars/4` fallback
+        // (snapshot `estimated: true`) is counted in `total_tokens` AND
+        // tagged in `estimated_tokens` — so the all-engine blend never
+        // presents an estimate as a server-authoritative count.
+        let state = MetricsState::new();
+        // An estimated stream (no usage frame, no tokenizer).
+        state.update(MetricsSnapshot {
+            estimated: true,
+            streams: vec![done_stream(0, Some(100.0), Some(0.5), Some(200))],
+            ..Default::default()
+        });
+        // A real stream (authoritative `usage` counts).
+        state.update(MetricsSnapshot {
+            estimated: false,
+            streams: vec![done_stream(1, Some(100.0), Some(0.5), Some(300))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.total_tokens, 500, "both streams' tokens in the blend");
+        assert_eq!(
+            o.estimated_tokens, 200,
+            "only the estimated stream is tagged"
+        );
+    }
+
+    #[test]
+    fn overall_estimated_tokens_zero_when_all_authoritative() {
+        // CF-30: when every stream used authoritative `usage` counts
+        // (`estimated: false`), the tagged estimated portion stays 0.
+        let state = MetricsState::new();
+        state.update(MetricsSnapshot {
+            estimated: false,
+            streams: vec![done_stream(0, Some(100.0), Some(0.5), Some(256))],
+            ..Default::default()
+        });
+        let o = state.load().overall.clone();
+        assert_eq!(o.total_tokens, 256);
+        assert_eq!(
+            o.estimated_tokens, 0,
+            "no estimate → the tagged portion is 0"
+        );
     }
 
     #[test]
