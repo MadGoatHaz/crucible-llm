@@ -77,6 +77,12 @@ const CHANNEL_CAPACITY: usize = 256;
 /// Max generation tokens per structured run (a small JSON value).
 pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 256;
 
+/// CF-51: how many times each constrained case is repeated. The stability
+/// rate (the fraction of repeats that are fully compliant) turns C3's old
+/// single-shot score into a reliability measurement — the data prerequisite
+/// for the planned McNemar/Wilson A/B comparator.
+pub const STABILITY_REPEATS: usize = 3;
+
 /// The constraint mechanism a C3 "constrained" run actually requests (CF-08).
 ///
 /// The docs once claimed C3 engages server-side *constrained decoding*
@@ -309,6 +315,11 @@ pub struct StructuredCaseResult {
     pub verdict: CaseVerdict,
     /// The raw constrained output (shown, truncated, for non-compliant cases).
     pub output: String,
+    /// CF-51: how many times this case was run (1 for a single-shot
+    /// [`evaluate_case`]; [`STABILITY_REPEATS`] for the repeated `run()` path).
+    pub repeats: usize,
+    /// CF-51: how many of those repeats were fully compliant.
+    pub compliant_repeats: usize,
 }
 
 impl StructuredCaseResult {
@@ -322,6 +333,18 @@ impl StructuredCaseResult {
     /// `true` when the case is fully compliant.
     pub fn is_compliant(&self) -> bool {
         self.verdict == CaseVerdict::Compliant
+    }
+
+    /// CF-51: the case's stability rate — the fraction of its repeats that
+    /// were fully compliant (`[0.0, 1.0]`). For a single-shot case this is
+    /// 1.0 when compliant, 0.0 otherwise.
+    #[must_use]
+    pub fn stability_rate(&self) -> f64 {
+        if self.repeats == 0 {
+            0.0
+        } else {
+            self.compliant_repeats as f64 / self.repeats as f64
+        }
     }
 }
 
@@ -468,13 +491,42 @@ impl StructuredResult {
             .is_some_and(|c| c.is_valid_json())
     }
 
+    /// CF-51: `true` when any case was run more than once (the stability
+    /// signal is meaningful).
+    fn has_repeats(&self) -> bool {
+        self.cases.iter().any(|c| c.repeats > 1)
+    }
+
+    /// CF-51: the overall stability rate — the mean of the per-case stability
+    /// rates (the fraction of repeated runs that were fully compliant). This
+    /// is the data prerequisite for the planned McNemar/Wilson A/B comparator.
+    #[must_use]
+    pub fn stability_rate(&self) -> f64 {
+        if self.cases.is_empty() {
+            return 0.0;
+        }
+        let sum: f64 = self.cases.iter().map(|c| c.stability_rate()).sum();
+        sum / self.cases.len() as f64
+    }
+
+    /// CF-51: a compact stability label (e.g. `stability 83%`), or empty when
+    /// no case was repeated (single-shot → nothing extra to say).
+    #[must_use]
+    pub fn stability_label(&self) -> String {
+        if !self.has_repeats() {
+            return String::new();
+        }
+        format!("stability {:.0}%", self.stability_rate() * 100.0)
+    }
+
     /// One-line summary for the sequence header / headless output.
     ///
     /// CF-17: the compliance part is the *split* `valid JSON … / schema-
     /// correct …` label (a response can parse as JSON yet violate the
     /// schema). CF-36: the penalty is reported only when the constraint was
     /// *effective* (the constrained run produced valid JSON); otherwise it is
-    /// flagged "constraint not effective". CF-08: the constraint mode is
+    /// flagged "constraint not effective". CF-51: a `stability …` figure is
+    /// added when the cases were repeated. CF-08: the constraint mode is
     /// flagged inline so a ~0% penalty on a backend that drops
     /// `response_format` is never misread as "constrained decoding is free".
     #[must_use]
@@ -484,11 +536,13 @@ impl StructuredResult {
         } else {
             "penalty N/A (constraint not effective)".to_string()
         };
-        format!(
-            "{penalty} · {} · [{}]",
-            self.compliance_label(),
-            self.constraint_mode().label()
-        )
+        let mut parts = vec![penalty, self.compliance_label()];
+        let stability = self.stability_label();
+        if !stability.is_empty() {
+            parts.push(stability);
+        }
+        parts.push(format!("[{}]", self.constraint_mode().label()));
+        parts.join(" · ")
     }
 }
 
@@ -500,6 +554,11 @@ pub struct StructuredEngine {
     model: String,
     api_key: Option<String>,
     timeout: u64,
+    /// CF-51: how many times each constrained case is repeated (the stability
+    /// rate). Defaults to 1 (single-shot, backward-compatible with the
+    /// existing 4-request run); set to [`STABILITY_REPEATS`] (3) for the full
+    /// reliability measurement.
+    repeats: usize,
     /// Optional HF tokenizer for re-tokenizing output when a proxy omits
     /// `usage` (the research's fallback counting method).
     tokenizer: Option<Arc<crate::prompt::Tokenizer>>,
@@ -534,12 +593,27 @@ impl StructuredEngine {
             model: cfg.model.clone(),
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
+            repeats: 1,
             tokenizer,
             progress: None,
             metrics: None,
             pause: None,
             logger: None,
         })
+    }
+
+    /// CF-51: set how many times each constrained case is repeated. The
+    /// stability rate (the fraction of repeats that are fully compliant) is
+    /// then reported per case and overall. Defaults to 1 (single-shot); use
+    /// [`STABILITY_REPEATS`] (3) for the full reliability measurement that is
+    /// the data prerequisite for the planned McNemar/Wilson A/B comparator.
+    ///
+    /// The free-form baseline always stays a single shot (it only feeds the
+    /// speed pair), so the total request count is `1 + 3 × n`.
+    #[must_use]
+    pub fn repeats(mut self, n: usize) -> Self {
+        self.repeats = n.max(1);
+        self
     }
 
     /// Attach a [`ProgressBus`] so the runs report `Run {n}/{total}` to the
@@ -727,83 +801,91 @@ impl StructuredEngine {
         (body, ttft, tps)
     }
 
-    /// The full evaluation: a free-form baseline (case 1), then the three
-    /// constrained cases. The speed penalty compares case 1 free-form vs
+    /// The full evaluation: a free-form baseline (case 0), then the three
+    /// constrained cases. The speed penalty compares case 0 free-form vs
     /// constrained; each case is scored on its own schema.
     ///
+    /// CF-51: each constrained case is repeated [`STABILITY_REPEATS`]× so a
+    /// single flake no longer silently drops the score; the stability rate
+    /// (the fraction of repeats that are fully compliant) is the data
+    /// prerequisite for the planned McNemar/Wilson A/B comparator. The
+    /// free-form baseline stays a single shot — it only feeds the speed pair.
+    ///
     /// While a [`ProgressBus`] is attached, each run publishes
-    /// `Run {n}/4` — the Benchmark Sequence mirrors it into the TUI's
+    /// `Run {n}/{total}` — the Benchmark Sequence mirrors it into the TUI's
     /// progress bar.
     pub async fn run(&self) -> StructuredResult {
-        const TOTAL_RUNS: usize = 4;
+        let n = self.repeats.max(1);
+        // 1 free-form baseline (the speed pair) + N repeats per constrained case.
+        let total_runs = 1 + STRUCTURED_CASES.len() * n;
         if let Some(l) = &self.logger {
             l.info(
                 crate::log::Context::EngineC3,
-                "Engine C3 (Structured) started — 3 schema cases (Simple → Complex) + free-form baseline",
+                format!(
+                    "Engine C3 (Structured) started — 3 schema cases (Simple → Complex) × {n} repeats + free-form baseline"
+                ),
             );
         }
 
-        // Run 1 — free-form baseline (case 1 prompt, *no* constraint).
+        // Run 1 — free-form baseline (case 0 prompt, *no* constraint).
         if let Some(gate) = &self.pause {
             gate.wait_while_paused().await;
         }
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::Structured {
                 run: 1,
-                total: TOTAL_RUNS,
+                total: total_runs,
             });
         }
         let (free_body, free_ttft, free_tps) = self.run_once(0, false).await;
 
-        // Run 2 — constrained case 1 (the grammar-speed pair).
-        if let Some(gate) = &self.pause {
-            gate.wait_while_paused().await;
+        // Constrained cases, each repeated N× (CF-51). Case 0's *first* repeat
+        // carries the speed-pair numbers; every repeat is evaluated for the
+        // per-case stability rate.
+        let mut constrained_tps = 0.0;
+        let mut constrained_ttft = 0.0;
+        let mut constrained_body = String::new();
+        let mut case_evals: Vec<Vec<StructuredCaseResult>> =
+            Vec::with_capacity(STRUCTURED_CASES.len());
+        let mut run_no = 1usize;
+        for case_idx in 0..STRUCTURED_CASES.len() {
+            let mut evals = Vec::with_capacity(n);
+            for rep in 0..n {
+                run_no += 1;
+                if let Some(gate) = &self.pause {
+                    gate.wait_while_paused().await;
+                }
+                if let Some(bus) = &self.progress {
+                    bus.publish(EngineProgress::Structured {
+                        run: run_no,
+                        total: total_runs,
+                    });
+                }
+                let (body, ttft, tps) = self.run_once(case_idx, true).await;
+                if case_idx == 0 && rep == 0 {
+                    constrained_tps = tps;
+                    constrained_ttft = ttft;
+                    constrained_body = body.clone();
+                }
+                evals.push(evaluate_case(STRUCTURED_CASES[case_idx].name, &body));
+            }
+            case_evals.push(evals);
         }
-        if let Some(bus) = &self.progress {
-            bus.publish(EngineProgress::Structured {
-                run: 2,
-                total: TOTAL_RUNS,
-            });
-        }
-        let (c1_body, c1_ttft, c1_tps) = self.run_once(0, true).await;
 
-        // Run 3 — constrained case 2.
-        if let Some(gate) = &self.pause {
-            gate.wait_while_paused().await;
-        }
-        if let Some(bus) = &self.progress {
-            bus.publish(EngineProgress::Structured {
-                run: 3,
-                total: TOTAL_RUNS,
-            });
-        }
-        let (c2_body, _, _) = self.run_once(1, true).await;
+        // Fold each case's repeats into its representative (CF-51).
+        let cases: Vec<StructuredCaseResult> = case_evals
+            .into_iter()
+            .map(|evals| {
+                let name = evals.first().map(|e| e.name.clone()).unwrap_or_default();
+                fold_case_repeats(&name, evals)
+            })
+            .collect();
 
-        // Run 4 — constrained case 3.
-        if let Some(gate) = &self.pause {
-            gate.wait_while_paused().await;
-        }
-        if let Some(bus) = &self.progress {
-            bus.publish(EngineProgress::Structured {
-                run: 4,
-                total: TOTAL_RUNS,
-            });
-        }
-        let (c3_body, _, _) = self.run_once(2, true).await;
-
-        let constrained_tps = c1_tps;
-        let constrained_ttft = c1_ttft;
         let penalty_pct = if free_tps > 0.0 {
             (free_tps - constrained_tps) / free_tps * 100.0
         } else {
             0.0
         };
-
-        let cases = vec![
-            evaluate_case(STRUCTURED_CASES[0].name, &c1_body),
-            evaluate_case(STRUCTURED_CASES[1].name, &c2_body),
-            evaluate_case(STRUCTURED_CASES[2].name, &c3_body),
-        ];
 
         let result = StructuredResult {
             free_tps,
@@ -812,7 +894,7 @@ impl StructuredEngine {
             free_ttft,
             constrained_ttft,
             cases,
-            constrained_body: c1_body,
+            constrained_body,
             free_body,
         };
         if let Some(l) = &self.logger {
@@ -1001,7 +1083,48 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
         checks,
         verdict,
         output: body.to_string(),
+        repeats: 1,
+        compliant_repeats: if verdict == CaseVerdict::Compliant { 1 } else { 0 },
     }
+}
+
+/// CF-51: fold the N per-repeat evaluations of one case into the single
+/// representative [`StructuredCaseResult`] shown in the UI, carrying the
+/// stability signal.
+///
+/// The representative's detail (checks / output) is the *first* repeat's, but
+/// its `verdict` is derived from the stability across all repeats so the
+/// headline reflects reliability, not a single flake:
+/// * all N repeats compliant → `Compliant`;
+/// * no repeat compliant → the first repeat's verdict (`Failed` / `Partial`);
+/// * a mixed result → `Partial` (unstable).
+///
+/// A dedicated `Stability (x/N)` check is appended (never inserted first, so
+/// [`StructuredCaseResult::is_valid_json`] keeps reading the `Valid JSON`
+/// check) and shown only when N > 1.
+fn fold_case_repeats(name: &str, evals: Vec<StructuredCaseResult>) -> StructuredCaseResult {
+    let repeats = evals.len();
+    let compliant_repeats = evals.iter().filter(|e| e.is_compliant()).count();
+    let mut rep = match evals.into_iter().next() {
+        Some(r) => r,
+        None => return evaluate_case(name, ""),
+    };
+    rep.verdict = if repeats > 0 && compliant_repeats == repeats {
+        CaseVerdict::Compliant
+    } else if compliant_repeats == 0 {
+        rep.verdict
+    } else {
+        CaseVerdict::Partial
+    };
+    if repeats > 1 {
+        rep.checks.push(CaseCheck {
+            label: format!("Stability ({compliant_repeats}/{repeats})"),
+            passed: compliant_repeats == repeats,
+        });
+    }
+    rep.repeats = repeats;
+    rep.compliant_repeats = compliant_repeats;
+    rep
 }
 
 /// `true` when `body` is a JSON object carrying every `required_fields` key.
@@ -1319,6 +1442,89 @@ mod tests {
         );
         assert!(r.constraint_effective(), "case-0 valid JSON → effective");
         assert!(r.summary_line().contains("+5.2% penalty"));
+    }
+
+    // ── CF-51: repeat-for-stability ────────────────────────────────────
+
+    #[test]
+    fn fold_case_repeats_reports_stability_rate() {
+        // CF-51: repeat a case N× and report the fraction of repeats that
+        // pass. 2 of 3 compliant → stability rate 2/3, verdict Partial
+        // (unstable, not a single flake).
+        let evals = vec![
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#), // compliant
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#), // compliant
+            evaluate_case("Simple", "not json"), // failed
+        ];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(folded.repeats, 3);
+        assert_eq!(folded.compliant_repeats, 2);
+        assert!((folded.stability_rate() - (2.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(
+            folded.verdict,
+            CaseVerdict::Partial,
+            "a mixed result is unstable (Partial), not Compliant"
+        );
+        // A dedicated stability check row is present (appended, not first).
+        assert!(folded
+            .checks
+            .iter()
+            .any(|c| c.label == "Stability (2/3)" && !c.passed));
+
+        // All-compliant → Compliant, rate 1.0.
+        let evals = vec![
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+        ];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(folded.verdict, CaseVerdict::Compliant);
+        assert!((folded.stability_rate() - 1.0).abs() < 1e-9);
+        assert!(folded
+            .checks
+            .iter()
+            .any(|c| c.label == "Stability (3/3)" && c.passed));
+
+        // All-failed → keeps the first repeat's Failed verdict, rate 0.0.
+        let evals = vec![evaluate_case("Simple", "nope"), evaluate_case("Simple", "nope")];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(folded.verdict, CaseVerdict::Failed);
+        assert!((folded.stability_rate() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stability_rate_is_the_mean_of_case_rates() {
+        // CF-51: the result-level stability is the mean over the cases.
+        // `result_with` uses single-shot `evaluate_case` (repeats = 1):
+        // compliant → 1.0, partial/failed → 0.0.
+        let r = result_with(
+            r#"{"name": "Ada", "age": 36}"#, // compliant → 1.0
+            r#"[{"id":1,"label":"a","active":true}]"#, // partial → 0.0
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":"free text"}"#, // partial → 0.0
+        );
+        assert!((r.stability_rate() - (1.0 / 3.0)).abs() < 1e-9);
+        // No repeats → the stability label is empty (not surfaced).
+        assert!(r.stability_label().is_empty());
+        assert!(!r.summary_line().contains("stability"));
+    }
+
+    #[test]
+    fn summary_line_includes_stability_when_cases_are_repeated() {
+        // CF-51: when a case carries N > 1 repeats, the summary line shows
+        // the stability figure.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+        );
+        // Simulate the run() path: give every case 3 repeats, all compliant.
+        for c in r.cases.iter_mut() {
+            c.repeats = 3;
+            c.compliant_repeats = 3;
+        }
+        assert!(r.has_repeats());
+        assert!((r.stability_rate() - 1.0).abs() < 1e-9);
+        assert!(r.summary_line().contains("stability 100%"));
     }
 
     // ── CF-08: real constrained decoding (mode selection + flagging) ─────
