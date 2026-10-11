@@ -1363,7 +1363,9 @@ fn thousands(n: u64) -> String {
 }
 
 /// Engine A's one-line summary: the averaged decode speed across the
-/// valid runs (`N/A` when every run failed).
+/// valid runs (`N/A` when every run failed), plus the P2-A stream-integrity
+/// flags when any valid run carries them (CF-44 E2E-only, CF-10 usage
+/// discrepancy, CF-24 clamped ITL samples).
 pub fn summarize_speed(results: &[SpeedResult]) -> String {
     let valid: Vec<&SpeedResult> = results.iter().filter(|r| !r.is_failed()).collect();
     match valid.first() {
@@ -1371,12 +1373,29 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
             let n = valid.len() as f64;
             let tg = valid.iter().map(|r| r.tg_speed).sum::<f64>() / n;
             let ttft = valid.iter().map(|r| r.ttft).sum::<f64>() / n * 1000.0;
-            format!(
+            let mut line = format!(
                 "{:.1} t/s decode · TTFT {:.0} ms · {} run(s)",
                 tg,
                 ttft,
                 valid.len()
-            )
+            );
+            // CF-44 (P2-A): a non-streaming (plain-JSON) result is
+            // E2E-only — its "TTFT" is total response latency.
+            if valid.iter().any(|r| r.e2e_only) {
+                line.push_str(" · E2E-only (non-streaming)");
+            }
+            // CF-10 (P2-A): the server's usage exceeded ~4× the observed
+            // frames — the count was corrected toward the wire truth.
+            if valid.iter().any(|r| r.usage_discrepancy) {
+                line.push_str(" · ⚠ usage > 4× frames (corrected)");
+            }
+            // CF-24 (P2-A): ITL samples clamped at the histogram bound —
+            // the percentile figures are capped, not exact.
+            let clamped: u64 = valid.iter().map(|r| r.itl_clamped).sum();
+            if clamped > 0 {
+                line.push_str(&format!(" · {clamped} ITL sample(s) clamped"));
+            }
+            line
         }
         None => "all runs failed".to_string(),
     }
@@ -1812,6 +1831,10 @@ mod tests {
             mode: "short".into(),
             error: failed.then(|| "boom".to_string()),
             looping: false,
+            // P2-A surfacing (CF-10/24/44): a clean fixture run.
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
         }
     }
 
@@ -1832,6 +1855,23 @@ mod tests {
             summarize_speed(&[speed_result(0.0, 0.0, 0, true)]),
             "all runs failed"
         );
+    }
+
+    #[test]
+    fn speed_summary_surfaces_the_p2a_integrity_flags() {
+        let mut r = speed_result(100.0, 0.2, 256, false);
+        r.e2e_only = true;
+        r.usage_discrepancy = true;
+        r.itl_clamped = 3;
+        let line = summarize_speed(&[r]);
+        assert!(line.contains("E2E-only (non-streaming)"), "{line}");
+        assert!(line.contains("⚠ usage > 4× frames (corrected)"), "{line}");
+        assert!(line.contains("3 ITL sample(s) clamped"), "{line}");
+        // A clean run carries no flag suffix.
+        let clean = summarize_speed(&[speed_result(100.0, 0.2, 256, false)]);
+        assert!(!clean.contains("E2E-only"), "{clean}");
+        assert!(!clean.contains("usage >"), "{clean}");
+        assert!(!clean.contains("clamped"), "{clean}");
     }
 
     #[test]
@@ -1943,6 +1983,13 @@ mod tests {
             duration_secs: 60.0,
             aggregate_tps: tokens as f64 / 60.0,
             per_stream_tps: tokens as f64 / 180.0,
+            // CF-04 (P2-D): no failures in this fixture — both views agree.
+            tps_per_completed_stream: tokens as f64 / 180.0,
+            tps_per_requested_stream: tokens as f64 / 180.0,
+            failed_stream_ratio: 0.0,
+            // CF-29 (P2-D): a normal run, unclamped cap.
+            config_error: None,
+            max_tokens_used: crate::engines::flatout::MAX_TOKENS,
             ttft_avg_ms: 100.0,
             itl_p50_ms: 20.0,
             itl_p99_ms: 40.0,
