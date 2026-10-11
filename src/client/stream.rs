@@ -73,9 +73,6 @@ const V1_SUFFIX: &str = "/v1";
 /// UTF-8 byte-order mark (some servers prefix the stream with one).
 const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
-/// Minimum prefix length needed to recognize an SSE `data:` frame.
-const SSE_PREFIX_LEN: usize = b"data:".len();
-
 /// Default idle (read) timeout: a stream that produces no bytes for this
 /// long is declared stalled.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -550,13 +547,23 @@ impl StreamWorker {
                 .await;
         }
 
+        // The response shape is decided by the `Content-Type` header and our
+        // request intent — NOT by sniffing the first data byte (which broke on
+        // SSE keep-alive `:comment` preambles; see `route_is_sse`, Issue #1).
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
         let mut stream = resp.bytes_stream();
         let mut parser = SseParser::new();
 
-        // The first bytes decide the response shape. A tiny first segment
-        // cannot be classified yet, so accumulate until the `data:` prefix
-        // (or lack of one) is visible.
-        let mut head: Vec<u8> = match read_chunk(&mut stream, self.read_timeout).await {
+        // Read the first body chunk: it stamps T2 (first byte) and surfaces
+        // the empty-body / timeout / read-error terminal cases. The routing
+        // decision no longer depends on these bytes.
+        let head: Vec<u8> = match read_chunk(&mut stream, self.read_timeout).await {
             ChunkRead::Bytes(b) => b.to_vec(),
             ChunkRead::Eof => {
                 // Empty 200 body: nothing to measure.
@@ -587,24 +594,6 @@ impl StreamWorker {
                     .await;
             }
         };
-        while head.len() < SSE_PREFIX_LEN {
-            match read_chunk(&mut stream, self.read_timeout).await {
-                ChunkRead::Bytes(b) => head.extend_from_slice(b.as_ref()),
-                ChunkRead::Eof => break,
-                ChunkRead::Timeout => {
-                    ts.t_end = Some(MonotonicInstant::now());
-                    return self
-                        .finish_failed(tx, ts, StreamError::Timeout(self.read_timeout), false, 0)
-                        .await;
-                }
-                ChunkRead::Error(msg) => {
-                    ts.t_end = Some(MonotonicInstant::now());
-                    return self
-                        .finish_failed(tx, ts, StreamError::Read(msg), false, 0)
-                        .await;
-                }
-            }
-        }
         let head_at = MonotonicInstant::now();
         if ts.t2.is_none() {
             ts.t2 = Some(head_at);
@@ -622,7 +611,7 @@ impl StreamWorker {
             );
         }
 
-        if looks_like_sse(head.as_ref()) {
+        if route_is_sse(&content_type) {
             self.run_sse(head, head_at, &mut parser, &mut ts, &mut stream, tx)
                 .await
         } else {
@@ -1334,9 +1323,33 @@ impl StreamWorker {
     }
 }
 
-/// True when `bytes` begin an SSE `data:` frame (BOM tolerated).
-fn looks_like_sse(bytes: &[u8]) -> bool {
-    strip_bom(bytes).starts_with(b"data:")
+/// Decide the response shape from the `Content-Type` header and our request
+/// intent — NOT from sniffing the first data byte.
+///
+/// Sniffing the first byte broke on SSE keep-alive `:comment` preambles: a
+/// stream that opens with `:keep-alive\n\n` before its first `data:` frame
+/// starts with `:`, not `data:`, so it was misrouted to the non-streaming JSON
+/// path and a valid retrieval looked like a "retrieval miss" (Issue #1). The
+/// `Content-Type` header is the authoritative signal:
+///
+/// * `text/event-stream` → SSE (the spec's mandatory content type for SSE).
+/// * `application/json` → the non-streaming completion object.
+/// * absent / unrecognized → we always request `stream: true`, so default to
+///   SSE. The SSE path then resolves a misrouted JSON body (the end-of-stream
+///   rescue in [`run_sse`]) and surfaces a real
+///   [`StreamError::InvalidTransport`] when the body is genuinely neither.
+fn route_is_sse(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.contains("text/event-stream") {
+        return true;
+    }
+    if ct.contains("application/json") {
+        return false;
+    }
+    // Absent or an unrecognized content type: we asked for `stream: true`, so
+    // treat the response as SSE. This is what keeps a keep-alive-prefixed
+    // stream (first byte `:`, not `data:`) from being misrouted to JSON.
+    true
 }
 
 /// Strip a leading UTF-8 BOM, if present.
@@ -1539,13 +1552,21 @@ mod tests {
     }
 
     #[test]
-    fn sse_detection_with_and_without_bom() {
-        assert!(looks_like_sse(b"data: {\"a\":1}\n\n"));
-        assert!(looks_like_sse(&[
-            0xEF, 0xBB, 0xBF, b'd', b'a', b't', b'a', b':'
-        ]));
-        assert!(!looks_like_sse(b"{\"choices\":[]}"));
-        assert!(!looks_like_sse(b"ev"));
+    fn route_is_sse_by_content_type_and_request_intent() {
+        // The authoritative signal: `text/event-stream` → SSE (case-insensitive,
+        // parameters tolerated).
+        assert!(route_is_sse("text/event-stream"));
+        assert!(route_is_sse("Text/Event-Stream; charset=utf-8"));
+        assert!(route_is_sse("text/event-stream;charset=UTF-8"));
+        // An explicit JSON content type → the non-streaming path.
+        assert!(!route_is_sse("application/json"));
+        assert!(!route_is_sse("Application/JSON; charset=utf-8"));
+        // Absent / unrecognized content type: we requested `stream: true`, so
+        // default to SSE. This is the Issue #1 guarantee — a keep-alive-prefixed
+        // stream (first byte `:`, not `data:`) must NOT fall through to JSON.
+        assert!(route_is_sse(""));
+        assert!(route_is_sse("text/plain"));
+        assert!(route_is_sse("application/octet-stream"));
     }
 
     #[test]
