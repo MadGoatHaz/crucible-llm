@@ -26,8 +26,8 @@ use crucible_llm::client::StreamEvent;
 use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
 use crucible_llm::engines::hardware::{joules_per_token, profile, EnergyResult};
 use crucible_llm::engines::speed::{
-    all_failed, format_result_box, format_summary, json_report, SpeedEngine, SpeedResult,
-    MAX_GEN_TOKENS,
+    all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
+    PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{
     build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, ReasoningEngine,
@@ -39,7 +39,7 @@ use crucible_llm::hw::{
 use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
 use crucible_llm::storage::{
-    BenchmarkSession, ConcurrencySummary, Database, EngineResults, EnergySummary, FlatOutSummary,
+    BenchmarkSession, ConcurrencySummary, Database, EnergySummary, EngineResults, FlatOutSummary,
     ReasoningSummary, StreamMetricRow, StructuredSummary,
 };
 use crucible_llm::timing::MonotonicInstant;
@@ -265,6 +265,19 @@ fn run_headless(
         // are declared outside the gate so the persistence + export below
         // can use them (they stay empty when A did not run).
         let mut results: Vec<SpeedResult> = Vec::new();
+        // CF-05: the per-run client-perceived first-token latency (T3−T0) for
+        // the short-prompt runs, alongside the server-side value in each
+        // `SpeedResult.ttft`.
+        let mut perceived: Vec<f64> = Vec::new();
+        // CF-05: the long-prompt pre-fill throughput (the bandwidth half).
+        // Filled after the short-prompt loop; an empty/invalid metric when
+        // every short run failed (a dead server) so no wasted prefill.
+        let mut prefill = PrefillMetric {
+            tok_s: 0.0,
+            prompt_tokens: 0,
+            server_ttft_s: 0.0,
+            estimated: false,
+        };
         let mut packets: Vec<PacketSample> = Vec::new();
         let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> = Vec::new();
 
@@ -323,6 +336,7 @@ fn run_headless(
                     packets.extend(export::samples_from_events(&events, (i + 1) as u64));
                 }
                 windows.push(run_window(&events));
+                perceived.push(perceived_ttft_seconds(&events));
                 if cfg.verbose && !cfg.json {
                     term.dim(&format!(
                         "  chunks={} content={} reasoning={}",
@@ -334,12 +348,27 @@ fn run_headless(
             if !cfg.json && iterations > 1 {
                 term.clear_progress();
             }
+            // CF-05: the pre-fill *throughput* half — a long-prompt
+            // measurement, distinct from the short-prompt latency above.
+            // Skipped when every short run failed (a dead server would only
+            // waste a multi-thousand-token prefill).
+            if !all_failed(&results) {
+                if !cfg.json {
+                    term.info(&format!(
+                        "Measuring pre-fill throughput on a {}-token long prompt…",
+                        cfg.tokens
+                    ));
+                }
+                prefill = engine.run_prefill().await;
+            }
             logger.info(
                 Context::EngineA,
                 format!(
-                    "Engine A complete — {}/{} run(s) succeeded",
+                    "Engine A complete — {}/{} run(s) succeeded; pre-fill {:.1} tok/s ({} tok)",
                     results.iter().filter(|r| !r.is_failed()).count(),
-                    results.len()
+                    results.len(),
+                    prefill.tok_s,
+                    prefill.prompt_tokens
                 ),
             );
         }
@@ -362,24 +391,33 @@ fn run_headless(
         // run (the document is printed *after* the additional-engine block
         // below, so `flat_out` is included in one JSON document on stdout).
         let mut json_doc = if cfg.json {
-            Some(json_report(cfg, &results))
+            Some(json_report_split(cfg, &results, &perceived, &prefill))
         } else {
             None
         };
         if !cfg.json && !results.is_empty() {
-            for (i, r) in results.iter().enumerate() {
-                match format_result_box(r, i + 1, results.len(), term.color) {
-                    Some(box_) => print!("{box_}"),
-                    None => term.error(&format!(
+            if all_failed(&results) {
+                for (i, r) in results.iter().enumerate() {
+                    term.error(&format!(
                         "Test {}/{} FAILED: {}",
                         i + 1,
                         results.len(),
                         r.error.as_deref().unwrap_or("unknown error")
-                    )),
+                    ));
                 }
-                if let Some(note) = &r.error {
-                    if r.completion_tokens > 0 {
-                        term.warning(&format!("Note: {note}"));
+            } else {
+                // CF-05: the two distinct, labeled metrics (first-token
+                // latency from the short prompt; pre-fill throughput from the
+                // long prompt) plus the intact decode numbers.
+                print!(
+                    "{}",
+                    format_split_report(&results, &perceived, &prefill, term.color)
+                );
+                for r in results.iter() {
+                    if let Some(note) = &r.error {
+                        if r.completion_tokens > 0 {
+                            term.warning(&format!("Note: {note}"));
+                        }
                     }
                 }
             }
@@ -560,8 +598,12 @@ fn run_headless(
         // (CF-14: they used to be lost — only A + C1 were persisted).
         let engine_results = EngineResults {
             b_concurrency: sweep_result.as_ref().map(ConcurrencySummary::from_sweep),
-            c2_reasoning: reasoning_result.as_ref().map(ReasoningSummary::from_reasoning),
-            c3_structured: structured_result.as_ref().map(StructuredSummary::from_structured),
+            c2_reasoning: reasoning_result
+                .as_ref()
+                .map(ReasoningSummary::from_reasoning),
+            c3_structured: structured_result
+                .as_ref()
+                .map(StructuredSummary::from_structured),
             d_energy: energy_result.as_ref().map(EnergySummary::from_energy),
             f_flatout: flatout_result.as_ref().map(FlatOutSummary::from_flatout),
         }
