@@ -13,17 +13,20 @@
 //!    * **Partial** — valid JSON, but one or more checks fail;
 //!    * **Failed** — the output is not valid JSON (cannot be evaluated).
 //!
-//!    **What the directive actually is (CF-08).** The *target* is a real
-//!    `response_format: { "type": "json_schema", "json_schema": {…} }`, which
+//!    **What the directive actually is (CF-08).** Each constrained run
+//!    sends a real `response_format: { "type": "json_schema",
+//!    "json_schema": {…} }` carrying the case's strict schema, which
 //!    engages server-side **constrained decoding** (vLLM XGrammar, Outlines,
-//!    GBNF). Today the shared `StreamWorker` transport can only encode a
-//!    `{"type": <string>}` field, so C3 sends the softer
-//!    `response_format: { "type": "json_object" }` **hint** — a directive
-//!    that biases the model toward JSON but is *not* a grammar constraint and
-//!    is *dropped* by several backends (llama.cpp, TGI). The
-//!    [`ConstraintMode`] of each run is recorded and **flagged** in the
-//!    result and summary line, so a ~0% "penalty" on a hint-ignoring backend
-//!    is never silently misread as "constrained decoding is free".
+//!    GBNF). The shared `StreamWorker` transport encodes the object verbatim
+//!    (`response_format_value`); backends that do not support
+//!    `response_format` (llama.cpp, TGI) *drop* the field per the OpenAI
+//!    spec — a graceful no-op. If a transport cannot encode the object, C3
+//!    falls back to the softer `response_format: { "type": "json_object" }`
+//!    **hint** — a directive that biases the model toward JSON but is *not*
+//!    a grammar constraint. The [`ConstraintMode`] of each run is recorded
+//!    and **flagged** in the result and summary line, so a ~0% "penalty" on
+//!    a hint-ignoring backend is never silently misread as "constrained
+//!    decoding is free".
 //! 2. **What does grammar validation cost in speed?** One free-form
 //!    baseline run (case 1, unconstrained) vs the constrained run (case 1)
 //!    measures `penalty% = (free_tps − constrained_tps) / free_tps × 100`
@@ -68,9 +71,10 @@ pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 256;
 /// The docs once claimed C3 engages server-side *constrained decoding*
 /// (XGrammar/Outlines/GBNF) via `json_object` — that is false. `json_object`
 /// is a soft *hint* that most backends ignore and that never drives a grammar
-/// stack. Recording the mode makes the "grammar speed penalty" honest: it is
-/// flagged as a *hint* measurement (not a constrained-decoding one) until the
-/// transport can send a real `json_schema`.
+/// stack. Recording the mode makes the "grammar speed penalty" honest: a
+/// constrained run is flagged as real `json_schema` constrained decoding,
+/// or — in the fallback — as a *hint* measurement (not a
+/// constrained-decoding one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintMode {
@@ -78,11 +82,13 @@ pub enum ConstraintMode {
     FreeForm,
     /// A soft `response_format: { "type": "json_object" }` *hint* — biases the
     /// model toward JSON but does **not** engage a grammar/decoder constraint.
-    /// This is what the current `StreamWorker` transport can send.
+    /// The flagged fallback for a transport that cannot encode the schema
+    /// object.
     JsonObjectHint,
     /// A real `response_format: { "type": "json_schema", "json_schema": {…} }`
     /// that engages server-side constrained decoding (XGrammar/Outlines).
-    /// The target mode; activates once the transport can encode the schema.
+    /// The active mode: the `StreamWorker` transport encodes the schema
+    /// object verbatim (the CF-08 handoff is closed).
     JsonSchema,
 }
 
@@ -100,13 +106,16 @@ impl ConstraintMode {
 /// Whether the shared `StreamWorker` transport can encode a full `json_schema`
 /// `response_format` object.
 ///
-/// **`false` today (the CF-08 handoff).** `client/stream.rs` (sibling-owned)
-/// builds the request body with `response_format: { "type": <string> }` only —
-/// it cannot carry the `json_schema` sub-object. Until that enhancement lands,
-/// C3 runs in [`ConstraintMode::JsonObjectHint`] and flags it. Flipping this
-/// to `true` (once `stream.rs` encodes the schema) activates
-/// [`ConstraintMode::JsonSchema`] with no other C3 change.
-const TRANSPORT_SUPPORTS_JSON_SCHEMA: bool = false;
+/// **`true` — the CF-08 handoff is closed.** `client/stream.rs` carries
+/// `response_format` as a verbatim `serde_json::Value`
+/// (`response_format_value`), so the full `{ "type": "json_schema",
+/// "json_schema": {…} }` object C3 builds reaches the wire; backends that do
+/// not support `response_format` (llama.cpp, TGI) drop the field per the
+/// OpenAI spec — a graceful no-op. C3 therefore runs in
+/// [`ConstraintMode::JsonSchema`]; [`ConstraintMode::JsonObjectHint`]
+/// remains the flagged fallback for a transport that cannot encode the
+/// object.
+const TRANSPORT_SUPPORTS_JSON_SCHEMA: bool = true;
 
 /// Choose the constraint mode for a C3 "constrained" run (CF-08).
 ///
@@ -173,11 +182,90 @@ pub const STRUCTURED_CASES: [StructuredCase; 3] = [
     StructuredCase {
         name: "Complex",
         prompt: "Return a JSON object matching this schema: \
-                 {{\"user\": {{\"name\": string, \"email\": string}}, \
-                 \"orders\": [{{\"id\": int, \"total\": number, \
-                 \"items\": [string]}}]}}. Respond with the JSON object only.",
+                  {{\"user\": {{\"name\": string, \"email\": string}}, \
+                  \"orders\": [{{\"id\": int, \"total\": number, \
+                  \"items\": [string]}}]}}. Respond with the JSON object only.",
     },
 ];
+
+/// The per-case strict JSON schemas (CF-08), index-aligned with
+/// [`STRUCTURED_CASES`]: the `schema` each constrained run sends inside
+/// `response_format: { "type": "json_schema", "json_schema": {…} }`.
+///
+/// They are **strict-mode** shapes: OpenAI `strict: true` requires
+/// `additionalProperties: false` on every object, and a schema-capable
+/// backend (vLLM XGrammar) rejects non-strict schemas outright. Each
+/// mirrors its case prompt exactly (Simple flat object → Medium
+/// fixed-length array → Complex nested object).
+///
+/// Stored as JSON strings — `serde_json::Value` is not `Copy`, so it cannot
+/// live in a `const` array — and parsed on demand (three parses per engine
+/// run; negligible).
+pub const STRUCTURED_CASE_SCHEMAS: [&str; 3] = [
+    r#"{
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "age": { "type": "integer" }
+        },
+        "required": ["name", "age"],
+        "additionalProperties": false
+    }"#,
+    r#"{
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer" },
+                "label": { "type": "string" },
+                "active": { "type": "boolean" }
+            },
+            "required": ["id", "label", "active"],
+            "additionalProperties": false
+        },
+        "minItems": 3,
+        "maxItems": 3
+    }"#,
+    r#"{
+        "type": "object",
+        "properties": {
+            "user": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "email": { "type": "string" }
+                },
+                "required": ["name", "email"],
+                "additionalProperties": false
+            },
+            "orders": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "total": { "type": "number" },
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "required": ["id", "total", "items"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["user", "orders"],
+        "additionalProperties": false
+    }"#,
+];
+
+/// Case `i`'s strict schema parsed to a `Value` (index-aligned with
+/// [`STRUCTURED_CASES`]).
+fn case_schema(i: usize) -> serde_json::Value {
+    serde_json::from_str(STRUCTURED_CASE_SCHEMAS[i])
+        .expect("C3 case schemas are valid JSON (checked in tests)")
+}
 
 /// The per-case compliance verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,10 +338,11 @@ impl StructuredResult {
     /// CF-08: the constraint mode this result's "constrained" runs used.
     ///
     /// Exposed as a method (not a stored field) so the struct-literal
-    /// construction sites in the UI / tests are unaffected. Today the
-    /// transport is [`ConstraintMode::JsonObjectHint`]; it becomes
-    /// [`ConstraintMode::JsonSchema`] once `client/stream.rs` can encode the
-    /// schema object (the CF-08 handoff).
+    /// construction sites in the UI / tests are unaffected. The transport
+    /// encodes the `json_schema` object (the CF-08 handoff is closed), so
+    /// constrained runs use [`ConstraintMode::JsonSchema`]; the
+    /// [`ConstraintMode::JsonObjectHint`] fallback remains for a transport
+    /// that cannot.
     pub fn constraint_mode(&self) -> ConstraintMode {
         select_constraint_mode(TRANSPORT_SUPPORTS_JSON_SCHEMA)
     }
@@ -400,15 +489,16 @@ impl StructuredEngine {
         self
     }
 
-    /// One run: spawn a worker (optionally with the JSON `response_format`
+    /// One run: spawn a worker (optionally with the case's `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
-    async fn run_once(&self, prompt: &str, constrained: bool) -> (String, f64, f64) {
+    async fn run_once(&self, case_idx: usize, constrained: bool) -> (String, f64, f64) {
+        let case = &STRUCTURED_CASES[case_idx];
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
             self.client.clone(),
             &self.url,
             &self.model,
-            prompt,
+            case.prompt,
             STRUCTURED_MAX_GEN_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
@@ -424,13 +514,24 @@ impl StructuredEngine {
             worker = worker.logger(logger.clone());
         }
         if constrained {
-            // CF-08: the target is a real `json_schema` (constrained decoding,
-            // see `json_schema_response_format`), but the current transport
-            // only encodes a `{"type": …}` string, so we send the
-            // `json_object` *hint* and the result flags that mode
-            // (`constraint_mode()`). Once `client/stream.rs` can encode the
-            // schema object, this becomes `JsonSchema`.
-            worker = worker.response_format("json_object");
+            // CF-08 (activated): the transport encodes the full object, so a
+            // constrained run sends the case's strict `json_schema`
+            // (`json_schema_response_format`) — real server-side constrained
+            // decoding. The `json_object` hint is the flagged fallback for a
+            // transport that cannot encode the object; the result records
+            // which mode ran (`constraint_mode()`).
+            match select_constraint_mode(TRANSPORT_SUPPORTS_JSON_SCHEMA) {
+                ConstraintMode::JsonSchema => {
+                    worker = worker.response_format_value(json_schema_response_format(
+                        case.name,
+                        &case_schema(case_idx),
+                    ))
+                }
+                ConstraintMode::JsonObjectHint => {
+                    worker = worker.response_format("json_object");
+                }
+                ConstraintMode::FreeForm => {}
+            }
         }
 
         // Spawn without awaiting: drain the channel concurrently to avoid
@@ -550,8 +651,7 @@ impl StructuredEngine {
                 total: TOTAL_RUNS,
             });
         }
-        let (free_body, free_ttft, free_tps) =
-            self.run_once(STRUCTURED_CASES[0].prompt, false).await;
+        let (free_body, free_ttft, free_tps) = self.run_once(0, false).await;
 
         // Run 2 — constrained case 1 (the grammar-speed pair).
         if let Some(gate) = &self.pause {
@@ -563,7 +663,7 @@ impl StructuredEngine {
                 total: TOTAL_RUNS,
             });
         }
-        let (c1_body, c1_ttft, c1_tps) = self.run_once(STRUCTURED_CASES[0].prompt, true).await;
+        let (c1_body, c1_ttft, c1_tps) = self.run_once(0, true).await;
 
         // Run 3 — constrained case 2.
         if let Some(gate) = &self.pause {
@@ -575,7 +675,7 @@ impl StructuredEngine {
                 total: TOTAL_RUNS,
             });
         }
-        let (c2_body, _, _) = self.run_once(STRUCTURED_CASES[1].prompt, true).await;
+        let (c2_body, _, _) = self.run_once(1, true).await;
 
         // Run 4 — constrained case 3.
         if let Some(gate) = &self.pause {
@@ -587,7 +687,7 @@ impl StructuredEngine {
                 total: TOTAL_RUNS,
             });
         }
-        let (c3_body, _, _) = self.run_once(STRUCTURED_CASES[2].prompt, true).await;
+        let (c3_body, _, _) = self.run_once(2, true).await;
 
         let constrained_tps = c1_tps;
         let constrained_ttft = c1_ttft;
@@ -1074,21 +1174,60 @@ mod tests {
 
     #[test]
     fn result_flags_the_constraint_mode_it_used() {
-        // The result exposes the mode it actually ran under (today: the
-        // `json_object` hint, because the transport can't encode a schema).
+        // The result exposes the mode it actually ran under (the `json_schema`
+        // object — constrained decoding — since the transport encodes it).
         let r = result_with(
             r#"{"name": "Ada", "age": 36}"#,
             r#"[{"id":1,"label":"a","active":true}]"#,
             r#"{"user":{"name":"Ada"},"orders":"free text"}"#,
         );
-        assert_eq!(r.constraint_mode(), ConstraintMode::JsonObjectHint);
+        assert_eq!(r.constraint_mode(), ConstraintMode::JsonSchema);
         // And the one-line summary carries the flag (no more silent
         // "constrained decoding" claim).
         assert!(
-            r.summary_line().contains("json_object hint"),
+            r.summary_line().contains("json_schema (constrained decoding)"),
             "summary_line flags the mode: {}",
             r.summary_line()
         );
+    }
+
+    #[test]
+    fn case_schemas_are_strict_and_match_the_cases() {
+        // `strict: true` requires `additionalProperties: false` on every
+        // object; a schema-capable backend (vLLM XGrammar) rejects
+        // non-strict shapes, so each per-case schema must be strict.
+        let s0 = case_schema(0);
+        assert_eq!(s0["type"], "object");
+        assert_eq!(s0["additionalProperties"], false);
+        assert_eq!(s0["properties"]["age"]["type"], "integer");
+
+        let s1 = case_schema(1);
+        assert_eq!(s1["type"], "array");
+        assert_eq!(s1["minItems"], 3);
+        assert_eq!(s1["maxItems"], 3);
+        assert_eq!(s1["items"]["additionalProperties"], false);
+
+        let s2 = case_schema(2);
+        assert_eq!(s2["type"], "object");
+        assert_eq!(s2["additionalProperties"], false);
+        assert_eq!(s2["properties"]["user"]["additionalProperties"], false);
+        assert_eq!(s2["properties"]["orders"]["items"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn constrained_run_sends_the_case_json_schema_object() {
+        // The activated handoff: a constrained run transmits the full
+        // `json_schema` object (name + strict schema) verbatim, not the
+        // `{"type": <string>}` hint.
+        let rf = json_schema_response_format(
+            STRUCTURED_CASES[0].name,
+            &case_schema(0),
+        );
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["name"], "Simple");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(rf["json_schema"]["schema"]["type"], "object");
+        assert_eq!(rf["json_schema"]["schema"]["additionalProperties"], false);
     }
 
     #[test]

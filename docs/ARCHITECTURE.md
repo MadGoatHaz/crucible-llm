@@ -350,7 +350,7 @@ Can you trust the model to follow format instructions? Critical for API integrat
 
 **4 runs total**: one free-form baseline + three constrained cases of escalating complexity.
 
-Each constrained run sends a `response_format` directive in the request body. The **target** is a real schema constraint — `response_format: { "type": "json_schema", "json_schema": {…} }` — which is what engages server-side **constrained decoding** (vLLM XGrammar, Outlines, GBNF) to restrict the token space to the schema. **As of v0.1.3 the shared request path can only encode a `{"type": …}` string, so C3 currently sends the softer `response_format: { "type": "json_object" }` *hint*.** `json_object` is **not** a grammar constraint: it biases the model toward emitting JSON, but several backends (llama.cpp, TGI) **drop the field entirely** and OpenAI/vLLM treat it as basic JSON mode, not schema enforcement. The result and summary line **flag which mode was used** (`json_object hint` vs. `json_schema`), so a ~0% "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
+Each constrained run sends a `response_format` directive in the request body: a real schema constraint — `response_format: { "type": "json_schema", "json_schema": {…} }` carrying the case's **strict** schema (`strict: true`, `additionalProperties: false` on every object) — which engages server-side **constrained decoding** (vLLM XGrammar, Outlines, GBNF) to restrict the token space to the schema. The shared request path encodes the object verbatim (Phase 1, CF-08). If a transport cannot encode the object, C3 falls back to the softer `response_format: { "type": "json_object" }` *hint* and flags it: `json_object` is **not** a grammar constraint — it biases the model toward emitting JSON, but several backends (llama.cpp, TGI) **drop the field entirely** and OpenAI/vLLM treat it as basic JSON mode, not schema enforcement. The result and summary line **flag which mode was used** (`json_schema` vs. `json_object hint`), so a ~0% "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
 
 | Case | Prompt | Checks |
 |------|--------|--------|
@@ -368,7 +368,7 @@ Each case is classified:
 
 A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in code fences).
 
-**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the constraint costs throughput. In `json_schema` mode this is the server-side **constrained-decoding** overhead; in the current `json_object`-hint fallback it measures only the cost of a prompt hint (≈0 on backends that drop the field — i.e. *no constraint was applied*, not *the grammar is free*).
+**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the constraint costs throughput. In `json_schema` mode this is the server-side **constrained-decoding** overhead; in the `json_object`-hint fallback it measures only the cost of a prompt hint (≈0 on backends that drop the field — i.e. *no constraint was applied*, not *the grammar is free*).
 
 ### What the Numbers Mean
 
