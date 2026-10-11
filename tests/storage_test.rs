@@ -131,6 +131,7 @@ fn engine_results_column_round_trips() {
             vendor: Some("NVIDIA".to_string()),
             model: Some("RTX 4090".to_string()),
             fragmentation_warning: None,
+            na_reason: None,
         }),
         f_flatout: Some(FlatOutSummary {
             stream_count: 16,

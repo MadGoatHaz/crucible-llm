@@ -81,6 +81,21 @@ impl EnergyResult {
         self.cpu_power_estimated = estimated;
         self
     }
+
+    /// `true` when **no power telemetry was available** (the module N/A
+    /// rule): no sample in scope carried a power reading, so `joules` is
+    /// `0.0` and every derived figure (`joules_per_token`, `avg_power_w`,
+    /// `peak_power_w`) is `None`.
+    ///
+    /// This is the distinct "no power telemetry" case — a driverless host,
+    /// or a sensor that returned no usable reading (e.g. the RAPL quirk on a
+    /// shared host). It is reported **N/A, clearly**, never a spurious
+    /// `0.0` J/token ("free inference") and never a silent gap. A profile
+    /// that *did* measure power (even an all-CPU-estimate one) is not N/A.
+    #[must_use]
+    pub fn is_na(&self) -> bool {
+        self.avg_power_w.is_none() && self.peak_power_w.is_none()
+    }
 }
 
 /// True when `t` lies within the closed window `[start, end]`.

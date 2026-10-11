@@ -316,6 +316,14 @@ pub struct EnergySummary {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragmentation_warning: Option<String>,
+    /// The clear N/A reason when no power telemetry was available (the
+    /// module N/A rule — a driverless host or a sensor with no usable
+    /// reading, e.g. the RAPL quirk on a shared host). `Some("N/A — no
+    /// power telemetry")` so the persisted/exported energy object is an
+    /// *honest, labeled* N/A, never a silent gap and never a spurious
+    /// `0.0` J/token. `None` when the profile measured power.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub na_reason: Option<String>,
 }
 
 impl EnergySummary {
@@ -330,6 +338,7 @@ impl EnergySummary {
             vendor: e.vendor.clone(),
             model: e.model.clone(),
             fragmentation_warning: e.fragmentation_warning.clone(),
+            na_reason: e.is_na().then(|| "N/A — no power telemetry".to_string()),
         }
     }
 }
