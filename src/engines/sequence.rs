@@ -3,8 +3,8 @@
 //! lock-free progress state that the TUI reads every frame.
 //!
 //! This is the TUI-side orchestration (the headless path keeps its own
-//! sequential order via `run_selected` / `main::run_headless`). The
-//! sequence is a `tokio::spawn`ed task that:
+//! sequential order in `main::run_headless`). The sequence is a
+//! `tokio::spawn`ed task that:
 //!
 //! 1. walks the ordered engine queue (only the engines the user selected
 //!    in the Configuration form / setup flow);

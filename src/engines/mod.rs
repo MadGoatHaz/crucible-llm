@@ -20,12 +20,26 @@
 //!   sweet-spot concurrency — `n` concurrent streams (Engine B's
 //!   recommendation) for one 60-second window, all at once.
 //!
-//! **Chunk 18 — full integration:** [`run_selected`] orchestrates *any*
-//! combination of the four engines from a single [`Config`] (the
-//! [`EngineSelection`] in `cfg.engines`), and [`ResultSlot`] is the
-//! lock-free `ArcSwap` double-buffer seam the TUI uses to read a
-//! completed engine result without ever touching the timing path
-//! (measurement-isolation invariant, blueprint §4).
+//! **Chunk 18 — full integration:** [`ResultSlot`] is the lock-free
+//! `ArcSwap` double-buffer seam the TUI uses to read a completed engine
+//! result without ever touching the timing path (measurement-isolation
+//! invariant, blueprint §4).
+//!
+//! **One orchestrator per mode (R1, closes the dead-code finding DO-07):**
+//! there is exactly *one* code path that runs "this subset of engines"
+//! per mode, so they cannot drift:
+//!
+//! * **Headless** — `main::run_headless` runs the selected engines
+//!   sequentially in the foreground (Engine A gated on the selection, the
+//!   additional engines B/C1/C2/C3/F gated on it, Engine D as the
+//!   background poller).
+//! * **TUI** — [`sequence::BenchmarkSequence`] runs the selected engines
+//!   one at a time, each publishing to its lock-free [`ResultSlot`].
+//!
+//! The earlier standalone `run_selected`/`RunReport` helper (a third,
+//! divergent runner that was never called) was removed: it duplicated the
+//! headless block without the `--json` / logger / sweet-spot wiring, so
+//! keeping it only invited drift.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -135,119 +149,14 @@ impl<T> Default for ResultSlot<T> {
 }
 
 // ── Engine orchestration (Chunk 18) ───────────────────────────────────────
-
-/// The combined result of a multi-engine run: whichever of A/B/C1/C2/C3
-/// were selected in [`EngineSelection`] have their results here; the rest
-/// stay empty/`None`. Engine D (hardware) is continuous telemetry, not a
-/// one-shot result, so it is driven by the [`crate::hw::HwPoller`] rather
-/// than collected here.
-#[derive(Debug, Default)]
-pub struct RunReport {
-    /// Engine A — one [`SpeedResult`] per iteration.
-    pub speed: Vec<SpeedResult>,
-    /// Engine B — the ladder sweep curve (knee + envelope derived from it).
-    pub concurrency: Option<SweepResult>,
-    /// Engine C1 — the NIAH matrix.
-    pub niah: Option<NiahResult>,
-    /// Engine C2 — the deterministic reasoning score + speed.
-    pub reasoning: Option<ReasoningResult>,
-    /// Engine C3 — the structured-output penalty + compliance.
-    pub structured: Option<StructuredResult>,
-    /// Engine F — Flat Out (real-world max throughput at the
-    /// sweet-spot concurrency, one 60s window).
-    pub flatout: Option<FlatOutResult>,
-}
-
-impl RunReport {
-    /// A human-readable one-line summary of what ran (for logs / the TUI).
-    pub fn summary_line(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.speed.is_empty() {
-            parts.push(format!("A: {} run(s)", self.speed.len()));
-        }
-        if let Some(s) = &self.concurrency {
-            parts.push(format!("B: {} level(s)", s.levels.len()));
-        }
-        if let Some(n) = &self.niah {
-            parts.push(format!("C1: {}", n.accuracy_label()));
-        }
-        if let Some(r) = &self.reasoning {
-            parts.push(format!("C2: {}", r.score.label()));
-        }
-        if let Some(s) = &self.structured {
-            parts.push(format!("C3: {}", s.summary_line()));
-        }
-        if let Some(f) = &self.flatout {
-            parts.push(format!("F: {}", f.summary_line()));
-        }
-        if parts.is_empty() {
-            "no engines selected".to_string()
-        } else {
-            parts.join(" · ")
-        }
-    }
-}
-
-/// Run the engines selected in `cfg.engines` (plan Chunk 18: "a single
-/// command/run can trigger any combination" of A/B/C/D).
-///
-/// Engines run **sequentially** (one at a time) so each measures the
-/// endpoint alone — no queueing cross-talk — and a failure in one engine
-/// degrades gracefully (its field stays empty) without aborting the rest.
-/// This is the headless / one-shot orchestration; the TUI instead spawns
-/// the selected engines as independent background tasks, each publishing to
-/// its own [`ResultSlot`] (see `App::start_run`).
-pub async fn run_selected(cfg: &Config) -> RunReport {
-    let sel = cfg.engines;
-    let mut report = RunReport::default();
-
-    if sel.speed {
-        if let Ok(engine) = SpeedEngine::new(cfg) {
-            let (_, results) = engine.run().await;
-            report.speed = results;
-        }
-    }
-
-    if sel.concurrency {
-        if let Some(sweep) = build_sweep(cfg, None, None) {
-            report.concurrency = Some(sweep.run().await);
-        }
-    }
-
-    if sel.niah {
-        if let Ok(engine) = NiahEngine::new(cfg) {
-            report.niah = Some(engine.run().await);
-        }
-    }
-
-    if sel.reasoning {
-        if let Ok(engine) = ReasoningEngine::new(cfg) {
-            report.reasoning = Some(engine.run().await);
-        }
-    }
-
-    if sel.structured {
-        if let Ok(engine) = StructuredEngine::new(cfg) {
-            report.structured = Some(engine.run().await);
-        }
-    }
-
-    if sel.flatout {
-        // Engine F runs at Engine B's sweet spot (the real-world
-        // full-load number); without a sweep it uses the default count.
-        let (stream_count, source) = report
-            .concurrency
-            .as_ref()
-            .map(|r| (r.sweet_spot, StreamCountSource::ConcurrencySweetSpot))
-            .unwrap_or((DEFAULT_STREAM_COUNT, StreamCountSource::Default));
-        if let Ok(engine) = FlatOutEngine::new(cfg) {
-            let engine = engine.stream_count(stream_count, source);
-            report.flatout = Some(engine.run().await);
-        }
-    }
-
-    report
-}
+//
+// The "run this subset" logic lives in the two mode-specific orchestrators
+// (see the module docs): `main::run_headless` (headless) and
+// `sequence::BenchmarkSequence` (TUI). There is deliberately *no* third
+// general-purpose runner here — the earlier `run_selected`/`RunReport`
+// helper was dead code that had drifted from both, and was removed
+// (DO-07). `build_sweep` below is the one shared Engine B constructor both
+// orchestrators use.
 
 /// Build an Engine B [`Sweep`] from a config (shared client, the
 /// configured ladder, and the configured prompt). `metrics` (optional)
@@ -369,79 +278,6 @@ mod tests {
         assert!(reader.load().is_none());
         slot.store("done".to_string());
         assert_eq!(reader.load().as_deref(), Some("done"));
-    }
-
-    #[test]
-    fn run_report_summary_line_names_the_engines_that_ran() {
-        let empty = RunReport::default();
-        assert_eq!(empty.summary_line(), "no engines selected");
-
-        let r = RunReport {
-            speed: vec![SpeedResult {
-                ttft: 0.1,
-                prompt_tokens: 100,
-                completion_tokens: 10,
-                pp_speed: 1000.0,
-                tg_speed: 10.0,
-                mtp_efficiency: 1.0,
-                stream_time: 1.0,
-                total_chunks: 10,
-                content_chunks: 10,
-                reasoning_chunks: 0,
-                other_chunks: 0,
-                estimated: false,
-                model: "m".into(),
-                mode: "short".into(),
-                error: None,
-
-                looping: false,
-            }],
-            ..Default::default()
-        };
-        let line = r.summary_line();
-        assert!(line.contains("A: 1 run(s)"), "{line}");
-        assert!(!line.contains("no engines"), "{line}");
-    }
-
-    #[test]
-    fn run_report_summary_includes_capability_scores() {
-        let r = RunReport {
-            reasoning: Some(ReasoningResult {
-                responses: vec![],
-                ttfts: vec![],
-                tg_speeds: vec![],
-                score: ReasoningScore {
-                    total: 13,
-                    solved: 9,
-                    by_category: [(4, 5), (3, 5), (2, 3)],
-                },
-            }),
-            structured: Some(StructuredResult {
-                free_tps: 100.0,
-                constrained_tps: 70.0,
-                penalty_pct: 30.0,
-                free_ttft: 0.1,
-                constrained_ttft: 0.12,
-                cases: vec![
-                    evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
-                    evaluate_case(
-                        "Medium",
-                        r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
-                    ),
-                    evaluate_case(
-                        "Complex",
-                        r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
-                    ),
-                ],
-                constrained_body: "{}".into(),
-                free_body: "hi".into(),
-            }),
-            ..Default::default()
-        };
-        let line = r.summary_line();
-        assert!(line.contains("C2: 9/13 solved"), "{line}");
-        assert!(line.contains("C3: +30.0% penalty"), "{line}");
-        assert!(line.contains("3/3 compliant"), "{line}");
     }
 
     #[test]
