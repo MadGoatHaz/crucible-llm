@@ -37,7 +37,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::{
-    default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, Mode, DEFAULT_RATE_KWH,
+    default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, EngineSelectionFile,
+    Mode, DEFAULT_RATE_KWH,
 };
 use crate::engines::concurrency::DEFAULT_LADDER;
 use crate::ui::app::{fmt, App};
@@ -429,7 +430,7 @@ impl ConfigState {
             log_dir: None,
             ladder,
             hardware: Some(self.hardware),
-            engines: Some(EngineSelection {
+            engines: Some(EngineSelectionFile::explicit(EngineSelection {
                 speed: self.engine_speed,
                 concurrency: self.engine_concurrency,
                 niah: self.engine_niah,
@@ -437,7 +438,7 @@ impl ConfigState {
                 structured: self.engine_structured,
                 hardware: self.hardware,
                 flatout: self.engine_flatout,
-            }),
+            })),
             // The matrix axis is a CLI/env concern — never persisted from the form.
             matrix_contexts: None,
             // The color theme is a pure preference — persisted so the
@@ -470,6 +471,17 @@ impl ConfigState {
             // Reset to defaults (`R` — intercepted before character typing).
             KeyCode::Char('R') => {
                 self.reset_to_defaults();
+                ConfigKeyResult::Inert
+            }
+            // Select-all / deselect-all engines (`A` / `X`) — intercepted
+            // *only* when the cursor is on an engine row, so typing `A`/`X`
+            // into the URL / model / ladder text fields is unaffected.
+            KeyCode::Char('A') | KeyCode::Char('a') if is_engine_field(self.current()) => {
+                self.select_all_engines();
+                ConfigKeyResult::Inert
+            }
+            KeyCode::Char('X') | KeyCode::Char('x') if is_engine_field(self.current()) => {
+                self.deselect_all_engines();
                 ConfigKeyResult::Inert
             }
             // Navigation.
@@ -638,6 +650,30 @@ impl ConfigState {
             }
             _ => {}
         }
+    }
+
+    /// Turn every engine toggle on (`A` pressed while an engine row is
+    /// focused) — the TUI equivalent of `--engine all`.
+    fn select_all_engines(&mut self) {
+        self.hardware = true;
+        self.engine_speed = true;
+        self.engine_concurrency = true;
+        self.engine_niah = true;
+        self.engine_reasoning = true;
+        self.engine_structured = true;
+        self.engine_flatout = true;
+    }
+
+    /// Turn every engine toggle off (`X` pressed while an engine row is
+    /// focused) — the TUI equivalent of an empty selection.
+    fn deselect_all_engines(&mut self) {
+        self.hardware = false;
+        self.engine_speed = false;
+        self.engine_concurrency = false;
+        self.engine_niah = false;
+        self.engine_reasoning = false;
+        self.engine_structured = false;
+        self.engine_flatout = false;
     }
 
     /// Step / cycle the focused field by `dir` (`←`/`-` = -1, `→`/`+` = +1).
@@ -812,7 +848,7 @@ fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame, gpu_label:
         style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
-        "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [type] edit · [⌫] delete",
+        "[Tab/↑↓] move · [Space/Enter] toggle · [←→/+/-] step · [A] all · [X] none · [type] edit",
         style::footer(th),
     )));
     lines.push(Line::from(Span::styled(
@@ -1031,6 +1067,22 @@ fn parse_rate(s: &str) -> f64 {
 /// startup snapshot and can be stale).
 pub fn current_rate(app: &crate::ui::app::App) -> f64 {
     parse_rate(&app.config.rate_text)
+}
+
+/// `true` for the seven engine-toggle rows. The `A` (select all) / `X`
+/// (deselect all) keys act only on these, so they never capture typing in
+/// the text fields.
+fn is_engine_field(f: Field) -> bool {
+    matches!(
+        f,
+        Field::Hardware
+            | Field::EngineSpeed
+            | Field::EngineConcurrency
+            | Field::EngineNiah
+            | Field::EngineReasoning
+            | Field::EngineStructured
+            | Field::EngineFlatOut
+    )
 }
 
 /// The toggle state glyph: `[✓]` on, `[ ]` off (clear, at-a-glance state).

@@ -219,12 +219,29 @@ impl Default for EngineSelection {
 }
 
 impl EngineSelection {
+    /// Every engine on (A, B, C1, C2, C3, D, F). The `all` primitive:
+    /// `--engine all`, `CRUCIBLE_ENGINE=all`, and the config-file string
+    /// `"all"` all resolve to this.
+    pub const fn all() -> Self {
+        Self {
+            speed: true,
+            concurrency: true,
+            niah: true,
+            reasoning: true,
+            structured: true,
+            hardware: true,
+            flatout: true,
+        }
+    }
+
     /// Build a selection from a list of engine names (case-insensitive).
     ///
-    /// Accepted names: `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`,
-    /// `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`. The
+    /// Accepted names: `all` (everything on), `speed`/`a`,
+    /// `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`,
+    /// `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`f`. The
     /// list is the **complete** selection: only the named engines are on
-    /// (so `--engine niah` runs exactly NIAH, not the default five).
+    /// (so `--engine niah` runs exactly NIAH, not the default five);
+    /// `all` turns everything on regardless of the other names.
     /// Returns the selection plus any unknown names, so the caller can
     /// surface a precise error. (The built-in default — everything except
     /// D — applies only when no engines are named at all.)
@@ -241,6 +258,10 @@ impl EngineSelection {
         let mut unknown = Vec::new();
         for name in names {
             match name.as_ref().to_ascii_lowercase().as_str() {
+                // `all` is the select-everything primitive: it turns on all
+                // seven engines (it composes with any other names, which
+                // are then redundant).
+                "all" => sel = Self::all(),
                 "speed" | "a" => sel.speed = true,
                 "concurrency" | "b" => sel.concurrency = true,
                 "niah" | "needle" | "c1" => sel.niah = true,
@@ -252,6 +273,33 @@ impl EngineSelection {
             }
         }
         (sel, unknown)
+    }
+
+    /// The canonical short names of the enabled engines, in A/B/C1/C2/C3/D/F
+    /// order (`speed`, `concurrency`, `niah`, `reasoning`, `structured`,
+    /// `hardware`, `flatout`). These are the exact tokens `from_names`
+    /// accepts, so the list round-trips through `--engine` / the env var.
+    pub fn selected_names(&self) -> Vec<&'static str> {
+        [
+            (self.speed, "speed"),
+            (self.concurrency, "concurrency"),
+            (self.niah, "niah"),
+            (self.reasoning, "reasoning"),
+            (self.structured, "structured"),
+            (self.hardware, "hardware"),
+            (self.flatout, "flatout"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| name)
+        .collect()
+    }
+
+    /// The JSON array of enabled engine names (e.g. `["speed","niah"]`),
+    /// for the `benchmark_sessions.engines` traceability column.
+    pub fn selected_names_json(&self) -> String {
+        serde_json::to_string(&self.selected_names())
+            .unwrap_or_else(|_| "[]".to_string())
     }
 
     /// `true` when no engine is selected.
@@ -296,6 +344,74 @@ impl EngineSelection {
         .into_iter()
         .filter(|(on, _)| *on)
         .map(|(_, label)| label)
+    }
+}
+
+/// The `engines` entry as it appears in the JSON config file.
+///
+/// It accepts **two** shapes (the file is hand-editable, so both are
+/// ergonomic):
+///
+/// * the **7-bool object** (the canonical form the TUI's `F2` save writes,
+///   e.g. `{"speed": true, "hardware": false, …}`);
+/// * the **string shorthand** `"all"` (every engine on) — and, as a bonus,
+///   any single engine name (`"niah"`) resolves to just that engine.
+///
+/// A newtype with a hand-written `Deserialize` (via `serde_json::Value`)
+/// is the only way to accept both shapes under the file's
+/// `#[serde(deny_unknown_fields)]`: the field is always a *known* field
+/// (`engines`), and the value is dispatched on its JSON type. `Serialize`
+/// always emits the canonical 7-bool object, so a round-tripped file stays
+/// in the explicit form the TUI expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineSelectionFile(EngineSelection);
+
+impl EngineSelectionFile {
+    /// Wrap an explicit [`EngineSelection`] (the TUI save path).
+    #[must_use]
+    pub fn explicit(sel: EngineSelection) -> Self {
+        Self(sel)
+    }
+
+    /// The wrapped selection.
+    #[must_use]
+    pub fn into_selection(self) -> EngineSelection {
+        self.0
+    }
+}
+
+impl Serialize for EngineSelectionFile {
+    // Always the canonical 7-bool object.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EngineSelectionFile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            // String shorthand: `"all"` (or a single engine name).
+            serde_json::Value::String(s) => {
+                let (sel, unknown) = EngineSelection::from_names([s.as_str()]);
+                if unknown.is_empty() {
+                    Ok(Self(sel))
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "unknown engine selection {s:?} (use \"all\" or a 7-bool object)"
+                    )))
+                }
+            }
+            // The canonical 7-bool object.
+            serde_json::Value::Object(_) => {
+                let sel =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(Self(sel))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "engines must be the string \"all\" or a 7-bool object, got {other:?}"
+            ))),
+        }
     }
 }
 
@@ -568,8 +684,9 @@ pub struct ConfigFile {
     pub ladder: Option<Vec<usize>>,
     /// Enable the hardware/energy telemetry poller (Chunk 18).
     pub hardware: Option<bool>,
-    /// Which engines a run orchestrates (Chunk 18).
-    pub engines: Option<EngineSelection>,
+    /// Which engines a run orchestrates (Chunk 18). Accepts the 7-bool
+    /// object (the TUI's canonical form) or the string shorthand `"all"`.
+    pub engines: Option<EngineSelectionFile>,
     /// The run-log directory (default `data_dir()/crucible/logs`).
     pub log_dir: Option<PathBuf>,
     /// The v0.1.1 2D matrix context axis (target prompt tokens).
@@ -640,7 +757,7 @@ impl ConfigFile {
             c.hardware = v;
         }
         if let Some(v) = self.engines {
-            c.engines = v;
+            c.engines = v.into_selection();
         }
         // A file-supplied engine selection is an explicit choice.
         c.engines_explicit = self.engines.is_some();
@@ -962,7 +1079,9 @@ pub fn layer(
             .collect();
         if names.is_empty() {
             (
-                file.and_then(|f| f.engines).unwrap_or_default(),
+                file.and_then(|f| f.engines)
+                    .map(|f| f.into_selection())
+                    .unwrap_or_default(),
                 file.and_then(|f| f.engines).is_some(),
             )
         } else {
@@ -970,7 +1089,9 @@ pub fn layer(
         }
     } else {
         (
-            file.and_then(|f| f.engines).unwrap_or_default(),
+            file.and_then(|f| f.engines)
+                .map(|f| f.into_selection())
+                .unwrap_or_default(),
             file.and_then(|f| f.engines).is_some(),
         )
     };
@@ -1612,6 +1733,131 @@ mod tests {
         assert_eq!(unknown, vec!["bogus".to_string()]);
         // The known name still applies.
         assert!(e.speed);
+    }
+
+    // ── the `all` primitive ──────────────────────────────────────────────
+
+    #[test]
+    fn engine_selection_all_turns_everything_on() {
+        let e = EngineSelection::all();
+        assert!(e.speed);
+        assert!(e.concurrency);
+        assert!(e.niah);
+        assert!(e.reasoning);
+        assert!(e.structured);
+        assert!(e.hardware);
+        assert!(e.flatout);
+        assert_eq!(e.count(), 7);
+        assert!(!e.is_empty());
+    }
+
+    #[test]
+    fn from_names_accepts_all() {
+        let (e, unknown) = EngineSelection::from_names(["all"]);
+        assert!(unknown.is_empty(), "all is a known name: {unknown:?}");
+        assert_eq!(e, EngineSelection::all());
+        assert_eq!(e.count(), 7);
+    }
+
+    #[test]
+    fn from_names_all_composes_with_other_names() {
+        // `all` plus a redundant name still yields all seven.
+        let (e, unknown) = EngineSelection::from_names(["all", "niah"]);
+        assert!(unknown.is_empty());
+        assert_eq!(e, EngineSelection::all());
+    }
+
+    #[test]
+    fn cli_engine_all_selects_everything() {
+        // `--engine all` resolves to all seven engines.
+        let cfg = resolve_bare(&["crucible-llm", "--engine", "all"]);
+        assert_eq!(cfg.engines, EngineSelection::all());
+        assert!(cfg.engines_explicit);
+    }
+
+    #[test]
+    fn env_engine_all_selects_everything() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        let env = vec![(env_vars::ENGINE.to_string(), "all".to_string())];
+        let cfg = layer(&cli, &matches, &env, None).unwrap();
+        assert_eq!(cfg.engines, EngineSelection::all());
+    }
+
+    #[test]
+    fn config_file_accepts_engines_string_all() {
+        // The string shorthand `"all"` in the config file selects every
+        // engine (the object form is the canonical/round-tripped one).
+        let f = file(r#"{"engines": "all"}"#);
+        let c = f.to_config();
+        assert_eq!(c.engines, EngineSelection::all());
+        assert!(c.engines_explicit);
+    }
+
+    #[test]
+    fn config_file_engines_object_still_accepted() {
+        // The 7-bool object form (the TUI's canonical save shape) keeps
+        // working alongside the string shorthand.
+        let f = file(
+            r#"{"engines":{"speed":true,"concurrency":false,"niah":true,
+                "reasoning":false,"structured":false,"hardware":false,"flatout":false}}"#,
+        );
+        let c = f.to_config();
+        assert!(c.engines.speed);
+        assert!(!c.engines.concurrency);
+        assert!(c.engines.niah);
+        assert!(!c.engines.hardware);
+        assert!(!c.engines.flatout);
+    }
+
+    #[test]
+    fn config_file_engines_unknown_string_is_an_error() {
+        // A string that is neither `all` nor a known engine name is
+        // rejected at parse time (surfaced as a file parse error).
+        assert!(
+            serde_json::from_str::<ConfigFile>(r#"{"engines": "warp-drive"}"#).is_err(),
+            "unknown engine string must be rejected"
+        );
+    }
+
+    #[test]
+    fn config_file_engines_round_trips_as_the_object() {
+        // Saving a selection always serializes the canonical 7-bool object
+        // (never the string), so a hand-`"all"` file becomes explicit on
+        // the next `F2` save.
+        let f = ConfigFile {
+            engines: Some(EngineSelectionFile::explicit(EngineSelection::all())),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"speed\":true"), "object form: {json}");
+        assert!(!json.contains("\"engines\":\"all\""), "not the string: {json}");
+        let back: ConfigFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.engines, Some(EngineSelectionFile::explicit(EngineSelection::all())));
+    }
+
+    #[test]
+    fn selected_names_and_json_round_trip() {
+        let e = EngineSelection {
+            speed: true,
+            concurrency: false,
+            niah: true,
+            reasoning: false,
+            structured: false,
+            hardware: false,
+            flatout: true,
+        };
+        assert_eq!(
+            e.selected_names(),
+            vec!["speed", "niah", "flatout"]
+        );
+        assert_eq!(e.selected_names_json(), r#"["speed","niah","flatout"]"#);
+        // The JSON list re-parses to the same selection.
+        let back = EngineSelection::from_names(
+            serde_json::from_str::<Vec<String>>(&e.selected_names_json()).unwrap(),
+        )
+        .0;
+        assert_eq!(back, e);
     }
 
     #[test]
