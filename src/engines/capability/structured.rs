@@ -866,7 +866,7 @@ impl StructuredEngine {
         let mut case_evals: Vec<Vec<StructuredCaseResult>> =
             Vec::with_capacity(STRUCTURED_CASES.len());
         let mut run_no = 1usize;
-        for case_idx in 0..STRUCTURED_CASES.len() {
+        for (case_idx, case) in STRUCTURED_CASES.iter().enumerate() {
             let mut evals = Vec::with_capacity(n);
             for rep in 0..n {
                 run_no += 1;
@@ -885,7 +885,7 @@ impl StructuredEngine {
                     constrained_ttft = ttft;
                     constrained_body = body.clone();
                 }
-                evals.push(evaluate_case(STRUCTURED_CASES[case_idx].name, &body));
+                evals.push(evaluate_case(case.name, &body));
             }
             case_evals.push(evals);
         }
