@@ -1391,4 +1391,128 @@ mod tests {
         assert!(loaded.is_some());
         assert_eq!(loaded.as_ref().as_ref().unwrap().accuracy(), (1, 1));
     }
+
+    // ── human_size shared formatter (Issue #3) ────────────────────────
+
+    #[test]
+    fn human_size_formats_k_and_m() {
+        assert_eq!(human_size(2000), "2k");
+        assert_eq!(human_size(128000), "128k");
+        assert_eq!(human_size(256000), "256k");
+        assert_eq!(human_size(500000), "500k");
+        assert_eq!(human_size(1_000_000), "1M");
+        assert_eq!(human_size(2_000_000), "2M");
+        // Fractional sizes get a single decimal.
+        assert_eq!(human_size(1500), "1.5k");
+        assert_eq!(human_size(1_500_000), "1.5M");
+        // Sub-1k counts are shown as-is.
+        assert_eq!(human_size(999), "999");
+    }
+
+    #[test]
+    fn context_label_uses_human_size_and_marks_approx() {
+        // Exact (tokenizer) at 1M reads plain "1M" (was "1000k" before #4).
+        assert_eq!(cell(1_000_000, 50, true, 0.5).context_label(), "1M");
+        // The chars/4 estimate at 256k is labeled approximate (C1, #4).
+        let mut approx = cell(256000, 50, true, 0.5);
+        approx.approximate = true;
+        assert_eq!(approx.context_label(), "256k (approx.)");
+        // 128k exact (the old CF-46 case, now rendered via human_size).
+        assert_eq!(cell(128000, 50, true, 0.5).context_label(), "128k");
+    }
+
+    // ── large haystack scaling (Issue #5) ─────────────────────────────
+
+    #[test]
+    fn build_document_scales_to_a_large_size_with_approx_label() {
+        // 200k tokens (beyond the old 128k ceiling), no tokenizer → the
+        // chars/4 estimate is flagged `estimated` (the "approx" label).
+        let needle = Needle::random();
+        let doc = build_document(200_000, 50, &needle, None);
+        assert!(doc.estimated, "no tokenizer → the size is a chars/4 estimate");
+        assert_eq!(doc.target_tokens, 200_000);
+        // The achieved count lands within ±10% of the 200k target.
+        assert!(
+            (doc.token_count as i64 - 200_000).abs() <= 20_000,
+            "token_count = {} (target 200k, ±10%)",
+            doc.token_count
+        );
+        // Depth 50: the needle sits at the middle of the document.
+        let pos = doc.text.find(&needle.sentence()).expect("needle present");
+        let frac = pos as f64 / doc.text.len() as f64;
+        assert!(
+            (frac - 0.5).abs() < 0.1,
+            "needle at {:.1}% of the document (expected ~50%)",
+            frac * 100.0
+        );
+        // A 200k-token haystack is ~800k chars (≈4 bytes/token).
+        assert!(
+            doc.text.len() > 700_000,
+            "haystack ~800k chars, got {}",
+            doc.text.len()
+        );
+    }
+
+    // ── matrix runner honors the config ladders (Issue #5) ────────────
+
+    #[test]
+    fn engine_honors_custom_context_and_depth_ladders() {
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            niah_contexts: vec![16_000, 256_000, 1_000_000],
+            niah_depths: vec![0, 50, 100],
+            niah_custom: None,
+            ..Config::default()
+        };
+        let engine = NiahEngine::new(&cfg).unwrap();
+        assert_eq!(engine.sizes_list(), &[16_000, 256_000, 1_000_000]);
+        assert_eq!(engine.depths_list(), &[0, 50, 100]);
+    }
+
+    #[test]
+    fn engine_custom_single_size_collapses_to_one_row() {
+        // The focused "count test": `niah_custom` takes precedence over
+        // `niah_contexts` and the matrix is a single size row.
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            niah_contexts: vec![2_000, 4_000],
+            niah_depths: vec![0, 50, 100],
+            niah_custom: Some(500_000),
+            ..Config::default()
+        };
+        let engine = NiahEngine::new(&cfg).unwrap();
+        assert_eq!(engine.sizes_list(), &[500_000]);
+        assert_eq!(engine.depths_list(), &[0, 50, 100]);
+    }
+
+    #[test]
+    fn engine_defaults_to_the_builtin_ladders_when_unconfigured() {
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            ..Config::default()
+        };
+        let engine = NiahEngine::new(&cfg).unwrap();
+        assert_eq!(engine.sizes_list(), NIAH_SIZES.as_slice());
+        assert_eq!(engine.depths_list(), NIAH_DEPTHS.as_slice());
+    }
+
+    #[test]
+    fn niah_engine_config_carries_and_applies_the_ladders() {
+        // The TUI standalone `n`-key path builds the engine via
+        // NiahEngineConfig::from_config + engine().
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            niah_contexts: vec![64_000, 256_000],
+            niah_depths: vec![10, 90],
+            niah_custom: Some(1_000_000),
+            ..Config::default()
+        };
+        let nec = NiahEngineConfig::from_config(&cfg);
+        assert_eq!(nec.niah_contexts, vec![64_000, 256_000]);
+        assert_eq!(nec.niah_depths, vec![10, 90]);
+        assert_eq!(nec.niah_custom, Some(1_000_000));
+        let engine = nec.engine().unwrap();
+        assert_eq!(engine.sizes_list(), &[1_000_000]);
+        assert_eq!(engine.depths_list(), &[10, 90]);
+    }
 }

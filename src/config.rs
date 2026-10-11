@@ -2242,4 +2242,94 @@ mod tests {
         assert!(!c.engines.hardware);
         assert!(!c.engines.flatout);
     }
+
+    // ── NIAH (C1) ladders (Issue #5) ─────────────────────────────────
+
+    #[test]
+    fn niah_ladders_default_to_the_builtin_2k_to_128k() {
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert_eq!(
+            cfg.niah_contexts,
+            vec![2000, 4000, 8000, 16000, 32000, 64000, 128000]
+        );
+        assert_eq!(
+            cfg.niah_depths,
+            vec![0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        );
+        assert_eq!(cfg.niah_custom, None);
+    }
+
+    #[test]
+    fn cli_niah_contexts_overrides_the_default_ladder() {
+        // k and M suffixes, beyond the old 128k ceiling.
+        let cfg = resolve_bare(&["crucible-llm", "--niah-contexts", "16k,64k,128k,256k,1M"]);
+        assert_eq!(
+            cfg.niah_contexts,
+            vec![16000, 64000, 128000, 256000, 1_000_000]
+        );
+    }
+
+    #[test]
+    fn cli_niah_depths_overrides_the_default_ladder() {
+        let cfg = resolve_bare(&["crucible-llm", "--niah-depths", "0,25,50,75,100"]);
+        assert_eq!(cfg.niah_depths, vec![0, 25, 50, 75, 100]);
+    }
+
+    #[test]
+    fn cli_niah_custom_is_a_single_size() {
+        let cfg = resolve_bare(&["crucible-llm", "--niah-custom", "256k"]);
+        assert_eq!(cfg.niah_custom, Some(256000));
+        // A plain number (no suffix) works too.
+        let cfg = resolve_bare(&["crucible-llm", "--niah-custom", "1000000"]);
+        assert_eq!(cfg.niah_custom, Some(1_000_000));
+    }
+
+    #[test]
+    fn niah_ladders_layer_from_env_and_file() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        // env wins over file for the two lists; the file supplies the custom.
+        let env = vec![
+            (env_vars::NIAH_CONTEXTS.to_string(), "32k,128k".to_string()),
+            (env_vars::NIAH_DEPTHS.to_string(), "0,50,100".to_string()),
+        ];
+        let f = file(r#"{"niah_contexts":[8000],"niah_depths":[50],"niah_custom":4000}"#);
+        let cfg = layer(&cli, &matches, &env, Some(&f)).unwrap();
+        assert_eq!(cfg.niah_contexts, vec![32000, 128000]);
+        assert_eq!(cfg.niah_depths, vec![0, 50, 100]);
+        assert_eq!(cfg.niah_custom, Some(4000));
+    }
+
+    #[test]
+    fn parse_niah_contexts_rejects_zero_and_bad_entries() {
+        assert_eq!(
+            parse_niah_contexts("16k,64k,1M"),
+            Some(vec![16000, 64000, 1_000_000])
+        );
+        // 0 has no "configured prompt" meaning for C1 — it is rejected (the
+        // caller falls back to the default ladder).
+        assert_eq!(parse_niah_contexts("0,8k"), None);
+        assert_eq!(parse_niah_contexts("8x,16k"), None);
+        assert_eq!(parse_niah_contexts(""), None);
+    }
+
+    #[test]
+    fn parse_niah_depths_rejects_out_of_range() {
+        assert_eq!(
+            parse_niah_depths("0,25,50,100"),
+            Some(vec![0, 25, 50, 100])
+        );
+        assert_eq!(parse_niah_depths("0,101"), None, "depths are 0..=100");
+        assert_eq!(parse_niah_depths("a,b"), None);
+    }
+
+    #[test]
+    fn parse_size_handles_k_m_and_plain() {
+        assert_eq!(parse_size("8k"), Some(8000));
+        assert_eq!(parse_size("1M"), Some(1_000_000));
+        assert_eq!(parse_size("256K"), Some(256000));
+        assert_eq!(parse_size("512"), Some(512));
+        assert_eq!(parse_size("8x"), None);
+        assert_eq!(parse_size(""), None);
+    }
 }
