@@ -24,21 +24,24 @@ use std::time::Duration;
 
 use crucible_llm::client::StreamEvent;
 use crucible_llm::config::{Config, ConfigError, ExportFormat, DEFAULT_MODEL};
-use crucible_llm::engines::hardware::{joules_per_token, profile};
+use crucible_llm::engines::hardware::{joules_per_token, profile, EnergyResult};
 use crucible_llm::engines::speed::{
     all_failed, format_result_box, format_summary, json_report, SpeedEngine, SpeedResult,
     MAX_GEN_TOKENS,
 };
 use crucible_llm::engines::{
-    build_sweep, summarize_sweep, FlatOutEngine, NiahEngine, ReasoningEngine, StreamCountSource,
-    StructuredEngine,
+    build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, ReasoningEngine,
+    ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult, SweepResult,
 };
 use crucible_llm::hw::{
     detect_gpu, gpu_display_name, CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS,
 };
 use crucible_llm::log::{Context, RunLogger};
 use crucible_llm::storage::export::{self, ExportPayload, PacketSample};
-use crucible_llm::storage::{BenchmarkSession, Database, StreamMetricRow};
+use crucible_llm::storage::{
+    BenchmarkSession, ConcurrencySummary, Database, EngineResults, EnergySummary, FlatOutSummary,
+    ReasoningSummary, StreamMetricRow, StructuredSummary,
+};
 use crucible_llm::timing::MonotonicInstant;
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::event::EventLoop;
@@ -384,27 +387,185 @@ fn run_headless(
                 print!("{summary}");
             }
         }
-        // Engine D (hardware/energy) run-level summary (blueprint §5D) —
-        // printed only when D is selected AND power telemetry was present
-        // (a driverless host prints nothing: the N/A rule, never a
-        // spurious 0.0). DO-08: this is now gated on the selection.
-        if cfg.hardware && !cfg.json {
+        // Engine D (hardware/energy) — the silicon-efficiency profile over
+        // the whole run. Computed once and reused for: the (non-JSON)
+        // display, the `--json` energy object (DO-09/CF-21), and the
+        // `engine_results` column. DO-08: only when D is selected. A
+        // driverless host yields the N/A rule (no spurious 0.0).
+        let energy_result: Option<EnergyResult> = if cfg.hardware {
             let total_tokens: u64 = results.iter().map(|r| r.completion_tokens).sum();
-            let energy = profile(&hw_trace, None, total_tokens);
-            if let Some(jpt) = energy.joules_per_token {
-                let peak = energy
-                    .peak_power_w
-                    .map(|w| format!(" · peak {w:.0} W"))
-                    .unwrap_or_default();
-                term.dim(&format!(
-                    "  Energy: {:.1} J ({:.3} J/token{peak})",
-                    energy.joules, jpt
-                ));
+            Some(profile(&hw_trace, None, total_tokens))
+        } else {
+            None
+        };
+        if let Some(energy) = &energy_result {
+            if !cfg.json {
+                if let Some(jpt) = energy.joules_per_token {
+                    let peak = energy
+                        .peak_power_w
+                        .map(|w| format!(" · peak {w:.0} W"))
+                        .unwrap_or_default();
+                    term.dim(&format!(
+                        "  Energy: {:.1} J ({:.3} J/token{peak})",
+                        energy.joules, jpt
+                    ));
+                }
+                if let Some(w) = &energy.fragmentation_warning {
+                    term.warning(&format!("VRAM: {w}"));
+                }
             }
-            if let Some(w) = &energy.fragmentation_warning {
-                term.warning(&format!("VRAM: {w}"));
+            // DO-09/CF-21: the `--json` document carries the energy object
+            // (the serializable summary, not the non-`Serialize` raw
+            // `EnergyResult`).
+            if let Some(v) = &mut json_doc {
+                v["energy"] = serde_json::to_value(EnergySummary::from_energy(energy))
+                    .unwrap_or(serde_json::Value::Null);
             }
         }
+
+        // ── Result capture (R2: the B/C2/C3/F headline numbers) ──
+        // The additional engines publish their results here so the
+        // persistence block (after them) can fold them into the session's
+        // `engine_results` column (CF-14: they used to be lost — only A +
+        // C1 were persisted).
+        let mut sweep_result: Option<SweepResult> = None;
+        let mut reasoning_result: Option<ReasoningResult> = None;
+        let mut structured_result: Option<StructuredResult> = None;
+        let mut flatout_result: Option<FlatOutResult> = None;
+
+        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
+        // C3 / F) and report a one-line summary for each. Engine A (speed)
+        // is the run above; Engine D (hardware) is the continuous poller
+        // started earlier. A selection of only `speed` skips this block
+        // entirely.
+        let extra = cfg.engines;
+        if extra.concurrency || extra.niah || extra.reasoning || extra.structured || extra.flatout {
+            if !cfg.json {
+                term.dim(&format!(
+                    "  running selected engines: {}",
+                    extra.iter_labels().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            // Engine F (Flat Out) reads Engine B's sweet spot as its
+            // stream count (the real-world full-load number); captured
+            // here because the sweep result is scoped to the block.
+            let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
+            if extra.concurrency {
+                if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
+                    if !cfg.json {
+                        term.dim(&format!(
+                            "  [B] concurrency sweep [{}]…",
+                            cfg.ladder
+                                .iter()
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                    }
+                    let r = sweep.run().await;
+                    flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
+                    // FIX 3: the headless summary leads with the
+                    // practical (per-stream usability) sweet spot, with
+                    // the pure-throughput knee as reference.
+                    if r.is_empty() {
+                        term.warning("  [B] sweep produced no usable levels");
+                    } else {
+                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
+                    }
+                    sweep_result = Some(r);
+                }
+            }
+            if extra.niah {
+                match NiahEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
+                        }
+                        let r = engine.logger(logger.clone()).run().await;
+                        term.info(&format!("  [C1] {}", r.accuracy_label()));
+                    }
+                    Err(e) => {
+                        term.warning(&format!("[C1] niah init failed: {e}"));
+                        logger.error(Context::EngineC1, format!("niah init failed: {e}"));
+                    }
+                }
+            }
+            if extra.reasoning {
+                match ReasoningEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C2] reasoning bank (13 challenges)…");
+                        }
+                        let r = engine.logger(logger.clone()).run().await;
+                        term.info(&format!(
+                            "  [C2] {} · avg {:.1} t/s",
+                            r.score.label(),
+                            r.avg_tg_speed()
+                        ));
+                        reasoning_result = Some(r);
+                    }
+                    Err(e) => {
+                        term.warning(&format!("[C2] reasoning init failed: {e}"));
+                        logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
+                    }
+                }
+            }
+            if extra.structured {
+                match StructuredEngine::new(cfg) {
+                    Ok(engine) => {
+                        if !cfg.json {
+                            term.dim("  [C3] structured output (free-form vs constrained)…");
+                        }
+                        let r = engine.logger(logger.clone()).run().await;
+                        term.info(&format!("  [C3] {}", r.summary_line()));
+                        structured_result = Some(r);
+                    }
+                    Err(e) => {
+                        term.warning(&format!("[C3] structured init failed: {e}"));
+                        logger.error(Context::EngineC3, format!("structured init failed: {e}"));
+                    }
+                }
+            }
+            if extra.flatout {
+                match FlatOutEngine::new(cfg) {
+                    Ok(mut engine) => {
+                        // The stream count is Engine B's sweet spot when
+                        // the sweep ran (real-world full load), else the
+                        // built-in default.
+                        if let Some((n, source)) = flatout_streams {
+                            engine = engine.stream_count(n, source);
+                        }
+                        if !cfg.json {
+                            term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
+                        }
+                        let r = engine.logger(logger.clone()).run().await;
+                        // The `--json` document carries the flat_out
+                        // result object.
+                        if let Some(v) = &mut json_doc {
+                            v["flat_out"] = r.to_dict();
+                        }
+                        term.info(&format!("  [F] {}", r.summary_line()));
+                        flatout_result = Some(r);
+                    }
+                    Err(e) => {
+                        term.warning(&format!("[F] flat out init failed: {e}"));
+                        logger.error(Context::EngineF, format!("flat out init failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        // R2 (traceability): fold the non-stream engine results
+        // (B/C2/C3/D/F) into the session's `engine_results` JSON column
+        // (CF-14: they used to be lost — only A + C1 were persisted).
+        let engine_results = EngineResults {
+            b_concurrency: sweep_result.as_ref().map(ConcurrencySummary::from_sweep),
+            c2_reasoning: reasoning_result.as_ref().map(ReasoningSummary::from_reasoning),
+            c3_structured: structured_result.as_ref().map(StructuredSummary::from_structured),
+            d_energy: energy_result.as_ref().map(EnergySummary::from_energy),
+            f_flatout: flatout_result.as_ref().map(FlatOutSummary::from_flatout),
+        }
+        .to_json();
 
         // Persist the completed run (Chunk 12): one `benchmark_sessions`
         // row + one `stream_metrics` row per iteration, in the platform
@@ -424,9 +585,8 @@ fn run_headless(
             // R2 (traceability): record which engines this run selected so
             // a stored session joins back to its run / log / export.
             engines: Some(cfg.engines.selected_names_json()),
-            // R2: the B/C2/C3/D/F headline results (populated below once
-            // the additional engines have run).
-            engine_results: None,
+            // R2: the B/C2/C3/D/F headline results (CF-14).
+            engine_results,
         };
         // Single-stream headless engine: every iteration runs at
         // concurrency level 1. Chunk 17: each row carries the
@@ -486,126 +646,9 @@ fn run_headless(
             Err(e) => term.warning(&format!("persist failed: {e}")),
         }
 
-        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
-        // C3 / F) and report a one-line summary for each. Engine A (speed)
-        // is the run above; Engine D (hardware) is the continuous poller
-        // started earlier. A selection of only `speed` skips this block
-        // entirely.
-        let extra = cfg.engines;
-        if extra.concurrency || extra.niah || extra.reasoning || extra.structured || extra.flatout {
-            if !cfg.json {
-                term.dim(&format!(
-                    "  running selected engines: {}",
-                    extra.iter_labels().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            // Engine F (Flat Out) reads Engine B's sweet spot as its
-            // stream count (the real-world full-load number); captured
-            // here because the sweep result is scoped to the block.
-            let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
-            if extra.concurrency {
-                if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
-                    if !cfg.json {
-                        term.dim(&format!(
-                            "  [B] concurrency sweep [{}]…",
-                            cfg.ladder
-                                .iter()
-                                .map(|n| n.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
-                    }
-                    let r = sweep.run().await;
-                    flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
-                    // FIX 3: the headless summary leads with the
-                    // practical (per-stream usability) sweet spot, with
-                    // the pure-throughput knee as reference.
-                    if r.is_empty() {
-                        term.warning("  [B] sweep produced no usable levels");
-                    } else {
-                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
-                    }
-                }
-            }
-            if extra.niah {
-                match NiahEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C1] NIAH matrix (7 sizes × 11 depths)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!("  [C1] {}", r.accuracy_label()));
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C1] niah init failed: {e}"));
-                        logger.error(Context::EngineC1, format!("niah init failed: {e}"));
-                    }
-                }
-            }
-            if extra.reasoning {
-                match ReasoningEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C2] reasoning bank (13 challenges)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!(
-                            "  [C2] {} · avg {:.1} t/s",
-                            r.score.label(),
-                            r.avg_tg_speed()
-                        ));
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C2] reasoning init failed: {e}"));
-                        logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
-                    }
-                }
-            }
-            if extra.structured {
-                match StructuredEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C3] structured output (free-form vs constrained)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!("  [C3] {}", r.summary_line()));
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C3] structured init failed: {e}"));
-                        logger.error(Context::EngineC3, format!("structured init failed: {e}"));
-                    }
-                }
-            }
-            if extra.flatout {
-                match FlatOutEngine::new(cfg) {
-                    Ok(mut engine) => {
-                        // The stream count is Engine B's sweet spot when
-                        // the sweep ran (real-world full load), else the
-                        // built-in default.
-                        if let Some((n, source)) = flatout_streams {
-                            engine = engine.stream_count(n, source);
-                        }
-                        if !cfg.json {
-                            term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        // The `--json` document carries the flat_out
-                        // result object.
-                        if let Some(v) = &mut json_doc {
-                            v["flat_out"] = r.to_dict();
-                        }
-                        term.info(&format!("  [F] {}", r.summary_line()));
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[F] flat out init failed: {e}"));
-                        logger.error(Context::EngineF, format!("flat out init failed: {e}"));
-                    }
-                }
-            }
-        }
-
         // The `--json` document (printed after the additional engines so
-        // the `flat_out` object is included): stdout stays pure JSON.
+        // the `flat_out` + `energy` objects are included): stdout stays
+        // pure JSON.
         if let Some(v) = json_doc {
             println!("{v}");
         }

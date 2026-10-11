@@ -508,6 +508,68 @@ fn binary_engine_niah_only_does_not_run_engine_a() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
+/// DO-09/CF-21: the headless `--json` document carries the energy object
+/// when Engine D (hardware) is selected. Run against the mock with
+/// `--engine speed,hardware` (A + the D poller; no 60 s F / no ladder, so
+/// it stays fast). The mock host has no GPU, so the energy fields are the
+/// N/A values — but the `energy` object itself must be present.
+#[test]
+fn binary_json_carries_the_energy_object() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let (url, _server) = rt.block_on(start_mock());
+
+    let tmp = temp_dir();
+    let data_home = tmp.join("xdg-data");
+    let out = Command::new(binary())
+        .args([
+            "--url",
+            url.as_str(),
+            "--model",
+            "energy-model",
+            // `--engine` is repeatable (one name per occurrence).
+            "--engine",
+            "speed",
+            "--engine",
+            "hardware",
+            "--iterations",
+            "1",
+            "--timeout",
+            "15",
+            "--json",
+            "--no-color",
+        ])
+        .env_clear()
+        .env("HOME", &tmp)
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("spawn the crucible-llm binary");
+
+    assert!(
+        out.status.success(),
+        "exit: {:?}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout must be valid JSON");
+    // The `energy` object is present (DO-09/CF-21).
+    assert!(
+        report.get("energy").is_some(),
+        "the --json document carries an energy object: {report}"
+    );
+    assert!(
+        report["energy"].get("joules").is_some(),
+        "energy.joules present: {report}"
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
 /// `--engine all` selects every engine: the binary accepts it and the
 /// resolved selection turns on all seven (asserted here at the config
 /// layer, since running all seven headless against a live endpoint is out

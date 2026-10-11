@@ -110,6 +110,60 @@ fn engines_column_round_trips() {
     cleanup(&dir);
 }
 
+/// The `engine_results` column (the B/C2/C3/D/F headline JSON) round-trips
+/// through a persist + reopen, and parses back into the `EngineResults`
+/// summary (CF-14: these engines used to be lost on persist).
+#[test]
+fn engine_results_column_round_trips() {
+    use crucible_llm::storage::{EngineResults, EnergySummary, FlatOutSummary};
+
+    let dir = temp_db_dir("engine-results");
+    let path = dir.join("benchmarks.db");
+    let mut db = Database::open(&path).unwrap();
+
+    let er = EngineResults {
+        d_energy: Some(EnergySummary {
+            joules: 123.4,
+            joules_per_token: Some(0.5),
+            avg_power_w: Some(40.0),
+            peak_power_w: Some(55.0),
+            avg_utilization_pct: Some(80.0),
+            vendor: Some("NVIDIA".to_string()),
+            model: Some("RTX 4090".to_string()),
+            fragmentation_warning: None,
+        }),
+        f_flatout: Some(FlatOutSummary {
+            stream_count: 16,
+            total_tokens: 9000,
+            duration_secs: 60.0,
+            aggregate_tps: 150.0,
+            per_stream_tps: 9.4,
+        }),
+        ..Default::default()
+    };
+    let json = er.to_json().expect("non-empty EngineResults serializes");
+    let s = BenchmarkSession {
+        session_id: "er-1".into(),
+        target_url: "http://x".into(),
+        model_name: "m".into(),
+        engine_results: Some(json.clone()),
+        ..Default::default()
+    };
+    db.persist_run(&s, &[]).unwrap();
+
+    let back = db.get_session("er-1").unwrap().expect("stored");
+    let parsed: EngineResults =
+        serde_json::from_str(back.engine_results.as_deref().expect("stored json")).unwrap();
+    assert_eq!(parsed.d_energy.as_ref().unwrap().joules, 123.4);
+    assert_eq!(
+        parsed.f_flatout.as_ref().unwrap().aggregate_tps,
+        150.0
+    );
+    assert!(parsed.b_concurrency.is_none());
+
+    cleanup(&dir);
+}
+
 /// A `benchmarks.db` created with the *pre-R2* schema (no `engines` /
 /// `engine_results` columns) is upgraded in place by `Database::open`:
 /// the new columns are added and the old row survives with `NULL`s.

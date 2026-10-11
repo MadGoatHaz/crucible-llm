@@ -40,14 +40,17 @@ use crate::engines::capability::{
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::StreamCountSource;
 use crate::engines::flatout::{FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT, WINDOW_SECS};
-use crate::engines::hardware::profile;
+use crate::engines::hardware::{profile, EnergyResult};
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::{HwPoller, IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::MetricsState;
 use crate::storage::db::Database;
-use crate::storage::models::{BenchmarkSession, NeedleEvaluation, StreamMetricRow};
+use crate::storage::models::{
+    BenchmarkSession, ConcurrencySummary, EngineResults, EnergySummary, FlatOutSummary,
+    NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredSummary,
+};
 
 /// The cooperative pause gate (the `Space` key, TUI): shared between the
 /// App's key path and every engine run loop.
@@ -857,6 +860,52 @@ impl BenchmarkSequence {
     /// results). A failure is logged but never propagated — the run is
     /// already complete and the TUI is showing its final state.
     fn persist_results(&self) {
+        // R2 (CF-14): fold the non-stream engine results (B/C2/C3/D/F) into
+        // the session's `engine_results` JSON column. A → `stream_metrics`
+        // and C1 → `needle_evaluations` (below); these are the engines that
+        // previously had *no* persistence at all.
+        //
+        // Engine D is continuous telemetry (no result slot), so its profile
+        // is recomputed here from the poller's trace (the same N/A rule as
+        // `run_hardware` / the headless path).
+        let d_energy: Option<EnergyResult> = self.hw.as_ref().and_then(|h| h.lock().ok())
+            .and_then(|g| {
+                let trace = g.trace().to_vec();
+                if trace.is_empty() {
+                    return None;
+                }
+                let total_tokens = (*self.slots.speed.load())
+                    .as_ref()
+                    .map(|rs| rs.iter().map(|r| r.completion_tokens).sum())
+                    .unwrap_or(0);
+                let mut e = profile(&trace, None, total_tokens);
+                if let Some(b) = g.backend() {
+                    e.vendor = Some(b.vendor().to_string());
+                    e.model = b.model().map(str::to_string);
+                }
+                Some(e)
+            });
+        let engine_results = EngineResults {
+            b_concurrency: (*self.slots.concurrency.load())
+                .clone()
+                .as_ref()
+                .map(ConcurrencySummary::from_sweep),
+            c2_reasoning: (*self.slots.reasoning.load())
+                .clone()
+                .as_ref()
+                .map(ReasoningSummary::from_reasoning),
+            c3_structured: (*self.slots.structured.load())
+                .clone()
+                .as_ref()
+                .map(StructuredSummary::from_structured),
+            d_energy: d_energy.as_ref().map(EnergySummary::from_energy),
+            f_flatout: (*self.slots.flatout.load())
+                .clone()
+                .as_ref()
+                .map(FlatOutSummary::from_flatout),
+        }
+        .to_json();
+
         // R2: the session id is the one shared with the run-log (stamped in
         // its header/archive name by `main`), so the stored row joins to it.
         let session = BenchmarkSession {
@@ -871,9 +920,8 @@ impl BenchmarkSequence {
             // R2 (traceability): record which engines this run selected so
             // a stored session joins back to its run / log / export.
             engines: Some(self.cfg.engines.selected_names_json()),
-            // R2: the B/C2/C3/D/F headline results (populated from the
-            // result slots once they are available).
-            engine_results: None,
+            // R2: the B/C2/C3/D/F headline results (CF-14).
+            engine_results,
         };
 
         // Engine A: speed results → stream_metrics rows.
