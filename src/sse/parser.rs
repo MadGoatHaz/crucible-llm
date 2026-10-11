@@ -24,7 +24,7 @@
 //! Chunk 5 `StreamWorker`, via `quanta`) stamps arrival times after each
 //! `feed` call, not inside the parse path.
 
-use crate::sse::chunk::{classify, Chunk, Usage};
+use crate::sse::chunk::{classify, Chunk, Usage, UsageDetails};
 use serde_json::Value;
 
 /// UTF-8 byte-order mark (stripped once at stream start).
@@ -58,6 +58,10 @@ pub struct SseParser {
     /// Last `usage` object seen anywhere in the stream, captured even on
     /// frames that also carry a content delta (matches the Python prototype).
     usage: Option<Usage>,
+    /// Last `usage` detail fields (reasoning / cached tokens) seen in the
+    /// stream (CF-02 — the reasoning-model detection enabler). `Default`
+    /// (zeros) when the backend does not report them.
+    details: UsageDetails,
 }
 
 impl Default for SseParser {
@@ -76,6 +80,7 @@ impl SseParser {
             bom_seen: false,
             malformed: 0,
             usage: None,
+            details: UsageDetails::default(),
         }
     }
 
@@ -126,6 +131,7 @@ impl SseParser {
         self.bom_seen = false;
         self.malformed = 0;
         self.usage = None;
+        self.details = UsageDetails::default();
     }
 
     /// Number of malformed-JSON frames skipped so far.
@@ -137,6 +143,14 @@ impl SseParser {
     /// Last `usage` object seen in the stream, if any.
     pub fn usage(&self) -> Option<Usage> {
         self.usage
+    }
+
+    /// The `usage` detail fields (reasoning / cached tokens) seen in the
+    /// stream (CF-02). `Default` (all zeros) when the backend does not
+    /// report them.
+    #[must_use]
+    pub fn details(&self) -> UsageDetails {
+        self.details
     }
 
     /// Handle one complete line. Drained lines carry their trailing `\n`
@@ -185,6 +199,9 @@ impl SseParser {
             Ok(value) => {
                 if let Some(usage) = Usage::from_value(&value) {
                     self.usage = Some(usage);
+                    // CF-02: capture the reasoning / cache detail fields
+                    // alongside the core counts (the detection enabler).
+                    self.details = UsageDetails::from_value(&value);
                 }
                 self.out.push(ParsedFrame {
                     chunk: classify(&value),

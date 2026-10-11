@@ -476,6 +476,36 @@ fn from_speed_result_zero_decode_speed_yields_null_tpot() {
     assert_eq!(row.ttft_ms, Some(125.0));
 }
 
+#[test]
+fn with_reasoning_tokens_populates_the_column() {
+    // CF-02: the persist path writes `reasoning_tokens` when a caller has the
+    // value (the `UsageDetails` the SSE parser now reads). `from_speed_result`
+    // leaves it NULL (Engine A's `SpeedResult` carries no detail field yet);
+    // the `with_reasoning_tokens` builder is the population seam that closes
+    // the always-NULL traceability gap.
+    let row = StreamMetricRow::from_speed_result(&speed_result(80.0), "sess-rt", 1)
+        .with_reasoning_tokens(256);
+    assert_eq!(row.reasoning_tokens, Some(256));
+
+    let dir = temp_db_dir("reasoning-col");
+    let path = dir.join("benchmarks.db");
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.insert_session(&sample_session("sess-rt")).unwrap();
+        db.insert_stream_metric(&row).unwrap();
+    }
+    // Reopen: the column survives the round-trip (was NULL before CF-02).
+    let db = Database::open(&path).unwrap();
+    let rows = db.get_stream_metrics("sess-rt").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].reasoning_tokens,
+        Some(256),
+        "reasoning_tokens column is populated, not NULL"
+    );
+    cleanup(&dir);
+}
+
 // ── completed-run flow (the chunk's core acceptance) ────────────────────
 
 #[test]

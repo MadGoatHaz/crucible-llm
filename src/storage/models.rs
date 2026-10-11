@@ -115,6 +115,21 @@ impl StreamMetricRow {
             cache_hit: None,
         }
     }
+
+    /// Set the `reasoning_tokens` column (CF-02).
+    ///
+    /// [`from_speed_result`](Self::from_speed_result) leaves this `NULL`
+    /// because the Engine A `SpeedResult` does not yet carry the server's
+    /// `reasoning_tokens` detail. When a caller *does* have the value (the
+    /// `UsageDetails` the SSE parser now reads, or a future `SpeedResult`
+    /// field), this builder populates the column so a run can be flagged
+    /// reasoning-dominated and thinking-suppression can be verified
+    /// (`reasoning_tokens ≈ 0` when disabled).
+    #[must_use]
+    pub fn with_reasoning_tokens(mut self, tokens: u64) -> Self {
+        self.reasoning_tokens = Some(tokens as i64);
+        self
+    }
 }
 
 /// One `needle_evaluations` row: a single NIAH size×depth cell (Chunk 15).

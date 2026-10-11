@@ -6,7 +6,7 @@
 //! correct order; a malformed frame injected mid-stream is skipped without
 //! panic.
 
-use crucible_llm::sse::{classify, Chunk, SseParser, Usage};
+use crucible_llm::sse::{classify, Chunk, SseParser, Usage, UsageDetails};
 use serde_json::json;
 
 /// A representative vLLM-style streaming response:
@@ -320,4 +320,98 @@ fn classify_priority_reasoning_over_content_over_usage() {
         "choices": [{ "delta": { "role": "assistant" } }]
     });
     assert_eq!(classify(&role_only), Chunk::Control);
+}
+
+// ── CF-02: UsageDetails (reasoning / cached token detection) ─────────────
+
+#[test]
+fn usage_details_reads_vllm_openai_reasoning_and_cached() {
+    // vLLM / OpenAI shape: `completion_tokens_details.reasoning_tokens` +
+    // `prompt_tokens_details.cached_tokens` (the research doc's canonical
+    // per-backend layout).
+    let value = json!({
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 87,
+            "completion_tokens": 256,
+            "total_tokens": 343,
+            "prompt_tokens_details": { "cached_tokens": 12 },
+            "completion_tokens_details": { "reasoning_tokens": 256 }
+        }
+    });
+    let d = UsageDetails::from_value(&value);
+    assert_eq!(d.reasoning_tokens, 256, "reasoning_tokens read from completion_tokens_details");
+    assert_eq!(d.cached_tokens, 12, "cached_tokens read from prompt_tokens_details");
+    // The whole 256-token completion budget is CoT (Strawberry smoking gun).
+    assert!(d.is_reasoning_dominated(256));
+}
+
+#[test]
+fn usage_details_reads_sglang_output_tokens_details() {
+    // SGLang shape: reasoning under `output_tokens_details` (not
+    // `completion_tokens_details`); both must resolve to the same field.
+    let value = json!({
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 28,
+            "completion_tokens": 112,
+            "output_tokens_details": { "reasoning_tokens": 45 },
+            "prompt_tokens_details": { "cached_tokens": 28 }
+        }
+    });
+    let d = UsageDetails::from_value(&value);
+    assert_eq!(d.reasoning_tokens, 45, "SGLang output_tokens_details.reasoning_tokens");
+    assert_eq!(d.cached_tokens, 28);
+    assert!(!d.is_reasoning_dominated(112), "45 < 112 → not dominated");
+}
+
+#[test]
+fn usage_details_absent_block_is_zero_not_missing() {
+    // Backends that report no detail block (Ollama / TGI) → zeros, never an
+    // error and never a panic (graceful degradation).
+    let value = json!({
+        "choices": [],
+        "usage": { "prompt_tokens": 15, "completion_tokens": 64 }
+    });
+    assert_eq!(UsageDetails::from_value(&value), UsageDetails::default());
+
+    // No usage block at all → also zeros.
+    let no_usage = json!({ "choices": [{ "delta": { "content": "hi" } }] });
+    assert_eq!(UsageDetails::from_value(&no_usage), UsageDetails::default());
+}
+
+#[test]
+fn parser_accumulates_usage_details_across_stream() {
+    // A reasoning-then-content stream whose terminal usage block reports the
+    // CoT split: the parser must surface the details for end-of-stream readers
+    // (the detection enabler that lets a run be flagged reasoning-dominated).
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n",
+        "\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking…\"}}]}\n",
+        "\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"42\"}}]}\n",
+        "\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":30,\"completion_tokens_details\":{\"reasoning_tokens\":30},\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
+    let mut parser = SseParser::new();
+    parser.feed(stream.as_bytes());
+    parser.finish();
+
+    assert_eq!(
+        parser.usage(),
+        Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 30
+        })
+    );
+    let d = parser.details();
+    assert_eq!(d.reasoning_tokens, 30, "parser captured reasoning_tokens");
+    assert_eq!(d.cached_tokens, 4, "parser captured cached_tokens");
+    // Pure CoT (reasoning == completion): the exact "thinking ate the whole
+    // budget" condition that false-fails the 64-token NIAH probe.
+    assert!(d.is_reasoning_dominated(30), "30/30 = all CoT");
 }

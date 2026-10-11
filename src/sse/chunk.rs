@@ -38,6 +38,70 @@ impl Usage {
     }
 }
 
+/// The reasoning / cache **detail** fields of a server `usage` block, beyond
+/// the core prompt/completion counts carried by [`Usage`].
+///
+/// These are the fields the research doc shows each backend emits for
+/// reasoning-model accounting (URC-1 — the reasoning-model blind spot):
+///
+/// * `reasoning_tokens` — chain-of-thought tokens. vLLM and the OpenAI API
+///   put it in `completion_tokens_details.reasoning_tokens`; SGLang in
+///   `output_tokens_details.reasoning_tokens`. `0` when the backend does not
+///   report it.
+/// * `cached_tokens` — prompt tokens served from the KV / prefix cache
+///   (`prompt_tokens_details.cached_tokens`). `0` when absent.
+///
+/// Kept separate from [`Usage`] (which stays a 2-field core so existing
+/// construction sites are untouched): this is the *detection* half of
+/// CF-02 — it lets a run be flagged reasoning-dominated and lets us verify
+/// that thinking suppression worked (`reasoning_tokens ≈ 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UsageDetails {
+    pub reasoning_tokens: u64,
+    pub cached_tokens: u64,
+}
+
+impl UsageDetails {
+    /// Extract the detail fields from a streaming chunk's `usage` object.
+    ///
+    /// Returns [`UsageDetails::default`] (all zeros) when the block is absent
+    /// — graceful degradation for backends that do not report the details.
+    #[must_use]
+    pub fn from_value(value: &Value) -> UsageDetails {
+        let Some(usage) = value.get("usage").and_then(|u| u.as_object()) else {
+            return UsageDetails::default();
+        };
+        // `reasoning_tokens` lives under `completion_tokens_details`
+        // (vLLM / OpenAI) or `output_tokens_details` (SGLang); read whichever
+        // is present.
+        let reasoning_tokens = usage
+            .get("completion_tokens_details")
+            .or_else(|| usage.get("output_tokens_details"))
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // `cached_tokens` lives under `prompt_tokens_details`.
+        let cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        UsageDetails {
+            reasoning_tokens,
+            cached_tokens,
+        }
+    }
+
+    /// `true` when the completion budget was (nearly) all chain-of-thought:
+    /// the reasoning token count equals the total completion count. This is
+    /// the exact "thinking ate the whole budget" condition that false-fails
+    /// the 64-token NIAH probe (Strawberry Issue 1).
+    #[must_use]
+    pub fn is_reasoning_dominated(&self, completion_tokens: u64) -> bool {
+        completion_tokens > 0 && self.reasoning_tokens >= completion_tokens
+    }
+}
+
 /// Category of one parsed SSE data frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Chunk {

@@ -10,5 +10,5 @@
 pub mod chunk;
 pub mod parser;
 
-pub use chunk::{classify, Chunk, Usage};
+pub use chunk::{classify, Chunk, Usage, UsageDetails};
 pub use parser::{ParsedFrame, SseParser};
