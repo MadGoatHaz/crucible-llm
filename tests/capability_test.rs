@@ -13,10 +13,12 @@
 //!   output — again against the mock (valid JSON under
 //!   `response_format`, malformed JSON in the second mode).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crucible_llm::config::Config;
 use crucible_llm::engines::{
@@ -36,11 +38,23 @@ enum MockMode {
     /// Every reasoning challenge answered with "I don't know."
     /// (the bank must score 0/13).
     ReasoningDumb,
+    /// C2 reasoning model (CF-16): each challenge answered with a
+    /// `reasoning_content` delta (crafted so the *old* reasoning+content
+    /// concatenation false-fails: a trailing digit fuses with the answer
+    /// for number checkers, a trailing "no"/"yes" fuses with the verdict
+    /// for logic) followed by the canonical answer as `content` deltas.
+    /// Content-only judging must score 13/13.
+    ReasoningThenAnswers,
     /// Structured: a valid JSON object when the body carries
     /// `response_format`, free-form prose otherwise.
     Structured,
     /// Structured: malformed (non-JSON) output under the constraint.
     StructuredBad,
+    /// C3 reasoning model (CF-18): a `reasoning_content` delta followed
+    /// by the valid JSON answer as `content` deltas (or prose for the
+    /// free-form run). Content-only accumulation must stay compliant —
+    /// the CoT never leaks into the judged body.
+    StructuredReasons,
 }
 
 /// An SSE stream whose content is split into ~12-char deltas (like real
@@ -75,9 +89,59 @@ async fn respond_sse(sock: &mut TcpStream, content: &str, prompt_tokens: u64) {
     let _ = sock.shutdown().await;
 }
 
-async fn start_mock(mode: MockMode) -> String {
+/// An SSE stream whose `reasoning_content` deltas (the chain-of-thought)
+/// come first, then whose `content` deltas carry the visible answer, with
+/// a usage block and the `[DONE]` terminator. Mirrors the reasoning-model
+/// wire shape the C1 tests use (`tests/niah_test.rs` `Mock::Reasons`).
+async fn respond_sse_reasoning(
+    sock: &mut TcpStream,
+    reasoning: &str,
+    content: &str,
+    prompt_tokens: u64,
+) {
+    write_all(sock, SSE_HEADERS).await;
+    write_chunk(
+        sock,
+        b"data: {\"id\":\"cmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+    )
+    .await;
+    let mut completion: u64 = 0;
+    let reason_chars: Vec<char> = reasoning.chars().collect();
+    for chunk in reason_chars.chunks(12) {
+        let delta: String = chunk.iter().collect();
+        completion += delta.chars().count() as u64;
+        let frame = format!(
+            "data: {{\"id\":\"cmpl-1\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":{}}}}}]}}\n\n",
+            serde_json::to_string(&delta).unwrap()
+        );
+        write_chunk(sock, frame.as_bytes()).await;
+    }
+    let content_chars: Vec<char> = content.chars().collect();
+    for chunk in content_chars.chunks(12) {
+        let delta: String = chunk.iter().collect();
+        completion += delta.chars().count() as u64;
+        let frame = format!(
+            "data: {{\"id\":\"cmpl-1\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(&delta).unwrap()
+        );
+        write_chunk(sock, frame.as_bytes()).await;
+    }
+    let usage = format!(
+        "data: {{\"id\":\"cmpl-1\",\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion}}}}}\n\n"
+    );
+    write_chunk(sock, usage.as_bytes()).await;
+    write_chunk(sock, b"data: [DONE]\n\n").await;
+    write_chunk(sock, b"").await; // terminating chunk
+    let _ = sock.shutdown().await;
+}
+
+/// Start the mock; returns the URL plus a log of every request body it
+/// received (the CF-16/CF-18 tests assert the suppression fields on them).
+async fn start_mock(mode: MockMode) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = bodies.clone();
     tokio::spawn(async move {
         loop {
             let (mut sock, _) = match listener.accept().await {
@@ -85,6 +149,7 @@ async fn start_mock(mode: MockMode) -> String {
                 Err(_) => return,
             };
             let (_, body) = read_request(&mut sock).await;
+            log.lock().await.push(body.clone());
             match mode {
                 MockMode::ReasoningClever => {
                     let answer = REASONING_BANK
@@ -96,6 +161,47 @@ async fn start_mock(mode: MockMode) -> String {
                 }
                 MockMode::ReasoningDumb => {
                     respond_sse(&mut sock, "I don't know.", 50).await;
+                }
+                MockMode::ReasoningThenAnswers => {
+                    // CF-16: think first, then answer. The CoT is crafted
+                    // so the *old* reasoning+content concatenation
+                    // false-fails: for number checkers its trailing digit
+                    // fuses with the answer's first digit ("…7" + "1161"
+                    // → "71161"); for verdict checkers its trailing
+                    // "no"/"yes" fuses with the answer word ("noNo"
+                    // contains no whole-word verdict). The committed
+                    // content span (the canonical answer) is clean —
+                    // content-only judging must score 13/13.
+                    if let Some(c) = REASONING_BANK.iter().find(|c| body.contains(c.test_key)) {
+                        let cot = match (c.category, c.checker) {
+                            ("math", _) => {
+                                "Let me work it out step by step, keeping track of the running total 7"
+                            }
+                            (
+                                "logic",
+                                crucible_llm::engines::Checker::ExactNumber(_),
+                            ) => "All four eggs share one pot of boiling water, so 5",
+                            (
+                                "logic",
+                                crucible_llm::engines::Checker::Verdict {
+                                    expected_yes: false,
+                                },
+                            ) => "Weighing the premises carefully, the conclusion does not follow, so no",
+                            (
+                                "logic",
+                                crucible_llm::engines::Checker::Verdict {
+                                    expected_yes: true,
+                                },
+                            ) => "Under the stated assumptions the statement holds, so yes",
+                            ("code", _) => {
+                                "Let me draft the signature and walk through the algorithm before writing it"
+                            }
+                            _ => unreachable!("bank categories are math / logic / code"),
+                        };
+                        respond_sse_reasoning(&mut sock, cot, c.canonical_answer, 50).await;
+                    } else {
+                        respond_sse(&mut sock, "I don't know.", 50).await;
+                    }
                 }
                 MockMode::Structured => {
                     if body.contains("response_format") {
@@ -130,11 +236,43 @@ async fn start_mock(mode: MockMode) -> String {
                         .await;
                     }
                 }
+                MockMode::StructuredReasons => {
+                    // CF-18: think first, then emit the JSON in the
+                    // content span. The content-only accumulation must
+                    // parse it (the CoT never leaks into the judged body).
+                    if body.contains("response_format") {
+                        let (cot, answer) = if body.contains("exactly 3 objects") {
+                            (
+                                "Let me list exactly three objects with the required fields.",
+                                r#"[{"id": 1, "label": "one", "active": true}, {"id": 2, "label": "two", "active": false}, {"id": 3, "label": "three", "active": true}]"#,
+                            )
+                        } else if body.contains("orders") {
+                            (
+                                "Let me build the nested object with the user and their orders.",
+                                r#"{"user": {"name": "Ada", "email": "ada@x.com"}, "orders": [{"id": 1, "total": 50.5, "items": ["a", "b"]}]}"#,
+                            )
+                        } else {
+                            (
+                                "Let me recall the person's name and age.",
+                                r#"{"name": "Ada", "age": 36}"#,
+                            )
+                        };
+                        respond_sse_reasoning(&mut sock, cot, answer, 40).await;
+                    } else {
+                        respond_sse_reasoning(
+                            &mut sock,
+                            "Let me think about what to say before answering.",
+                            "Sure! Here is the information you asked for: Ada, 36 years old, lives in London.",
+                            40,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     });
     // `StreamWorker` normalizes a bare host to `/v1/chat/completions`.
-    format!("http://{addr}")
+    (format!("http://{addr}"), bodies)
 }
 
 fn test_config(url: &str) -> Config {
@@ -144,6 +282,27 @@ fn test_config(url: &str) -> Config {
         timeout: 10,
         ..Config::default()
     }
+}
+
+/// Assert a recorded chat-completions body carries all three per-backend
+/// thinking-suppression mechanisms (CF-01 / CF-16 / CF-18):
+/// `chat_template_kwargs.enable_thinking=false` (vLLM / SGLang / LM
+/// Studio), `think=false` (Ollama), and the trailing `/no_think` prompt
+/// suffix (llama.cpp).
+fn assert_body_suppresses_thinking(body: &str) {
+    let v: serde_json::Value = serde_json::from_str(body).expect("mock bodies are JSON");
+    assert_eq!(
+        v["chat_template_kwargs"]["enable_thinking"], false,
+        "vLLM / SGLang / LM Studio switch must be present"
+    );
+    assert_eq!(v["think"], false, "Ollama switch must be present");
+    let prompt = v["messages"][0]["content"]
+        .as_str()
+        .expect("the user message content is a string");
+    assert!(
+        prompt.ends_with("/no_think"),
+        "llama.cpp suffix must be appended: {prompt:?}"
+    );
 }
 
 // ── C2: deterministic reasoning bank ──────────────────────────────────────
@@ -221,7 +380,7 @@ fn score_responses_reports_n_over_m_accuracy() {
 
 #[tokio::test]
 async fn live_bank_run_against_clever_mock_scores_13_of_13() {
-    let url = start_mock(MockMode::ReasoningClever).await;
+    let (url, _bodies) = start_mock(MockMode::ReasoningClever).await;
     let engine = ReasoningEngine::new(&test_config(&url)).unwrap();
     let result = engine.run().await;
 
@@ -240,7 +399,7 @@ async fn live_bank_run_against_clever_mock_scores_13_of_13() {
 
 #[tokio::test]
 async fn live_bank_run_against_dumb_mock_scores_0_of_13() {
-    let url = start_mock(MockMode::ReasoningDumb).await;
+    let (url, _bodies) = start_mock(MockMode::ReasoningDumb).await;
     let engine = ReasoningEngine::new(&test_config(&url)).unwrap();
     let result = engine.run().await;
 
@@ -251,11 +410,53 @@ async fn live_bank_run_against_dumb_mock_scores_0_of_13() {
     assert_eq!(result.score.label(), "0/13 solved (0.0%)");
 }
 
+// ── C2: CF-16 reasoning-model suppression + content-only judging ────────
+
+#[tokio::test]
+async fn live_bank_run_against_reasoning_mock_scores_13_of_13() {
+    // CF-16: the mock emits `reasoning` deltas (crafted to corrupt the
+    // *old* reasoning+content concatenation — a trailing digit/verdict
+    // fusing with the answer) and then `content` deltas carrying the
+    // canonical answers. Content-only judging must credit the committed
+    // answers: 13/13. Under the pre-CF-16 accumulation the fusing items
+    // false-failed (see `reasoning.rs`
+    // `content_span_passes_where_the_combined_span_fails`).
+    let (url, _bodies) = start_mock(MockMode::ReasoningThenAnswers).await;
+    let engine = ReasoningEngine::new(&test_config(&url)).unwrap();
+    let result = engine.run().await;
+
+    assert_eq!(
+        result.score.solved, 13,
+        "reasoning-then-content must be judged on the content span (13/13)"
+    );
+    assert_eq!(result.score.by_category, [(5, 5), (5, 5), (3, 3)]);
+    // The stored spans are the committed content (CoT excluded) and each
+    // one solves its own challenge.
+    for (c, r) in REASONING_BANK.iter().zip(&result.responses) {
+        assert!(c.is_solved(r), "content span must solve {}", c.id);
+    }
+}
+
+#[tokio::test]
+async fn c2_requests_carry_thinking_suppression() {
+    // CF-16: every C2 request carries the per-backend suppression fields
+    // (the same `disable_thinking` seam C1 uses).
+    let (url, bodies) = start_mock(MockMode::ReasoningThenAnswers).await;
+    let engine = ReasoningEngine::new(&test_config(&url)).unwrap();
+    let _ = engine.run().await;
+
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 13, "one request per bank challenge");
+    for b in bodies.iter() {
+        assert_body_suppresses_thinking(b);
+    }
+}
+
 // ── C3: structured output (constrained vs free-form) ──────────────────────
 
 #[tokio::test]
 async fn structured_run_reports_tps_penalty_and_compliance() {
-    let url = start_mock(MockMode::Structured).await;
+    let (url, _bodies) = start_mock(MockMode::Structured).await;
     let engine = StructuredEngine::new(&test_config(&url)).unwrap();
     let result = engine.run().await;
 
@@ -282,7 +483,7 @@ async fn structured_run_reports_tps_penalty_and_compliance() {
 
 #[tokio::test]
 async fn structured_run_flags_non_compliant_output() {
-    let url = start_mock(MockMode::StructuredBad).await;
+    let (url, _bodies) = start_mock(MockMode::StructuredBad).await;
     let engine = StructuredEngine::new(&test_config(&url)).unwrap();
     let result = engine.run().await;
 
@@ -292,6 +493,42 @@ async fn structured_run_flags_non_compliant_output() {
         "non-JSON constrained output must fail compliance"
     );
     assert_eq!(result.score(), (0, 0, 3));
+}
+
+// ── C3: CF-18 reasoning-model suppression ───────────────────────────────
+
+#[tokio::test]
+async fn structured_run_with_reasoning_deltas_stays_compliant() {
+    // CF-18: the mock emits a `reasoning` delta (CoT) and then the JSON
+    // answer in the `content` span. The content-only accumulation must
+    // parse the JSON — the CoT never leaks into the judged body, so a
+    // reasoning model that thinks then answers stays fully compliant
+    // (pre-CF-18 it spent the 256-token budget on CoT and emitted empty
+    // content → "not valid JSON").
+    let (url, _bodies) = start_mock(MockMode::StructuredReasons).await;
+    let engine = StructuredEngine::new(&test_config(&url)).unwrap();
+    let result = engine.run().await;
+
+    assert!(
+        result.fully_compliant(),
+        "content-only accumulation must stay compliant with reasoning deltas present"
+    );
+    assert_eq!(result.score(), (3, 0, 0));
+}
+
+#[tokio::test]
+async fn c3_requests_carry_thinking_suppression() {
+    // CF-18: every C3 request (free-form baseline + 3 constrained cases)
+    // carries the per-backend suppression fields.
+    let (url, bodies) = start_mock(MockMode::StructuredReasons).await;
+    let engine = StructuredEngine::new(&test_config(&url)).unwrap();
+    let _ = engine.run().await;
+
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 4, "free-form baseline + 3 constrained cases");
+    for b in bodies.iter() {
+        assert_body_suppresses_thinking(b);
+    }
 }
 
 #[tokio::test]
