@@ -242,19 +242,21 @@ Bridges the gap between software performance and physical compute:
 
 The application implements rigorous system definitions for all calculated metrics:
 
-1. **Monotonic High-Resolution TTFT:**
-   $$\text{TTFT} = T_{\text{first\_token\_arrival}} - T_{\text{request\_dispatched}}$$
-   *(Timed via hardware cycle registers, strictly excluding local parsing and buffer setup delays).*
+1. **Monotonic High-Resolution TTFT (dual, CF-06):**
+   $$\text{TTFT}_{\text{perceived}} = T_{\text{first\_token}} - T_{\text{request\_start}} \qquad\qquad \text{TTFT}_{\text{server}} = T_{\text{first\_token}} - T_{\text{response\_headers}}$$
+   *(Timed via hardware cycle registers (quanta TSC), strictly excluding local parsing and buffer setup delays. `T1` is stamped when the server's **response headers arrive** — not when the last request byte is written — so the server-side TTFT excludes the request-send network leg and isolates server queue + prefill + first decode; the perceived TTFT is the full client round-trip. What falls inside `T1→T3` varies by backend (vLLM includes queue + prefill; llama.cpp/Ollama exclude it), which is why both are published.)*
 
 2. **Isolated Token Generation Speed (TG Speed):**
-   $$\text{TG Speed} = \frac{N_{\text{completion\_tokens}} - 1}{T_{\text{stream\_end}} - T_{\text{first\_token\_arrival}}}$$
+   $$\text{TG Speed} = \frac{N_{\text{completion\_tokens}}}{T_{\text{last\_token}} - T_{\text{first\_token}}}$$
+   *(v0.1.1 code formula: the decode window runs from the **first** token frame to the **last** — prefill/TTFT and the trailing gap to `[DONE]` are excluded. The numerator is `N`, not `N−1`: `N` tokens span the window, while `N−1` is the count of inter-token *gaps* — that is the ITL formula, not the rate. When the server reports reasoning-token detail, the window splits at the reasoning→content transition and the rate is content tokens over the content window (the answer phase).)*
 
 3. **Inter-Token Latency (ITL) Jitter:**
    $$\text{Jitter} = \sqrt{\frac{1}{M-1} \sum_{i=1}^{M} (\Delta t_i - \overline{\Delta t})^2}$$
    *(Where $\Delta t_i$ represents the time delta between completion chunk $i$ and $i-1$).*
 
-4. **Speculative Decoding Multi-Token Efficiency Rate:**
-   $$\eta_{\text{MTP}} = \frac{N_{\text{total\_tokens}}}{N_{\text{SSE\_packets}}}$$
+4. **Speculative Decoding Multi-Token Efficiency Rate (MTP η):**
+   $$\eta_{\text{MTP}} = \frac{N_{\text{completion\_tokens}}}{N_{\text{total\_token\_frames}}}$$
+   *(v0.1.1 canonical definition (CF-12): the numerator is the server's `usage.completion_tokens`; the denominator is **all** token frames observed in the stream (Reasoning + Content combined) — not content-only frames and not raw SSE packets. η = 1.0 means one token per frame (standard auto-regressive); η > 1 is legitimate and quantifies multi-token / speculative batching (vLLM MTP, EAGLE), where a single SSE frame carries several accepted tokens. 0.0 = N/A when no token frame arrives.)*
 
 5. **Prefix Cache Detection Heuristic:**
    $$\text{Cache Status} = \begin{cases} \text{HIT}, & \text{if } \text{TTFT}_{\text{test}} \le 0.15 \times \text{TTFT}_{\text{cold\_baseline}} \\ \text{MISS}, & \text{otherwise} \end{cases}$$
