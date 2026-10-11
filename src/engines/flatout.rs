@@ -16,11 +16,17 @@
 //!   together via the shared [`WorkerPool`];
 //! * **one minimal (~15-token) open-ended prompt per stream** — prefill
 //!   takes <100 ms, negligible against the 60-second decode window;
-//! * **`max_tokens = 100,000` + `ignore_eos`** — effectively unlimited,
-//!   so the *only* stop condition is the 60-second window
-//!   ([`WINDOW_SECS`]); `ignore_eos` keeps llama.cpp servers from letting
-//!   the model end a stream on its own end-token (other backends ignore
-//!   the field);
+//! * **`max_tokens` = [`MAX_TOKENS`] (100,000) clamped to the model's
+//!   max context + `ignore_eos`** — effectively unlimited, so the
+//!   *only* stop condition is the 60-second window
+//!   ([`WINDOW_SECS`]); `ignore_eos` keeps llama.cpp servers from
+//!   letting the model end a stream on its own end-token (other
+//!   backends ignore the field). Before the run, the engine probes the
+//!   model's max context (`GET /v1/models`, CF-29) and clamps the
+//!   requested `max_tokens` to it — servers that cap generation
+//!   reject a 100,000 request with a uniform HTTP 400, which is then
+//!   surfaced as a clear **configuration error** ("requested tokens
+//!   exceed model limit"), never a silent 0 t/s;
 //! * **all streams start together and are all aborted at the 60 s mark**
 //!   (aborting the supervisor drops every worker task, closing its
 //!   socket so the server stops generating);
@@ -36,8 +42,11 @@
 //!   presented as a precise measurement.
 //!
 //! The result records the **aggregate t/s** (the headline), the
-//! **per-stream t/s** (aggregate ÷ streams — ≈ 30 confirms the sweet
-//! spot), the total tokens, and the pooled TTFT / ITL evidence.
+//! **per-stream t/s in two labeled views** (CF-04: `÷ completed
+//! streams` — the capacity view — and `÷ requested streams` — the
+//! user-experience view; the legacy `per_stream_tps` remains the
+//! requested view for back-compat), the total tokens, and the pooled
+//! TTFT / ITL evidence.
 //!
 //! Measurement-isolation note: all timing is captured in the workers
 //! (quanta, `T0..Tn`); this module only takes deltas of those records and
@@ -51,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::client::pool::{PoolEvent, WorkerPool};
-use crate::client::{authoritative_tokens, StreamEvent};
+use crate::client::{authoritative_tokens, StreamError, StreamEvent};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
@@ -74,7 +83,33 @@ const WINDOW_NS: u64 = 60 * 1_000_000_000;
 
 /// The `max_tokens` requested per stream: 100,000 — effectively
 /// unlimited. The 60-second window, not this cap, ends the test.
+/// (CF-29: the cap actually sent is this value clamped to the
+/// probed model max context — see [`clamp_max_tokens`].)
 pub const MAX_TOKENS: u32 = 100_000;
+
+/// (CF-04) The `failed_stream_ratio` above which the summary line /
+/// run log flags the run: more than a fifth of the requested streams
+/// produced no tokens, so the capacity and user-experience views
+/// differ materially.
+pub const FAILED_STREAM_RATIO_FLAG: f64 = 0.20;
+
+/// (CF-29) The `/v1/models` fields that carry the model's max context,
+/// in priority order — the first present, parseable value wins. vLLM
+/// exposes `max_model_len`; other OpenAI-compatible backends may use
+/// the OpenAI-style names. A server that exposes none of them degrades
+/// to the unclamped [`MAX_TOKENS`] (N/A-never-fail).
+const MODEL_CONTEXT_FIELDS: [&str; 5] = [
+    "max_model_len",
+    "max_context",
+    "context_length",
+    "max_context_length",
+    "max_output_tokens",
+];
+
+/// (CF-29) Overall budget for the max-context probe: model lists are
+/// small, so a server that cannot answer within 10 s is stuck — the
+/// run proceeds unclamped rather than hanging.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The stream count when Engine B did not run (there is no sweet spot to
 /// read): a small, always-valid load.
@@ -127,9 +162,48 @@ pub struct FlatOutResult {
     /// The headline number: `total_tokens / duration_secs` — the
     /// server's real-world maximum throughput at full sweet-spot load.
     pub aggregate_tps: f64,
-    /// `aggregate_tps / stream_count` — what each user gets at the
-    /// recommended load (≈ 30 t/s confirms the sweet spot).
+    /// **Back-compat alias of [`tps_per_requested_stream`](Self::tps_per_requested_stream)**
+    /// — `aggregate_tps / stream_count`: what each *requested* user
+    /// gets at the recommended load (≈ 30 t/s confirms the sweet
+    /// spot). Kept so older JSON/DB consumers keep reading the same
+    /// number; new consumers should use the two labeled CF-04 views.
     pub per_stream_tps: f64,
+    /// **Capacity view** (CF-04): `aggregate_tps / completed_streams`
+    /// — what each *healthy* stream sustains. Failed / zero-token
+    /// streams are excluded from the denominator, so they no longer
+    /// dilute the number. `0.0` when no stream completed.
+    #[serde(default)]
+    pub tps_per_completed_stream: f64,
+    /// **User-experience view** (CF-04): `aggregate_tps /
+    /// requested_streams` — the average per *requested* stream,
+    /// failures included (the honest "per user" number at the
+    /// recommended load; identical to [`per_stream_tps`](Self::per_stream_tps)).
+    #[serde(default)]
+    pub tps_per_requested_stream: f64,
+    /// (CF-04): `failed_streams / requested_streams`. A stream that
+    /// never produced a token (a terminal failure, or a stall before
+    /// any frame) counts as failed. Flagged in the summary line / run
+    /// log when above [`FAILED_STREAM_RATIO_FLAG`] (0.20) — more than a
+    /// fifth of the requested load is not producing tokens.
+    #[serde(default)]
+    pub failed_stream_ratio: f64,
+    /// (CF-29) `Some` when the run is a **configuration error, not a
+    /// measurement**: every requested stream was rejected by the server
+    /// with a uniform HTTP 400 (request too large) and no stream
+    /// produced a single token. The message names the condition
+    /// ("requested tokens exceed model limit") so a 0 t/s headline is
+    /// never read as "the server is slow". `None` for normal runs and
+    /// for partial failures (those are dilution, surfaced via
+    /// [`failed_stream_ratio`](Self::failed_stream_ratio)).
+    #[serde(default)]
+    pub config_error: Option<String>,
+    /// (CF-29) The `max_tokens` actually sent per stream:
+    /// [`MAX_TOKENS`] when the model's max context could not be probed,
+    /// else the clamped value (`model max context − prompt tokens`,
+    /// floored at 1 — see [`clamp_max_tokens`]). `0` in pre-CF-29
+    /// documents (the field did not exist yet).
+    #[serde(default)]
+    pub max_tokens_used: u32,
     /// Mean time to first token across the streams (milliseconds).
     pub ttft_avg_ms: f64,
     /// Inter-token latency p50, pooled across all streams (milliseconds).
@@ -179,6 +253,15 @@ impl FlatOutResult {
     /// included, exactly what a full-load deployment sustains. The ITL
     /// percentiles are the gaps between consecutive token frames, pooled
     /// across all streams.
+    ///
+    /// The **per-stream t/s** is reported in two labeled views
+    /// (CF-04): `÷ completed streams` (capacity — failed / zero-token
+    /// streams don't dilute it) and `÷ requested streams`
+    /// (user-experience — the honest per-user average; the legacy
+    /// `per_stream_tps` equals this one). A stream *completed* when it
+    /// produced at least one token frame (the 60 s abort still counts —
+    /// it ran to the window); it *failed* when it has a terminal
+    /// `Failed` event or produced no tokens at all.
     #[must_use]
     pub fn from_events(
         per_stream: &[Vec<StreamEvent>],
@@ -192,6 +275,9 @@ impl FlatOutResult {
         let mut methods: Vec<&'static str> = Vec::new();
         let mut ttfts_ms: Vec<f64> = Vec::new();
         let mut itl = LatencyHistogram::default();
+        // CF-04: the dual-denominator stream classification.
+        let mut completed_streams = 0usize;
+        let mut failed_streams = 0usize;
         for events in per_stream {
             // The stream's authoritative count (usage → text estimate),
             // with the `estimated` flag that separates the server's
@@ -203,6 +289,18 @@ impl FlatOutResult {
                 tokens_estimated = true;
             }
             methods.push(counting_method(usage, estimated));
+            // CF-04: classify the stream for the dual denominators —
+            // *completed* when it produced at least one token frame
+            // (the 60 s abort still counts: it ran to the window), else
+            // *failed* (a terminal error, or a stall before any frame).
+            if events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Frame { frame, .. } if frame.chunk.is_token()))
+            {
+                completed_streams += 1;
+            } else {
+                failed_streams += 1;
+            }
             // Pooled ITL: the gaps between this stream's consecutive
             // token frames.
             let mut prev: Option<MonotonicInstant> = None;
@@ -233,6 +331,18 @@ impl FlatOutResult {
         } else {
             0.0
         };
+        // CF-04: the dual per-stream denominators. `requested` is the
+        // streams the run asked for (the legacy single view);
+        // `completed` excludes the failed / zero-token streams so they
+        // stop diluting the capacity number (no divide-by-zero: an all-
+        // failed run reports 0.0, not ∞).
+        let tps_per_requested_stream = aggregate_tps / stream_count as f64;
+        let tps_per_completed_stream = if completed_streams > 0 {
+            aggregate_tps / completed_streams as f64
+        } else {
+            0.0
+        };
+        let failed_stream_ratio = failed_streams as f64 / stream_count as f64;
         let (itl_p50_ms, itl_p99_ms) = itl_percentiles_ms(&itl);
         let ttft_avg_ms = if ttfts_ms.is_empty() {
             0.0
@@ -245,7 +355,18 @@ impl FlatOutResult {
             total_tokens,
             duration_secs,
             aggregate_tps,
-            per_stream_tps: aggregate_tps / stream_count as f64,
+            // Back-compat alias: the legacy number is the requested view.
+            per_stream_tps: tps_per_requested_stream,
+            tps_per_completed_stream,
+            tps_per_requested_stream,
+            failed_stream_ratio,
+            // CF-29: `from_events` does not know the probe outcome —
+            // `run()` fills the real cap (and a config error, when the
+            // server uniformly rejects every stream) after building the
+            // result. `0` marks a result built without a run (the
+            // pre-CF-29 shape).
+            config_error: None,
+            max_tokens_used: 0,
             ttft_avg_ms,
             itl_p50_ms,
             itl_p99_ms,
@@ -260,18 +381,44 @@ impl FlatOutResult {
     /// tokenizer — the default configuration), the headline t/s is
     /// prefixed with `≈` and annotated `(est., <method>)`, so the number
     /// is never read as a precise measurement.
+    ///
+    /// The per-stream figure is shown in both labeled views (CF-04):
+    /// `t/s per stream` (÷ requested — the user-experience view) and
+    /// `t/s per completed stream` (÷ completed — the capacity view).
+    /// A run where more than a fifth of the requested streams produced
+    /// no tokens (above [`FAILED_STREAM_RATIO_FLAG`]) carries a `⚠`
+    /// failure-ratio flag.
+    ///
+    /// (CF-29) When [`config_error`](Self::config_error) is set — every
+    /// stream was rejected with a uniform HTTP 400 — the line leads
+    /// with the configuration error so it is never read as "0 t/s,
+    /// slow server".
     #[must_use]
     pub fn summary_line(&self) -> String {
+        if let Some(e) = &self.config_error {
+            return format!("⚠ CONFIG: {e}");
+        }
         let (agg_prefix, est_note) = if self.tokens_estimated {
             ("≈", format!(" (est., {})", self.counting_method))
         } else {
             ("", String::new())
         };
+        // CF-04: flag a run where more than a fifth of the requested
+        // streams produced no tokens.
+        let fail_note = if self.failed_stream_ratio > FAILED_STREAM_RATIO_FLAG {
+            format!(
+                " · ⚠ {:.0}% of streams failed",
+                self.failed_stream_ratio * 100.0
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {ps:.1} t/s per stream · {tok} tok in {d:.0}s",
+            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {req:.1} t/s per stream · {comp:.1} t/s per completed stream{fail_note} · {tok} tok in {d:.0}s",
             agg = self.aggregate_tps,
             n = self.stream_count,
-            ps = self.per_stream_tps,
+            req = self.tps_per_requested_stream,
+            comp = self.tps_per_completed_stream,
             tok = self.total_tokens,
             d = self.duration_secs
         )
@@ -280,13 +427,19 @@ impl FlatOutResult {
     /// The `--json` object for this result.
     #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "stream_count": self.stream_count,
             "stream_count_source": self.stream_count_source,
             "total_tokens": self.total_tokens,
             "duration_secs": self.duration_secs,
             "aggregate_tps": self.aggregate_tps,
             "per_stream_tps": self.per_stream_tps,
+            // CF-04: the dual per-stream denominators (exact contract
+            // names, shared with Engine B): capacity (÷ completed) and
+            // user-experience (÷ requested), plus the failed ratio.
+            "tps_per_completed_stream": self.tps_per_completed_stream,
+            "tps_per_requested_stream": self.tps_per_requested_stream,
+            "failed_stream_ratio": self.failed_stream_ratio,
             "ttft_avg_ms": self.ttft_avg_ms,
             "itl_p50_ms": self.itl_p50_ms,
             "itl_p99_ms": self.itl_p99_ms,
@@ -296,7 +449,19 @@ impl FlatOutResult {
             // `usage` frame arrives); `counting_method` names the source.
             "tokens_estimated": self.tokens_estimated,
             "counting_method": self.counting_method,
-        })
+            // CF-29: the `max_tokens` actually sent per stream
+            // ([`MAX_TOKENS`] when the model's max context could not be
+            // probed, else the clamped value).
+            "max_tokens_used": self.max_tokens_used,
+        });
+        // CF-29: the configuration-error diagnostic (uniform HTTP 400
+        // rejection of every stream) — present only when set.
+        if let Some(e) = &self.config_error {
+            obj.as_object_mut()
+                .unwrap()
+                .insert("config_error".into(), serde_json::json!(e));
+        }
+        obj
     }
 }
 
@@ -336,6 +501,100 @@ fn summarize_methods(methods: &[&'static str]) -> String {
     match distinct.as_slice() {
         [only] => only.to_string(),
         _ => "mixed".to_string(),
+    }
+}
+
+// ── CF-29: respect the model's max context ─────────────────────────────
+
+/// Extract the model's max context from a `/v1/models` response body
+/// (CF-29): find the entry whose `id` matches `model` and read the
+/// first present max-context field ([`MODEL_CONTEXT_FIELDS`]). Pure (no
+/// network) — unit-testable with mock bodies. `None` when the body is
+/// not JSON, the model is absent, or no field is present (graceful:
+/// the run proceeds unclamped).
+#[must_use]
+pub fn parse_model_max_context(body: &str, model: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = v.get("data")?.as_array()?;
+    let entry = data
+        .iter()
+        .find(|m| m.get("id").and_then(|id| id.as_str()) == Some(model))?;
+    MODEL_CONTEXT_FIELDS
+        .iter()
+        .find_map(|f| entry.get(*f))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+}
+
+/// The `max_tokens` to request per stream (CF-29): [`MAX_TOKENS`] when
+/// the model's max context could not be probed, else clamped to
+/// `max context − prompt tokens` (servers enforce
+/// `prompt + max_tokens ≤ max context`) — floored at 1 so a tiny
+/// context still yields a legal request.
+#[must_use]
+pub fn clamp_max_tokens(probed_max_context: Option<u64>, prompt_tokens: u64) -> u32 {
+    match probed_max_context {
+        None => MAX_TOKENS,
+        Some(max_ctx) => {
+            let headroom = max_ctx.saturating_sub(prompt_tokens);
+            (MAX_TOKENS as u64).min(headroom.max(1)) as u32
+        }
+    }
+}
+
+/// Detect the CF-29 condition: **every** requested stream was rejected
+/// by the server with a uniform HTTP 400 (request too large) and no
+/// stream produced a single token. That is a *configuration* error
+/// ("requested tokens exceed model limit"), not a measurement — the run
+/// must not be reported as a silent 0 t/s. `None` for any partial
+/// failure (those are dilution, flagged via `failed_stream_ratio`), a
+/// non-400 failure, or a stream that produced tokens before failing.
+#[must_use]
+pub fn uniform_400_config_error(
+    per_stream: &[Vec<StreamEvent>],
+    max_tokens_used: u32,
+    probed_max_context: Option<u64>,
+) -> Option<String> {
+    if per_stream.is_empty() {
+        return None;
+    }
+    let mut tokens_seen = false;
+    let mut all_400 = true;
+    for events in per_stream {
+        // A stream with no terminal `Failed` event at all (stalled,
+        // aborted in flight) is not a 400 rejection.
+        if !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Failed { .. }))
+        {
+            all_400 = false;
+        }
+        for e in events {
+            match e {
+                StreamEvent::Frame { frame, .. } if frame.chunk.is_token() => {
+                    tokens_seen = true;
+                }
+                StreamEvent::Failed { error, .. }
+                    if !matches!(error, StreamError::Http { status: 400, .. }) =>
+                {
+                    all_400 = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    if all_400 && !tokens_seen {
+        let probed_note = match probed_max_context {
+            Some(max) => format!(" (probed model max context: {max})"),
+            None => " (the model's max context could not be probed)".to_string(),
+        };
+        Some(format!(
+            "requested tokens exceed model limit: the server rejected every stream with a uniform HTTP 400 (request too large){probed_note}; the per-stream max_tokens was {max_tokens_used}. The server's effective generation cap is lower — reduce the request size or raise the server's max-model-len. This is a configuration error, not a 0 t/s measurement."
+        ))
+    } else {
+        None
     }
 }
 
@@ -494,6 +753,38 @@ impl FlatOutEngine {
         self
     }
 
+    /// Probe the model's max context via `GET {base}/v1/models` (CF-29).
+    ///
+    /// Best-effort by design (N/A-never-fail): any failure — no
+    /// `/models` route (404), a stalled server (the [`PROBE_TIMEOUT`]
+    /// budget), a body with no recognizable max-context field
+    /// ([`MODEL_CONTEXT_FIELDS`]), or the configured model not being
+    /// listed — yields `None`, and the run proceeds with the unclamped
+    /// [`MAX_TOKENS`] (today's behavior). The probe rides the engine's
+    /// shared `reqwest` client and the configured API key.
+    async fn probe_model_max_context(&self) -> Option<u64> {
+        let url = format!(
+            "{}/models",
+            crate::client::models::normalize_base_url(&self.cfg.url)
+        );
+        let fut = async {
+            let mut req = self.client.get(&url);
+            if let Some(key) = &self.cfg.api_key {
+                req = req.bearer_auth(key);
+            }
+            let resp = req.send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.text().await.ok()
+        };
+        match tokio::time::timeout(PROBE_TIMEOUT, fut).await {
+            Ok(Some(body)) => parse_model_max_context(&body, &self.cfg.model),
+            Ok(None) => None,
+            Err(_) => None, // stalled: degrade to unclamped
+        }
+    }
+
     /// Run the `n`-stream window and return the result.
     ///
     /// All streams are spawned together (one [`WorkerPool`] level),
@@ -509,6 +800,14 @@ impl FlatOutEngine {
         if let Some(gate) = &self.pause {
             gate.wait_while_paused().await;
         }
+
+        // CF-29: probe the model's max context and clamp the requested
+        // `max_tokens` to it — servers that cap generation reject a
+        // 100,000 request with a uniform HTTP 400 (previously: all
+        // streams failed → a silent 0 t/s with no diagnostic). A
+        // failed probe degrades to the unclamped cap.
+        let probed_max_context = self.probe_model_max_context().await;
+        let max_tokens_used = clamp_max_tokens(probed_max_context, prompt.token_count as u64);
 
         if let Some(bus) = &self.progress {
             bus.publish(EngineProgress::FlatOut {
@@ -531,7 +830,20 @@ impl FlatOutEngine {
                 l.info(
                     Context::EngineF,
                     format!(
-                        "Real-world max throughput: {n} streams (concurrency sweet spot) for {WINDOW_SECS:.0}s, max_tokens {MAX_TOKENS}"
+                        "Real-world max throughput: {n} streams (concurrency sweet spot) for {WINDOW_SECS:.0}s, max_tokens {max_tokens_used}"
+                    ),
+                );
+            }
+        }
+        // CF-29: make the clamp visible in the run log (the probe
+        // succeeded and reduced the cap).
+        if max_tokens_used != MAX_TOKENS {
+            if let Some(l) = &self.logger {
+                l.info(
+                    Context::EngineF,
+                    format!(
+                        "CF-29: max_tokens clamped {MAX_TOKENS} → {max_tokens_used} to fit the model's max context ({} prompt tokens reserved)",
+                        prompt.token_count
                     ),
                 );
             }
@@ -542,7 +854,7 @@ impl FlatOutEngine {
             &self.cfg.url,
             &self.cfg.model,
             &prompt.text,
-            MAX_TOKENS,
+            max_tokens_used,
         )
         .read_timeout(Duration::from_secs(self.cfg.timeout.max(1)))
         // The 60 s window — not the model's own end-token — is the only
@@ -619,12 +931,26 @@ impl FlatOutEngine {
         drop(rx);
 
         let elapsed = start.elapsed().as_secs_f64();
-        let result = FlatOutResult::from_events(
+        let mut result = FlatOutResult::from_events(
             &per_stream,
             elapsed,
             self.generator.tokenizer().as_deref(),
             self.stream_count_source,
         );
+        // CF-29: record the cap actually sent. A uniform server
+        // rejection of every stream (HTTP 400, no tokens produced) is a
+        // *configuration* error — "requested tokens exceed model
+        // limit" — surfaced in the result, the summary line, and the
+        // run log. It is never a silent 0 t/s measurement.
+        result.max_tokens_used = max_tokens_used;
+        if let Some(err) =
+            uniform_400_config_error(&per_stream, max_tokens_used, probed_max_context)
+        {
+            result.config_error = Some(err.clone());
+            if let Some(l) = &self.logger {
+                l.error(Context::EngineF, format!("CONFIG: {err}"));
+            }
+        }
 
         // Final publish (the last batch may not have flushed). The 60 s
         // window is over and the workers are aborted: every stream is a
@@ -654,16 +980,31 @@ impl FlatOutEngine {
             l.info(
                 Context::EngineF,
                 format!(
-                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
+                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (requested), {:.1} t/s per completed stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
                     result.total_tokens,
                     result.duration_secs,
                     result.aggregate_tps,
-                    result.per_stream_tps,
+                    result.tps_per_requested_stream,
+                    result.tps_per_completed_stream,
                     result.ttft_avg_ms,
                     result.itl_p50_ms,
                     result.itl_p99_ms
                 ),
             );
+            // CF-04: a level where more than a fifth of the requested
+            // streams produced no tokens is flagged, not silently
+            // averaged.
+            if result.failed_stream_ratio > FAILED_STREAM_RATIO_FLAG {
+                l.warn(
+                    Context::EngineF,
+                    format!(
+                        "CF-04: {:.0}% of the requested streams produced no tokens (failed-stream ratio {:.2} > {} threshold) — the capacity and user-experience per-stream views differ materially",
+                        result.failed_stream_ratio * 100.0,
+                        result.failed_stream_ratio,
+                        FAILED_STREAM_RATIO_FLAG
+                    ),
+                );
+            }
         }
 
         result
@@ -1313,6 +1654,13 @@ mod tests {
             duration_secs: 60.0,
             aggregate_tps: 285.4,
             per_stream_tps: 35.7,
+            // CF-04: no failures in this fixture — both views agree.
+            tps_per_completed_stream: 35.7,
+            tps_per_requested_stream: 35.7,
+            failed_stream_ratio: 0.0,
+            // CF-29: a normal run — no config error, the unclamped cap.
+            config_error: None,
+            max_tokens_used: MAX_TOKENS,
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
@@ -1322,7 +1670,11 @@ mod tests {
         let line = r.summary_line();
         assert!(line.contains("285.4 t/s aggregate (8 streams)"), "{line}");
         assert!(line.contains("35.7 t/s per stream"), "{line}");
+        // CF-04: the capacity view is labeled separately.
+        assert!(line.contains("35.7 t/s per completed stream"), "{line}");
         assert!(line.contains("17124 tok in 60s"), "{line}");
+        // No failure flag when nothing failed.
+        assert!(!line.contains("of streams failed"), "{line}");
     }
 
     #[test]
@@ -1334,6 +1686,13 @@ mod tests {
             duration_secs: 60.0,
             aggregate_tps: 285.4,
             per_stream_tps: 35.7,
+            // CF-04: no failures in this fixture — both views agree.
+            tps_per_completed_stream: 35.7,
+            tps_per_requested_stream: 35.7,
+            failed_stream_ratio: 0.0,
+            // CF-29: a normal run — no config error, the unclamped cap.
+            config_error: None,
+            max_tokens_used: MAX_TOKENS,
             ttft_avg_ms: 312.5,
             itl_p50_ms: 28.3,
             itl_p99_ms: 65.1,
@@ -1351,18 +1710,31 @@ mod tests {
                 "duration_secs",
                 "aggregate_tps",
                 "per_stream_tps",
+                // CF-04: the dual per-stream denominators (exact
+                // contract names, shared with Engine B).
+                "tps_per_completed_stream",
+                "tps_per_requested_stream",
+                "failed_stream_ratio",
                 "ttft_avg_ms",
                 "itl_p50_ms",
                 "itl_p99_ms",
                 "tokens_estimated",
-                "counting_method"
+                "counting_method",
+                // CF-29: the cap actually sent (a normal run: unclamped).
+                "max_tokens_used"
             ]
         );
+        // CF-29: a normal run carries no `config_error` key at all.
+        assert!(v.get("config_error").is_none(), "no config_error when None");
+        assert_eq!(v["max_tokens_used"], MAX_TOKENS);
         assert_eq!(v["stream_count"], 8);
         assert_eq!(v["stream_count_source"], "concurrency_sweet_spot");
         assert_eq!(v["total_tokens"], 17_124);
         assert!((v["aggregate_tps"].as_f64().unwrap() - 285.4).abs() < 1e-9);
         assert!((v["per_stream_tps"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert!((v["tps_per_completed_stream"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert!((v["tps_per_requested_stream"].as_f64().unwrap() - 35.7).abs() < 1e-9);
+        assert_eq!(v["failed_stream_ratio"].as_f64().unwrap(), 0.0);
         // CF-07: the JSON carries the token-count provenance.
         assert_eq!(v["tokens_estimated"], false);
         assert_eq!(v["counting_method"], "usage");
@@ -1492,5 +1864,546 @@ mod tests {
             assert_eq!(v["tokens_estimated"], true);
             assert_eq!(v["counting_method"], "mixed");
         });
+    }
+
+    // ── CF-04: the dual per-stream denominators ─────────────────────────
+
+    /// A stream that failed before producing a single token frame.
+    fn failed_stream(t0: MonotonicInstant, status: u16) -> StreamEvent {
+        StreamEvent::Failed {
+            timestamps: ts_at(t0),
+            error: crate::client::StreamError::Http {
+                status,
+                body: "rejected".into(),
+            },
+            looping: false,
+            loop_excluded_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn cf04_dual_denominators_completed_vs_requested() {
+        // 3 requested: two produce tokens (completed — the 60 s abort
+        // still counts), one fails before any frame. The capacity view
+        // divides by 2, the user-experience view by 3 — and the
+        // back-compat `per_stream_tps` equals the requested view.
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            let s0 = vec![content_frame_text("abcd", t1, ts)]; // 1 token
+            let s1 = vec![content_frame_text("efgh", t1, ts)]; // 1 token
+            let s2 = vec![failed_stream(t0, 400)]; // failed, no tokens
+            let r =
+                FlatOutResult::from_events(&[s0, s1, s2], 10.0, None, StreamCountSource::Default);
+            assert_eq!(r.stream_count, 3, "requested streams");
+            assert_eq!(r.total_tokens, 2);
+            assert!(
+                (r.aggregate_tps - 0.2).abs() < 1e-9,
+                "aggregate: {}",
+                r.aggregate_tps
+            );
+            // Capacity view: ÷ 2 completed streams.
+            assert!(
+                (r.tps_per_completed_stream - 0.1).abs() < 1e-9,
+                "capacity view: {}",
+                r.tps_per_completed_stream
+            );
+            // User-experience view: ÷ 3 requested streams.
+            assert!(
+                (r.tps_per_requested_stream - 0.2 / 3.0).abs() < 1e-9,
+                "requested view: {}",
+                r.tps_per_requested_stream
+            );
+            // Back-compat alias: the legacy number is the requested view.
+            assert!(
+                (r.per_stream_tps - r.tps_per_requested_stream).abs() < 1e-12,
+                "per_stream_tps must equal the requested view"
+            );
+            // The failed ratio: 1 of 3.
+            assert!(
+                (r.failed_stream_ratio - 1.0 / 3.0).abs() < 1e-9,
+                "ratio: {}",
+                r.failed_stream_ratio
+            );
+            // 33% > 20% → the summary line carries the failure flag.
+            assert!(
+                r.summary_line().contains("⚠ 33% of streams failed"),
+                "{}",
+                r.summary_line()
+            );
+        });
+    }
+
+    #[test]
+    fn cf04_all_failed_no_divide_by_zero_and_full_ratio() {
+        // Every stream failed (a uniform rejection): the capacity view
+        // is 0.0 (not ∞ / NaN), the ratio is 1.0, and the summary flags
+        // it.
+        let t0 = MonotonicInstant::now();
+        let r = FlatOutResult::from_events(
+            &[
+                vec![failed_stream(t0, 400)],
+                vec![failed_stream(t0, 400)],
+                vec![failed_stream(t0, 400)],
+            ],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert_eq!(r.total_tokens, 0);
+        assert_eq!(r.aggregate_tps, 0.0);
+        assert_eq!(
+            r.tps_per_completed_stream, 0.0,
+            "no completed streams → 0.0, never a divide-by-zero"
+        );
+        assert_eq!(r.tps_per_requested_stream, 0.0);
+        assert_eq!(r.failed_stream_ratio, 1.0, "all requested streams failed");
+        assert!(
+            r.summary_line().contains("⚠ 100% of streams failed"),
+            "{}",
+            r.summary_line()
+        );
+    }
+
+    #[test]
+    fn cf04_failure_flag_only_above_20_percent() {
+        // 5 requested, 1 failed → exactly 0.20 → NOT flagged (the flag
+        // is strictly greater than the threshold).
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let ok = || vec![content_frame_text("abcd", t0, ts)];
+        let r5 = FlatOutResult::from_events(
+            &[ok(), ok(), ok(), ok(), vec![failed_stream(t0, 400)]],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert!((r5.failed_stream_ratio - 0.20).abs() < 1e-9);
+        assert!(
+            !r5.summary_line().contains("of streams failed"),
+            "exactly 20% is not flagged: {}",
+            r5.summary_line()
+        );
+        // 4 requested, 1 failed → 0.25 → flagged.
+        let r4 = FlatOutResult::from_events(
+            &[ok(), ok(), ok(), vec![failed_stream(t0, 400)]],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        assert!((r4.failed_stream_ratio - 0.25).abs() < 1e-9);
+        assert!(
+            r4.summary_line().contains("⚠ 25% of streams failed"),
+            "{}",
+            r4.summary_line()
+        );
+    }
+
+    #[test]
+    fn cf04_to_dict_carries_the_exact_contract_names() {
+        // The JSON export carries the dual denominators under the exact
+        // contract field names (shared with Engine B), and the
+        // back-compat `per_stream_tps` is the requested view.
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let s0 = vec![content_frame_text("abcd", t0, ts)];
+        let s1 = vec![failed_stream(t0, 400)];
+        let r = FlatOutResult::from_events(&[s0, s1], 10.0, None, StreamCountSource::Default);
+        let v = r.to_dict();
+        assert!(
+            (v["tps_per_completed_stream"].as_f64().unwrap() - 0.1).abs() < 1e-9,
+            "÷ 1 completed stream: {}",
+            v["tps_per_completed_stream"]
+        );
+        assert!(
+            (v["tps_per_requested_stream"].as_f64().unwrap() - 0.05).abs() < 1e-9,
+            "÷ 2 requested streams: {}",
+            v["tps_per_requested_stream"]
+        );
+        assert!(
+            (v["failed_stream_ratio"].as_f64().unwrap() - 0.5).abs() < 1e-9,
+            "1 of 2 failed: {}",
+            v["failed_stream_ratio"]
+        );
+        assert_eq!(
+            v["per_stream_tps"].as_f64().unwrap(),
+            v["tps_per_requested_stream"].as_f64().unwrap(),
+            "the back-compat field is the requested view"
+        );
+    }
+
+    // ── CF-29: respect the model's max context ──────────────────────────
+
+    #[test]
+    fn cf29_parse_vllm_max_model_len() {
+        // vLLM exposes `max_model_len` on its `/v1/models` entries.
+        let body = r#"{
+            "object": "list",
+            "data": [
+                {"id": "qwen3.8-27b", "object": "model", "owned_by": "vllm", "max_model_len": 851968},
+                {"id": "other-model", "object": "model"}
+            ]
+        }"#;
+        assert_eq!(parse_model_max_context(body, "qwen3.8-27b"), Some(851968));
+        // A model with no max-context field → None (no clamp).
+        assert_eq!(parse_model_max_context(body, "other-model"), None);
+        // A model not in the list → None.
+        assert_eq!(parse_model_max_context(body, "missing"), None);
+    }
+
+    #[test]
+    fn cf29_parse_tolerates_missing_and_string_fields() {
+        // String-valued limits (some backends quote the number).
+        let body = r#"{"data": [{"id": "m", "max_context": "4096"}]}"#;
+        assert_eq!(parse_model_max_context(body, "m"), Some(4096));
+        // OpenAI-style `context_length`.
+        let body = r#"{"data": [{"id": "m", "context_length": 32768}]}"#;
+        assert_eq!(parse_model_max_context(body, "m"), Some(32768));
+        // No recognizable field → None.
+        let body = r#"{"data": [{"id": "m", "object": "model"}]}"#;
+        assert_eq!(parse_model_max_context(body, "m"), None);
+        // Not JSON at all → None (graceful, never a panic).
+        assert_eq!(parse_model_max_context("this is not json", "m"), None);
+        // Empty `data` → None.
+        assert_eq!(
+            parse_model_max_context(r#"{"object":"list","data":[]}"#, "m"),
+            None
+        );
+    }
+
+    #[test]
+    fn cf29_clamp_subtracts_prompt_headroom() {
+        // 1,000-token context, 20-token prompt → 980 requested.
+        assert_eq!(clamp_max_tokens(Some(1_000), 20), 980);
+        // A context exactly at MAX_TOKENS still reserves the prompt.
+        assert_eq!(clamp_max_tokens(Some(100_000), 20), 99_980);
+        // No probe (unknown backend) → the unclamped cap.
+        assert_eq!(clamp_max_tokens(None, 20), MAX_TOKENS);
+        // A huge context → the cap is unchanged.
+        assert_eq!(clamp_max_tokens(Some(851_968), 20), MAX_TOKENS);
+        // A tiny context → floored at 1 (always a legal request).
+        assert_eq!(clamp_max_tokens(Some(10), 20), 1);
+    }
+
+    #[test]
+    fn cf29_uniform_400_is_a_config_error() {
+        // Every stream rejected with HTTP 400, no tokens: the
+        // "requested tokens exceed model limit" configuration error.
+        let t0 = MonotonicInstant::now();
+        let per_stream = vec![
+            vec![failed_stream(t0, 400)],
+            vec![failed_stream(t0, 400)],
+            vec![failed_stream(t0, 400)],
+        ];
+        let err = uniform_400_config_error(&per_stream, 980, Some(1_000));
+        assert!(err.is_some(), "uniform 400 must be detected");
+        let msg = err.unwrap();
+        assert!(msg.contains("requested tokens exceed model limit"), "{msg}");
+        assert!(msg.contains("980"), "names the cap that was sent: {msg}");
+        assert!(msg.contains("1000"), "names the probed context: {msg}");
+    }
+
+    #[test]
+    fn cf29_partial_failure_is_not_a_config_error() {
+        // Two streams 400, one produced tokens: that is dilution (the
+        // CF-04 failed_stream_ratio flags it), not a uniform config
+        // rejection.
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let per_stream = vec![
+            vec![failed_stream(t0, 400)],
+            vec![failed_stream(t0, 400)],
+            vec![content_frame_text("abcd", t0, ts)],
+        ];
+        assert!(uniform_400_config_error(&per_stream, 980, Some(1_000)).is_none());
+    }
+
+    #[test]
+    fn cf29_non400_failure_is_not_a_config_error() {
+        // All streams failed, but with connection errors (not 400): a
+        // server problem, not a request-size configuration error.
+        let t0 = MonotonicInstant::now();
+        let per_stream = vec![
+            vec![StreamEvent::Failed {
+                timestamps: ts_at(t0),
+                error: crate::client::StreamError::Connection("refused".into()),
+                looping: false,
+                loop_excluded_tokens: 0,
+            }],
+            vec![StreamEvent::Failed {
+                timestamps: ts_at(t0),
+                error: crate::client::StreamError::Connection("refused".into()),
+                looping: false,
+                loop_excluded_tokens: 0,
+            }],
+        ];
+        assert!(uniform_400_config_error(&per_stream, MAX_TOKENS, None).is_none());
+    }
+
+    #[test]
+    fn cf29_400_after_tokens_is_not_a_config_error() {
+        // A stream that produced tokens before its 400 terminal has
+        // evidence the request size was accepted — not uniform.
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let per_stream = vec![
+            vec![content_frame_text("abcd", t0, ts), failed_stream(t0, 400)],
+            vec![failed_stream(t0, 400)],
+        ];
+        assert!(uniform_400_config_error(&per_stream, 980, Some(1_000)).is_none());
+    }
+
+    #[test]
+    fn cf29_config_error_surfaces_in_summary_and_json() {
+        // A result carrying a config error leads with it in the
+        // one-line summary (never a bare "0.0 t/s") and in the JSON.
+        let r = FlatOutResult {
+            stream_count: 3,
+            stream_count_source: StreamCountSource::Default,
+            total_tokens: 0,
+            duration_secs: 1.2,
+            aggregate_tps: 0.0,
+            per_stream_tps: 0.0,
+            tps_per_completed_stream: 0.0,
+            tps_per_requested_stream: 0.0,
+            failed_stream_ratio: 1.0,
+            config_error: Some(
+                "requested tokens exceed model limit: the server rejected every stream with a uniform HTTP 400 (request too large)"
+                    .into(),
+            ),
+            max_tokens_used: 980,
+            ttft_avg_ms: 0.0,
+            itl_p50_ms: 0.0,
+            itl_p99_ms: 0.0,
+            tokens_estimated: true,
+            counting_method: "none".into(),
+        };
+        assert!(
+            r.summary_line().starts_with("⚠ CONFIG:"),
+            "{}",
+            r.summary_line()
+        );
+        assert!(
+            r.summary_line()
+                .contains("requested tokens exceed model limit"),
+            "{}",
+            r.summary_line()
+        );
+        let v = r.to_dict();
+        assert!(v["config_error"].is_string());
+        assert_eq!(v["max_tokens_used"], 980);
+    }
+
+    // ── CF-29: mock model server (loopback only — no live server) ───────
+
+    /// A minimal one-shot HTTP server on 127.0.0.1 (ephemeral port):
+    /// serves `GET …/v1/models` with `models_status` + `models_body` and
+    /// answers every `POST …/chat/completions` with `chat_status` +
+    /// `chat_body`. Records the `max_tokens` it saw in each chat body
+    /// so a test can assert the clamp reached the wire.
+    ///
+    /// It accepts at most `max_connections` connections and then closes
+    /// (the listener drops with the task at runtime teardown). No
+    /// external network is touched.
+    async fn spawn_mock_model_server(
+        models_status: u16,
+        models_body: &str,
+        chat_status: u16,
+        chat_body: &str,
+        max_connections: usize,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<u32>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: std::sync::Arc<tokio::sync::Mutex<Vec<u32>>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let models_body = models_body.to_string();
+        let chat_body = chat_body.to_string();
+        let seen_cl = seen.clone();
+        tokio::spawn(async move {
+            for _ in 0..max_connections {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                // Read the full request (headers + Content-Length body).
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                        Err(_) => break,
+                    }
+                }
+                let header_end = buf
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .unwrap_or(buf.len());
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let content_length = head
+                    .lines()
+                    .filter_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .next()
+                    .unwrap_or(0);
+                // The body starts *after* the blank line (header_end + 4).
+                let body_start = header_end + 4;
+                while buf.len() < body_start + content_length {
+                    match socket.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(k) => buf.extend_from_slice(&tmp[..k]),
+                        Err(_) => break,
+                    }
+                }
+                let body_len = (buf.len() - body_start).min(content_length);
+                let body =
+                    String::from_utf8_lossy(&buf[body_start..body_start + body_len]).to_string();
+                let first_line = head.lines().next().unwrap_or_default().to_string();
+                let (status, resp_body) = if first_line.contains("/models") {
+                    (models_status, models_body.clone())
+                } else {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(mt) = v.get("max_tokens").and_then(|m| m.as_u64()) {
+                            seen_cl.lock().await.push(mt as u32);
+                        }
+                    }
+                    (chat_status, chat_body.clone())
+                };
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                    resp_body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn cf29_mock_small_context_clamps_and_uniform_400_is_a_config_error() {
+        // A mock model with a 1,000-token max context (vLLM-style
+        // `max_model_len`) whose true generation cap is lower: it
+        // rejects every chat request with HTTP 400. The run must
+        // (1) clamp `max_tokens` to the probed context (minus the
+        // prompt) before sending, and (2) surface the uniform 400 as a
+        // configuration error — not a silent 0 t/s.
+        let (url, seen) = spawn_mock_model_server(
+            200,
+            r#"{"object":"list","data":[{"id":"m","object":"model","max_model_len":1000}]}"#,
+            400,
+            r#"{"error":"max_tokens exceeds the model limit"}"#,
+            3, // 1 probe + 2 chat streams
+        )
+        .await;
+        let engine = FlatOutEngine::new(&Config {
+            url,
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap()
+        .stream_count(2, StreamCountSource::Default);
+        let r = engine.run().await;
+        // The clamp: 1,000 context − the ~20-token prompt (chars/4).
+        let prompt_tokens = count_tokens(MINIMAL_PROMPT, None).tokens;
+        let expected = clamp_max_tokens(Some(1_000), prompt_tokens as u64);
+        assert!(expected < MAX_TOKENS, "the probe must reduce the cap");
+        assert_eq!(
+            r.max_tokens_used, expected,
+            "max_tokens clamped to the probed model max context"
+        );
+        // The clamp reached the wire on every request.
+        let seen = seen.lock().await;
+        assert!(
+            !seen.is_empty() && seen.iter().all(|&mt| mt == expected),
+            "every chat request carried the clamped cap: {seen:?}"
+        );
+        // The uniform 400 is a configuration error, not 0 t/s.
+        assert!(r.config_error.is_some(), "uniform 400 → config error");
+        assert!(r
+            .config_error
+            .as_ref()
+            .unwrap()
+            .contains("requested tokens exceed model limit"));
+        assert!(
+            r.summary_line().starts_with("⚠ CONFIG"),
+            "the summary leads with the config error, not a bare 0 t/s: {}",
+            r.summary_line()
+        );
+        assert!(r.to_dict()["config_error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn cf29_mock_without_context_field_runs_unclamped() {
+        // A backend whose `/v1/models` entries carry no max-context field
+        // (llama.cpp-style): the probe finds nothing, the run proceeds
+        // with the unclamped cap — and a uniform 400 is *still* surfaced
+        // as a configuration error (the server's cap is simply
+        // unprobed).
+        let (url, seen) = spawn_mock_model_server(
+            200,
+            r#"{"object":"list","data":[{"id":"m","object":"model","owned_by":"llama.cpp"}]}"#,
+            400,
+            r#"{"error":"too large"}"#,
+            3,
+        )
+        .await;
+        let engine = FlatOutEngine::new(&Config {
+            url,
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap()
+        .stream_count(2, StreamCountSource::Default);
+        let r = engine.run().await;
+        assert_eq!(
+            r.max_tokens_used, MAX_TOKENS,
+            "no context field → no clamp (graceful degradation)"
+        );
+        let seen = seen.lock().await;
+        assert!(seen.iter().all(|&mt| mt == MAX_TOKENS), "{seen:?}");
+        assert!(
+            r.config_error.is_some(),
+            "the uniform 400 is still a config error"
+        );
+        assert!(r
+            .config_error
+            .as_ref()
+            .unwrap()
+            .contains("could not be probed"));
+    }
+
+    #[tokio::test]
+    async fn cf29_models_endpoint_404_degrades_gracefully() {
+        // No `/v1/models` route at all (404): the probe degrades to
+        // `None`, the run proceeds unclamped, and a uniform 400 on the
+        // chat requests is still surfaced as a configuration error.
+        let (url, _seen) = spawn_mock_model_server(
+            404,
+            r#"{"error":"no route"}"#,
+            400,
+            r#"{"error":"too large"}"#,
+            3,
+        )
+        .await;
+        let engine = FlatOutEngine::new(&Config {
+            url,
+            model: "m".to_string(),
+            ..Config::default()
+        })
+        .unwrap()
+        .stream_count(2, StreamCountSource::Default);
+        let r = engine.run().await;
+        assert_eq!(r.max_tokens_used, MAX_TOKENS, "404 probe → unclamped");
+        assert!(r.config_error.is_some(), "uniform 400 still surfaced");
     }
 }
