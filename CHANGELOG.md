@@ -2,6 +2,43 @@
 
 All notable changes to Crucible LLM.
 
+## [0.1.4] - 2026-10-11
+
+The full remediation cycle: metric integrity, reasoning-model correctness, engine selection, and traceability.
+
+### Fixed
+- **NIAH (C1) reasoning-model false-fails** — each cell now suppresses the model's chain-of-thought (per-backend: `enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, `/no_think` for llama.cpp) and checks retrieval on the **visible answer only**. A reasoning model whose 64-token budget used to be all-CoT (≈35 % false-fail) now retrieves ≈100 %; a needle mentioned only in CoT can no longer false-pass.
+- **Engine A's conflated "pre-fill speed"** — the single `prompt_tokens / TTFT` number on a ~45–87-token short prompt (a latency floor wearing a bandwidth label) is **split** into two labeled metrics: **first-token latency (ms)** from the short prompt (dual: perceived `T3−T0` + server-side `T3−T1`) and **pre-fill throughput (tok/s)** from a long prompt (default 10k, three averaged runs).
+- **C2/C3 checker correctness on reasoning models** — C2 judges the committed content span (first-number/whole-value math match, first whole-word verdict, string/comment-aware delimiter balance) with thinking suppressed; C3 suppresses thinking on all runs.
+- **Honest T1** — `T1` is stamped at *response-headers receipt* (not "request write complete"), and both TTFT flavors are published since what falls inside `T1→T3` varies by backend.
+- **Methodology block** — every formula string in the JSON `methodology` block now states exactly what the code does (dual TTFT, the prefill/latency split, the canonical MTP η, the dual denominators, the real warmup, the $/kWh rate source).
+- **Energy math re-based onto the 100 ms trace** — `∫P(t)dt` is windowed to the active load on the 100 ms hardware trace (the 1 Hz history is graph-only), so a sub-second TTFT yields a *real* prefill-phase power; the J/token denominator spans **every engine that ran**, not just A+B.
+- **`--no-hardware` now disables both the poller and the energy engine** consistently in the headless and TUI paths.
+
+### Added
+- **All seven engines individually selectable** — A/B/C1/C2/C3/D/F via `--engine <name>` (repeatable, plus the `all` primitive), `CRUCIBLE_ENGINE`, the config file's `engines` object, and the TUI (Setup / View 6). **Headless honors the selection**: Engine A is no longer unconditional (`--engine niah` runs only C1) and Engine D is selectable. An empty selection is an operator error, not a silent full run.
+- **Traceability** — every run gets a session UUID that stamps the `benchmark_sessions` row, the run-log archive (`run-<timestamp>-<id[:8]>.log`), and the default export name (`crucible-<id[:8]>.<ext>`). The session row records which engines ran (`engines` column) and the headline result of every non-stream engine (`engine_results`: B/C2/C3/D/F); Engine A persists per-run `stream_metrics` and C1 persists per-cell `needle_evaluations` — in **both** the TUI and headless paths.
+- **Complete exports** — JSON/MD/CSV now carry the energy object, Engine A's prefill/latency split, the dual per-stream denominators, NIAH reliability, and `reasoning_tokens`.
+- **`reasoning_tokens` tracked end-to-end** — parsed from the server's `usage` detail, persisted, exported, and driving the decode-window split (Engine A's decode t/s is the *answer phase* when the detail is present; pure-CoT streams report 0.0).
+- **Canonical MTP η** — `completion_tokens / total_token_frames` (all Reasoning + Content frames; η > 1 legitimate) as the single definition across Engine A, Engine B, and the methodology block.
+- **Dual per-stream denominators (B & F)** — `tps_per_completed_stream` (capacity) / `tps_per_requested_stream` (user-experience) / `failed_stream_ratio`, with levels > 20 % failed flagged `high_failure`.
+- **Real discarded warmups** — Engine A runs one discarded warmup iteration and Engine B one discarded warmup level before measuring (logged, counted nowhere).
+- **C3 real constrained decoding** — constrained runs send `response_format: { "type": "json_schema", "json_schema": { …, "strict": true } }` (strict schemas, `additionalProperties: false`) where the transport supports it — engaging server-side XGrammar/Outlines/GBNF — with a clearly-flagged `json_object`-hint fallback. The speed penalty is reported only when the constraint was effective (`constraint_effective`), plus a per-case `stability_rate` (repeatable cases).
+- **Stream-integrity flags surfaced** — `usage_discrepancy` (usage > 4× frames), `e2e_only` (non-streaming result), `itl_clamped` (histogram 60 s cap), and `degraded` (no token frame → TTFT N/A) in the JSON, terminal, and TUI.
+- **Engine F honesty & portability** — `max_tokens` clamped to the model's probed max context (`GET /v1/models`); a uniform HTTP-400/zero-token run surfaces as a `config_error`, never a silent 0 t/s; `chars/4` fallback counts are flagged (`tokens_estimated` / `counting_method`, `≈ … (est.)`).
+- **Energy N/A rule** — no power telemetry (no GPU, no driver, non-Linux host) degrades every derived metric to a clearly-labeled `N/A`, never a spurious `0.0`; Linux-only by design.
+- **NIAH reliability display** — "reliable up to" (largest size with ≥ 80 % pass rate) drives the TUI capability bar; missing-baseline cells are flagged distinctly and non-tokenizer sizes are labeled `(approx.)`.
+- **C1 accuracy counts run cells only** — a partial/interrupted matrix no longer dilutes the headline with never-run cells.
+
+### Changed
+- Engine A report layout: two clearly labeled sections (first-token latency / pre-fill throughput) plus the intact decode/MTP numbers and a pointer to C1's 2k→128k prefill curve.
+- 100 ms hardware poller runs on a **dedicated OS thread** in both paths (decoupled from the runtime that owns the measured workload).
+- Docs updated to match the code: README, blueprint, architecture, user guide (all claims verified against the implementation).
+
+### Code Quality
+- 893 tests, 0 failures (19 suites: unit + integration + e2e, fully offline via the in-process mock SSE server)
+- `cargo build --release` 0 warnings; `cargo clippy --all-targets` 0 warnings
+
 ## [0.1.3] - 2026-10-05
 
 ### Added

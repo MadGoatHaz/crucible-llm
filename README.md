@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-849%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-893%20green-brightgreen)](#)
 
 </div>
 
@@ -44,15 +44,15 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 
 | Engine | Measures | Use Case |
 | :--- | :--- | :--- |
-| **A · Speed** | tokens/sec (decode), prefill throughput, TTFT, ITL p50/p99, MTP/speculative ratio | How fast does the model respond to **one** user? |
+| **A · Speed** | first-token latency (ms, dual perceived/server-side TTFT), pre-fill throughput (tok/s, long prompt), tokens/sec (decode, answer phase), ITL p50/p99, MTP/speculative ratio (η) | How fast does the model respond to **one** user? |
 | **B · Concurrency** | sweep 1→32 parallel streams, per-stream t/s, saturation knee, **practical sweet spot** (highest level where each user still gets ≥ 30 t/s) | How many users can your server **actually** serve? |
 | **C1 · NIAH** | needle-in-a-haystack retrieval across 2k→128k contexts × 11 depths | Can the model **find a fact** buried in a long document? |
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
-| **C3 · Structured** | JSON compliance across 3 schema-complexity levels + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
+| **C3 · Structured** | JSON compliance across 3 schema-complexity levels under real constrained decoding (`json_schema`, strict) where the backend supports it — with a clearly-flagged hint fallback — + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
 | **D · Energy** | GPU power + utilization monitoring. Auto-detects NVIDIA, AMD, or Intel. Measures watts, Joules/token, temperature, VRAM, clocks | What's the **power cost**? |
 | **F · Flat Out** | runs at the server's **sweet-spot concurrency** for 60 s — aggregate + per-stream t/s at real-world full load | What's the **headline number** to quote when comparing setups? |
 
-By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enables when a GPU is detected** (it must run on the machine with the GPU; no GPU → off, no N/A panels). Select any subset with `--engine`; an explicit selection always wins over auto-detection.
+By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enables when a GPU is detected** (it must run on the machine with the GPU; no GPU → off, no N/A panels). **All seven engines are individually selectable** — via `--engine <name>` (repeatable, or `--engine all`), the `CRUCIBLE_ENGINE` variable, the config file's `engines` object, and the TUI (Setup / View 6) — in headless *and* TUI runs: an explicit selection is always respected (A is not unconditional, D is not unselectable).
 
 ### GPU Monitoring (Multi-Vendor)
 - NVIDIA (NVML), AMD (sysfs/hwmon), Intel (Level Zero + sysfs)
@@ -115,6 +115,7 @@ For CI/CD, scripting, and regression gating:
 - **Pure JSON** output on stdout for programmatic consumption.
 - **Export** to JSON, Markdown (GitHub-Flavored tables), or raw CSV (per-packet timestamps).
 - **SQLite persistence** of every run for historical comparison and diffing.
+- **Engine selection honored** — headless runs exactly the engines you select (`--engine`, `CRUCIBLE_ENGINE`, or the config file): Engine A is *not* unconditional (a `--engine niah` run executes only C1), and Engine D is selectable like any other. An empty selection is an operator error, not a silent full run.
 - **Exit codes** for pipeline integration: `0` = pass, `1` = benchmark failed, `2` = configuration error.
 
 ---
@@ -236,7 +237,7 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact token counts; without it, counts are `chars/4` estimates (flagged `estimated`). |
 | `--tui` | off | Force the interactive dashboard (default mode on a TTY). |
 | `--headless` | off | Run the classic headless benchmark instead of the TUI. |
-| `--engine <NAME>` | A,B,C1,C2,C3,F | Select which engines a run orchestrates (repeatable): `speed`/`a`, `concurrency`/`b`, `niah`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`d`, `flatout`/`f`. |
+| `--engine <NAME>` | A,B,C1,C2,C3,F (D auto) | Select which engines a run orchestrates (repeatable): `all` (every engine), `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`f`. An explicit selection always wins over GPU auto-detection. |
 | `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
 | `--matrix-context <CSV>` | `0,8k,32k` | Context sizes for Engine B's 2D concurrency × context matrix (`0` = the configured prompt). |
 | `--no-hardware` | off | Disable the hardware/energy telemetry poller. |
@@ -256,11 +257,16 @@ Token counts use the **server's reported `usage.completion_tokens`** as the auth
 
 ### Speed (Engine A)
 
-- **Tokens/sec (decode / TG)** — how fast the model produces output tokens.
-- **Prompt throughput (prefill / PP)** — `prompt_tokens / TTFT`; how fast the server ingests your input.
-- **TTFT** — time from sending the request to the first token arriving.
-- **ITL p50 / p99** — median and worst-case gap between consecutive output tokens.
+The old single "pre-fill speed" number was a conflation — a ~45–87-token short prompt divided by an overhead-dominated TTFT is a *latency floor wearing a bandwidth label*. It is now split into two distinct, labeled metrics:
+
+- **First-token latency (ms)** — from the **short** prompt, published in two flavors: *perceived* (`T3 − T0`, the full client round-trip, network included) and *server-side* (`T3 − T1`, where `T1` is the response-headers receipt — it isolates server queue + prefill + first decode).
+- **Pre-fill throughput (tok/s)** — from a **long** prompt (default 10k tokens, `--tokens`): `prompt_tokens / server-side TTFT`. This is the bandwidth number that scales with context. Three clean runs are averaged. The full 2k→128k prefill-degradation curve comes from Engine C1's NIAH matrix.
+- **Tokens/sec (decode / TG)** — how fast the model produces output tokens. When the server reports reasoning-token detail, this is the *answer phase* (content tokens over the content window, split at the reasoning→content transition); without that detail it is the full-window blended rate.
+- **ITL p50 / p99** — median and worst-case gap between consecutive output tokens (one timestamp per parsed token frame, so batched MTP frames keep their real inter-frame gaps).
 - **MTP ratio (η)** — `completion_tokens / total_token_frames` (all token frames, Reasoning + Content); `1.0` = one token per frame (standard auto-regressive), `> 1` quantifies multi-token / speculative-decoding acceptance (vLLM MTP, EAGLE).
+- **`reasoning_tokens`** — the server-reported chain-of-thought token count is tracked (persisted, exported) and drives the decode-window split; `None` when the backend does not report the detail.
+- Runs that receive **no token frame** report TTFT as `N/A` (a `0.0` sentinel, flagged `degraded`) — never a total-latency number mislabeled as TTFT. Stream-integrity flags (`usage_discrepancy`, `e2e_only`, `itl_clamped`) surface in the JSON, terminal, and TUI.
+- Every measured run is preceded by **one discarded warmup** iteration (cold-start / KV-cache effects absorbed, logged, counted nowhere).
 
 ### Concurrency (Engine B)
 
@@ -274,30 +280,35 @@ Token counts use the **server's reported `usage.completion_tokens`** as the auth
 Hides a unique random fact in a synthetic document and asks the model to retrieve it, across **7 context sizes (2k → 128k) × 11 depths (0 → 100%)** = 77 cells.
 
 - 🟢 **Green ≥ 80 %** · 🟡 **Yellow 50–79 %** · 🔴 **Red < 50 %** (per context size).
-- Tells you the **maximum reliable context window** for RAG / long-document QA, plus how prefill speed degrades as context grows.
+- **Reasoning-model correct:** each cell suppresses the model's chain-of-thought (per-backend switch) and checks retrieval on the **visible answer only** (strict substring of the 128-bit needle). A model that *thinks* the needle into its CoT cannot false-pass, and a reasoning model whose answer was previously buried in a 64-token CoT budget no longer false-fails — retrieval on reasoning models went from ~35 % (false-fail) to ~100 %.
+- Tells you the **maximum reliable context window** for RAG / long-document QA ("reliable up to" = largest size with ≥ 80 % pass rate), plus how prefill speed degrades as context grows.
 
 ### Reasoning (Engine C2)
 
 - **13 deterministic challenges** (5 math, 5 logic, 3 code), each validated by a **strict checker** — no LLM-as-judge, no fuzzy scoring.
-- **% solved** is a reproducible, cross-model indicator of raw problem-solving ability, reported alongside average decode speed.
+- **Reasoning-model correct:** thinking is suppressed (per-backend) and the checkers judge the **committed answer span** (content only) — a chatty "I think… yes, but actually no" no longer flips a verdict, and a chain-of-thought that merely *contains* the answer is not credited.
+- **% solved** is a reproducible, cross-model indicator of raw problem-solving ability, reported alongside average decode speed (the *content/answer-phase* rate).
 
 ### Structured (Engine C3)
 
-A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-length array) → **Complex** (nested schema) — each run under the `response_format: json_object` constraint and scored field-by-field, plus a free-form baseline to quantify the **grammar speed penalty**.
+A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-length array) → **Complex** (nested schema) — plus a free-form baseline to quantify the **grammar speed penalty**.
 
+- **Real constrained decoding:** where the transport supports it, each constrained run sends `response_format: { "type": "json_schema", "json_schema": { name, schema, strict: true } }` (strict schemas, `additionalProperties: false` on every object) — engaging the server's constrained-decoding engine (vLLM XGrammar, Outlines, GBNF). Backends that cannot carry the object fall back to the softer `response_format: { "type": "json_object" }` **hint**, and the result **flags which mode was used** (`json_schema (constrained decoding)` vs `json_object hint`) — so a ~0 % "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
+- The **speed penalty** is reported only when the constraint was *effective* (the constrained run produced valid JSON); otherwise it reads "penalty N/A (constraint not effective)".
 - **Verdict:** `3/3` fully suitable for API/agent use · `2/3` simple-only · `1/3` trivial key-value only · `0/3` not suitable (needs parsing/fallback).
 
 ### Energy (Engine D)
 
-- GPU **power draw** (watts) sampled at 100 ms during inference.
-- **Joules/token** = `∫P(t)dt / total_tokens` — the silicon-efficiency metric for comparing quantizations and hardware.
+- GPU **power draw** (watts) sampled at 100 ms during inference; energy is the trapezoidal `∫P(t)dt` over the **100 ms hardware trace**, windowed to the active load (phase-aware: separate prefill vs. decode average power), not the coarse 1 Hz graph history.
+- **Joules/token** = `∫P(t)dt / total_tokens` — the denominator spans **every engine that ran** (not just A+B) — the silicon-efficiency metric for comparing quantizations and hardware.
 - **Requires a local GPU with driver support** — Crucible auto-detects **NVIDIA (NVML, on by default), AMD (sysfs/hwmon), or Intel (Level Zero, with a sysfs fallback)** at startup and activates the matching backend. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
 - **Effectively Linux-only, by design** — every GPU power backend reads Linux interfaces (NVML, sysfs/hwmon, Level Zero), so the energy feature is a Linux feature: on a non-Linux host it degrades to N/A (with the CPU-side estimate labeled) while the rest of the suite runs unchanged.
 
 ### Flat Out (Engine F)
 
-- **Real-world maximum throughput** — the server loaded at its **concurrency sweet spot** (Engine B's recommendation) for a full **60 seconds**.
-- **Aggregate t/s** is the headline number: `total_tokens / 60 s`. **Per-stream t/s** (= aggregate ÷ streams) confirms each user stays at the sweet spot (~30 t/s).
+- **Real-world maximum throughput** — the server loaded at its **concurrency sweet spot** (Engine B's recommendation) for a full **60 seconds** (`max_tokens` clamped to the model's probed max context, `ignore_eos` on).
+- **Aggregate t/s** is the headline number: `total_tokens / 60 s`. **Per-stream t/s** uses the same **dual denominators** as Engine B — `tps_per_completed_stream` (capacity) and `tps_per_requested_stream` (user-experience) — plus a `failed_stream_ratio` flag.
+- **Honest counting:** when the 60 s abort prevents a terminal `usage` frame, the token count falls back to re-tokenization and is **flagged** (`tokens_estimated`, `≈ … (est.)`); a uniform HTTP-400 / zero-token run surfaces as a `config_error`, never a silent 0 t/s.
 - Without a prior sweep it falls back to a small default load (3 streams). This is the "one number" to quote when comparing setups.
 
 ---
@@ -307,11 +318,11 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 | What | Where |
 | :--- | :--- |
 | Benchmark history (SQLite) | `~/.local/share/crucible/benchmarks.db` |
-| Exports (default) | `~/.local/share/crucible/exports/` |
-| Run logs | `~/.local/share/crucible/logs/latest.log` (+ timestamped archives) |
+| Exports (default) | `~/.local/share/crucible/exports/crucible-<session-id[:8]>.<ext>` |
+| Run logs | `~/.local/share/crucible/logs/latest.log` (+ `run-<timestamp>-<session-id[:8]>.log` archives) |
 | Config file | `~/.config/crucible/config.json` |
 
-Every completed run (headless or TUI) persists automatically across three tables — `benchmark_sessions`, `stream_metrics`, and `needle_evaluations`. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
+**Every run is traceable end-to-end.** Each run gets a session UUID that stamps the `benchmark_sessions` row, the run-log archive name, and the default export filename — the three join deterministically. The session row records **which engines ran** (`engines` column) and the **headline result of every non-stream engine** (`engine_results`: B's sweet spot, C2's score, C3's compliance/penalty, D's energy, F's throughput); Engine A persists per-run `stream_metrics` (including `reasoning_tokens`) and C1 persists per-cell `needle_evaluations`. So a stored run carries the complete picture — not just A + C1. Exports (JSON/MD/CSV) are equally complete: the energy object, the prefill/latency split, the dual per-stream denominators, NIAH reliability, and `reasoning_tokens` all make it out. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
 
 ---
 
@@ -319,7 +330,7 @@ Every completed run (headless or TUI) persists automatically across three tables
 
 Crucible is a single static binary organized around one core invariant: **measurement isolation**.
 
-- **Four decoupled execution rings** — a stream-worker pool (network I/O), the engine core (metric synthesis), a 100 ms hardware profiler, and the 60 Hz TUI render loop — connected by lock-free channels.
+- **Decoupled execution** — a stream-worker pool (network I/O and *all* timing), the engine core (metric synthesis), a 100 ms hardware poller (on its own dedicated thread), and the 60 Hz TUI render loop — connected by lock-free channels and snapshots.
 - **Timing never touches the UI.** All latency is stamped by `quanta` (CPU cycle counters, no syscalls) inside the worker rings. The dashboard reads a lock-free, double-buffered (`ArcSwap`) snapshot; a dropped frame, a resize, or a SQLite flush can never perturb a measurement.
 - **High-resolution statistics.** `hdrhistogram` drives the p50/p90/p99/p99.9 latency percentiles; a manual zero-allocation SSE line-buffer state machine + `reqwest` (HTTP/1.1 for local endpoints, HTTP/2 for TLS) drive the stream parsing that separates *reasoning* (chain-of-thought) deltas from *content* deltas.
 - **Zero runtime dependencies.** SQLite is compiled in (`rusqlite` bundled); GPU telemetry (NVIDIA NVML on by default, AMD sysfs, Intel Level Zero loaded at runtime — no link dependency) degrades to N/A where a driver is missing.

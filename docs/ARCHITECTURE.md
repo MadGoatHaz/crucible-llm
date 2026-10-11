@@ -71,7 +71,7 @@ The key architectural principle is **measurement isolation**: the render loop, t
 
 ### How I Talk to the Server
 
-All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stream: true`. The request body includes:
+All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stream: true`. The base request body includes:
 
 ```json
 {
@@ -83,6 +83,8 @@ All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stre
   "max_tokens": 256
 }
 ```
+
+plus **conditional fields** the engines opt into: `chat_template_kwargs: {"enable_thinking": false}` (vLLM / SGLang / LM Studio), `think: false` (Ollama), and a trailing `/no_think` in the message (llama.cpp) — the per-backend chain-of-thought suppression used by C1/C2/C3; `response_format` (C3's `json_schema` object, or the flagged `json_object` hint fallback); and `ignore_eos` (Engine F's 60-second window). Backends that don't recognize a field drop it — graceful, per the OpenAI spec.
 
 Requests are sent via `reqwest` (a connection-pooled HTTP client). For local endpoints (plain HTTP), this is HTTP/1.1 with chunked transfer encoding. For remote endpoints (TLS), this is HTTP/2. The server responds with Server-Sent Events (SSE) — one `data:` frame per token (or token group), terminated by `data: [DONE]`.
 
@@ -102,33 +104,34 @@ T0 ────────── T1 ──── T2 ──── T3 ───�
  │             │       │       │                │
  │             │       │       │                └─ Stream close
  │             │       │       │                   ([DONE] or EOF)
- │             │       │       └─ First token frame
- │             │       │          decoded (Content or
- │             │       │          Reasoning chunk)
- │             │       └─ First body byte received
- │             │            (TTFB)
- │             └─ Request write complete
- │                (send() resolved on
- │                 response headers)
- └─ Socket connection start
+  │             │       │       └─ First token frame
+  │             │       │          decoded (Content or
+  │             │       │          Reasoning chunk)
+  │             │       └─ First body byte received
+  │             │            (TTFB)
+  │             └─ Response headers received
+  │                (send() resolved — the
+  │                 honest T1, not "request
+  │                 write complete")
+  └─ Socket connection start
 ```
 
 | Timestamp | Meaning | When captured |
 |-----------|---------|---------------|
 | **T0** | Socket connection start | Just before `reqwest` sends the POST |
-| **T1** | Request write complete | `send()` resolves (response headers received) |
+| **T1** | Response headers received | `send()` resolves. *Not* "request write complete" — what falls inside `T1→T3` varies by backend (vLLM includes queue + prefill; llama.cpp/Ollama exclude it), which is why both TTFT flavors are published |
 | **T2** | First byte received | First body chunk arrives (TTFB) |
 | **T3** | First token decoded | First `Content` or `Reasoning` SSE frame parsed |
 | **Tn** | Stream close | `[DONE]` frame, clean EOF, or premature close |
 
 From these, I derive:
 
-- **TTFT** = T3 − T1 — time from request dispatched to first token arrival. This is the perceived "responsiveness" of the server.
-- **TTFB** = T2 − T1 — time from request dispatched to first byte. This is the network + prefill hand-off window (used for logging, not the primary metric).
-- **ITL** (Inter-Token Latency) = T(n) − T(n−1) for each consecutive pair of token frames. This measures generation smoothness.
-- **Generation speed (TG)** = `completion_tokens / (Tn − T3)` — tokens/sec during the decode phase only (the prefill is excluded).
-- **Prompt throughput (PP)** = `prompt_tokens / TTFT` — tokens/sec during the prefill phase.
-- **MTP efficiency (η)** = `completion_tokens / content_chunks` — tokens per SSE data frame. A value of 1.0 means standard single-token generation; values above 1.0 indicate speculative decoding or multi-token prediction is active on the server.
+- **TTFT (dual)** — *perceived* = T3 − T0 (the full client round-trip, network included) and *server-side* = T3 − T1 (isolates server queue + prefill + first decode). A run that receives no token frame reports TTFT as `0.0` (the N/A sentinel) and is flagged `degraded` — never a total-latency number mislabeled as TTFT.
+- **TTFB** = T2 − T1 — time from response headers to first body byte (used for logging, not the primary metric).
+- **ITL** (Inter-Token Latency) = T(n) − T(n−1) for each consecutive pair of token frames — one timestamp per parsed token frame, so a batched MTP frame keeps its real inter-frame gap. The published figures are the mean plus p50/p90/p99/p99.9 from an `hdrhistogram` (60 s clamp, clamp count reported).
+- **Generation speed (TG)** = `completion_tokens / (T_last_token − T_first_token)` — the decode window runs from the first token frame to the last (prefill/TTFT and the trailing gap to `[DONE]` excluded). When the server reports reasoning-token detail, the window splits at the reasoning→content transition and the rate is the **answer phase** (content tokens over the content window).
+- **Pre-fill throughput (PP)** = `prompt_tokens / server-side TTFT` — measured on the **long** prompt (Engine A's bandwidth number; the short-prompt TTFT is reported as a *latency*, in ms, not divided into a token count).
+- **MTP efficiency (η)** = `completion_tokens / total_token_frames` — all token frames observed (Reasoning + Content combined). A value of 1.0 means standard single-token generation; values above 1.0 are legitimate and quantify multi-token / speculative batching (vLLM MTP, EAGLE). 0.0 = N/A (no token frame arrived).
 
 ### Token Counting
 
@@ -175,31 +178,32 @@ Single-stream generation performance. This answers: "How fast does the model tal
 ### Methodology
 
 1. **Generate a prompt** of the target token length:
-   - `short` mode: a brief ~100-token prompt (measures TTFT responsiveness for chat-like use)
-   - `long` mode: a prompt padded to the configured token target (measures sustained throughput)
-   - `nocache` variant: prepends a unique UUID prefix to bust the server's KV-cache, ensuring a cold prefill
+    - `short` mode: a brief ~50-token prompt (≈45–50 BPE tokens; ~87 including the chat template on some servers) — the instrument for **first-token latency**
+    - `long` mode: a prompt padded to the configured token target (`--tokens`, default 10k) — the instrument for **pre-fill throughput**
+    - `nocache` variant: prepends a unique random prefix to bust the server's KV-cache, ensuring a cold prefill
 2. **Send a single streaming request** to the server (`temperature: 0`, `max_tokens: 256`)
 3. **Record T0, T1, T2, T3, and every Tn** via the quanta monotonic clock
 4. **Parse all SSE frames** through the incremental parser, classifying each as Content / Reasoning / Usage / Control
 5. **Calculate** on stream completion:
-   - TTFT (T3 − T1)
-   - ITL distribution: p50, p90, p99, p99.9 (HdrHistogram)
-   - Generation speed: `completion_tokens / (Tn − T3)`
-   - Prompt throughput: `prompt_tokens / TTFT`
-   - MTP efficiency: `completion_tokens / content_chunks`
-6. **Repeat for N iterations** (default: 1; the same prompt is reused across iterations)
-7. **Report**: average, min, and max across all iterations
+    - Dual TTFT: perceived (T3 − T0) and server-side (T3 − T1)
+    - ITL distribution: p50, p90, p99, p99.9 (HdrHistogram, one sample per token frame)
+    - Generation speed: `completion_tokens / (T_last − T_first)` — the answer phase (content tokens over the content window) when the server reports `reasoning_tokens`, else the full-window blended rate
+    - Pre-fill throughput: `prompt_tokens / server-side TTFT` on the long prompt (three clean runs averaged; `--nocache` busts the cache)
+    - MTP efficiency (η): `completion_tokens / total_token_frames` (Reasoning + Content)
+6. **One discarded warmup iteration first** (logged, counted nowhere), then **repeat for N iterations** (default: 1; the same prompt is reused across iterations)
+7. **Report**: average, min, and max across all iterations — as two clearly labeled sections: *first-token latency (ms, short prompt)* and *pre-fill throughput (tok/s, long prompt)*
 
 ### What the Numbers Mean
 
 | Metric | Interpretation |
 |--------|---------------|
-| **TTFT** | Time from request to first token. >1s suggests queuing, cold cache, or slow prefill. <100ms is snappy. |
+| **First-token latency (ms)** | Dual: *perceived* (T3−T0, network included) and *server-side* (T3−T1). >1s suggests queuing, cold cache, or slow prefill. <100ms is snappy. A latency number — not bandwidth. |
+| **Pre-fill throughput (tok/s)** | `prompt_tokens / server-side TTFT` on the long prompt — how fast the server ingests input, and the number that scales with context. Critical for long-context use. |
 | **ITL p50** | Typical gap between tokens. 30ms ≈ 33 t/s. This is your "reading speed." |
 | **ITL p99** | Worst 1% of token gaps. >100ms means occasional "stuttering" the user will perceive. |
-| **Generation t/s** | Raw decode speed. 30+ t/s = comfortable reading. 100+ = fast. |
-| **Prompt t/s** | Prefill speed. Critical for long-context use. A 4k-token prompt at 1000 t/s prefills in 4ms. |
-| **MTP η** | >1.0 indicates speculative decoding is active. 1.8× means the server is generating ~2 tokens per frame. |
+| **Generation t/s** | Decode speed — the answer phase (content tokens over the content window) when reasoning detail is reported. 30+ t/s = comfortable reading. 100+ = fast. |
+| **MTP η** | `completion_tokens / total_token_frames`. >1.0 is legitimate (multi-token / speculative batching); 1.8× means the server is delivering ~2 tokens per frame. |
+| **reasoning_tokens** | The server-reported chain-of-thought count (persisted + exported). `None` = the backend didn't report it; `0` = thinking was suppressed. |
 
 ### Why `temperature: 0`
 
@@ -214,18 +218,19 @@ How your server scales with multiple simultaneous users. This answers: "How many
 ### Methodology
 
 1. **Build a `WorkerPool`** — a shared connection-pooled `reqwest` client with N `StreamWorker` instances, each on an independent HTTP stream
-2. **Step through the concurrency ladder** (default: `1, 2, 3, 4, 8, 12, 16, 24, 32`):
-   - Granular at the low end (where home setups operate), capped at 32 (64 concurrent streams is unrealistic for a home rig)
-   - Custom ladders are accepted (normalized: positive, deduped, ascending)
+2. **One discarded warmup level first** (at the first, smallest ladder concurrency, bounded by that level's step budget — logged `B:warmup-…`, counted nowhere), then **step through the concurrency ladder** (default: `1, 2, 3, 4, 8, 12, 16, 24, 32`):
+    - Granular at the low end (where home setups operate), capped at 32 (64 concurrent streams is unrealistic for a home rig)
+    - Custom ladders are accepted (normalized: positive, deduped, ascending)
 3. **At each level**: spawn N identical streams simultaneously, all sending the same prompt with `max_tokens`
 4. **Wait for all N streams to complete** (with three safety bounds, see below)
 5. **Record per level**:
-   - Aggregate t/s = total tokens across all streams ÷ level wall time
-   - Per-stream t/s = aggregate t/s ÷ N
-   - ITL percentiles (p50, p90, p99) pooled across all streams
-   - TTFT percentiles (p50, p90) — one sample per stream
-   - Completion / failure / timeout counts
-   - Per-stream detail rows (for the TUI stream matrix)
+    - Aggregate t/s = total tokens across all streams ÷ level wall time
+    - **Dual per-stream denominators**: `tps_per_completed_stream` = aggregate ÷ *completed* streams (capacity — what the healthy streams got) and `tps_per_requested_stream` = aggregate ÷ *requested* streams (user-experience — a failed stream dilutes it); plus `failed_stream_ratio`, with levels > 20 % failed flagged `high_failure`
+    - ITL percentiles (p50, p90, p99) pooled across all streams
+    - TTFT percentiles (p50, p90) — one sample per stream
+    - MTP η per stream (the canonical `completion_tokens / total_token_frames`)
+    - Completion / failure / timeout counts (timed-out streams' tokens are excluded from the aggregate)
+    - Per-stream detail rows (for the TUI stream matrix)
 6. **Repeat until all ladder levels complete**
 
 ### Safety Bounds (The Freeze Fix)
@@ -283,16 +288,18 @@ For each cell:
    - The needle sentence is inserted at the depth position: `IMPORTANT: the secret code is {value}. Remember the secret code exactly as written.`
    - The retrieval query is appended: `What is the secret code? Answer with the value only.`
 
-3. **Send the full document as a single streaming request** (`max_tokens: 64` — the answer is the value only, so a short budget keeps the matrix fast)
+3. **Send the full document as a single streaming request** (`max_tokens: 64` — the answer is the value only, so a short budget keeps the matrix fast), with the model's chain-of-thought **suppressed** (per-backend: `chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp; a graceful no-op elsewhere)
 
-4. **Check retrieval**: does the model's response contain the exact 33-character needle value? Strict substring match — no fuzzy matching. A one-character difference is a failure.
+4. **Check retrieval on the visible answer only**: does the *content* span (reasoning deltas deliberately excluded) contain the exact 33-character needle value? Strict substring match — no fuzzy matching. A one-character difference is a failure; a needle that appears only in the model's CoT is not a retrieval. This is what makes the engine correct on reasoning models (before the suppression, a reasoning model spent its entire 64-token budget on CoT and false-failed ~65 % of cells it could actually answer).
 
-5. **Record TTFT and prefill throughput** for the cell
+5. **Record TTFT and prefill throughput** (`prompt_tokens / TTFT`) for the cell
 
 6. **Classify the cell** (after the full matrix is complete):
-   - **Failed (red)**: retrieval missed, or no TTFT recorded
-   - **Nominal (green)**: retrieval succeeded, and TTFT is within 2× the linear expectation (anchored on the smallest context size at the same depth)
-   - **Throttled (yellow)**: retrieval succeeded, but TTFT exceeds 2× the linear expectation — the server is struggling with the context length
+    - **Failed (red)**: retrieval missed, or no TTFT recorded
+    - **Nominal (green)**: retrieval succeeded, and TTFT is within 2× the linear expectation (anchored on the smallest context size at the same depth)
+    - **Throttled (yellow)**: retrieval succeeded, but TTFT exceeds 2× the linear expectation — the server is struggling with the context length
+    - **No-baseline flag**: an accurate *larger* cell whose smallest-size baseline failed (no TTFT to anchor against) is flagged `no_baseline` — distinct from a confirmed-healthy Nominal, so a missing baseline never masks real prefill degradation
+    - **Approximate label**: a context size measured without a tokenizer is labeled `Nk (approx.)` (the haystack is a `chars/4` estimate) — never presented as exact
 
 Cells run **sequentially** (one stream at a time) so each cell measures the endpoint alone — no queueing cross-talk, and the prefill-degradation curve is not polluted by concurrency.
 
@@ -320,15 +327,17 @@ A bank of **13 self-contained challenges** across three categories:
 | **Logic** | 5 | Syllogism validity, parity check, knights-and-knaves, boiling eggs (parallel vs. serial), premise-based deduction |
 | **Code** | 3 | Fibonacci function, string reversal, GCD (Euclidean algorithm) — all in Rust |
 
+All challenges run with the model's chain-of-thought **suppressed** (the same per-backend switch as C1), and the checkers judge the **committed answer span only** — the accumulated *content* deltas. A model that *thinks* the answer into its CoT is not credited, and a chatty "yes, but actually no" tail cannot flip the verdict.
+
 Each challenge has exactly one correct answer, validated by a **strict, deterministic checker**:
 
-- **Math**: the *last* numeric value in the response must equal the expected value (tolerance: 1e-6). The prompts ask for "the number only," so the last number is the answer.
-- **Logic**: the *last* whole-word yes/no verdict (case-insensitive) must match the expected verdict. `none`, `normal`, `yeses` never match — only exact `yes`/`no` word boundaries.
-- **Code**: the response must contain a fenced code block (``` ``` ```). The block must have balanced, properly nested delimiters (`()` `[]` `{}`) and contain every required structural marker (e.g., `fn fib`, `n: u32`, `-> u32`). This is a *structural* (lexical) check — full AST parsing is a post-v1 extension.
+- **Math**: solved when the expected value matches the *first* number in the answer span, or appears *whole* anywhere in it (tolerance: 1e-6). The old "last number wins" rule false-failed valid chatty answers.
+- **Logic**: the *first* whole-word yes/no verdict in the answer span (case-insensitive) must match the expected verdict. `none`, `normal`, `yeses` never match — only exact `yes`/`no` word boundaries.
+- **Code**: the response must contain a fenced code block. The block must have balanced, properly nested delimiters (`()` `[]` `{}`) — the balance check skips string/char literals and comments, so a `}` inside one can't corrupt the stack — and contain every required structural marker (e.g., `fn fib`, `n: u32`, `-> u32`). This is a *structural* (lexical) check — full AST parsing is a post-v1 extension.
 
 All checkers are pure `std` — no `regex` or parser crates — preserving the zero-dependency design.
 
-The bank runs **sequentially** (one stream at a time, `max_tokens: 512` for code answers), so each challenge measures the endpoint alone.
+The bank runs **sequentially** (one stream at a time, `max_tokens: 512` for every challenge), so each challenge measures the endpoint alone. The per-challenge decode speed is the **content/answer phase** rate (CoT excluded).
 
 ### What the Numbers Mean
 
@@ -362,13 +371,15 @@ The **free-form baseline** (run 1) uses the Simple case's prompt *without* the `
 
 Each case is classified:
 
-- **Compliant**: every check passes
-- **Partial**: valid JSON, but one or more checks fail (e.g., wrong array length, missing field, bad type)
+- **Compliant**: valid JSON *and* schema-correct (every check passes — "valid JSON" and "schema-correct" are reported as separate rates, so a response that parses but violates the schema is not silently counted as compliant)
+- **Partial**: valid JSON, but one or more schema checks fail (e.g., wrong array length, missing field, bad type)
 - **Failed**: not valid JSON (cannot be evaluated further)
 
-A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in code fences).
+A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in code fences). Integer fields accept a finite float with a zero fraction (`36.0` is a valid integer answer — not false-failed).
 
-**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the constraint costs throughput. In `json_schema` mode this is the server-side **constrained-decoding** overhead; in the `json_object`-hint fallback it measures only the cost of a prompt hint (≈0 on backends that drop the field — i.e. *no constraint was applied*, not *the grammar is free*).
+**Stability:** each constrained case can be run `repeats` times (default 1, single-shot; 3 is the recommended reliability measurement). All repeats compliant → Compliant; none → the first repeat's verdict; mixed → Partial (*unstable*), with a `Stability (x/N)` note. The mean per-case rate is the `stability_rate`.
+
+**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the constraint costs throughput. In `json_schema` mode this is the server-side **constrained-decoding** overhead; in the `json_object`-hint fallback it measures only the cost of a prompt hint (≈0 on backends that drop the field — i.e. *no constraint was applied*, not *the grammar is free*). The penalty is **gated on the constraint being effective** (`constraint_effective` = the constrained run produced valid JSON): when it wasn't, the summary reads "penalty N/A (constraint not effective)" instead of publishing a +100 %/≈0 % number that can't be interpreted.
 
 ### What the Numbers Mean
 
@@ -385,7 +396,7 @@ The **speed penalty** tells you the cost of the constraint in use (see the mode 
 
 ### What It Measures
 
-Power consumption and energy efficiency of inference. "What does it cost, in joules, to generate a token?"
+Power consumption and energy efficiency of inference. "What does it cost, in joules, to generate a token?" **Linux-only by design** — every power source (NVML, `amdgpu` sysfs/hwmon, Level Zero, RAPL/Super I/O) is a Linux interface — so on a non-Linux host, or a host with no GPU/driver, Engine D degrades to a clearly-labeled **N/A** while the rest of the suite runs unchanged. It must run on the machine with the GPU: all telemetry is local.
 
 ### Methodology
 
@@ -394,14 +405,14 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
    - **Cross-platform CPU/RAM** (`sysinfo`): global CPU usage %, RAM used/total. Available on every host.
    - Each sample is appended to a bounded rolling trace (3600 samples = 6 minutes of power history).
 
-2. **During the benchmark run**, the poller continuously integrates power over time using the **trapezoidal rule**:
-   ```
-   Energy = Σ (P(i) + P(i+1)) / 2 × Δt(i)
-   ```
-   where `P(i)` is the instantaneous power in watts and `Δt(i)` is the time between samples. A missing power reading (e.g., `power_usage()` fails on some vGPU hosts) contributes nothing — the integral simply spans from the last known reading to the next.
+2. **During the benchmark run**, energy is integrated from the **100 ms `HwSample` trace** using the **trapezoidal rule**, windowed to the active load (`[load_start, load_end]`):
+    ```
+    Energy = Σ (P(i) + P(i+1)) / 2 × Δt(i)
+    ```
+    where `P(i)` is the instantaneous power in watts and `Δt(i)` is the time between samples. A missing power reading (e.g., `power_usage()` fails on some vGPU hosts) contributes nothing — the integral simply spans from the last known reading to the next. The 1 Hz aggregate history is **graph-only** (View 4's charts) — too coarse to measure a sub-second TTFT. Phase-aware **prefill vs. decode average power** also samples the 100 ms trace, so even a sub-second prefill yields a *real* phase power (the overall-average fallback survives only for a TTFT under ~100 ms).
 
 3. **At run completion**, the energy profile is computed:
-   - **Joules/Token** = total energy ÷ total tokens generated
+    - **Joules/Token** = total energy ÷ total tokens generated **by every engine that ran** (A+B+C1+C2+C3+F — real counts where the result type carries them, labeled `chars/4` estimates for the capability engines) — the honest denominator, not an A+B-only subset that inflates the figure
    - **Peak power** (watts)
    - **Average power** (watts) = total energy ÷ span of power-bearing samples
    - **Peak VRAM** (bytes and ratio)
@@ -488,7 +499,7 @@ A **manual** idle measurement is available from the GPU tab: pressing `[i]` star
 
 ### Energy Integration (Trapezoidal Rule)
 
-Total energy is computed as `∫P(t)dt` over the 1 Hz power history using the trapezoidal rule:
+Total energy is computed as `∫P(t)dt` over the **100 ms power trace** (windowed to the active load) using the trapezoidal rule — the 1 Hz history drives the graphs, the 100 ms trace drives the numbers:
 
 ```
 Energy (J) = Σ (P(i) + P(i+1)) / 2 × Δt(i)
@@ -516,7 +527,7 @@ $/1M output = (decode_kWh  × $/kWh) / (completion_tokens / 1M)
 $/1M blended = (prefill_kWh + decode_kWh) × $/kWh / (total_tokens / 1M)
 ```
 
-The blended rate is the **token-count-weighted mean** of the input and output rates — always between the two (structurally impossible to fall below the cheaper phase). The throughput model is a strict generalization of `power × duration`: for a single request they are identical; for a multi-engine run it correctly attributes the cumulative input token total against the *total* prefill time across every request.
+The blended rate is the **token-count-weighted mean** of the input and output rates — always between the two (structurally impossible to fall below the cheaper phase). The phase powers (`avg_prefill_power` / `avg_decode_power`) come from the 100 ms trace; when no phase throughput has been measured yet (e.g., a sub-second TTFT left no usable window, or a single-request run), the model falls back to `power × duration` for that phase — and the `cpu_power_estimated` flag labels the result whenever the CPU side of the total draw is the 40 W estimate.
 
 ### Multi-GPU Support
 
@@ -552,7 +563,7 @@ Total system power = Σ(GPU power) + CPU power. Feeds the energy integral and $/
 
 ### Power Plausibility
 
-All GPU backends apply a clamp: readings >1000W are treated as errors (no single GPU draws more). NVIDIA additionally clamps to 1.5× TDP, where the TDP is the card's *default* power-management limit (`nvmlDeviceGetPowerManagementDefaultLimit` — the factory TDP, not user-settable), falling back to the current limit (`nvmlDeviceGetPowerManagementLimit`) if the default query is unsupported. Anomalous readings are logged once (warn-once latch) and capped.
+All GPU backends apply a clamp: readings >1000W are treated as errors (no single GPU draws more). NVIDIA additionally flags readings >2× TDP and caps them at 1.5× TDP, where the TDP reference is the card's *default* power-management limit (`nvmlDeviceGetPowerManagementDefaultLimit` — the factory TDP, not user-settable), falling back to the current limit (`nvmlDeviceGetPowerManagementLimit`) if the default query is unsupported. Anomalous readings are logged once (warn-once latch) and capped.
 
 ## Engine F: Flat Out
 
@@ -564,17 +575,17 @@ Real-world maximum throughput: the server's **total** tokens/sec when it is load
 
 1. **Read the stream count** from Engine B's stored sweep result: the practical sweet spot (the highest level where every user still gets ≥ 29.4 t/s — 30 ideal with a 2% margin). When Engine B did not run, fall back to a small default load (3 streams, tagged `default`).
 2. **Spawn all `n` streams together** via the shared `WorkerPool`, each sending the same minimal (~15-token) open-ended prompt so prefill is <100 ms — negligible against the 60-second window.
-3. **`max_tokens = 100,000` + `ignore_eos`** — effectively unlimited, so the *only* stop condition is the **60-second window** (`WINDOW_SECS`). `ignore_eos` keeps llama.cpp servers from ending a stream on the model's own end-token; other backends ignore the field (graceful degradation).
+3. **`max_tokens = 100,000`, clamped to the model's probed max context, + `ignore_eos`** — effectively unlimited, so the *only* stop condition is the **60-second window** (`WINDOW_SECS`). Before the run the engine probes `GET /v1/models` for the model's max context (`max_model_len` / `max_context` / `context_length` / …) and clamps `max_tokens` to `context − prompt tokens` (floored at 1); a uniform HTTP-400 / zero-token run then surfaces as a `config_error` ("requested tokens exceed model limit"), **never** a silent 0 t/s. `ignore_eos` keeps llama.cpp servers from ending a stream on the model's own end-token; other backends ignore the field (graceful degradation).
 4. **Abort at 60 s** — the supervisor task is dropped, every worker task and its socket closes, and the server stops generating.
-5. **Authoritative token counting** per stream (`authoritative_tokens`): the server `usage` when it arrives, else re-tokenized text — never the raw frame tally.
+5. **Authoritative token counting** per stream (`authoritative_tokens`): the server `usage` when it arrives, else re-tokenized text — never the raw frame tally. Because the 60 s abort usually prevents a terminal `usage` frame, a `chars/4` fallback count is **flagged** (`tokens_estimated: true`, `counting_method` recorded, `≈ … (est.)` in the terminal) — an exact `--tokenizer` re-count is *not* flagged (it is authoritative).
 
 ### What the Numbers Mean
 
 - **Aggregate t/s** = `total_tokens / duration` — the headline: what a full-load deployment sustains.
-- **Per-stream t/s** = `aggregate ÷ streams` — ≈ 30 t/s confirms the load is at the sweet spot.
+- **Per-stream t/s** — the same **dual denominators** as Engine B: `tps_per_completed_stream` (aggregate ÷ completed streams, capacity) and `tps_per_requested_stream` (aggregate ÷ requested streams, user-experience; `per_stream_tps` is the back-compat alias of the requested view) — ≈ 30 t/s confirms the load is at the sweet spot. `failed_stream_ratio` is flagged when > 20 %.
 - **TTFT avg / ITL p50 / p99** — pooled across all streams, the latency evidence behind the throughput.
 
-The JSON export records the result under `flat_out` with `stream_count`, `stream_count_source` (`concurrency_sweet_spot` / `default`), `total_tokens`, `duration_secs`, `aggregate_tps`, `per_stream_tps`, and the latency percentiles.
+The JSON export records the result under `flat_out` with `stream_count`, `stream_count_source` (`concurrency_sweet_spot` / `default`), `total_tokens`, `duration_secs`, `aggregate_tps`, `tps_per_completed_stream`, `tps_per_requested_stream`, `failed_stream_ratio`, `tokens_estimated`, `counting_method`, `config_error`, `max_tokens_used`, and the latency percentiles.
 
 ## Data Flow Diagram
 
@@ -714,7 +725,7 @@ I report **per-user experience**, not just aggregate numbers.
 
 ### 3. Zero Dependencies
 
-A single static Rust binary. No Python, no Node, no system packages (beyond optional GPU drivers). The binary is ~14 MB and runs on any Linux/macOS machine with a terminal.
+A single static Rust binary. No Python, no Node, no system packages (beyond optional GPU drivers). The binary is ~14 MB and runs on any machine with a terminal (Linux is the primary target; the energy/telemetry feature is Linux-only by design and degrades to N/A elsewhere).
 
 - The SSE parser is a manual state machine — no `eventsource-stream` crate (dependency removed in v0.1.2).
 - The reasoning checkers are pure `std` — no `regex` or parser crates.
@@ -730,7 +741,7 @@ The tool always runs, even when optional features are missing:
 |----------------|----------|
 | No GPU / no driver (any vendor) | GPU telemetry is `None`: the TUI GPU panel is hidden, Engine D auto-disables (or reports `N/A` if forced on). CPU/RAM telemetry still works. |
 | No tokenizer file | Prompt and completion counts use `chars/4` estimation, flagged `[ESTIMATED]`. NIAH haystack sizing uses the estimate. |
-| Server omits `usage` | Token counts fall back to SSE frame count (labeled as estimate in the log). |
+| Server omits `usage` | Token counts fall back to re-tokenization — the exact `--tokenizer` when supplied, else a `chars/4` estimate (flagged `estimated` in the log, JSON, and TUI). Never the raw SSE frame count. |
 | Server ignores `stream: true` | Plain-JSON fallback: the whole body is parsed as one completion. |
 | Malformed SSE frames | Counted and skipped. The parser never panics. A note is added to the result. |
 | Connection refused | Only *connect-phase* failures are retriable. HTTP errors, timeouts, and read errors are final — they are *measurements* of the endpoint, not transient faults. |
@@ -741,7 +752,7 @@ The tool always runs, even when optional features are missing:
 
 Every run is logged, stored, and exportable:
 
-- **Run log**: every HTTP request, SSE frame milestone, stream completion, and engine transition is written to `latest.log` (overwritten each run) and an archived `run-<timestamp>.log`. Thread-safe, non-blocking (dedicated writer thread), and degrades to a silent no-op when files can't be created.
-- **SQLite storage**: every benchmark session is persisted with its stream metrics, NIAH evaluations, and energy profile. Compare across time, across models, across hardware, across server versions.
+- **Run log**: every HTTP request, SSE frame milestone, stream completion, and engine transition is written to `latest.log` (overwritten each run) and an archived `run-<timestamp>-<session-id[:8]>.log`. The run's session UUID stamps both the archive name and the log header, so the log joins deterministically to its `benchmark_sessions` row. Thread-safe, non-blocking (dedicated writer thread), and degrades to a silent no-op when files can't be created.
+- **SQLite storage**: every benchmark session is persisted with the engines it ran (`engines` column), the headline result of every non-stream engine (`engine_results`), Engine A's per-run `stream_metrics` (including `reasoning_tokens`), Engine C1's per-cell `needle_evaluations`, and the energy profile. Compare across time, across models, across hardware, across server versions.
 - **Export**: JSON (for CI/CD pipelines), GitHub Flavored Markdown (for PRs and READMEs), and raw CSV (for external analysis in Python, R, or Grafana).
 - **Deterministic**: `temperature: 0` ensures the same prompt produces the same tokens. The 13-challenge reasoning bank has hand-verified canonical answers. NIAH needles are random per cell (so a coincidental match is impossible), but the pass/fail criterion is deterministic.

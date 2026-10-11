@@ -158,10 +158,10 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Cache bypass | ON = cold-start (real first-request perf); OFF = warm (steady-state) |
 | Tokenizer | Path to a HuggingFace `tokenizer.json` for exact counts; without it, `chars/4` estimate |
 | Concurrency ladder | Engine B levels, comma-separated (default `1,2,3,4,8,12,16,24,32`) |
-| Hardware telemetry | Engine D energy poller — auto on when a GPU is detected; shows the detected GPU (e.g. `[✓] Energy — RTX 4090`) |
+| Hardware telemetry | Engine D (energy) — auto on when a GPU is detected; shows the detected GPU (e.g. `[✓] Energy — RTX 4090`). This row is what selects Engine D. |
 | Theme | TUI color theme — Cyberpunk / Vampire / Monochrome Pastel; `←`/`→` cycles, `1`/`2`/`3` selects |
-| Engine A–F | Toggle each benchmark on/off (D / energy auto-selects with GPU detection; your explicit choice always wins) |
-| $/kWh | Electricity rate for cost estimation in the GPU & Power view (default $0.15) |
+| Engine A–F | Six toggle rows — `Engine A — Speed`, `Engine B — Concurrency`, `Engine C1 — NIAH`, `Engine C2 — Reasoning`, `Engine C3 — Structured`, `Engine F — Flat Out` (plus the Hardware telemetry row for D: all seven engines are individually selectable; D auto-selects with GPU detection and your explicit choice always wins) |
+| $/kWh | Electricity rate for cost estimation in the GPU & Power view (default $0.16) |
 
 ## GPU & Power Monitor (Tab 4)
 
@@ -217,17 +217,20 @@ Your $/1M token cost reflects TRUE system draw, not just the GPU.
 
 ## Headless / CLI Mode
 
-For scripting, CI/CD, or when you don't want a TUI:
+For scripting, CI/CD, or when you don't want a TUI. **Headless honors engine selection exactly like the TUI does** — all seven engines (A/B/C1/C2/C3/D/F) are selectable via `--engine` (repeatable, or `--engine all`), `CRUCIBLE_ENGINE`, or the config file's `engines` object. Engine A is *not* unconditional: a `--engine niah` run executes only C1. Engine D is selectable like any other (and auto-on when a GPU is present and you didn't pick engines explicitly).
 
 ```bash
-# Basic speed test
-./crucible-llm --headless --url http://localhost:8000/v1 --model my-model
+# Basic speed test (Engine A only)
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --engine speed
 
 # JSON output (for parsing)
 ./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --json
 
 # Specific engines only
 ./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --engine speed --engine niah
+
+# Every engine, including energy
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --engine all
 
 # Export results
 ./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --export json --export-path results.json
@@ -270,14 +273,22 @@ Press `e` during or after a run. Choose format: JSON, Markdown, or CSV.
 ```
 
 ### Default Export Location
-`~/.local/share/crucible/exports/crucible-<session-id>.<ext>`
+`~/.local/share/crucible/exports/crucible-<session-id[:8]>.<ext>` — the run's session UUID (first 8 chars), so the export joins deterministically to the stored session and the session-stamped run-log archive. A TUI `e`-key export of the live snapshot uses `live-<unix-timestamp>.<ext>` instead.
 
 ## Understanding Your Results
 
+### Reading Engine A's numbers
+Engine A reports two **distinct** prefill-related metrics — don't read one where the other belongs:
+
+- **First-token latency (ms)** — from the *short* prompt: `perceived` (T3−T0, includes your network round-trip) and `server-side` (T3−T1, the server's queue + prefill + first decode). This is a *latency* number — how responsive the server feels.
+- **Pre-fill throughput (tok/s)** — from the *long* prompt (default 10k tokens): `prompt_tokens / server-side TTFT`. This is a *bandwidth* number — and the one that scales with context. The full 2k→128k scaling curve is Engine C1's NIAH matrix.
+
+Decode t/s is the *answer phase* when the server reports `reasoning_tokens` (the thinking phase is split out); MTP η is `completion_tokens / total_token_frames` (η > 1 = multi-token batching on the server).
+
 ### Is my server fast enough?
-- **Chat use**: 30+ t/s generation, TTFT < 500ms = comfortable
-- **Coding agents**: 50+ t/s, TTFT < 300ms = productive
-- **RAG pipelines**: Prompt throughput > 1000 t/s = efficient context loading
+- **Chat use**: 30+ t/s generation, first-token latency < 500ms = comfortable
+- **Coding agents**: 50+ t/s, first-token latency < 300ms = productive
+- **RAG pipelines**: pre-fill throughput > 1000 tok/s = efficient context loading
 
 ### How many users can I serve?
 Look at the Concurrency view's "Practical Sweet Spot." That's your answer.

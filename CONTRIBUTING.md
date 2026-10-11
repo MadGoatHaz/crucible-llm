@@ -16,9 +16,10 @@ cargo test
 src/
 ├── lib.rs            # Library crate root (modules shared by the binary & tests)
 ├── main.rs           # Entry point, CLI parsing, TUI/headless dispatch
+├── headless.rs       # Headless orchestration (run_headless, public lib fn)
 ├── config.rs         # Configuration (CLI > env > file > defaults)
 ├── timing.rs         # High-resolution timing (quanta)
-├── log.rs            # File-based run logger (latest.log + run archives)
+├── log.rs            # File-based run logger (latest.log + session-stamped run archives)
 ├── client/
 │   ├── mod.rs
 │   ├── stream.rs     # StreamWorker (HTTP + SSE + timing + authoritative token count)
@@ -51,8 +52,13 @@ src/
 │   ├── histogram.rs  # HdrHistogram (ITL distribution)
 │   └── methodology.rs # Methodology block for JSON export
 ├── hw/
-│   ├── mod.rs        # HwPoller trait
-│   └── nvml.rs       # NVIDIA backend
+│   ├── mod.rs              # GpuBackend trait + HwSample/HwPoller
+│   ├── nvml.rs             # NVIDIA backend (NVML)
+│   ├── amd.rs              # AMD backend (amdgpu sysfs/hwmon)
+│   ├── intel_level_zero.rs # Intel Arc backend (Level Zero Sysman, runtime dlopen)
+│   ├── intel.rs            # Intel sysfs fallback (i915/xe)
+│   ├── monitor.rs          # GpuPowerMonitor (100 ms trace + 1 Hz graph history)
+│   └── cpu_power.rs        # CPU power (RAPL / Super I-O / labeled 40 W estimate)
 ├── storage/
 │   ├── mod.rs
 │   ├── db.rs         # SQLite persistence
