@@ -361,9 +361,12 @@ pub struct StreamWorker {
     ignore_eos: bool,
     /// When `true`, the request asks a reasoning model to answer without a
     /// chain-of-thought monologue (CF-01 — the reasoning-model blind spot).
-    /// The mechanism is **per-backend and graceful** (each backend honors the
-    /// one it knows and ignores the rest per the OpenAI spec, so a backend
-    /// with no switch degrades to the model's natural behavior):
+    ///
+    /// **This is a *best-effort speed optimization*, NOT a correctness
+    /// dependency.** The mechanism is **per-backend and graceful** (each
+    /// backend honors the one it knows and ignores the rest per the OpenAI
+    /// spec, so a backend with no switch degrades to the model's natural
+    /// behavior):
     ///
     /// * `chat_template_kwargs: {"enable_thinking": false}` — vLLM / SGLang /
     ///   LM Studio (the Jinja chat template turns off CoT);
@@ -371,11 +374,23 @@ pub struct StreamWorker {
     /// * a trailing `/no_think` in the user message — llama.cpp (Qwen3's
     ///   native template checks for it).
     ///
-    /// Engine C1 sets this on its 64-token NIAH probe: without it, a
-    /// reasoning model spends the *entire* budget on CoT (`content = 0`,
-    /// `finish_reason = length`) and never emits the needle value — a false
-    /// failure of a retrieval capability the model actually has
-    /// (Strawberry Issue 1).
+    /// Where a server honors one of these, generation skips CoT and the
+    /// visible answer fits a small budget — a pure speed/cost win. Where a
+    /// server ignores them (config-only inference servers, and Qwen3.5+ where
+    /// `/no_think` is not a guaranteed switch), the request degrades
+    /// gracefully to the model's natural (thinking-on) behavior — harmless
+    /// per the OpenAI spec's drop-unknown-fields rule (the same pattern as
+    /// `response_format` / `ignore_eos`).
+    ///
+    /// **Correctness therefore rests on the generation budget (`max_tokens`),
+    /// which every OpenAI-compatible server honors — not on this switch.** A
+    /// raised budget lets a verbose model finish its CoT and *still* emit
+    /// content; if it over-thinks and commits nothing, the stream is reported
+    /// `truncated_by_reasoning` (see
+    /// [`StreamOutcome::is_truncated_by_reasoning`] /
+    /// [`count_reasoning_content_frames`]) — an honest, non-fail outcome
+    /// rather than the false capability failure this once caused (Engine C1's
+    /// 64-token NIAH probe, Strawberry Issue 1).
     disable_thinking: bool,
     /// Optional run-log writer: when present, the worker logs its HTTP /
     /// SSE lifecycle (request, TTFB, first token, every 50th token,
@@ -471,17 +486,25 @@ impl StreamWorker {
         self
     }
 
-    /// Ask a reasoning model to suppress its chain-of-thought so the
-    /// generation budget goes to the visible answer (CF-01).
+    /// Ask a reasoning model to suppress its chain-of-thought (CF-01) — a
+    /// **best-effort speed optimization**, not a correctness requirement.
     ///
     /// Injects the per-backend switches (see the `disable_thinking` field
     /// doc): `chat_template_kwargs.enable_thinking=false` (vLLM / SGLang /
     /// LM Studio), `think=false` (Ollama), and a trailing `/no_think` in the
-    /// user message (llama.cpp). Backends without a switch ignore the unknown
-    /// fields per the OpenAI spec, so non-reasoning models and unsupported
-    /// backends are unaffected (the same graceful-degradation pattern as
-    /// [`ignore_eos`](Self::ignore_eos)). Engine C1 sets this on its NIAH
-    /// probe.
+    /// user message (llama.cpp). Where a server honors one, CoT is skipped
+    /// and the visible answer fits a small budget (fast + cheap). Backends
+    /// without a switch ignore the unknown fields per the OpenAI spec, so the
+    /// request degrades gracefully to the model's natural behavior (the same
+    /// pattern as [`ignore_eos`](Self::ignore_eos)) — non-reasoning models
+    /// and config-only servers are unaffected.
+    ///
+    /// **Correctness does not depend on this:** it rests on the generation
+    /// budget (`max_tokens`), which every server honors. When suppression is
+    /// ignored and a verbose model over-thinks past the budget, the result is
+    /// reported `truncated_by_reasoning` (see
+    /// [`StreamOutcome::is_truncated_by_reasoning`]), not a false failure.
+    /// Engine C1 sets this on its NIAH probe.
     pub fn disable_thinking(mut self, v: bool) -> Self {
         self.disable_thinking = v;
         self
@@ -1173,18 +1196,24 @@ impl StreamWorker {
             body["ignore_eos"] = serde_json::json!(true);
         }
         if self.disable_thinking {
-            // CF-01 — per-backend thinking suppression. Each backend honors
-            // the mechanism it knows and ignores the rest (unknown top-level
-            // fields are dropped per the OpenAI spec), so the request degrades
-            // gracefully to the model's natural behavior where no switch
-            // exists:
+            // CF-01 — per-backend thinking suppression, sent as a
+            // **best-effort speed optimization** (NOT a correctness
+            // dependency). Each backend honors the mechanism it knows and
+            // ignores the rest (unknown top-level fields are dropped per the
+            // OpenAI spec), so where no switch exists the request degrades
+            // gracefully to the model's natural behavior:
             //   * `chat_template_kwargs.enable_thinking=false` → vLLM / SGLang /
-            //     LM Studio (the Jinja chat template turns off CoT);
+            //     LM Studio (the Jinja chat template turns off CoT) — fast;
             //   * `think=false` → Ollama's extension field;
             //   * a trailing `/no_think` in the user message → llama.cpp
             //     (Qwen3's native template checks for it).
-            // Together they stop a reasoning model from spending the whole
-            // generation budget on chain-of-thought (Strawberry Issue 1).
+            // Where honored, a reasoning model skips CoT and the visible
+            // answer fits a small budget (a pure speed/cost win). Where
+            // ignored (config-only servers, Qwen3.5+), correctness rests on
+            // the generation budget (`max_tokens`), which every server
+            // honors; an over-thinker that commits nothing is reported
+            // `truncated_by_reasoning` — not a false failure (Strawberry
+            // Issue 1).
             body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": false });
             body["think"] = serde_json::json!(false);
             let base = self.prompt.trim_end_matches(['\n', '\r']);
