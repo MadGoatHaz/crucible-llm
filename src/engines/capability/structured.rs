@@ -47,11 +47,33 @@
 //! well under half of it, and in `json_schema` mode the decoder is
 //! constrained to the case's exact shape (no rambling).
 //!
+//! **Checker hardening (Phase 3, CF-17/36/50/51).** With a real
+//! `json_schema` in place (CF-08), the scoring was hardened to report what it
+//! actually measures:
+//! * **CF-17 — valid-JSON vs. schema-correct, split.** A response can parse
+//!   as JSON yet violate the schema; [`StructuredResult::compliance_rates`] /
+//!   [`compliance_label`] report the two signals separately instead of one
+//!   blended number.
+//! * **CF-36 — the penalty only when the constraint is effective.**
+//!   [`StructuredResult::constraint_effective`] is true only when the
+//!   constrained case-0 run produced valid JSON; otherwise the summary flags
+//!   "constraint not effective" instead of reading a +100% / ~0% number.
+//! * **CF-50 — integer-valued floats.** `is_int` accepts a finite float with
+//!   `fract() == 0.0`, so a model emitting `36.0` for an `integer` field is
+//!   not false-failed to Partial.
+//! * **CF-51 — repeat-for-stability.** Each constrained case is repeated
+//!   `self.repeats`× (default 1, single-shot; [`STABILITY_REPEATS`] = 3 is
+//!   the recommended reliability measurement); [`fold_case_repeats`] folds
+//!   the repeats and [`StructuredResult::stability_rate`] reports the
+//!   fraction that were fully compliant — the data prerequisite for the
+//!   planned McNemar/Wilson A/B comparator.
+//!
 //! The [`StructuredResult`] carries the per-case checks, the overall score
-//! (N/3 compliant / partial / failed), the speed penalty, the constraint
-//! mode, and an auto-generated practical **verdict** — the TUI renders the
-//! full compliance detail in the Live capability panel and a summary line in
-//! the sequence header / headless output.
+//! (N/3 compliant / partial / failed), the split compliance rates, the speed
+//! penalty (gated on the constraint being effective), the stability rate, the
+//! constraint mode, and an auto-generated practical **verdict** — the TUI
+//! renders the full compliance detail in the Live capability panel and a
+//! summary line in the sequence header / headless output.
 //!
 //! Measurement-isolation note: every run reuses the Chunk 5 `StreamWorker`
 //! (quanta `T0..Tn` live in the worker); this module only takes deltas of
@@ -466,9 +488,7 @@ impl StructuredResult {
         let total = self.cases.len();
         let valid_json = self.cases.iter().filter(|c| c.is_valid_json()).count();
         let schema_correct = self.cases.iter().filter(|c| c.is_compliant()).count();
-        format!(
-            "valid JSON {valid_json}/{total} · schema-correct {schema_correct}/{total}"
-        )
+        format!("valid JSON {valid_json}/{total} · schema-correct {schema_correct}/{total}")
     }
 
     /// CF-36: `true` when the constrained case-0 run produced valid JSON, so
@@ -486,9 +506,7 @@ impl StructuredResult {
     /// `StructuredResult` construction sites are unaffected.
     #[must_use]
     pub fn constraint_effective(&self) -> bool {
-        self.cases
-            .first()
-            .is_some_and(|c| c.is_valid_json())
+        self.cases.first().is_some_and(|c| c.is_valid_json())
     }
 
     /// CF-51: `true` when any case was run more than once (the stability
@@ -917,7 +935,8 @@ impl StructuredEngine {
 /// fractional part (`3.0` → integer; `3.5` → not).
 fn is_int(v: &serde_json::Value) -> bool {
     v.as_i64().is_some()
-        || v.as_f64().is_some_and(|f| f.is_finite() && f.fract() == 0.0)
+        || v.as_f64()
+            .is_some_and(|f| f.is_finite() && f.fract() == 0.0)
 }
 
 /// Score one case's constrained output against its checks and classify it.
@@ -1084,7 +1103,11 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
         verdict,
         output: body.to_string(),
         repeats: 1,
-        compliant_repeats: if verdict == CaseVerdict::Compliant { 1 } else { 0 },
+        compliant_repeats: if verdict == CaseVerdict::Compliant {
+            1
+        } else {
+            0
+        },
     }
 }
 
@@ -1454,7 +1477,7 @@ mod tests {
         let evals = vec![
             evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#), // compliant
             evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#), // compliant
-            evaluate_case("Simple", "not json"), // failed
+            evaluate_case("Simple", "not json"),                      // failed
         ];
         let folded = fold_case_repeats("Simple", evals);
         assert_eq!(folded.repeats, 3);
@@ -1486,7 +1509,10 @@ mod tests {
             .any(|c| c.label == "Stability (3/3)" && c.passed));
 
         // All-failed → keeps the first repeat's Failed verdict, rate 0.0.
-        let evals = vec![evaluate_case("Simple", "nope"), evaluate_case("Simple", "nope")];
+        let evals = vec![
+            evaluate_case("Simple", "nope"),
+            evaluate_case("Simple", "nope"),
+        ];
         let folded = fold_case_repeats("Simple", evals);
         assert_eq!(folded.verdict, CaseVerdict::Failed);
         assert!((folded.stability_rate() - 0.0).abs() < 1e-9);
@@ -1498,7 +1524,7 @@ mod tests {
         // `result_with` uses single-shot `evaluate_case` (repeats = 1):
         // compliant → 1.0, partial/failed → 0.0.
         let r = result_with(
-            r#"{"name": "Ada", "age": 36}"#, // compliant → 1.0
+            r#"{"name": "Ada", "age": 36}"#,           // compliant → 1.0
             r#"[{"id":1,"label":"a","active":true}]"#, // partial → 0.0
             r#"{"user":{"name":"Ada","email":"e@x"},"orders":"free text"}"#, // partial → 0.0
         );
