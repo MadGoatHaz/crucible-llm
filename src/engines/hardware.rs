@@ -383,6 +383,26 @@ mod tests {
         assert_eq!(profile(&samples, None, 0).joules_per_token, None);
     }
 
+    /// CF-53: the CPU "estimated" flag defaults to `false` on a profile (the
+    /// pure trace math never knows the CPU method) and is settable via the
+    /// builder — the caller copies it from
+    /// [`crate::hw::cpu_power::CpuPowerBackend::is_estimated`].
+    #[test]
+    fn cpu_power_estimated_flag_defaults_false_and_is_settable() {
+        let a = MonotonicInstant::now();
+        let b = MonotonicInstant::now();
+        let samples = vec![
+            hw_sample(a, Some(50_000), None, None),
+            hw_sample(b, Some(50_000), None, None),
+        ];
+        // `profile` defaults the flag to `false`.
+        let r = profile(&samples, None, 100);
+        assert!(!r.cpu_power_estimated, "profile defaults the flag to false");
+        // The builder sets it (what the caller does from `is_estimated`).
+        let r_est = r.with_cpu_power_estimated(true);
+        assert!(r_est.cpu_power_estimated, "builder sets the flag true");
+    }
+
     #[test]
     fn profile_reports_power_and_vram_stats() {
         let a = MonotonicInstant::now();
