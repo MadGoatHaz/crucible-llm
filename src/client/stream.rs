@@ -237,10 +237,20 @@ pub struct StreamWorker {
     max_tokens: u32,
     read_timeout: Duration,
     retries: u32,
-    /// The OpenAI-compatible `response_format` type (e.g.
-    /// `"json_object"`) — Engine C3's grammar-constrained runs. `None`
-    /// (the default) sends the body unchanged.
-    response_format: Option<String>,
+    /// The OpenAI-compatible `response_format` object — Engine C3's
+    /// constrained-decoding runs. Two forms are supported:
+    /// * a simple type hint, `{"type": "json_object"}` (set via
+    ///   [`response_format`](Self::response_format));
+    /// * a full `json_schema` object, `{"type": "json_schema",
+    ///   "json_schema": {name, schema, strict}}` (set via
+    ///   [`response_format_value`](Self::response_format_value)) — the form
+    ///   that engages server-side constrained decoding (XGrammar / Outlines /
+    ///   GBNF) on vLLM / SGLang.
+    ///
+    /// `None` (the default) sends the body unchanged. Backends that do not
+    /// support `response_format` (llama.cpp, TGI) drop the field per the
+    /// OpenAI spec — a graceful no-op that never breaks the request.
+    response_format: Option<serde_json::Value>,
     /// When `true`, the body gains `"ignore_eos": true` (a llama.cpp
     /// server parameter): the model is not allowed to stop on its own
     /// end-token, so generation runs until `max_tokens` — the engine's
@@ -326,8 +336,28 @@ impl StreamWorker {
     /// `response_format` directive (Engine C3, Chunk 16): the body gains
     /// `"response_format": { "type": <format> }` (e.g. `"json_object"`),
     /// which server-side constrained-decoding engines honor.
+    ///
+    /// This is the simple *type-hint* form. For the full `json_schema`
+    /// object (which engages real grammar-constrained decoding), use
+    /// [`response_format_value`](Self::response_format_value).
     pub fn response_format(mut self, format: &str) -> Self {
-        self.response_format = Some(format.to_string());
+        self.response_format = Some(serde_json::json!({ "type": format }));
+        self
+    }
+
+    /// Set a full OpenAI-compatible `response_format` **object** (Engine C3's
+    /// `json_schema` constrained decoding, CF-08): the body's
+    /// `response_format` field is set to `value` verbatim, e.g.
+    /// `{"type": "json_schema", "json_schema": {name, schema, strict}}`.
+    ///
+    /// This is the wire encoding that lets a schema-constrained run be
+    /// transmitted end-to-end — the `{"type": <string>}` form of
+    /// [`response_format`](Self::response_format) cannot carry the
+    /// `json_schema` sub-object. Backends that do not support
+    /// `response_format` drop the field per the OpenAI spec — a graceful
+    /// no-op that never breaks the request.
+    pub fn response_format_value(mut self, value: impl Into<serde_json::Value>) -> Self {
+        self.response_format = Some(value.into());
         self
     }
 
@@ -909,7 +939,8 @@ impl StreamWorker {
     }
 
     /// The chat-completion request body. Gains a `response_format`
-    /// object when [`response_format`](Self::response_format) is set
+    /// object when [`response_format`](Self::response_format) /
+    /// [`response_format_value`](Self::response_format_value) is set
     /// (Engine C3); otherwise byte-identical to the Engine A body.
     fn request_body(&self) -> serde_json::Value {
         let mut body = serde_json::json!({
@@ -921,7 +952,10 @@ impl StreamWorker {
             "max_tokens": self.max_tokens,
         });
         if let Some(format) = &self.response_format {
-            body["response_format"] = serde_json::json!({ "type": format });
+            // Set verbatim: the simple `{"type": <string>}` hint (from
+            // `response_format`) or the full `json_schema` object (from
+            // `response_format_value`) both pass through unchanged.
+            body["response_format"] = format.clone();
         }
         if self.ignore_eos {
             body["ignore_eos"] = serde_json::json!(true);
@@ -1457,6 +1491,72 @@ mod tests {
         // The rest of the body is untouched.
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn request_body_with_json_schema_response_format_is_encoded_verbatim() {
+        // CF-08 handoff: C3's `json_schema` constrained-decoding object is
+        // transmitted end-to-end. The full object (not just `{"type": s}`)
+        // is set on the body verbatim, matching the exact shape WS3's
+        // `json_schema_response_format()` builds.
+        let wf = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .response_format_value(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "crucible_case",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": { "code": { "type": "string" } },
+                    "required": ["code"]
+                }
+            }
+        }));
+        let body = wf.request_body();
+        // The `json_schema` sub-object is present and intact.
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["name"], "crucible_case");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["properties"]["code"]["type"],
+            "string"
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["required"],
+            serde_json::json!(["code"])
+        );
+        // The rest of the body is untouched.
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 10);
+    }
+
+    #[test]
+    fn request_body_response_format_is_a_graceful_no_op_when_unset() {
+        // Graceful: a worker that never sets `response_format` (FreeForm
+        // mode, or a backend that does not support it) sends the plain
+        // Engine A body — no `response_format` field, nothing broken.
+        let wf = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        );
+        let body = wf.request_body();
+        assert!(body.get("response_format").is_none());
+        // The body is still complete and valid (all required fields present).
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["temperature"], 0);
+        assert_eq!(body["max_tokens"], 10);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert!(body["messages"].is_array());
     }
 
     #[test]
