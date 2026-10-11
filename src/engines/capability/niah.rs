@@ -738,7 +738,12 @@ impl NiahResult {
     /// full per-cell detail — each cell labeled via [`NiahCell::context_label`],
     /// so the `(approx.)` qualifier is present when no tokenizer was supplied.
     /// This makes a headless `--json` run self-contained: the NIAH recall no
-    /// longer lives only in the run log + DB. Pure and testable.
+    /// longer lives only in the run log + DB.
+    ///
+    /// **Option C:** the top level carries the three-way split —
+    /// `truncated_by_reasoning` (the aggregate count of inconclusive (budget)
+    /// cells) and `failed` (genuine retrieval failures) — and each cell
+    /// carries its own `truncated_by_reasoning` flag. Pure and testable.
     #[must_use]
     pub fn to_dict(&self) -> serde_json::Value {
         let (retrieved, total) = self.accuracy();
@@ -770,6 +775,7 @@ impl NiahResult {
                     "label": c.context_label(),
                     "depth": c.depth_percent,
                     "retrieved": c.retrieved,
+                    "truncated_by_reasoning": c.truncated_by_reasoning,
                     "ttft_s": c.ttft_s,
                     "prefill_tps": c.prefill_tps,
                     "state": state_name(c.state),
@@ -782,6 +788,12 @@ impl NiahResult {
             "accuracy": self.accuracy_label(),
             "retrieved": retrieved,
             "total": total,
+            // Option C: the three-way split, so a headless `--json` run is
+            // self-contained about *why* cells didn't retrieve. `truncated_
+            // by_reasoning` is an inconclusive (budget) outcome, reported
+            // separately from genuine `failed` cells.
+            "truncated_by_reasoning": self.truncated_count(),
+            "failed": self.failed_count(),
             "reliable_up_to": self.reliable_up_to(80.0),
             "sizes": sizes,
             "depths": self.depths,
@@ -1550,6 +1562,10 @@ mod tests {
         assert!(v["accuracy"].is_string(), "accuracy label present");
         assert_eq!(v["retrieved"], 5);
         assert_eq!(v["total"], 6);
+        // Option C three-way split: cell 5 is a genuine fail (content present,
+        // needle absent — NOT truncated), and no cell is truncated-by-reasoning.
+        assert_eq!(v["truncated_by_reasoning"], 0);
+        assert_eq!(v["failed"], 1);
         // Only 2k (100%) clears the 80% bar → reliable up to 2000.
         assert_eq!(v["reliable_up_to"], 2000);
         // Per-size recall, with the approx label.
@@ -1567,6 +1583,10 @@ mod tests {
         assert_eq!(cells[0]["label"], "2k (approx.)");
         assert_eq!(cells[0]["retrieved"], true);
         assert_eq!(cells[5]["retrieved"], false);
+        // The per-cell `truncated_by_reasoning` flag is present on every cell
+        // (false here — none of these cells are the over-thinker case).
+        assert_eq!(cells[0]["truncated_by_reasoning"], false);
+        assert_eq!(cells[5]["truncated_by_reasoning"], false);
     }
 
     // ── Per-size pass rate / reliable threshold ───────────────────────────
