@@ -56,14 +56,21 @@ fn main() {
         }
     };
 
+    // R2 (traceability): the session UUID is generated **up front**, before
+    // the logger is created, so the run-log (header + archive file name)
+    // and the persisted `benchmark_sessions` row share the *same* id — a
+    // deterministic log ↔ DB join. The same id is threaded into both the
+    // headless and TUI run paths.
+    let session_id = uuid::Uuid::new_v4().to_string();
+
     // The file-based run log: `latest.log` (overwritten each run) + a
-    // `run-<timestamp>.log` archive in the log dir (default
+    // `run-<timestamp>-<session>.log` archive in the log dir (default
     // `~/.local/share/crucible/logs/`, configurable via `--log-dir` /
     // `CRUCIBLE_LOG_DIR` / the config file). Created before dispatch so
     // both the TUI and headless paths — and every engine they spawn —
     // share the same run log. A logger that cannot create its files
     // degrades to a silent no-op (logging never breaks a run).
-    let logger = RunLogger::start(cfg.log_dir.as_deref());
+    let logger = RunLogger::start_with_session(cfg.log_dir.as_deref(), Some(&session_id));
 
     // `--banner` (hidden, Chunk 20): the old bare-invocation banner path,
     // demoted to an explicit flag. Checked before the (unnecessary for a
@@ -146,7 +153,7 @@ fn main() {
                 cfg.timeout
             ),
         );
-        let code = run_headless(&cfg, logger.clone(), gpu, cpu_power);
+        let code = run_headless(&cfg, logger.clone(), gpu, cpu_power, session_id.clone());
         logger.info(
             Context::Setup,
             format!("run ended — headless — exit code {code}"),
@@ -169,7 +176,7 @@ fn main() {
                 .unwrap_or_default()
         ),
     );
-    let ok = run_tui(&cfg, logger.clone(), gpu, cpu_power);
+    let ok = run_tui(&cfg, logger.clone(), gpu, cpu_power, session_id.clone());
     EventLoop::restore(); // best-effort terminal restore on all paths
     logger.info(Context::Tui, format!("run ended — TUI — ok={ok}"));
     logger.finish(); // flush before exit (drops are skipped by process::exit)
@@ -186,6 +193,7 @@ fn run_headless(
     logger: Arc<RunLogger>,
     gpu: Option<Arc<dyn GpuBackend>>,
     cpu_power: Option<Box<CpuPowerBackend>>,
+    session_id: String,
 ) -> i32 {
     // Empty-selection guard (mirrors the TUI's `App::start_run`): a run
     // with no engines selected has nothing to do. `--engine` names a
@@ -402,8 +410,10 @@ fn run_headless(
         // row + one `stream_metrics` row per iteration, in the platform
         // data dir. A storage failure degrades gracefully — it must never
         // break (or change the exit code of) a benchmark run.
+        // R2: the session id is the one generated up front in `main` and
+        // stamped into the run-log — so the DB row and the log join on it.
         let session = BenchmarkSession {
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id,
             timestamp: None, // SQLite `DEFAULT CURRENT_TIMESTAMP` fills it
             target_url: cfg.url.clone(),
             model_name: cfg.model.clone(),
@@ -681,6 +691,7 @@ fn run_tui(
     logger: Arc<RunLogger>,
     gpu: Option<Arc<dyn GpuBackend>>,
     cpu_power: Option<Box<CpuPowerBackend>>,
+    session_id: String,
 ) -> bool {
     let export_format = cfg.export.unwrap_or_default();
     // Chunk 17: the detected backend (any vendor) + the CPU power backend +
@@ -708,6 +719,7 @@ fn run_tui(
                 .with_config(cfg)
                 .with_theme(Theme::from_id(&cfg.theme).unwrap_or_default())
                 .with_logger(logger.clone())
+                .with_session_id(session_id)
                 .with_gpu(gpu);
             // The target is "fully given" when an explicit URL + a
             // non-placeholder model are present; otherwise the Setup

@@ -315,6 +315,12 @@ pub struct App {
     /// `latest.log` + the run archive. A `disabled` logger (the
     /// `App::new()` default for tests) makes every call a no-op.
     pub logger: Arc<RunLogger>,
+    /// R2 (traceability): this run's session UUID, shared with the
+    /// run-log (stamped in its header/archive name by `main`) and used as
+    /// the `benchmark_sessions.session_id` the sequence persists — so the
+    /// TUI's stored run joins to its log. `App::new()` mints a fresh one
+    /// (tests); the entry point overrides it via [`Self::with_session_id`].
+    pub session_id: String,
 }
 
 impl Default for App {
@@ -371,7 +377,18 @@ impl App {
             // them off the filesystem (the entry point attaches the real
             // one via `with_logger`).
             logger: RunLogger::disabled(),
+            // A fresh session id per app (the entry point overrides it
+            // with the one shared by the run-log via `with_session_id`).
+            session_id: uuid::Uuid::new_v4().to_string(),
         }
+    }
+
+    /// R2 (traceability): set this run's session UUID (the one `main`
+    /// generated and stamped into the run-log) so the persisted
+    /// `benchmark_sessions` row joins to the log.
+    pub fn with_session_id(mut self, session_id: String) -> Self {
+        self.session_id = session_id;
+        self
     }
 
     /// Attach the run logger (the entry point calls this with the
@@ -956,6 +973,7 @@ impl App {
             Some(tx),
             self.pause.clone(),
             self.logger.clone(),
+            self.session_id.clone(),
         );
         tokio::spawn(async move {
             seq.run().await;

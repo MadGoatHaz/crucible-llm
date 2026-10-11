@@ -151,6 +151,10 @@ pub struct RunLogger {
     handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The `latest.log` path (`None` when disabled).
     path: Option<PathBuf>,
+    /// R2 (traceability): the run's session UUID, stamped into the log
+    /// header + archive name so the log joins deterministically to the
+    /// `benchmark_sessions` row. `None` when the caller did not supply one.
+    session: Option<String>,
 }
 
 impl std::fmt::Debug for RunLogger {
@@ -158,32 +162,53 @@ impl std::fmt::Debug for RunLogger {
         f.debug_struct("RunLogger")
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("path", &self.path)
+            .field("session", &self.session)
             .finish()
     }
 }
 
 impl RunLogger {
+    /// Start a fresh run log (no session id): a thin wrapper over
+    /// [`Self::start_with_session`] for callers that have no session to
+    /// join the log to.
+    pub fn start(log_dir: Option<&Path>) -> Arc<Self> {
+        Self::start_with_session(log_dir, None)
+    }
+
     /// Start a fresh run log: open `latest.log` (overwritten) and an
     /// archived `run-<timestamp>.log` in `log_dir`, and spawn the writer
     /// thread.
+    ///
+    /// R2 (traceability): when `session` is `Some(id)` (the run's UUID),
+    /// it is stamped into the **header** (`(session {id})`) and the
+    /// **archive file name** (`run-<timestamp>-<id[:8]>.log`), so the log
+    /// joins deterministically to the `benchmark_sessions` row that
+    /// carries the same id.
     ///
     /// `log_dir` defaults to `data_dir()/crucible/logs` (i.e.
     /// `~/.local/share/crucible/logs` on Linux) when `None`. Any failure
     /// (missing home dir, permissions, …) degrades to a
     /// [`disabled`](Self::disabled) logger — logging never breaks a run.
-    pub fn start(log_dir: Option<&Path>) -> Arc<Self> {
+    pub fn start_with_session(log_dir: Option<&Path>, session: Option<&str>) -> Arc<Self> {
+        let session = session.map(str::to_string);
         let dir = log_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| crate::config::data_dir().join("logs"));
         let now_ms = now_ms();
-        // The archive name is second-granular; disambiguate collisions
-        // (two runs in the same second) with a `-2`, `-3`, … suffix.
+        // The archive name is second-granular; with a session id it is
+        // `run-<timestamp>-<id[:8]>.log` (the deterministic log↔DB join),
+        // else `run-<timestamp>.log`. Collisions (two runs in the same
+        // second) are disambiguated with a `-2`, `-3`, … suffix.
         let stamp = archive_stamp(now_ms);
-        let mut archive_name = format!("run-{stamp}.log");
+        let base = match &session {
+            Some(id) => format!("run-{stamp}-{}", short_id(id)),
+            None => format!("run-{stamp}"),
+        };
+        let mut archive_name = format!("{base}.log");
         let mut counter = 1;
         while dir.join(&archive_name).exists() {
             counter += 1;
-            archive_name = format!("run-{stamp}-{counter}.log");
+            archive_name = format!("{base}-{counter}.log");
         }
         let (latest, archive) = match (
             std::fs::create_dir_all(&dir),
@@ -226,10 +251,19 @@ impl RunLogger {
 
         let (tx, rx) = mpsc::channel::<Msg>();
         let header_at = now_ms;
-        let header = format!(
-            "=== crucible-llm run log — {} ===",
-            format_timestamp(header_at, true)
-        );
+        // R2: the header carries the session id (when present) so the log
+        // is joinable to its DB row even without reading the archive name.
+        let header = match &session {
+            Some(id) => format!(
+                "=== crucible-llm run log — {} (session {}) ===",
+                format_timestamp(header_at, true),
+                id
+            ),
+            None => format!(
+                "=== crucible-llm run log — {} ===",
+                format_timestamp(header_at, true)
+            ),
+        };
         let handle = std::thread::Builder::new()
             .name("crucible-runlog".to_string())
             .spawn(move || writer_thread(rx, latest, archive, header))
@@ -239,6 +273,7 @@ impl RunLogger {
             active: AtomicBool::new(true),
             handle: std::sync::Mutex::new(handle),
             path: Some(dir.join("latest.log")),
+            session,
         });
         // The header is the first record the writer emits (it is not
         // sent through the channel: the writer owns it and prints it
@@ -257,7 +292,15 @@ impl RunLogger {
             active: AtomicBool::new(false),
             handle: std::sync::Mutex::new(None),
             path: None,
+            session: None,
         })
+    }
+
+    /// The run's session id (`None` when the logger was started without
+    /// one) — exposed so callers can verify the log↔DB join.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 
     /// `true` while the logger is writing to its files.
@@ -423,6 +466,11 @@ pub(crate) fn format_timestamp(at_ms: u64, date_part: bool) -> String {
     }
 }
 
+/// The first `n` characters of an id (the archive-name session suffix).
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
 /// The archive file-name stamp: `YYYYmmdd-HHMMSS`.
 pub(crate) fn archive_stamp(at_ms: u64) -> String {
     let secs = (at_ms / 1000) as i64;
@@ -551,6 +599,46 @@ mod tests {
         }
         // Both files carry the same records.
         assert_eq!(latest, archive);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2 (traceability): the session id is stamped into the log header and
+    // the archive file name, so the log joins deterministically to the
+    // `benchmark_sessions` row that carries the same UUID.
+    #[test]
+    fn start_with_session_stamps_the_session_id() {
+        let dir = temp_log_dir("session");
+        let session_id = "12345678-aaaa-bbbb-cccc-dddddddddddd".to_string();
+        let logger = RunLogger::start_with_session(Some(&dir), Some(&session_id));
+        logger.info(Context::Setup, "run started");
+        logger.finish();
+
+        // The header in latest.log carries the full session id.
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        let needle = format!("(session {session_id})");
+        assert!(
+            latest.contains(&needle),
+            "header carries the session id: {latest}"
+        );
+
+        // The archive file name carries the short (8-char) session id.
+        let archives: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("run-") && n.ends_with(".log"))
+            .collect();
+        assert_eq!(archives.len(), 1, "one archive: {archives:?}");
+        assert!(
+            archives[0].contains("12345678"),
+            "archive name carries the short session id: {archives:?}"
+        );
+        // The archive carries the same stamped header.
+        let archive = std::fs::read_to_string(dir.join(&archives[0])).unwrap();
+        assert!(archive.contains(&needle), "{archive}");
+
+        // The logger exposes the session id for a programmatic join.
+        assert_eq!(logger.session_id(), Some(session_id.as_str()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

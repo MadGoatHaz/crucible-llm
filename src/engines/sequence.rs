@@ -517,6 +517,10 @@ pub struct BenchmarkSequence {
     /// The file-based run logger (the executor records engine
     /// transitions; a `disabled` logger makes this a no-op).
     logger: Arc<RunLogger>,
+    /// R2 (traceability): this run's session UUID — the same id the
+    /// run-log carries, so the persisted `benchmark_sessions` row joins to
+    /// its log.
+    session_id: String,
     /// The ordered engine queue (selection-filtered, canonical order).
     engines: Vec<Engine>,
     /// The queue index the ticker is mirroring (the current engine).
@@ -561,6 +565,7 @@ impl BenchmarkSequence {
         log: Option<mpsc::Sender<String>>,
         pause: Arc<RunPause>,
         logger: Arc<RunLogger>,
+        session_id: String,
     ) -> Self {
         let engines = queue_for(&cfg.engines);
         Self {
@@ -573,6 +578,7 @@ impl BenchmarkSequence {
             log,
             pause,
             logger,
+            session_id,
             engines,
             current: Arc::new(AtomicUsize::new(0)),
             completed: Arc::new(Mutex::new(Vec::new())),
@@ -851,8 +857,10 @@ impl BenchmarkSequence {
     /// results). A failure is logged but never propagated — the run is
     /// already complete and the TUI is showing its final state.
     fn persist_results(&self) {
+        // R2: the session id is the one shared with the run-log (stamped in
+        // its header/archive name by `main`), so the stored row joins to it.
         let session = BenchmarkSession {
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: self.session_id.clone(),
             timestamp: None, // SQLite `DEFAULT CURRENT_TIMESTAMP` fills it
             target_url: self.cfg.url.clone(),
             model_name: self.cfg.model.clone(),
@@ -1353,6 +1361,7 @@ mod tests {
             None,
             Arc::new(RunPause::new()),
             crate::log::RunLogger::disabled(),
+            "test-session".to_string(),
         )
     }
 
@@ -1790,6 +1799,7 @@ mod tests {
             None,
             Arc::new(RunPause::new()),
             crate::log::RunLogger::disabled(),
+            "test-session".to_string(),
         );
         s.run().await;
         assert!(!slot.is_running(), "the slot clears when the run ends");
