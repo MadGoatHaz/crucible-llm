@@ -4,23 +4,27 @@ All notable changes to Crucible LLM.
 
 ## [Unreleased]
 
-The NIAH expansion + SSE keep-alive cycle: long-context NIAH becomes runtime-configurable and token-honest (and lands in `--json`), and the stream transport stops misrouting valid SSE.
+The NIAH expansion + SSE keep-alive cycle: long-context NIAH becomes runtime-configurable and token-honest (and lands in `--json`), the stream transport stops misrouting valid SSE, and the C1/C3 hybrid-reasoning generation budgets become user-configurable (R3) with live-calibrated defaults sized for verbose reasoners.
 
 ### Added
 - **NIAH (C1) runtime-configurable ladders** — `--niah-contexts <CSV>` (e.g. `16k,64k,256k,1M`), `--niah-depths <CSV>` (e.g. `0,50,100`), and `--niah-custom <SIZE>` (single-size "count test", e.g. `256k`), each layered **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS` / `CRUCIBLE_NIAH_CUSTOM`) > config file > default** (2k→128k × 11 depths). `--niah-custom` takes precedence and collapses the matrix to one size row — for probing a RoPE/YaRN-extended limit.
 - **1M+ haystack scaling** — the document generator is unbounded (a 1M-token haystack builds in a few hundred ms; `target × 4` char math is overflow-safe for any `u32` target). The practical ceiling is the server's max context; an over-limit size degrades to a labeled per-cell HTTP 400 (no crash, never a silent zero).
 - **NIAH results in `--json`** — an additive `niah` section (accuracy headline, `retrieved`/`total`, `reliable_up_to`, per-size recall with labels, full per-cell detail incl. `ttft_s` / `prefill_tps` / `state` / `no_baseline` / `approximate`) so a headless `--json` run is self-contained; the Engine-A JSON shape is untouched.
+- **Configurable C1/C3 generation budgets (R3)** — `--niah-max-tokens <N>` / `CRUCIBLE_NIAH_MAX_TOKENS` (C1, was a fixed 1024) and `--structured-max-tokens <N>` / `CRUCIBLE_STRUCTURED_MAX_TOKENS` (C3, was a fixed 2048), each layered **CLI > env > config file (`niah_max_tokens` / `structured_max_tokens`) > default**, so any model — from a token-efficient finetune to a verbose reasoner — can be accommodated without a recompile.
+- **Per-cell / per-case `reasoning_tokens` in `--json` (R3)** — the `niah` cells and `structured` cases now carry the server-reported CoT token count (`null` when the backend reports no usage block), the calibration measurement of a model's reasoning usage.
+- **`--no-disable-thinking` force-test switch (R3)** — the C1/C3 best-effort `disable_thinking` suppression (a speed optimization) can be turned off client-side, so the `truncated_by_reasoning` safety net (designed for servers that drop the suppression field) can be exercised live: tiny budget + thinking on → the model runs out mid-CoT and is reported *truncated*, never a capability fail.
 
 ### Changed
 - **C1 `chars/4` approximate labeling** — without a `--tokenizer`, the haystack is a `chars/4` estimate and every context size now reads `Nk (approx.)` consistently across the headless run log (header + per-cell tags), the TUI NIAH grid, the TUI Long Context bar, and the `--json` `niah` section; with a tokenizer, labels are exact.
 - **Headless log size formatting** — NIAH sizes render through the shared `human_size` formatter (`32k` / `256k` / `2M`) in the run log and worker tags (was `128000k`); the `[C1] NIAH (…)` header now shows the *configured* ladders and names the count-test mode.
+- **Hybrid-reasoning defaults raised with live-calibrated headroom (R3)** — the C1 per-cell budget goes **1024 → 2048** and the C3 per-run budget **2048 → 4096**. Calibrated live against the token-efficient qwen3.8-27b finetune (0 CoT when the server honors suppression; 57–90+ when forced to think): the new defaults leave large headroom for a verbose reasoner (several× the finetune's usage, e.g. vanilla qwen3.8's 256-CoT small-prompt baseline) to finish its chain-of-thought *and* commit the answer, while staying a rarely-hit ceiling on suppression-honoring servers.
 
 ### Fixed
 - **SSE keep-alive misroute (Issue #1)** — the stream-vs-JSON route is now decided by the response **`Content-Type` + request intent** (`text/event-stream` → SSE, `application/json` → JSON, absent/other → SSE since we always send `stream: true`), not by sniffing the first body byte; a `:keep-alive` comment preamble can no longer push a valid stream onto the JSON path and poison the result. A stream ending with zero valid `data:` frames first tries a **JSON rescue** on the retained body (1 MiB inspection cap), and a body that is genuinely neither surfaces as a real `StreamError::InvalidTransport` — never a silent retrieval miss. The SSE parser gains `data_frames` / `valid_frames` counters to drive that resolution.
 - **TUI token-honest labeling (completes Issue #4)** — the interactive TUI now renders the `(approx.)` qualifier: the NIAH grid (View 3) row labels (`128k (approx.)`) and the Live view's Long Context capability bar (`≤ 128k (approx.) reliable`). Both read through the same shared `context_size_label` the headless run log and the `--json` `niah` section use, so a no-`--tokenizer` run is never presented as exact on any output surface (with a `--tokenizer`, all labels are plain).
 
 ### Code Quality
-- 919 tests, 0 failures (21 suites: unit + integration + e2e, fully offline via the in-process mock SSE server)
+- 967 tests, 0 failures (21 suites: unit + integration + e2e, fully offline via the in-process mock SSE server)
 - `cargo build --release` 0 warnings; `cargo clippy --all-targets` 0 warnings
 
 ## [0.1.4] - 2026-10-11

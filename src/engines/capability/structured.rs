@@ -47,7 +47,7 @@
 //! (vLLM/SGLang/LM Studio/Ollama) the model answers without CoT and the
 //! budget is a rarely-hit ceiling. A *config-only* server silently drops the
 //! per-request fields (OpenAI-spec graceful degradation) and the model
-//! thinks by default — which is why **the 2048-token budget is the
+//! thinks by default — which is why **the 4096-token budget is the
 //! correctness guarantee** (`max_tokens` is honored by every server). It
 //! leaves headroom for chain-of-thought *before* the JSON, so a
 //! suppression-ignoring model can finish its CoT and still commit the
@@ -109,19 +109,30 @@ use crate::timing::StreamTimestamps;
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Max generation tokens per structured run.
+/// Max generation tokens per structured run (the default; overridable at
+/// runtime via `--structured-max-tokens` / `CRUCIBLE_STRUCTURED_MAX_TOKENS`
+/// / the config file — R3).
 ///
-/// **Hybrid reasoning (R2, Option C):** 2048 is the *correctness
+/// **Hybrid reasoning (R2, Option C):** 4096 is the *correctness
 /// guarantee*. The JSON answer itself is small (the largest case, Complex,
 /// needs well under 200 tokens) and is further constrained by the case's
-/// strict `json_schema`; 2048 is headroom for a reasoning model's
+/// strict `json_schema`; 4096 is headroom for a reasoning model's
 /// chain-of-thought *before* the JSON on a server that ignores our
 /// best-effort `disable_thinking` suppression (R1: the budget carries
 /// correctness, suppression is only a speed optimization). A stream that
 /// exhausts the budget in CoT with zero content is the distinct
 /// `truncated_by_reasoning` outcome ([`CaseVerdict::Truncated`]), not a
 /// capability failure.
-pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 2048;
+///
+/// **R3 calibration (live, 2026-10-11, qwen3.8-27b finetune @
+/// 192.168.51.163):** the token-efficient finetune used **0** CoT tokens
+/// per case (the vLLM server honors `enable_thinking=false`); forced to
+/// think (`--no-disable-thinking`) it spent 57–64+ CoT on the C3 prompts
+/// (the 64-token force-test budget was exhausted mid-CoT on 2 of 3 cases).
+/// 4096 leaves **large headroom** above that: a verbose reasoner (several×
+/// the finetune's ~60) can spend ~3800 tokens on CoT and still commit the
+/// ≤200-token JSON answer.
+pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 4096;
 
 /// CF-51: how many times each constrained case is repeated. The stability
 /// rate (the fraction of repeats that are fully compliant) turns C3's old
@@ -879,10 +890,9 @@ impl StructuredEngine {
     /// One run: spawn a worker (optionally with the case's `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
     /// Thinking is suppressed on every run (CF-18, best-effort speed) so the
-    /// 2048-token budget mostly goes to the JSON answer, and only
-    /// `Chunk::Content` deltas are accumulated into the judged body. The
-    /// run also reports the hybrid `truncated_by_reasoning` flag (R2) via
-    /// [`RunOutput`].
+    /// budget mostly goes to the JSON answer, and only `Chunk::Content`
+    /// deltas are accumulated into the judged body. The run also reports the
+    /// hybrid `truncated_by_reasoning` flag (R2) via [`RunOutput`].
     async fn run_once(&self, case_idx: usize, constrained: bool) -> RunOutput {
         let case = &STRUCTURED_CASES[case_idx];
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -1505,14 +1515,17 @@ mod tests {
     // ── hybrid reasoning (R2): the budget is the correctness guarantee ──
 
     #[test]
-    fn budget_is_raised_to_2048_for_reasoning_headroom() {
-        // R2 (Option C, `work/plans/REASONING_DESIGN.md` §5.1): the 2048
-        // generation budget is the *correctness guarantee* — headroom for a
-        // reasoning model's chain-of-thought before the JSON on a server
-        // that ignores our best-effort `disable_thinking` suppression. The
-        // JSON body itself is still constrained by the case's strict schema
-        // (the largest case needs well under 200 tokens).
-        assert_eq!(STRUCTURED_MAX_GEN_TOKENS, 2048);
+    fn budget_is_4096_for_reasoning_headroom() {
+        // R2 (Option C, `work/plans/REASONING_DESIGN.md` §5.1) + R3
+        // calibration: the 4096 generation budget is the *correctness
+        // guarantee* — headroom for a verbose reasoner's chain-of-thought
+        // before the JSON on a server that ignores our best-effort
+        // `disable_thinking` suppression. The JSON body itself is still
+        // constrained by the case's strict schema (the largest case needs
+        // well under 200 tokens). Sized with large headroom above the
+        // measured qwen3.8-27b finetune usage (0 CoT suppressed; 57–64+
+        // forced — `work/scratch/r3_calibration.md`).
+        assert_eq!(STRUCTURED_MAX_GEN_TOKENS, 4096);
     }
 
     // ── is_json_compliant (general helper) ───────────────────────────────
@@ -2288,15 +2301,14 @@ mod tests {
     #[test]
     fn engine_honors_the_configured_generation_budget() {
         // The resolved config budget (R3) reaches the engine and is used
-        // for the per-run worker / snapshots (not the compile-time
-        // default).
+        // for the per-run worker / snapshots (not the built-in default).
         let cfg = Config {
             url: "http://127.0.0.1:9".to_string(),
-            structured_max_tokens: 4096,
+            structured_max_tokens: 1024,
             ..Config::default()
         };
         let engine = StructuredEngine::new(&cfg).unwrap();
-        assert_eq!(engine.max_gen_tokens(), 4096);
+        assert_eq!(engine.max_gen_tokens(), 1024);
         // The default config carries the built-in safety-net budget.
         let engine = StructuredEngine::new(&Config::default()).unwrap();
         assert_eq!(engine.max_gen_tokens(), STRUCTURED_MAX_GEN_TOKENS);

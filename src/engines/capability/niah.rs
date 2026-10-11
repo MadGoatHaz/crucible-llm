@@ -54,18 +54,28 @@ use crate::timing::StreamTimestamps;
 /// Bounded worker→engine channel capacity (same as Engine A / C2).
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Max generation tokens per cell.
+/// Max generation tokens per cell (the default; overridable at runtime via
+/// `--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config file — R3).
 ///
 /// **Hybrid reasoning (Option C):** the *budget* is the correctness
 /// guarantee. `disable_thinking` is best-effort — a speed optimization a
 /// config-only server may silently drop — so a reasoning model that ignores
 /// it would spend a tiny budget entirely on chain-of-thought and emit no
-/// answer (the v0.1.4 false failure, C1 ≈ 5/77). 1024 gives an over-thinker
-/// room to finish its CoT *and* emit the answer (the needle value is a single
-/// ~15-token string). On a suppression-honoring server the answer arrives in
-/// ~15 tokens and the ceiling is rarely hit, so the matrix stays fast — the
-/// budget is a ceiling, not a target.
-pub const NIAH_MAX_GEN_TOKENS: u32 = 1024;
+/// answer (the v0.1.4 false failure, C1 ≈ 5/77).
+///
+/// **R3 calibration (live, 2026-10-11, qwen3.8-27b finetune @
+/// 192.168.51.163):** the token-efficient finetune used **0** CoT tokens
+/// per cell (the vLLM server honors `enable_thinking=false`); forced to
+/// think (`--no-disable-thinking`) it spent 32+ CoT on the 2k NIAH query
+/// (the 32-token force-test budget was exhausted mid-CoT) and ~90 on a
+/// step-by-step math probe. 2048 leaves **large headroom** above that: a
+/// verbose reasoner (several× the finetune's ~100, or a vanilla qwen3.8
+/// that used 256 CoT on an 87-token prompt) can spend ~2000 tokens on CoT
+/// and still commit the ~15-token needle answer. On a
+/// suppression-honoring server the answer arrives in ~15 tokens and the
+/// ceiling is rarely hit, so the matrix stays fast — the budget is a
+/// ceiling, not a target.
+pub const NIAH_MAX_GEN_TOKENS: u32 = 2048;
 
 /// The context token sizes of the N×M matrix (blueprint §5 C1:
 /// 2k/4k/8k/16k/32k/64k/128k).
@@ -1976,15 +1986,14 @@ mod tests {
     #[test]
     fn engine_honors_the_configured_generation_budget() {
         // The resolved config budget (R3) reaches the engine and is used
-        // for the per-cell worker / snapshots (not the compile-time
-        // default).
+        // for the per-cell worker / snapshots (not the built-in default).
         let cfg = Config {
             url: "http://127.0.0.1:9".to_string(),
-            niah_max_tokens: 2048,
+            niah_max_tokens: 512,
             ..Config::default()
         };
         let engine = NiahEngine::new(&cfg).unwrap();
-        assert_eq!(engine.max_gen_tokens(), 2048);
+        assert_eq!(engine.max_gen_tokens(), 512);
         // The default config carries the built-in safety-net budget.
         let engine = NiahEngine::new(&Config::default()).unwrap();
         assert_eq!(engine.max_gen_tokens(), NIAH_MAX_GEN_TOKENS);
@@ -1996,13 +2005,13 @@ mod tests {
         // `NiahEngineConfig` too.
         let cfg = Config {
             url: "http://127.0.0.1:9".to_string(),
-            niah_max_tokens: 4096,
+            niah_max_tokens: 1024,
             ..Config::default()
         };
         let nec = NiahEngineConfig::from_config(&cfg);
-        assert_eq!(nec.max_gen_tokens, 4096);
+        assert_eq!(nec.max_gen_tokens, 1024);
         let engine = nec.engine().unwrap();
-        assert_eq!(engine.max_gen_tokens(), 4096);
+        assert_eq!(engine.max_gen_tokens(), 1024);
     }
 
     #[test]

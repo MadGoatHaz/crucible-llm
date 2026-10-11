@@ -2469,16 +2469,16 @@ mod tests {
 
     #[test]
     fn cli_niah_max_tokens_overrides_the_default() {
-        let cfg = resolve_bare(&["crucible-llm", "--niah-max-tokens", "2048"]);
-        assert_eq!(cfg.niah_max_tokens, 2048);
+        let cfg = resolve_bare(&["crucible-llm", "--niah-max-tokens", "512"]);
+        assert_eq!(cfg.niah_max_tokens, 512);
         // The C3 budget is untouched.
         assert_eq!(cfg.structured_max_tokens, STRUCTURED_MAX_GEN_TOKENS);
     }
 
     #[test]
     fn cli_structured_max_tokens_overrides_the_default() {
-        let cfg = resolve_bare(&["crucible-llm", "--structured-max-tokens", "4096"]);
-        assert_eq!(cfg.structured_max_tokens, 4096);
+        let cfg = resolve_bare(&["crucible-llm", "--structured-max-tokens", "1024"]);
+        assert_eq!(cfg.structured_max_tokens, 1024);
         // The C1 budget is untouched.
         assert_eq!(cfg.niah_max_tokens, NIAH_MAX_GEN_TOKENS);
     }
@@ -2552,18 +2552,18 @@ mod tests {
     #[test]
     fn config_file_round_trips_the_budgets() {
         let f = ConfigFile {
-            niah_max_tokens: Some(2048),
-            structured_max_tokens: Some(4096),
+            niah_max_tokens: Some(1536),
+            structured_max_tokens: Some(3072),
             ..Default::default()
         };
         let json = serde_json::to_string(&f).expect("serialize");
-        assert!(json.contains("\"niah_max_tokens\":2048"), "{json}");
-        assert!(json.contains("\"structured_max_tokens\":4096"), "{json}");
+        assert!(json.contains("\"niah_max_tokens\":1536"), "{json}");
+        assert!(json.contains("\"structured_max_tokens\":3072"), "{json}");
         let back: ConfigFile = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back.niah_max_tokens, Some(2048));
-        assert_eq!(back.structured_max_tokens, Some(4096));
+        assert_eq!(back.niah_max_tokens, Some(1536));
+        assert_eq!(back.structured_max_tokens, Some(3072));
         let c = back.to_config();
-        assert_eq!(c.niah_max_tokens, 2048);
-        assert_eq!(c.structured_max_tokens, 4096);
+        assert_eq!(c.niah_max_tokens, 1536);
+        assert_eq!(c.structured_max_tokens, 3072);
     }
 }

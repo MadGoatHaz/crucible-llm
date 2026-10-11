@@ -2036,11 +2036,11 @@ mod tests {
         // The old A+B-only denominator would be 256 + 1000 = 1256.
         let a_b_only = 256u64 + 1000;
         // The honest all-engine denominator (the C1 contribution is
-        // `run_cells × NIAH_MAX_GEN_TOKENS` — 1024 after the Option C budget
+        // `run_cells × NIAH_MAX_GEN_TOKENS` — 2048 after the R3 budget
         // raise):
-        //   256 + 1000 + (1×1024) + (400/4) + (800/4) + 5000 = 7580.
+        //   256 + 1000 + (1×2048) + (400/4) + (800/4) + 5000 = 8604.
         let all = s.all_engines_tokens();
-        assert_eq!(all, 7580, "denominator spans A+B+C1+C2+C3+F, not just A+B");
+        assert_eq!(all, 8604, "denominator spans A+B+C1+C2+C3+F, not just A+B");
         assert!(
             all > a_b_only,
             "the all-engine denominator ({all}) must exceed the old A+B-only ({a_b_only})"
