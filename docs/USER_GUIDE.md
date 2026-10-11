@@ -112,9 +112,10 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 - **Graph**: Visual curve of throughput vs users
 
 ### Reading the NIAH View (View 3)
-- **Matrix**: Rows = context size, shows pass rate
+- **Matrix**: Rows = context size (the configured ladder — default 2k→128k), shows pass rate
 - **Colors**: Green ≥80%, Yellow 50-79%, Red <50%
 - **Verdict**: "Reliable up to ~Xk tokens"
+- **Labels**: sizes read `Nk` (or `1M`, `2M`, …) via the shared size formatter; without a `--tokenizer` each size carries the `(approx.)` qualifier (the haystack is a `chars/4` estimate)
 
 ### Reading the History View (View 5)
 The History view reads your stored runs (from `~/.local/share/crucible/benchmarks.db`). It has four modes:
@@ -241,6 +242,31 @@ For scripting, CI/CD, or when you don't want a TUI. **Headless honors engine sel
 # Custom timeout
 ./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --timeout 60
 ```
+
+### Configuring the NIAH (C1) matrix
+
+The C1 matrix's context sizes and needle depths are **runtime-configurable** (defaults: `2k,4k,8k,16k,32k,64k,128k` × `0…100` step 10 = 77 cells). All three options accept `k` / `M` suffixes (`16k`, `1M`) as well as plain numbers, and layer **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS` / `CRUCIBLE_NIAH_CUSTOM`) > config file > default**:
+
+| Flag | Example | Effect |
+|------|---------|--------|
+| `--niah-contexts <CSV>` | `--niah-contexts 16k,64k,256k` | Replace the context-size ladder (`0` is not allowed — a haystack must be a positive size) |
+| `--niah-depths <CSV>` | `--niah-depths 0,50,100` | Replace the needle-depth ladder (percentages 0–100) |
+| `--niah-custom <SIZE>` | `--niah-custom 256k` | Single-size "count test" at exactly that context, across the depth ladder — **takes precedence** over `--niah-contexts` |
+
+```bash
+# A focused probe of one large window (e.g. a RoPE/YaRN-extended context):
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --engine niah --niah-custom 256k
+
+# A custom ladder — two sizes at three depths (6 cells):
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --engine niah \
+  --niah-contexts 16k,64k --niah-depths 0,50,100
+```
+
+**Reading the sizes:** without a `--tokenizer`, haystack sizes are `chars/4` estimates and are labeled `(approx.)` everywhere they appear — the headless header (`[C1] NIAH (2 sizes 16k (approx.)→64k (approx.) × 3 depths)…`), the per-cell tags (`C1:256k (approx.)-d50`), and the `--json` `niah` section. Supply `--tokenizer <path>` for exact counts (plain labels).
+
+**If a size exceeds the server's max context:** the cells are *not* pre-clamped — each request is sent and the server's HTTP 400 is recorded as a labeled per-cell error (summary `0/N retrieved`, exit code stays 0 — never a silent zero). A size the server supports (e.g. 256k on an 851,968-token model) simply runs.
+
+**JSON output:** a headless `--json` run includes an additive `niah` section (accuracy headline, `retrieved`/`total`, `reliable_up_to`, per-size recall with labels, and full per-cell detail) — the Engine-A report shape is untouched.
 
 ### Exit Codes
 | Code | Meaning |

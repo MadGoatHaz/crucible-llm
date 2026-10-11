@@ -46,7 +46,7 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 | :--- | :--- | :--- |
 | **A · Speed** | first-token latency (ms, dual perceived/server-side TTFT), pre-fill throughput (tok/s, long prompt), tokens/sec (decode, answer phase), ITL p50/p99, MTP/speculative ratio (η) | How fast does the model respond to **one** user? |
 | **B · Concurrency** | sweep 1→32 parallel streams, per-stream t/s, saturation knee, **practical sweet spot** (highest level where each user still gets ≥ 30 t/s) | How many users can your server **actually** serve? |
-| **C1 · NIAH** | needle-in-a-haystack retrieval across 2k→128k contexts × 11 depths | Can the model **find a fact** buried in a long document? |
+| **C1 · NIAH** | needle-in-a-haystack retrieval across a configurable context ladder (default 2k→128k × 11 depths) | Can the model **find a fact** buried in a long document? |
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
 | **C3 · Structured** | JSON compliance across 3 schema-complexity levels under real constrained decoding (`json_schema`, strict) where the backend supports it — with a clearly-flagged hint fallback — + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
 | **D · Energy** | GPU power + utilization monitoring. Auto-detects NVIDIA, AMD, or Intel. Measures watts, Joules/token, temperature, VRAM, clocks | What's the **power cost**? |
@@ -75,7 +75,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker (first run only; a saved config skips straight to the dashboard).
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
 - **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
-- **View 3 · NIAH** — the long-context retrieval matrix (7 sizes × 11 depths), color-coded green / yellow / red.
+- **View 3 · NIAH** — the long-context retrieval matrix (default 7 sizes × 11 depths; both ladders are runtime-configurable), color-coded green / yellow / red.
 - **View 4 · GPU & Power** — multi-GPU telemetry table (full names, power, util, avg util, temp, avg temp, max temp, VRAM, clocks), power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), $/1M token cost analysis (input/output/blended), efficiency metrics (J/token, tokens/watt), system power (GPU + CPU), idle baseline (auto 5s / manual `[i]` 10s), and duration (freezes at completion).
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
@@ -240,6 +240,9 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--engine <NAME>` | A,B,C1,C2,C3,F (D auto) | Select which engines a run orchestrates (repeatable): `all` (every engine), `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`f`. An explicit selection always wins over GPU auto-detection. |
 | `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
 | `--matrix-context <CSV>` | `0,8k,32k` | Context sizes for Engine B's 2D concurrency × context matrix (`0` = the configured prompt). |
+| `--niah-contexts <CSV>` | `2k,4k,8k,16k,32k,64k,128k` | Engine C1's context-size ladder (`k`/`M` suffixes; `0` not allowed), e.g. `16k,64k,256k,1M`. |
+| `--niah-depths <CSV>` | `0,10,…,100` (step 10) | Engine C1's needle-depth ladder (percentages 0–100), e.g. `0,50,100`. |
+| `--niah-custom <SIZE>` | — | Engine C1 single-size "count test" at exactly that context (e.g. `256k`, `1M`) across the depth ladder — probes a RoPE/YaRN-extended limit; takes precedence over `--niah-contexts`. |
 | `--no-hardware` | off | Disable the hardware/energy telemetry poller. |
 | `--export <fmt>` | — | Export the run: `json`, `md`, or `csv`. |
 | `--export-path <PATH>` | `data_dir()/exports/…` | Destination file for `--export`. |
@@ -277,11 +280,14 @@ The old single "pre-fill speed" number was a conflation — a ~45–87-token sho
 
 ### NIAH (Engine C1)
 
-Hides a unique random fact in a synthetic document and asks the model to retrieve it, across **7 context sizes (2k → 128k) × 11 depths (0 → 100%)** = 77 cells.
+Hides a unique random fact in a synthetic document and asks the model to retrieve it, across a **configurable context × depth matrix** — by default **7 context sizes (2k → 128k) × 11 depths (0 → 100%)** = 77 cells.
 
 - 🟢 **Green ≥ 80 %** · 🟡 **Yellow 50–79 %** · 🔴 **Red < 50 %** (per context size).
+- **Runtime-configurable ladders** — `--niah-contexts` (e.g. `16k,64k,256k,1M`) and `--niah-depths` (e.g. `0,50,100`) replace the default ladders (`k`/`M` suffixes; layered CLI > env > config file > default). The **`--niah-custom <size>`** "count test" collapses the matrix to a **single size** at exactly that context across the depth ladder — the way to probe a RoPE/YaRN-extended limit well beyond the 128k default top.
+- **Scales well beyond 128k** — the haystack generator is unbounded (a 1M-token document builds in a few hundred ms); the practical ceiling is the server's max context, and an over-limit size degrades to a labeled per-cell HTTP 400 (no crash, never a silent zero).
 - **Reasoning-model correct:** each cell suppresses the model's chain-of-thought (per-backend switch) and checks retrieval on the **visible answer only** (strict substring of the 128-bit needle). A model that *thinks* the needle into its CoT cannot false-pass, and a reasoning model whose answer was previously buried in a 64-token CoT budget no longer false-fails — retrieval on reasoning models went from ~35 % (false-fail) to ~100 %.
-- Tells you the **maximum reliable context window** for RAG / long-document QA ("reliable up to" = largest size with ≥ 80 % pass rate), plus how prefill speed degrades as context grows.
+- **Token-honest sizes** — without a `--tokenizer` the haystack is a `chars/4` estimate and every size reads `Nk (approx.)` (headless log, TUI grid, and the `--json` `niah` section alike); with one, sizes are exact.
+- Tells you the **maximum reliable context window** for RAG / long-document QA ("reliable up to" = largest size with ≥ 80 % pass rate), plus how prefill speed degrades as context grows. NIAH results are included in `--json` output (an additive `niah` section: accuracy, `reliable_up_to`, per-size recall, per-cell detail).
 
 ### Reasoning (Engine C2)
 

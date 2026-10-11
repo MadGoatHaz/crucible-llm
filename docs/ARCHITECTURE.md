@@ -90,7 +90,9 @@ Requests are sent via `reqwest` (a connection-pooled HTTP client). For local end
 
 The `include_usage: true` flag is critical: it asks the server to append a `usage` object (with `prompt_tokens` and `completion_tokens`) to the final SSE frame, giving me authoritative token counts without needing a client-side tokenizer.
 
-If a server ignores `stream: true` and returns a plain JSON completion object instead, the worker detects this (the first bytes do not start with `data:`) and falls back to parsing the single-object response. The measurement is still valid, but there is only one "token frame" instead of a stream.
+The stream-vs-JSON route is decided by the response **`Content-Type` header and our request intent — not by sniffing the first body byte** (`client/stream.rs::route_is_sse`): `text/event-stream` → the SSE path, `application/json` → the plain-JSON path, and an absent/unrecognized content type → SSE, because every engine requests `stream: true` (the request intent is the tie-breaker). The old first-byte `data:` test was a lossy heuristic: a server that opens an SSE stream with a `:keep-alive` comment preamble (first byte `:`, not `data:`) was misrouted to the JSON path, where a valid stream failed to parse and a genuine retrieval was reported as a miss (GitHub Issue #1).
+
+If a server ignores `stream: true` and returns a plain JSON completion object instead, the SSE path resolves it at stream end: a stream that terminates with **zero valid `data:` frames** re-parses the retained body (bounded to a 1 MiB inspection cap) as a single-object completion — the measurement is still valid, but there is only one "token frame" instead of a stream. A body that is neither valid SSE nor valid JSON surfaces as a real `StreamError::InvalidTransport` — never a silent retrieval miss.
 
 ### Timing Methodology
 
@@ -158,6 +160,8 @@ The SSE parser is a manual, incremental line-buffer state machine — zero exter
 - Malformed JSON (counted and skipped — the parser never panics)
 
 Each parsed frame is classified into one of four `Chunk` types: `Content(text)`, `Reasoning(text)`, `Usage({prompt_tokens, completion_tokens})`, or `Control`. The parser returns frames through an internal ring buffer, so a steady stream causes no per-frame heap allocation. The parser leaves `t_nanos` at zero by contract — the stream worker stamps arrival times with the quanta clock after each `feed` call (measurement-isolation invariant).
+
+The parser also tallies `data:` frames and **valid** frames (`data_frames` / `valid_frames`, `has_valid_frame()`). The stream worker's end-of-stream resolution (`resolve_sse_end`) keys off that count: ≥ 1 valid frame → a normal completion (`premature` only reflects a missing `[DONE]`); 0 valid frames → the JSON rescue on the retained body; 0 valid frames and not JSON → `StreamError::InvalidTransport`. This is what makes a keep-alive-prefixed stream (preamble skipped, first `data:` frame later) unambiguously a stream.
 
 ### Run Completion & the Metrics Freeze
 
@@ -272,10 +276,12 @@ Long-context retrieval accuracy. Can the model find specific information buried 
 
 ### Methodology
 
-The matrix is **7 context sizes × 11 depths = 77 cells**:
+The matrix is **N context sizes × M depths** — **7 × 11 = 77 cells by default**:
 
-- **Sizes**: 2k, 4k, 8k, 16k, 32k, 64k, 128k tokens
-- **Depths**: 0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%
+- **Sizes (default)**: 2k, 4k, 8k, 16k, 32k, 64k, 128k tokens
+- **Depths (default)**: 0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%
+
+**The ladders are runtime-configurable** (GitHub Issue #5): `--niah-contexts` (e.g. `16k,64k,256k,1M`) and `--niah-depths` (e.g. `0,50,100`) replace the defaults — layered **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS`) > config file > default**, `k`/`M` suffixes (case-insensitive), `0` rejected on the size axis (a haystack must be a positive token count). `--niah-custom <size>` (env `CRUCIBLE_NIAH_CUSTOM`) takes precedence and collapses the matrix to a **single size row** at exactly that context across the depth ladder — the focused "count test" for probing a RoPE/YaRN-extended limit beyond the 128k default top. The document generator scales **unbounded** (a 1M-token haystack is a ~4–6 MB string that builds in a few hundred ms; the `target × 4` char math uses a `u64` intermediate, overflow-safe for any `u32` target) — the practical ceiling is the server's `max_model_len`, not the client. An over-limit size is not pre-clamped: each cell's request is sent and the server's HTTP 400 is recorded as a labeled per-cell error (the run completes, exit 0, `0/N retrieved` — never a silent zero).
 
 For each cell:
 

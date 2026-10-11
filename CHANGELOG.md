@@ -2,6 +2,22 @@
 
 All notable changes to Crucible LLM.
 
+## [Unreleased]
+
+The NIAH expansion + SSE keep-alive cycle: long-context NIAH becomes runtime-configurable and token-honest (and lands in `--json`), and the stream transport stops misrouting valid SSE.
+
+### Added
+- **NIAH (C1) runtime-configurable ladders** — `--niah-contexts <CSV>` (e.g. `16k,64k,256k,1M`), `--niah-depths <CSV>` (e.g. `0,50,100`), and `--niah-custom <SIZE>` (single-size "count test", e.g. `256k`), each layered **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS` / `CRUCIBLE_NIAH_CUSTOM`) > config file > default** (2k→128k × 11 depths). `--niah-custom` takes precedence and collapses the matrix to one size row — for probing a RoPE/YaRN-extended limit.
+- **1M+ haystack scaling** — the document generator is unbounded (a 1M-token haystack builds in a few hundred ms; `target × 4` char math is overflow-safe for any `u32` target). The practical ceiling is the server's max context; an over-limit size degrades to a labeled per-cell HTTP 400 (no crash, never a silent zero).
+- **NIAH results in `--json`** — an additive `niah` section (accuracy headline, `retrieved`/`total`, `reliable_up_to`, per-size recall with labels, full per-cell detail incl. `ttft_s` / `prefill_tps` / `state` / `no_baseline` / `approximate`) so a headless `--json` run is self-contained; the Engine-A JSON shape is untouched.
+
+### Changed
+- **C1 `chars/4` approximate labeling** — without a `--tokenizer`, the haystack is a `chars/4` estimate and every context size now reads `Nk (approx.)` consistently across the headless run log (header + per-cell tags), the TUI grid, and the `--json` `niah` section; with a tokenizer, labels are exact.
+- **Headless log size formatting** — NIAH sizes render through the shared `human_size` formatter (`32k` / `256k` / `2M`) in the run log and worker tags (was `128000k`); the `[C1] NIAH (…)` header now shows the *configured* ladders and names the count-test mode.
+
+### Fixed
+- **SSE keep-alive misroute (Issue #1)** — the stream-vs-JSON route is now decided by the response **`Content-Type` + request intent** (`text/event-stream` → SSE, `application/json` → JSON, absent/other → SSE since we always send `stream: true`), not by sniffing the first body byte; a `:keep-alive` comment preamble can no longer push a valid stream onto the JSON path and poison the result. A stream ending with zero valid `data:` frames first tries a **JSON rescue** on the retained body (1 MiB inspection cap), and a body that is genuinely neither surfaces as a real `StreamError::InvalidTransport` — never a silent retrieval miss. The SSE parser gains `data_frames` / `valid_frames` counters to drive that resolution.
+
 ## [0.1.4] - 2026-10-11
 
 The full remediation cycle: metric integrity, reasoning-model correctness, engine selection, and traceability.
