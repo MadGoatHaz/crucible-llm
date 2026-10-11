@@ -40,7 +40,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::EngineSelection;
-use crate::engines::capability::CaseVerdict;
+use crate::engines::capability::{context_size_label, CaseVerdict};
 use crate::engines::sequence::{Engine, SeqPhase, SeqState};
 use crate::metrics::state::{EngineMarker, MetricsSnapshot};
 use crate::ui::app::{fmt, App};
@@ -999,10 +999,18 @@ fn build_capability_scores(
                 (Some(s), m) if m > 0 => s as f64 / m as f64 * 100.0,
                 _ => 0.0,
             };
+            // Issue #4: the reliable-up-to threshold renders through the
+            // shared `context_size_label` (the same fn the headless run log
+            // and the `--json` `niah` section use) — no `--tokenizer` means
+            // the sizes are `chars/4` estimates, so the bar reads
+            // `≤ 128k (approx.) reliable`; with a tokenizer the size is
+            // exact (`≤ 128k reliable`). This also fixes the old raw
+            // `s / 1000` formatting, which rendered a 1M threshold as
+            // `1000k`.
             let detail = match reliable {
                 Some(s) => format!(
-                    "≤ {}k reliable · {} avg ({retrieved}/{total})",
-                    s / 1000,
+                    "≤ {} reliable · {} avg ({retrieved}/{total})",
+                    context_size_label(s, app.niah_approximate()),
                     fmt::format_pct(flat)
                 ),
                 None => format!(
@@ -2105,8 +2113,13 @@ mod tests {
             "pct = reliable ÷ max tested: {}",
             lc.pct.unwrap()
         );
-        // The detail leads with the reliable-up-to threshold…
-        assert!(lc.detail.contains("≤ 8k reliable"), "detail: {}", lc.detail);
+        // The detail leads with the reliable-up-to threshold — qualified
+        // `(approx.)` because `App::new()` supplies no tokenizer (Issue #4).
+        assert!(
+            lc.detail.contains("≤ 8k (approx.) reliable"),
+            "detail: {}",
+            lc.detail
+        );
         // …and keeps the flat average only as secondary context.
         assert!(
             lc.detail.contains("66.7%"),
@@ -2138,9 +2151,10 @@ mod tests {
             "panel present: {text}"
         );
         assert!(text.contains("Long Context"), "the row is present: {text}");
-        // The reliable-up-to threshold is surfaced in the panel.
+        // The reliable-up-to threshold is surfaced in the panel, qualified
+        // `(approx.)` (no tokenizer in `App::new()` — Issue #4).
         assert!(
-            text.contains("≤ 8k reliable"),
+            text.contains("≤ 8k (approx.) reliable"),
             "reliable-up-to shown in the panel: {text}"
         );
     }
