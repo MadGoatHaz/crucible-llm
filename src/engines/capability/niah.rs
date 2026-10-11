@@ -103,6 +103,26 @@ pub fn human_size(tokens: u32) -> String {
     }
 }
 
+/// Render a raw context size with the optional `(approx.)` qualifier — the
+/// free-function form of [`NiahCell::context_label`] for call sites that have
+/// a size (not a cell) plus an estimate flag.
+///
+/// **C1 token-honesty (Issue #4 / CF-46):** with an exact `--tokenizer` the
+/// haystack is padded to the target and the label reads plain (`128k`);
+/// without one, the size comes from the `chars/4` heuristic (the low-entropy
+/// repeated-sentence haystack), so the label reads `"{size} (approx.)"` — the
+/// same qualifier the TUI grid renders. Surfacing it in the headless run log
+/// / summary keeps the headless path consistent with the TUI.
+#[must_use]
+pub fn context_size_label(tokens: u32, approximate: bool) -> String {
+    let size = human_size(tokens);
+    if approximate {
+        format!("{size} (approx.)")
+    } else {
+        size
+    }
+}
+
 // ── The needle ────────────────────────────────────────────────────────────
 
 /// A unique, cryptographically random key-value fact.
@@ -437,12 +457,7 @@ impl NiahCell {
     /// presented as exact. The `approximate` flag is set by
     /// [`NiahEngine::run_cell`] from the document's `estimated` flag.
     pub fn context_label(&self) -> String {
-        let size = human_size(self.target_tokens);
-        if self.approximate {
-            format!("{size} (approx.)")
-        } else {
-            size
-        }
+        context_size_label(self.target_tokens, self.approximate)
     }
 }
 
@@ -808,10 +823,12 @@ impl NiahEngine {
             NIAH_MAX_GEN_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
-        // Issue #3: the shared human-size formatter (was `C1:{size}k-…`,
+        // Issue #3 + Issue #4: the shared size formatter (was `C1:{size}k-…`,
         // which rendered a 128 000-token cell as `C1:128000k-d50` in the
-        // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI).
-        .tag(format!("C1:{}-d{depth}", human_size(size)));
+        // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI) plus
+        // the `(approx.)` qualifier when the haystack is the `chars/4`
+        // estimate (`doc.estimated` — no `--tokenizer`): `C1:128k (approx.)-d50`.
+        .tag(format!("C1:{}-d{depth}", context_size_label(size, doc.estimated)));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -1419,6 +1436,16 @@ mod tests {
         assert_eq!(approx.context_label(), "256k (approx.)");
         // 128k exact (the old CF-46 case, now rendered via human_size).
         assert_eq!(cell(128000, 50, true, 0.5).context_label(), "128k");
+    }
+
+    #[test]
+    fn context_size_label_marks_approx() {
+        // Exact (tokenizer) reads plain.
+        assert_eq!(context_size_label(128_000, false), "128k");
+        assert_eq!(context_size_label(1_000_000, false), "1M");
+        // The `chars/4` estimate carries the qualifier (Issue #4).
+        assert_eq!(context_size_label(128_000, true), "128k (approx.)");
+        assert_eq!(context_size_label(1_000_000, true), "1M (approx.)");
     }
 
     // ── large haystack scaling (Issue #5) ─────────────────────────────

@@ -33,9 +33,9 @@ use crate::engines::speed::{
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, human_size, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, NiahResult,
-    ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult,
-    SweepResult,
+    build_sweep, context_size_label, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine,
+    NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine,
+    StructuredResult, SweepResult,
 };
 use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crate::log::{Context, RunLogger};
@@ -425,32 +425,15 @@ pub fn run_headless(
                 match NiahEngine::new(cfg) {
                     Ok(engine) => {
                         if !cfg.json {
-                            // Issue #3: render the *configured* ladders with
-                            // the shared human_size formatter (was a
+                            // Issue #3 + Issue #4: render the *configured*
+                            // ladders with the shared size formatter (was a
                             // hard-coded "7 sizes × 11 depths", and the
                             // per-cell worker tags logged `128000k`). Now the
-                            // headline matches the TUI grid (`2k→128k`,
-                            // `1M`, …) and names the count-test mode.
-                            let size_desc = match cfg.niah_custom {
-                                Some(size) => format!("count test at {}", human_size(size)),
-                                None => {
-                                    let sizes = &cfg.niah_contexts;
-                                    if sizes.len() == 1 {
-                                        format!("1 size {}", human_size(sizes[0]))
-                                    } else {
-                                        format!(
-                                            "{} sizes {}→{}",
-                                            sizes.len(),
-                                            human_size(sizes[0]),
-                                            human_size(*sizes.last().unwrap())
-                                        )
-                                    }
-                                }
-                            };
-                            term.dim(&format!(
-                                "  [C1] NIAH ({size_desc} × {} depths)…",
-                                cfg.niah_depths.len()
-                            ));
+                            // headline matches the TUI grid (`2k→128k`, `1M`,
+                            // …) and names the count-test mode — and carries
+                            // the `(approx.)` qualifier when no `--tokenizer`
+                            // is set (`niah_size_desc`).
+                            term.dim(&niah_size_desc(cfg));
                         }
                         let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!("  [C1] {}", r.accuracy_label()));
@@ -685,6 +668,36 @@ fn run_window(events: &[StreamEvent]) -> Option<(MonotonicInstant, MonotonicInst
     }
 }
 
+/// The `[C1] NIAH (...)` header line for a headless NIAH run (Issue #3
+/// sizes + Issue #4 approx qualifier). Pure and testable: the sizes are
+/// rendered with the shared [`context_size_label`] formatter, which carries
+/// the `(approx.)` qualifier when no `--tokenizer` is set (the `chars/4`
+/// estimate) — consistent with the TUI grid, so a headless reader sees the
+/// same token-honesty the TUI shows.
+fn niah_size_desc(cfg: &Config) -> String {
+    let approx = cfg.tokenizer.is_none();
+    let size_desc = match cfg.niah_custom {
+        Some(size) => format!("count test at {}", context_size_label(size, approx)),
+        None => {
+            let sizes = &cfg.niah_contexts;
+            if sizes.len() == 1 {
+                format!("1 size {}", context_size_label(sizes[0], approx))
+            } else {
+                format!(
+                    "{} sizes {}→{}",
+                    sizes.len(),
+                    context_size_label(sizes[0], approx),
+                    context_size_label(*sizes.last().unwrap(), approx)
+                )
+            }
+        }
+    };
+    format!(
+        "  [C1] NIAH ({size_desc} × {} depths)…",
+        cfg.niah_depths.len()
+    )
+}
+
 /// Chunk 13: write the `--export` file for a just-persisted run,
 /// consuming the data back from the SQLite storage layer (session row +
 /// `stream_metrics` rows), plus the live per-packet samples for the CSV.
@@ -897,5 +910,43 @@ mod tests {
         assert_eq!(run_window(&[]), None);
         assert_eq!(run_window(&[complete]), None);
         assert_eq!(run_window(&[frame]), None);
+    }
+
+    /// Issue #4: the headless NIAH header surfaces the `(approx.)` qualifier
+    /// when no `--tokenizer` is set (the `chars/4` estimate), and plain sizes
+    /// when a tokenizer is configured — consistent with the TUI grid.
+    #[test]
+    fn niah_size_desc_marks_approx_without_tokenizer() {
+        // No tokenizer → approx qualifier (count-test mode).
+        let cfg = Config {
+            niah_custom: Some(32_000),
+            niah_depths: vec![0, 50, 100],
+            tokenizer: None,
+            ..Config::default()
+        };
+        let desc = niah_size_desc(&cfg);
+        assert!(desc.contains("32k (approx.)"), "{desc}");
+        assert!(desc.contains("3 depths"), "{desc}");
+
+        // Multi-size ladder, no tokenizer → every size qualified.
+        let cfg2 = Config {
+            niah_contexts: vec![16_000, 64_000],
+            niah_depths: vec![0, 50, 100],
+            tokenizer: None,
+            ..Config::default()
+        };
+        let desc2 = niah_size_desc(&cfg2);
+        assert!(desc2.contains("16k (approx.)→64k (approx.)"), "{desc2}");
+
+        // With a tokenizer → plain sizes (no qualifier).
+        let cfg3 = Config {
+            niah_custom: Some(32_000),
+            niah_depths: vec![0, 50, 100],
+            tokenizer: Some(std::path::PathBuf::from("tok.json")),
+            ..Config::default()
+        };
+        let desc3 = niah_size_desc(&cfg3);
+        assert!(desc3.contains("32k"), "{desc3}");
+        assert!(!desc3.contains("approx."), "{desc3}");
     }
 }

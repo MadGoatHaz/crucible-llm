@@ -15,9 +15,9 @@ pub mod reasoning;
 pub mod structured;
 
 pub use niah::{
-    build_document, classify, human_size, Needle, NiahCell, NiahCellState, NiahDocument,
-    NiahEngine, NiahEngineConfig, NiahResult, NiahSlot, NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS,
-    NIAH_SIZES, PREFILL_THROTTLE_FACTOR,
+    build_document, classify, context_size_label, human_size, Needle, NiahCell, NiahCellState,
+    NiahDocument, NiahEngine, NiahEngineConfig, NiahResult, NiahSlot, NIAH_DEPTHS,
+    NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR,
 };
 pub use reasoning::{
     score_responses, Challenge, Checker, ReasoningEngine, ReasoningResult, ReasoningScore,

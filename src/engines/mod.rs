@@ -57,12 +57,12 @@ pub mod sequence;
 pub mod speed;
 
 pub use capability::{
-    build_document, classify, evaluate_case, human_size, is_json_compliant, score_responses,
-    CaseCheck, CaseVerdict, Challenge, Checker, Needle, NiahCell, NiahCellState, NiahDocument,
-    NiahEngine, NiahEngineConfig, NiahResult, NiahSlot, ReasoningEngine, ReasoningResult,
-    ReasoningScore, StructuredCase, StructuredCaseResult, StructuredEngine, StructuredResult,
-    NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR, REASONING_BANK,
-    REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
+    build_document, classify, context_size_label, evaluate_case, human_size, is_json_compliant,
+    score_responses, CaseCheck, CaseVerdict, Challenge, Checker, Needle, NiahCell, NiahCellState,
+    NiahDocument, NiahEngine, NiahEngineConfig, NiahResult, NiahSlot, ReasoningEngine,
+    ReasoningResult, ReasoningScore, StructuredCase, StructuredCaseResult, StructuredEngine,
+    StructuredResult, NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES, PREFILL_THROTTLE_FACTOR,
+    REASONING_BANK, REASONING_MAX_GEN_TOKENS, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
 };
 pub use concurrency::{
     normalize_ladder, recommended_streams_for, ConcurrencyMatrix, Envelope, KneePoint, MatrixCell,
