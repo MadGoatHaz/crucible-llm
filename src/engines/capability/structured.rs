@@ -36,6 +36,17 @@
 //!    measures the cost of a prompt hint (≈0 where the backend drops the
 //!    field).
 //!
+//! **Reasoning-model suppression (CF-18).** Every run sets
+//! `disable_thinking` on the shared worker (per-backend and graceful —
+//! `StreamWorker::disable_thinking`, CF-01). Without it, a reasoning model
+//! spends the 256-token budget on chain-of-thought, which the content-only
+//! accumulation deliberately excludes, and emits *empty* content — a false
+//! "not valid JSON" failure of a structured capability the model has.
+//! Once the CoT no longer competes for the budget, the existing 256-token
+//! budget is ample for the JSON answers: the largest case (Complex) needs
+//! well under half of it, and in `json_schema` mode the decoder is
+//! constrained to the case's exact shape (no rambling).
+//!
 //! The [`StructuredResult`] carries the per-case checks, the overall score
 //! (N/3 compliant / partial / failed), the speed penalty, the constraint
 //! mode, and an auto-generated practical **verdict** — the TUI renders the
@@ -491,6 +502,9 @@ impl StructuredEngine {
 
     /// One run: spawn a worker (optionally with the case's `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
+    /// Thinking is suppressed on every run (CF-18) so the 256-token budget
+    /// goes to the JSON answer, and only `Chunk::Content` deltas are
+    /// accumulated into the judged body.
     async fn run_once(&self, case_idx: usize, constrained: bool) -> (String, f64, f64) {
         let case = &STRUCTURED_CASES[case_idx];
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -513,6 +527,18 @@ impl StructuredEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
+        // CF-18: suppress the model's chain-of-thought so the 256-token
+        // budget goes to the JSON answer. Without this, a reasoning model
+        // spends the *entire* budget on CoT (which the content-only
+        // accumulation below deliberately excludes) and emits *empty*
+        // content → "not valid JSON" → a false failure of a structured
+        // capability the model has (the C3 face of the C1 root cause,
+        // CF-01). The suppression is per-backend and graceful (see
+        // `StreamWorker::disable_thinking`), so non-reasoning models and
+        // backends without a switch are unaffected. Set on the free-form
+        // baseline too, so both legs of the penalty measurement judge
+        // content on equal footing.
+        worker = worker.disable_thinking(true);
         if constrained {
             // CF-08 (activated): the transport encodes the full object, so a
             // constrained run sends the case's strict `json_schema`
@@ -537,6 +563,11 @@ impl StructuredEngine {
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
         let handle = spawn_worker(worker, tx);
+        // Content-only accumulation (verified, CF-18): the judged body is
+        // the model's *visible JSON answer*; `Chunk::Reasoning` deltas are
+        // deliberately excluded (they are forwarded to the live snapshot /
+        // metrics only). With thinking suppressed above, a reasoning model
+        // no longer starves this span.
         let mut body = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
