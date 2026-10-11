@@ -1942,6 +1942,9 @@ mod tests {
             ttft_avg_ms: 100.0,
             itl_p50_ms: 20.0,
             itl_p99_ms: 40.0,
+            // CF-07 fields (WS2): this fixture is an authoritative count.
+            tokens_estimated: false,
+            counting_method: "usage".into(),
         }
     }
 
