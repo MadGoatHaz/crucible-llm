@@ -8,11 +8,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::engines::capability::{ReasoningResult, StructuredResult};
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::FlatOutResult;
 use crate::engines::hardware::EnergyResult;
 use crate::engines::speed::SpeedResult;
-use crate::engines::capability::{ReasoningResult, StructuredResult};
 
 /// One `benchmark_sessions` row: a completed benchmark run.
 ///
@@ -86,10 +86,14 @@ impl StreamMetricRow {
     /// (Chunk 7).
     ///
     /// `tpot_ms` is derived from the decode speed (TG): the mean
-    /// inter-token time, `1000 / tg_speed`. `reasoning_tokens`,
-    /// `joules_per_token`, and `cache_hit` stay `NULL` until the
-    /// capability/hardware engines (Chunks 15/17) and a cold TTFT
-    /// baseline produce them.
+    /// inter-token time, `1000 / tg_speed`. `reasoning_tokens` and
+    /// `joules_per_token` stay `NULL` until the capability/hardware
+    /// engines (Chunks 15/17) produce them. `cache_hit` (CF-26) also
+    /// stays `NULL` here: the Engine A `SpeedResult` does not yet carry
+    /// the server's `cached_tokens` detail (the CF-02 parser captures it,
+    /// but `client/stream.rs` — a P2-A seam — does not propagate it into
+    /// the outcome). Use [`with_cache_hit`](Self::with_cache_hit) to set it
+    /// once the value is available.
     #[must_use]
     pub fn from_speed_result(
         result: &SpeedResult,
@@ -128,6 +132,21 @@ impl StreamMetricRow {
     #[must_use]
     pub fn with_reasoning_tokens(mut self, tokens: u64) -> Self {
         self.reasoning_tokens = Some(tokens as i64);
+        self
+    }
+
+    /// Set the `cache_hit` column (CF-26): `true` when the server reports
+    /// `UsageDetails.cached_tokens > 0` (a warm KV / prefix-cache hit).
+    ///
+    /// [`from_speed_result`](Self::from_speed_result) leaves this `NULL`
+    /// because the Engine A `SpeedResult` does not yet carry the server's
+    /// `cached_tokens` detail (the CF-02 parser captures it, but
+    /// `client/stream.rs` — a P2-A seam — does not propagate it into the
+    /// outcome). When a caller *does* have the value, this builder
+    /// populates the column.
+    #[must_use]
+    pub fn with_cache_hit(mut self, hit: bool) -> Self {
+        self.cache_hit = Some(hit);
         self
     }
 }
@@ -187,9 +206,7 @@ impl EngineResults {
     /// Serialize to the JSON stored in `benchmark_sessions.engine_results`.
     /// `None` when every field is empty (nothing to store).
     pub fn to_json(&self) -> Option<String> {
-        if self
-            .b_concurrency
-            .is_none()
+        if self.b_concurrency.is_none()
             && self.c2_reasoning.is_none()
             && self.c3_structured.is_none()
             && self.d_energy.is_none()
