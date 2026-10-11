@@ -290,15 +290,23 @@ pub enum NiahCellState {
     Failed,
 }
 
-/// Classify one cell.
+/// Classify one cell's *prefill* state against the baseline.
 ///
 /// * `!retrieved` (or no TTFT) → [`NiahCellState::Failed`];
-/// * the baseline row itself (`tokens <= base_tokens`), or a missing
-///   baseline (the smallest-size cell failed) → [`NiahCellState::Nominal`]
-///   (nothing to compare — never a false throttle);
+/// * the baseline row itself (`tokens <= base_tokens`) →
+///   [`NiahCellState::Nominal`] (nothing to compare — never a false throttle);
+/// * a **missing / failed baseline** (`base_ttft_s <= 0.0`) on a larger cell →
+///   [`NiahCellState::Nominal`] here, *but* [`NiahResult::compute_states`]
+///   records that on the cell as `no_baseline = true` so it is **not** read as
+///   a confirmed-healthy nominal (CF-45 — a failed smallest-size row used to
+///   mask real prefill degradation by classifying every larger cell nominal);
 /// * TTFT within `PREFILL_THROTTLE_FACTOR`× the linear expectation
 ///   (`base_ttft × tokens / base_tokens`) → [`NiahCellState::Nominal`];
 /// * beyond that → [`NiahCellState::Throttled`].
+///
+/// The 3-state [`NiahCellState`] cannot express "no baseline" (the sibling
+/// View-3 render matches it exhaustively), so that distinction is carried on
+/// the cell itself, not the enum.
 pub fn classify(
     retrieved: bool,
     ttft_s: f64,
@@ -333,6 +341,12 @@ pub struct NiahCell {
     pub prefill_tps: f64,
     /// The ANSI class View 3 renders (assigned by [`NiahResult::compute_states`]).
     pub state: NiahCellState,
+    /// `true` when this cell retrieved the needle but had **no valid baseline**
+    /// to anchor the prefill comparison against — the smallest-size cell at this
+    /// depth failed (`ttft_s == 0.0`), so the prefill-degradation verdict is
+    /// *unknown*, not a confirmed-healthy nominal (CF-45). Set by
+    /// [`NiahResult::compute_states`].
+    pub no_baseline: bool,
 }
 
 impl NiahCell {
@@ -345,6 +359,7 @@ impl NiahCell {
             ttft_s: 0.0,
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
+            no_baseline: false,
         }
     }
 }
@@ -489,6 +504,14 @@ impl NiahResult {
                     base_size,
                     *size,
                 );
+                // CF-45: an accurate *larger* cell whose baseline (same depth,
+                // smallest size) failed has no valid anchor — its prefill
+                // verdict is unknown, NOT a confirmed-healthy nominal. Record
+                // that distinctly on the cell (the 3-state enum can't carry it,
+                // and the sibling View-3 match is exhaustive over the 3).
+                cell.no_baseline = cell.state == NiahCellState::Nominal
+                    && *size > base_size
+                    && base_ttfts[di] <= 0.0;
             }
         }
     }
@@ -791,6 +814,7 @@ impl NiahEngine {
             prefill_tps,
             // Assigned by `compute_states` once the whole matrix is in.
             state: NiahCellState::Failed,
+            no_baseline: false,
         }
     }
 }
@@ -1048,6 +1072,7 @@ mod tests {
             ttft_s: ttft,
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
+            no_baseline: false,
         }
     }
 
@@ -1114,6 +1139,33 @@ mod tests {
         r.cells[2].ttft_s = 0.5;
         r.compute_states();
         assert_eq!(r.cells[2].state, NiahCellState::Throttled);
+    }
+
+    #[test]
+    fn compute_states_flags_missing_baseline_distinctly_cf45() {
+        // 2k is the baseline row. The 2k @ 0 cell FAILED (no retrieval, no
+        // TTFT), so there is no valid anchor for the 4k @ 0 cell at that depth.
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        // Baseline row (2k): @0 failed, @100 fine.
+        r.cells[0] = cell(2000, 0, false, 0.0);
+        r.cells[1] = cell(2000, 100, true, 0.1);
+        // Larger row (4k): @0 retrieved+fast, @100 fine.
+        r.cells[2] = cell(4000, 0, true, 0.2);
+        r.cells[3] = cell(4000, 100, true, 0.2);
+
+        r.compute_states();
+
+        // CF-45: the 4k @ 0 cell retrieved the needle, but its baseline (2k @ 0)
+        // failed → its prefill verdict is *unknown*, flagged distinctly (not a
+        // silent, confirmed-healthy nominal).
+        assert!(r.cells[2].no_baseline, "4k@0 has no valid baseline (CF-45)");
+        assert_eq!(r.cells[2].state, NiahCellState::Nominal);
+        // The 4k @ 100 cell HAS a valid baseline (2k @ 100 = 0.1) → not flagged.
+        assert!(!r.cells[3].no_baseline, "4k@100 has a valid baseline");
+        assert_eq!(r.cells[3].state, NiahCellState::Nominal);
+        // The baseline row itself is never flagged (nothing to compare).
+        assert!(!r.cells[0].no_baseline, "baseline row is never 'no baseline'");
+        assert!(!r.cells[1].no_baseline, "baseline row is never 'no baseline'");
     }
 
     #[test]
