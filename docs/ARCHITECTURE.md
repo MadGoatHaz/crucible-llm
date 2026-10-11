@@ -344,13 +344,13 @@ The per-category breakdown (math N/5, logic N/5, code N/3) shows *where* the mod
 
 ### What It Measures
 
-Can you trust the model to follow format instructions? Critical for API integrations, function calling, and agent tool use. This tests both **compliance** (does the model produce valid, schema-conforming JSON?) and **speed cost** (what does grammar-constrained decoding cost in throughput?).
+Can you trust the model to follow format instructions? Critical for API integrations, function calling, and agent tool use. This tests both **compliance** (does the model produce valid, schema-conforming JSON?) and **speed cost** (what a `response_format` constraint costs in throughput — ideally the real *constrained-decoding* overhead, measured via `json_schema`).
 
 ### Methodology
 
 **4 runs total**: one free-form baseline + three constrained cases of escalating complexity.
 
-Each constrained run sends `response_format: { "type": "json_object" }` in the request body, which server-side constrained-decoding engines (vLLM XGrammar, SGLang, llama.cpp grammar, Outlines) honor to restrict the token space to valid JSON.
+Each constrained run sends a `response_format` directive in the request body. The **target** is a real schema constraint — `response_format: { "type": "json_schema", "json_schema": {…} }` — which is what engages server-side **constrained decoding** (vLLM XGrammar, Outlines, GBNF) to restrict the token space to the schema. **As of v0.1.3 the shared request path can only encode a `{"type": …}` string, so C3 currently sends the softer `response_format: { "type": "json_object" }` *hint*.** `json_object` is **not** a grammar constraint: it biases the model toward emitting JSON, but several backends (llama.cpp, TGI) **drop the field entirely** and OpenAI/vLLM treat it as basic JSON mode, not schema enforcement. The result and summary line **flag which mode was used** (`json_object hint` vs. `json_schema`), so a ~0% "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
 
 | Case | Prompt | Checks |
 |------|--------|--------|
@@ -368,7 +368,7 @@ Each case is classified:
 
 A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in code fences).
 
-**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the grammar constraint costs throughput. This measures the server-side constrained-decoding overhead.
+**Speed penalty** = `(free_tps − constrained_tps) / free_tps × 100`. Positive means the constraint costs throughput. In `json_schema` mode this is the server-side **constrained-decoding** overhead; in the current `json_object`-hint fallback it measures only the cost of a prompt hint (≈0 on backends that drop the field — i.e. *no constraint was applied*, not *the grammar is free*).
 
 ### What the Numbers Mean
 
@@ -379,7 +379,7 @@ A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in cod
 | **1/3 compliant** | ⚠ Limited use — only trivial key-value extraction. |
 | **0/3 compliant** | ✗ Not suitable for structured output. The model produces free text regardless of instructions. Requires output parsing/fallback. |
 
-The **speed penalty** tells you the cost of constrained decoding: a +5% penalty is negligible; a +30% penalty is significant for high-throughput deployments.
+The **speed penalty** tells you the cost of the constraint in use (see the mode flag in the summary line): a +5% penalty is negligible; a +30% penalty is significant for high-throughput deployments. A ~0% penalty in `json_object`-hint mode means the backend ignored the directive, **not** that constrained decoding is free.
 
 ## Engine D: Energy
 

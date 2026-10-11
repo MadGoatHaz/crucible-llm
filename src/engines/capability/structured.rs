@@ -5,25 +5,39 @@
 //!
 //! 1. **How well does the model follow a JSON schema?** A *ladder* of three
 //!    cases of increasing complexity (Simple flat object → Medium
-//!    fixed-length array → Complex nested object) is each run under the
-//!    OpenAI-compatible `response_format: { "type": "json_object" }`
-//!    directive (server-side constrained decoding — vLLM XGrammar, SGLang,
-//!    llama.cpp grammar, Outlines) and scored on a small set of checks
+//!    fixed-length array → Complex nested object) is each run with a
+//!    `response_format` directive and scored on a small set of checks
 //!    (valid JSON, schema shape, all fields, correct types). Each case is
 //!    classified [`CaseVerdict`]:
 //!    * **Compliant** — every check passes;
 //!    * **Partial** — valid JSON, but one or more checks fail;
 //!    * **Failed** — the output is not valid JSON (cannot be evaluated).
+//!
+//!    **What the directive actually is (CF-08).** The *target* is a real
+//!    `response_format: { "type": "json_schema", "json_schema": {…} }`, which
+//!    engages server-side **constrained decoding** (vLLM XGrammar, Outlines,
+//!    GBNF). Today the shared `StreamWorker` transport can only encode a
+//!    `{"type": <string>}` field, so C3 sends the softer
+//!    `response_format: { "type": "json_object" }` **hint** — a directive
+//!    that biases the model toward JSON but is *not* a grammar constraint and
+//!    is *dropped* by several backends (llama.cpp, TGI). The
+//!    [`ConstraintMode`] of each run is recorded and **flagged** in the
+//!    result and summary line, so a ~0% "penalty" on a hint-ignoring backend
+//!    is never silently misread as "constrained decoding is free".
 //! 2. **What does grammar validation cost in speed?** One free-form
 //!    baseline run (case 1, unconstrained) vs the constrained run (case 1)
 //!    measures `penalty% = (free_tps − constrained_tps) / free_tps × 100`
-//!    (positive = the grammar constraint costs throughput).
+//!    (positive = the constraint costs throughput). The penalty is only a
+//!    valid *constrained-decoding* measurement in
+//!    [`ConstraintMode::JsonSchema`]; in the `JsonObjectHint` fallback it
+//!    measures the cost of a prompt hint (≈0 where the backend drops the
+//!    field).
 //!
 //! The [`StructuredResult`] carries the per-case checks, the overall score
-//! (N/3 compliant / partial / failed), the speed penalty, and an
-//! auto-generated practical **verdict** — the TUI renders the full
-//! compliance detail in the Live capability panel and a summary line in the
-//! sequence header / headless output.
+//! (N/3 compliant / partial / failed), the speed penalty, the constraint
+//! mode, and an auto-generated practical **verdict** — the TUI renders the
+//! full compliance detail in the Live capability panel and a summary line in
+//! the sequence header / headless output.
 //!
 //! Measurement-isolation note: every run reuses the Chunk 5 `StreamWorker`
 //! (quanta `T0..Tn` live in the worker); this module only takes deltas of
@@ -32,6 +46,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::client::{join_worker, spawn_worker, token_window, StreamEvent, StreamWorker};
@@ -47,6 +62,87 @@ const CHANNEL_CAPACITY: usize = 256;
 
 /// Max generation tokens per structured run (a small JSON value).
 pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 256;
+
+/// The constraint mechanism a C3 "constrained" run actually requests (CF-08).
+///
+/// The docs once claimed C3 engages server-side *constrained decoding*
+/// (XGrammar/Outlines/GBNF) via `json_object` — that is false. `json_object`
+/// is a soft *hint* that most backends ignore and that never drives a grammar
+/// stack. Recording the mode makes the "grammar speed penalty" honest: it is
+/// flagged as a *hint* measurement (not a constrained-decoding one) until the
+/// transport can send a real `json_schema`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConstraintMode {
+    /// The free-form baseline run (no `response_format` at all).
+    FreeForm,
+    /// A soft `response_format: { "type": "json_object" }` *hint* — biases the
+    /// model toward JSON but does **not** engage a grammar/decoder constraint.
+    /// This is what the current `StreamWorker` transport can send.
+    JsonObjectHint,
+    /// A real `response_format: { "type": "json_schema", "json_schema": {…} }`
+    /// that engages server-side constrained decoding (XGrammar/Outlines).
+    /// The target mode; activates once the transport can encode the schema.
+    JsonSchema,
+}
+
+impl ConstraintMode {
+    /// The short label used in summaries / the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConstraintMode::FreeForm => "free-form",
+            ConstraintMode::JsonObjectHint => "json_object hint (not schema-constrained)",
+            ConstraintMode::JsonSchema => "json_schema (constrained decoding)",
+        }
+    }
+}
+
+/// Whether the shared `StreamWorker` transport can encode a full `json_schema`
+/// `response_format` object.
+///
+/// **`false` today (the CF-08 handoff).** `client/stream.rs` (sibling-owned)
+/// builds the request body with `response_format: { "type": <string> }` only —
+/// it cannot carry the `json_schema` sub-object. Until that enhancement lands,
+/// C3 runs in [`ConstraintMode::JsonObjectHint`] and flags it. Flipping this
+/// to `true` (once `stream.rs` encodes the schema) activates
+/// [`ConstraintMode::JsonSchema`] with no other C3 change.
+const TRANSPORT_SUPPORTS_JSON_SCHEMA: bool = false;
+
+/// Choose the constraint mode for a C3 "constrained" run (CF-08).
+///
+/// [`ConstraintMode::JsonSchema`] is the target (real constrained decoding).
+/// It is selected only when the transport can encode the schema object;
+/// otherwise we gracefully fall back to the [`ConstraintMode::JsonObjectHint`]
+/// — and the result flags which mode was actually used, so a ~0% penalty on a
+/// hint-ignoring backend is never a silent false-negative.
+#[must_use]
+pub fn select_constraint_mode(transport_supports_schema: bool) -> ConstraintMode {
+    if transport_supports_schema {
+        ConstraintMode::JsonSchema
+    } else {
+        ConstraintMode::JsonObjectHint
+    }
+}
+
+/// The real OpenAI `response_format` object for constrained decoding (CF-08):
+/// `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}`.
+///
+/// This is the target artifact that engages the server-side grammar stack
+/// (XGrammar/Outlines). C3 owns the per-case schemas and builds the object
+/// here; wiring it into the HTTP body is the `client/stream.rs` enhancement
+/// (sibling-owned). `strict: true` is the OpenAI recommended flag for
+/// schema-constrained generation.
+#[must_use]
+pub fn json_schema_response_format(name: &str, schema: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "schema": schema,
+            "strict": true,
+        }
+    })
+}
 
 /// The complexity ladder: three cases of increasing schema depth. Each
 /// prompt asks for a *specific* JSON shape so the constrained output can be
@@ -151,6 +247,17 @@ pub struct StructuredResult {
 }
 
 impl StructuredResult {
+    /// CF-08: the constraint mode this result's "constrained" runs used.
+    ///
+    /// Exposed as a method (not a stored field) so the struct-literal
+    /// construction sites in the UI / tests are unaffected. Today the
+    /// transport is [`ConstraintMode::JsonObjectHint`]; it becomes
+    /// [`ConstraintMode::JsonSchema`] once `client/stream.rs` can encode the
+    /// schema object (the CF-08 handoff).
+    pub fn constraint_mode(&self) -> ConstraintMode {
+        select_constraint_mode(TRANSPORT_SUPPORTS_JSON_SCHEMA)
+    }
+
     /// `(compliant, partial, failed)` counts over the cases.
     pub fn score(&self) -> (usize, usize, usize) {
         let (mut c, mut p, mut f) = (0, 0, 0);
@@ -199,9 +306,18 @@ impl StructuredResult {
     }
 
     /// One-line summary for the sequence header / headless output
-    /// (`+30.0% penalty · 2/3 compliant`).
+    /// (`+30.0% penalty · 2/3 compliant · [json_object hint …]`).
+    ///
+    /// CF-08: the constraint mode is flagged inline so a ~0% penalty on a
+    /// backend that drops `response_format` is never misread as "constrained
+    /// decoding is free" (the old code's silent false-negative).
     pub fn summary_line(&self) -> String {
-        format!("{:+.1}% penalty · {}", self.penalty_pct, self.score_label())
+        format!(
+            "{:+.1}% penalty · {} · [{}]",
+            self.penalty_pct,
+            self.score_label(),
+            self.constraint_mode().label()
+        )
     }
 }
 
@@ -308,6 +424,12 @@ impl StructuredEngine {
             worker = worker.logger(logger.clone());
         }
         if constrained {
+            // CF-08: the target is a real `json_schema` (constrained decoding,
+            // see `json_schema_response_format`), but the current transport
+            // only encodes a `{"type": …}` string, so we send the
+            // `json_object` *hint* and the result flags that mode
+            // (`constraint_mode()`). Once `client/stream.rs` can encode the
+            // schema object, this becomes `JsonSchema`.
             worker = worker.response_format("json_object");
         }
 
@@ -905,5 +1027,76 @@ mod tests {
         assert_eq!(r.score(), (2, 1, 0));
         assert!(r.summary_line().contains("+5.2% penalty"));
         assert!(r.summary_line().contains("2/3 compliant"));
+    }
+
+    // ── CF-08: real constrained decoding (mode selection + flagging) ─────
+
+    #[test]
+    fn select_constraint_mode_prefers_schema_when_supported() {
+        // When the transport can encode a `json_schema` object, C3 requests
+        // real constrained decoding.
+        assert_eq!(select_constraint_mode(true), ConstraintMode::JsonSchema);
+    }
+
+    #[test]
+    fn select_constraint_mode_falls_back_to_hint_when_unsupported() {
+        // When the transport can only send a `{"type": …}` string, C3
+        // gracefully falls back to the `json_object` hint — and flags it.
+        assert_eq!(
+            select_constraint_mode(false),
+            ConstraintMode::JsonObjectHint
+        );
+    }
+
+    #[test]
+    fn json_schema_response_format_is_the_openai_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "age": { "type": "integer" }
+            },
+            "required": ["name", "age"]
+        });
+        let rf = json_schema_response_format("simple", &schema);
+        assert_eq!(rf["type"], "json_schema");
+        assert_eq!(rf["json_schema"]["name"], "simple");
+        assert_eq!(rf["json_schema"]["strict"], true);
+        assert_eq!(
+            rf["json_schema"]["schema"]["properties"]["age"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            rf["json_schema"]["schema"]["required"],
+            serde_json::json!(["name", "age"])
+        );
+    }
+
+    #[test]
+    fn result_flags_the_constraint_mode_it_used() {
+        // The result exposes the mode it actually ran under (today: the
+        // `json_object` hint, because the transport can't encode a schema).
+        let r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true}]"#,
+            r#"{"user":{"name":"Ada"},"orders":"free text"}"#,
+        );
+        assert_eq!(r.constraint_mode(), ConstraintMode::JsonObjectHint);
+        // And the one-line summary carries the flag (no more silent
+        // "constrained decoding" claim).
+        assert!(
+            r.summary_line().contains("json_object hint"),
+            "summary_line flags the mode: {}",
+            r.summary_line()
+        );
+    }
+
+    #[test]
+    fn constraint_mode_labels_are_distinct() {
+        assert_ne!(
+            ConstraintMode::JsonObjectHint.label(),
+            ConstraintMode::JsonSchema.label()
+        );
+        assert_eq!(ConstraintMode::FreeForm.label(), "free-form");
     }
 }
