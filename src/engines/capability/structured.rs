@@ -1185,7 +1185,8 @@ mod tests {
         // And the one-line summary carries the flag (no more silent
         // "constrained decoding" claim).
         assert!(
-            r.summary_line().contains("json_schema (constrained decoding)"),
+            r.summary_line()
+                .contains("json_schema (constrained decoding)"),
             "summary_line flags the mode: {}",
             r.summary_line()
         );
@@ -1211,7 +1212,10 @@ mod tests {
         assert_eq!(s2["type"], "object");
         assert_eq!(s2["additionalProperties"], false);
         assert_eq!(s2["properties"]["user"]["additionalProperties"], false);
-        assert_eq!(s2["properties"]["orders"]["items"]["additionalProperties"], false);
+        assert_eq!(
+            s2["properties"]["orders"]["items"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]
@@ -1219,10 +1223,7 @@ mod tests {
         // The activated handoff: a constrained run transmits the full
         // `json_schema` object (name + strict schema) verbatim, not the
         // `{"type": <string>}` hint.
-        let rf = json_schema_response_format(
-            STRUCTURED_CASES[0].name,
-            &case_schema(0),
-        );
+        let rf = json_schema_response_format(STRUCTURED_CASES[0].name, &case_schema(0));
         assert_eq!(rf["type"], "json_schema");
         assert_eq!(rf["json_schema"]["name"], "Simple");
         assert_eq!(rf["json_schema"]["strict"], true);
