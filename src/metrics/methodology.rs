@@ -47,7 +47,9 @@ pub fn methodology_block(overhead_ns: u64) -> Value {
             "overhead_ns": overhead_ns
         },
         "ttft": "dual: perceived = T3 - T0 (first token − request start; the full client round-trip, incl. network + server queue/prefill/first-decode); server-side = T3 - T1 (first token − response-headers; excludes the request-send network leg, isolates server prefill). T1 is stamped when the server's response headers arrive, not when the last request byte is written.",
-        "prefill_throughput": "prompt_tokens / (T3 - T1) — measured over the server-side TTFT window (response-headers → first token)",
+        "first_token_latency": "CF-05: a LATENCY metric (reported in ms, never divided into a token count), measured on the SHORT prompt. perceived = T3 - T0 (client round-trip, network-included); server-side = T3 - T1 (server queue + prefill + first-decode). This is 'how responsive is this server'.",
+        "prefill_throughput": "CF-05: a BANDWIDTH metric (tok/s) that scales with context, measured on a LONG prompt (a real context size, --tokens): prompt_tokens / (T3 - T1). The numerator is large enough that prefill compute dominates the TTFT denominator — unlike the old short-prompt 'PP speed', which was a latency floor wearing a bandwidth label.",
+        "prefill_scaling": "Engine A's prefill_throughput is one point on the prefill-degradation curve (the compute→memory-bandwidth crossover as context grows). The full 2k→128k curve is measured by Engine C1's NIAH matrix (per-cell prefill_tps = prompt_tokens / TTFT); see that curve for how prefill bandwidth changes with context length.",
         "decode_throughput": "completion_tokens / (T_last_content - T_first_content)",
         "e2e_throughput": "total_tokens / total_wall_time",
         "itl": "(T_last_content - T_first_content) / (output_tokens - 1)",
@@ -78,7 +80,9 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["timing"]["overhead_ns"], 42);
         for key in [
+            "first_token_latency",
             "prefill_throughput",
+            "prefill_scaling",
             "decode_throughput",
             "e2e_throughput",
             "itl",
@@ -93,6 +97,14 @@ mod tests {
                 "{key}"
             );
         }
+        // CF-05: the latency and bandwidth metrics are distinct, and the
+        // prefill metric is documented as a long-prompt (scaling) number.
+        assert_ne!(v["first_token_latency"], v["prefill_throughput"]);
+        assert!(v["prefill_throughput"]
+            .as_str()
+            .unwrap()
+            .contains("LONG prompt"));
+        assert!(v["prefill_scaling"].as_str().unwrap().contains("C1"));
         // The three labeled layers are distinct formulas (never blended).
         assert_ne!(v["prefill_throughput"], v["decode_throughput"]);
         assert_ne!(v["decode_throughput"], v["e2e_throughput"]);

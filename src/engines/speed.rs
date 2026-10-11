@@ -7,13 +7,28 @@
 //! blueprint §7 formulas —
 //!
 //! * `TTFT = T3 − T1` (first token arrival − request dispatched),
-//! * `PP speed = prompt_tokens / TTFT`,
 //! * `TG speed = completion_tokens / (stream_time − TTFT)`,
 //! * `MTP η = completion_tokens / content_chunks`,
 //!
 //! with the same result-box layout, `--json` field set, and exit-code
 //! semantics as `llmspeedtest.py` (`print_result_box` / `output_json` /
 //! "exit 1 if all runs failed").
+//!
+//! **CF-05 prefill/latency split.** The old single "PP speed"
+//! (`prompt_tokens / TTFT`) conflated two distinct metrics on a ~45–87-token
+//! short prompt — a *latency floor* wearing a *bandwidth* label. Engine A now
+//! reports them separately, each with the right instrument:
+//!
+//! * **first-token latency (ms)** — the **short** prompt, both the
+//!   client-perceived (`T3−T0`, [`perceived_ttft_seconds`]) and the
+//!   server-side (`T3−T1`, [`SpeedResult::ttft`]) values. A *latency* number.
+//! * **pre-fill throughput (tok/s)** — a **long** prompt
+//!   ([`SpeedEngine::run_prefill`], `prompt_tokens / server-side TTFT`). The
+//!   *bandwidth* number that scales with context.
+//!
+//! The headless report ([`format_split_report`] / [`json_report_split`]) shows
+//! both, clearly labeled, plus a pointer to C1's 2k→128k prefill-degradation
+//! curve for the full scaling picture. Decode / ITL / MTP are intact.
 //!
 //! Measurement-isolation note: all timing is captured in the worker
 //! (quanta, `T0..Tn`); this module only takes deltas of those records.
@@ -111,11 +126,50 @@ impl SpeedResult {
     }
 }
 
+/// The CF-05 **pre-fill throughput** metric — the *bandwidth* half of the
+/// split, distinct from first-token *latency*.
+///
+/// Measured on a **long** prompt (a real context size, `cfg.tokens`) so the
+/// numerator is large enough that prefill *compute* dominates the TTFT
+/// denominator: `tok_s = prompt_tokens / server-side TTFT (T3−T1)`. This is
+/// the number that scales with context — the honest replacement for the old
+/// single "PP speed", which divided a ~45–87-token short prompt by an
+/// overhead-dominated TTFT (a latency floor wearing a bandwidth label).
+#[derive(Debug, Clone)]
+pub struct PrefillMetric {
+    /// Pre-fill throughput, tokens/s (`prompt_tokens / server-side TTFT`),
+    /// measured on the long prompt.
+    pub tok_s: f64,
+    /// The long prompt's token count (the numerator).
+    pub prompt_tokens: u64,
+    /// The long prompt's server-side TTFT, seconds (T3−T1, the denominator).
+    pub server_ttft_s: f64,
+    /// `true` when the token count came from the `chars/4` estimate.
+    pub estimated: bool,
+}
+
+impl PrefillMetric {
+    /// `true` when the measurement is usable (a real prefill window).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.server_ttft_s > 0.0 && self.prompt_tokens > 0
+    }
+}
+
 /// Round to `decimals` places (the prototype's `round(x, n)` in
 /// `to_dict` / `output_json`).
 fn round(v: f64, decimals: u32) -> f64 {
     let f = 10f64.powi(decimals as i32);
     (v * f).round() / f
+}
+
+/// The mean of `values`, `0.0` when empty (the CF-05 split report averages).
+fn mean_of(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
 }
 
 /// Engine construction errors.
@@ -588,6 +642,56 @@ impl SpeedEngine {
         }
         (prompt, results)
     }
+
+    /// The CF-05 **pre-fill throughput** measurement: run the **long** prompt
+    /// (padded to `cfg.tokens`) and report `prompt_tokens / server-side TTFT`
+    /// (T3−T1) — the *bandwidth* number that scales with context. This is
+    /// distinct from the short-prompt first-token *latency* (the
+    /// [`SpeedResult::ttft`] server value + [`perceived_ttft_seconds`] client
+    /// value).
+    ///
+    /// A small fixed number of clean prefill runs are averaged; a run that
+    /// fails, loops, or has no usable window is excluded. `cfg.nocache` busts
+    /// the server KV cache so the prefill is genuinely recomputed (a cached
+    /// prefill reads near-zero TTFT and would inflate the number).
+    pub async fn run_prefill(&self) -> PrefillMetric {
+        let prompt = if self.cfg.nocache {
+            self.generator.nocache_long(self.cfg.tokens)
+        } else {
+            self.generator.long(self.cfg.tokens)
+        };
+        const PREFILL_RUNS: usize = 3;
+        let mut tok_s_sum = 0.0f64;
+        let mut ttft_sum = 0.0f64;
+        let mut valid = 0usize;
+        let mut estimated = false;
+        for i in 0..PREFILL_RUNS {
+            let (r, _events) = self
+                .run_iteration_events_tagged(&prompt, &format!("A:prefill:{}", i + 1))
+                .await;
+            estimated |= r.estimated;
+            // A usable prefill sample: not failed, not looping, real window.
+            if !r.is_failed() && !r.looping && r.ttft > 0.0 && r.prompt_tokens > 0 {
+                tok_s_sum += r.pp_speed; // = prompt_tokens / server TTFT
+                ttft_sum += r.ttft;
+                valid += 1;
+            }
+        }
+        PrefillMetric {
+            tok_s: if valid > 0 {
+                tok_s_sum / valid as f64
+            } else {
+                0.0
+            },
+            prompt_tokens: prompt.token_count as u64,
+            server_ttft_s: if valid > 0 {
+                ttft_sum / valid as f64
+            } else {
+                0.0
+            },
+            estimated,
+        }
+    }
 }
 
 /// Synthesize one [`SpeedResult`] from a finished worker run plus its
@@ -801,6 +905,230 @@ pub fn json_report(cfg: &Config, results: &[SpeedResult]) -> serde_json::Value {
 #[must_use]
 pub fn all_failed(results: &[SpeedResult]) -> bool {
     !results.is_empty() && results.iter().all(SpeedResult::is_failed)
+}
+
+// ── CF-05: the prefill/latency split ──────────────────────────────────────
+
+/// The client-perceived first-token latency (T3−T0) in seconds for one run's
+/// events — the *full* client round-trip (request-send network leg + server
+/// queue/prefill/first-decode). `0.0` when no token frame / milestone is
+/// available.
+///
+/// This is the **perceived** half of the CF-05 first-token *latency* metric;
+/// the **server-side** half (T3−T1) is [`SpeedResult::ttft`].
+#[must_use]
+pub fn perceived_ttft_seconds(events: &[StreamEvent]) -> f64 {
+    for event in events.iter().rev() {
+        if let StreamEvent::Complete { timestamps, .. } = event {
+            if let Some(ns) = timestamps.ttft_perceived_nanos() {
+                return ns as f64 / 1e9;
+            }
+        }
+    }
+    0.0
+}
+
+/// The CF-05 terminal report: Engine A's two **distinct, labeled** metrics —
+/// first-token *latency* (short prompt, a latency number) and pre-fill
+/// *throughput* (long prompt, a bandwidth number) — plus the intact decode /
+/// MTP numbers and a pointer to C1's 2k→128k prefill-degradation curve for
+/// the full scaling picture.
+///
+/// `results` are the short-prompt runs (latency + decode); `perceived` is the
+/// per-run client-perceived TTFT (T3−T0, seconds); `prefill` is the long-
+/// prompt throughput measurement.
+#[must_use]
+pub fn format_split_report(
+    results: &[SpeedResult],
+    perceived: &[f64],
+    prefill: &PrefillMetric,
+    color: bool,
+) -> String {
+    // The valid (non-failed, non-looping) short runs drive the latency +
+    // decode numbers.
+    let valid: Vec<&SpeedResult> = results
+        .iter()
+        .filter(|r| !r.is_failed() && !r.looping)
+        .collect();
+    let est = if valid.iter().any(|r| r.estimated) || prefill.estimated {
+        " [ESTIMATED]"
+    } else {
+        ""
+    };
+
+    let server_ms = mean_of(&valid.iter().map(|r| r.ttft * 1000.0).collect::<Vec<_>>());
+    let perceived_ms = mean_of(
+        &perceived
+            .iter()
+            .copied()
+            .filter(|v| *v > 0.0)
+            .map(|v| v * 1000.0)
+            .collect::<Vec<_>>(),
+    );
+    let lat_tokens = valid.first().map(|r| r.prompt_tokens).unwrap_or(0);
+    let decode_tps = mean_of(&valid.iter().map(|r| r.tg_speed).collect::<Vec<_>>());
+    let mtp = mean_of(&valid.iter().map(|r| r.mtp_efficiency).collect::<Vec<_>>());
+
+    // Build the interior lines; a `None` entry is a section separator.
+    let mut items: Vec<Option<String>> = Vec::new();
+    items.push(Some(
+        "Engine A — Speed & Latency  (CF-05 prefill/latency split)".to_string(),
+    ));
+    items.push(None);
+    items.push(Some(
+        "■ FIRST-TOKEN LATENCY — short prompt (a latency)".to_string(),
+    ));
+    items.push(Some(format!(
+        "  perceived (T3−T0, incl. network): {perceived_ms:>9.0} ms{est}"
+    )));
+    items.push(Some(format!(
+        "  server-side (T3−T1):            {server_ms:>9.0} ms{est}"
+    )));
+    items.push(Some(format!(
+        "  prompt size:                    {lat_tokens:>9} tok"
+    )));
+    items.push(None);
+    items.push(Some(
+        "■ PRE-FILL THROUGHPUT — long prompt (bandwidth)".to_string(),
+    ));
+    if prefill.is_valid() {
+        items.push(Some(format!(
+            "  {} tok / server TTFT {:.0} ms: {tok:>8.1} tok/s{est}",
+            prefill.prompt_tokens,
+            prefill.server_ttft_s * 1000.0,
+            tok = prefill.tok_s
+        )));
+    } else {
+        items.push(Some(
+            "  (no valid long-prompt prefill measurement)".to_string(),
+        ));
+    }
+    items.push(None);
+    items.push(Some("■ DECODE — intact (short prompt)".to_string()));
+    items.push(Some(format!("  TG speed:  {decode_tps:.1} tok/s{est}")));
+    items.push(Some(format!("  MTP eff:   {mtp:.2} tok/chunk")));
+    items.push(None);
+    items.push(Some(
+        "Scaling: the full prefill-degradation curve (the".to_string(),
+    ));
+    items.push(Some(
+        "compute→memory-bandwidth crossover) is measured by".to_string(),
+    ));
+    items.push(Some(
+        "Engine C1's 2k→128k NIAH matrix (per-cell prefill_tps).".to_string(),
+    ));
+
+    // Render the box at the widest interior line (min 50, prototype width).
+    let w = items
+        .iter()
+        .filter_map(|i| i.as_ref())
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(50)
+        .max(50);
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("╔{}╗", "═".repeat(w)));
+    for item in &items {
+        match item {
+            Some(text) => lines.push(format!("║{:<width$}║", text, width = w)),
+            None => lines.push(format!("╠{}╣", "─".repeat(w))),
+        }
+    }
+    lines.push(format!("╚{}╝", "═".repeat(w)));
+
+    let mut out = String::new();
+    for line in &lines {
+        if color {
+            out.push_str(CYAN);
+            out.push_str(line);
+            out.push_str(RESET);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The CF-05 `--json` document: Engine A's two **distinct, labeled** metrics
+/// (first-token *latency* from the short prompt; pre-fill *throughput* from
+/// the long prompt) plus the intact decode numbers, the per-iteration
+/// short-run records, and the standard `timing` / `methodology` blocks.
+#[must_use]
+pub fn json_report_split(
+    cfg: &Config,
+    results: &[SpeedResult],
+    perceived: &[f64],
+    prefill: &PrefillMetric,
+) -> serde_json::Value {
+    let valid: Vec<&SpeedResult> = results
+        .iter()
+        .filter(|r| !r.is_failed() && !r.looping)
+        .collect();
+    let server_ms = round(
+        mean_of(&valid.iter().map(|r| r.ttft * 1000.0).collect::<Vec<_>>()),
+        1,
+    );
+    let perceived_ms = round(
+        mean_of(
+            &perceived
+                .iter()
+                .copied()
+                .filter(|v| *v > 0.0)
+                .map(|v| v * 1000.0)
+                .collect::<Vec<_>>(),
+        ),
+        1,
+    );
+    let decode_tps = round(
+        mean_of(&valid.iter().map(|r| r.tg_speed).collect::<Vec<_>>()),
+        2,
+    );
+    let mtp = round(
+        mean_of(&valid.iter().map(|r| r.mtp_efficiency).collect::<Vec<_>>()),
+        4,
+    );
+
+    let mut output = json!({
+        "url": cfg.url,
+        "model": cfg.model,
+        "engine": "A (Speed & Latency)",
+        "first_token_latency": {
+            "perceived_ms": perceived_ms,
+            "server_ms": server_ms,
+            "prompt_tokens": valid.first().map(|r| r.prompt_tokens).unwrap_or(0),
+            "note": "Short-prompt first-token LATENCY. perceived = T3−T0 (client round-trip, network-included); server = T3−T1 (server queue + prefill + first-decode). A latency number, not bandwidth."
+        },
+        "prefill_throughput": {
+            "tok_s": round(prefill.tok_s, 1),
+            "prompt_tokens": prefill.prompt_tokens,
+            "server_ttft_ms": round(prefill.server_ttft_s * 1000.0, 1),
+            "estimated": prefill.estimated,
+            "note": "Long-prompt pre-fill BANDWIDTH = prompt_tokens / server-side TTFT (T3−T1). The numerator is a real context size, so this is the number that scales with context."
+        },
+        "decode": {
+            "tg_speed_tok_s": decode_tps,
+            "mtp_efficiency": mtp,
+        },
+        "scaling_note": "prefill_throughput above is one point at the long-prompt size. The full prefill-degradation curve (the compute→memory-bandwidth crossover as context grows) is measured by Engine C1's 2k→128k NIAH matrix (per-cell prefill_tps = prompt_tokens / TTFT).",
+        "iterations": results.len(),
+        "results": results.iter().map(|r| r.to_dict()).collect::<Vec<_>>(),
+    });
+    // The prototype's per-run `summary` block (avg over the valid short runs)
+    // is preserved for backward-compatible JSON consumers / exports.
+    if valid.len() > 1 {
+        let n = valid.len() as f64;
+        output["summary"] = json!({
+            "avg_ttft": round(valid.iter().map(|r| r.ttft).sum::<f64>() / n, 4),
+            "avg_pp_speed": round(valid.iter().map(|r| r.pp_speed).sum::<f64>() / n, 2),
+            "avg_tg_speed": round(valid.iter().map(|r| r.tg_speed).sum::<f64>() / n, 2),
+            "avg_mtp": round(valid.iter().map(|r| r.mtp_efficiency).sum::<f64>() / n, 4),
+        });
+    }
+    let overhead = crate::timing::measure_timestamp_overhead();
+    output["timing"] = crate::metrics::methodology::timing_block(overhead);
+    output["methodology"] = crate::metrics::methodology::methodology_block(overhead);
+    output
 }
 
 // ── Terminal formatting (prototype parity) ───────────────────────────────
@@ -1538,5 +1866,111 @@ mod tests {
         };
         let failed = aggregate(&cfg(), &prompt(), &bad, &[], None);
         assert!(format_summary(&[a.clone(), failed], false).is_none());
+    }
+
+    // ── CF-05: the prefill/latency split ─────────────────────────────────
+
+    /// A long-prompt prefill metric (the bandwidth half): 10 000 tok over a
+    /// 2.0 s server-side TTFT → 5 000 tok/s.
+    fn long_prefill() -> PrefillMetric {
+        PrefillMetric {
+            tok_s: 5000.0,
+            prompt_tokens: 10_000,
+            server_ttft_s: 2.0,
+            estimated: false,
+        }
+    }
+
+    #[test]
+    fn perceived_ttft_is_t3_minus_t0_distinct_from_server() {
+        let (outcome, events) = completed_run();
+        // completed_run: T0=0 ms, T1=5 ms, T3=10 ms.
+        let perceived = perceived_ttft_seconds(&events);
+        assert!((perceived - 0.010).abs() < 1e-6, "perceived {perceived}");
+        // The server-side value (SpeedResult.ttft = T3−T1 = 5 ms) is a
+        // distinct, smaller number.
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        assert!((r.ttft - 0.005).abs() < 1e-6, "server {}", r.ttft);
+        assert!((perceived - r.ttft).abs() > 0.004, "perceived != server");
+    }
+
+    #[test]
+    fn split_report_labels_latency_and_prefill_as_distinct_metrics() {
+        let (outcome, events) = completed_run();
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let perceived = vec![perceived_ttft_seconds(&events)];
+        let prefill = long_prefill();
+        let report = format_split_report(std::slice::from_ref(&r), &perceived, &prefill, false);
+
+        // Two distinct, clearly-labeled sections.
+        assert!(report.contains("FIRST-TOKEN LATENCY"), "{report}");
+        assert!(report.contains("PRE-FILL THROUGHPUT"), "{report}");
+        // Latency from the SHORT prompt: perceived (T3−T0) + server (T3−T1).
+        assert!(report.contains("perceived (T3−T0"), "{report}");
+        assert!(report.contains("server-side (T3−T1)"), "{report}");
+        // Prefill from the LONG prompt: 10 000 tok → 5 000 tok/s.
+        assert!(report.contains("10000 tok"), "{report}");
+        assert!(report.contains("5000.0 tok/s"), "{report}");
+        // The scaling pointer to C1's 2k→128k curve.
+        assert!(report.contains("2k→128k"), "{report}");
+    }
+
+    #[test]
+    fn json_report_split_computes_metrics_from_the_right_inputs() {
+        let (outcome, events) = completed_run();
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        let perceived = vec![perceived_ttft_seconds(&events)];
+        let prefill = long_prefill();
+        let v = json_report_split(&cfg(), std::slice::from_ref(&r), &perceived, &prefill);
+
+        // Latency from the SHORT prompt: perceived (T3−T0 = 10 ms) + server
+        // (T3−T1 = 5 ms).
+        assert!((v["first_token_latency"]["perceived_ms"].as_f64().unwrap() - 10.0).abs() < 0.1);
+        assert!((v["first_token_latency"]["server_ms"].as_f64().unwrap() - 5.0).abs() < 0.1);
+        // Throughput from the LONG prompt: 10 000 tok / 2.0 s = 5 000 tok/s.
+        assert!((v["prefill_throughput"]["tok_s"].as_f64().unwrap() - 5000.0).abs() < 0.1);
+        assert_eq!(
+            v["prefill_throughput"]["prompt_tokens"].as_u64().unwrap(),
+            10_000
+        );
+        // Decode is intact and present.
+        assert!(v["decode"]["tg_speed_tok_s"].is_number());
+        assert!(v["decode"]["mtp_efficiency"].is_number());
+        // The scaling pointer references C1.
+        assert!(v["scaling_note"].as_str().unwrap().contains("C1"));
+    }
+
+    #[test]
+    fn short_prompt_run_no_longer_emits_a_single_prefill_bandwidth() {
+        let (outcome, events) = completed_run();
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None);
+        // The short run's own pp_speed (128 tok / 5 ms server TTFT = 25 600)
+        // is the old misleading "bandwidth" — it must NOT be presented as the
+        // prefill throughput. The prefill metric comes from the LONG prompt.
+        let short_pp = r.pp_speed;
+        assert!(
+            (short_pp - 25_600.0).abs() < 1.0,
+            "short pp_speed {short_pp}"
+        );
+        let prefill = long_prefill();
+        let perceived = vec![perceived_ttft_seconds(&events)];
+
+        let report = format_split_report(std::slice::from_ref(&r), &perceived, &prefill, false);
+        // The report's pre-fill throughput is the LONG number (5 000), not the
+        // short run's pp_speed (25 600).
+        assert!(report.contains("5000.0 tok/s"), "{report}");
+        assert!(
+            !report.contains(&format!("{short_pp:.1} tok/s")),
+            "short pp_speed {short_pp} must not be the prefill bandwidth: {report}"
+        );
+
+        // In JSON, prefill_throughput.tok_s is the long value, distinct from
+        // the per-run pp_speed_tok_s.
+        let v = json_report_split(&cfg(), std::slice::from_ref(&r), &perceived, &prefill);
+        let prefill_tps = v["prefill_throughput"]["tok_s"].as_f64().unwrap();
+        let run_pp = v["results"][0]["pp_speed_tok_s"].as_f64().unwrap();
+        assert!((prefill_tps - 5000.0).abs() < 0.1);
+        assert!((run_pp - short_pp).abs() < 1.0);
+        assert_ne!(prefill_tps, run_pp, "the two metrics are distinct");
     }
 }
