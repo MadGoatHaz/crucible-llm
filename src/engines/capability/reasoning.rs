@@ -7,11 +7,14 @@
 //! pass/fail accuracy (`N/M solved`) is reproducible run-to-run and
 //! comparable across models, quantizations, and server versions:
 //!
-//! * **Math** — the *last* numeric value in the response must equal the
-//!   exact expected value (models are prompted to answer with just the
-//!   number, so the last number is the answer).
-//! * **Logic** — the *last* yes/no verdict (case-insensitive, whole-word)
-//!   must match the expected verdict.
+//! * **Math** — the *answer-position* (first) numeric value in the
+//!   committed span must equal the exact expected value; the expected
+//!   value is also accepted when it is present whole anywhere in the span
+//!   (CF-33 — a chatty-but-correct answer that restates other numbers
+//!   after the answer is not false-failed).
+//! * **Logic** — the *answer-position* yes/no verdict (case-insensitive,
+//!   whole-word) in the committed span must match the expected verdict
+//!   (CF-34 — the committed answer, not trailing prose).
 //! * **Code** — the response must contain a fenced code block; the block
 //!   must have balanced, properly nested delimiters (`()` `[]` `{}`) and
 //!   contain every required structural marker (the function signature,
@@ -43,13 +46,13 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::client::{join_worker, spawn_worker, token_window, StreamEvent, StreamWorker};
+use crate::client::{join_worker, spawn_worker, StreamEvent, StreamWorker};
 use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
 use crate::sse::Chunk;
-use crate::timing::StreamTimestamps;
+use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
@@ -60,9 +63,11 @@ pub const REASONING_MAX_GEN_TOKENS: u32 = 512;
 /// The strict, deterministic checker for one challenge.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Checker {
-    /// The last number in the response must equal `value`.
+    /// The answer-position (first) number must equal `value`, or `value`
+    /// must be present whole in the committed span (CF-33).
     ExactNumber(f64),
-    /// The last whole-word yes/no verdict must be `expected_yes`.
+    /// The answer-position whole-word yes/no verdict must be
+    /// `expected_yes` (CF-34).
     Verdict { expected_yes: bool },
     /// A fenced code block with balanced delimiters containing every
     /// required structural marker.
@@ -93,9 +98,15 @@ impl Challenge {
     /// `true` when `response` solves this challenge (strict checker).
     pub fn is_solved(&self, response: &str) -> bool {
         match self.checker {
+            // CF-33: the answer-position (first) number matches, OR the
+            // expected value is present whole anywhere in the committed
+            // span — a chatty-but-correct answer that restates other
+            // numbers is not false-failed.
             Checker::ExactNumber(v) => {
-                extract_last_number(response).is_some_and(|got| (got - v).abs() < 1e-6)
+                extract_answer_number(response).is_some_and(|got| (got - v).abs() < 1e-6)
+                    || contains_number(response, v)
             }
+            // CF-34: the committed content span's answer-position verdict.
             Checker::Verdict { expected_yes } => extract_verdict(response) == Some(expected_yes),
             Checker::Code { required } => extract_code_fence(response).is_some_and(|code| {
                 delimiters_balanced(&code) && required.iter().all(|m| contains_marker(&code, m))
@@ -250,9 +261,16 @@ impl ReasoningScore {
 
 /// Score `responses` (index-aligned with [`REASONING_BANK`]) against the
 /// strict checkers. Pure — no network, no timing.
+///
+/// **CF-48:** the denominator (`total`) is the number of challenges
+/// *actually scored* — `min(bank length, responses provided)` — not the
+/// full bank length. A partial / interrupted run (fewer responses than
+/// bank entries) reports an honest `N/M` instead of silently counting the
+/// un-run challenges against the model.
 pub fn score_responses(responses: &[String]) -> ReasoningScore {
+    let total = responses.len().min(REASONING_BANK.len());
     let mut score = ReasoningScore {
-        total: REASONING_BANK.len(),
+        total,
         solved: 0,
         by_category: [(0, 0); 3],
     };
@@ -282,13 +300,16 @@ pub struct ReasoningResult {
     pub responses: Vec<String>,
     /// Per-challenge TTFT, seconds (`T3 − T1`).
     pub ttfts: Vec<f64>,
-    /// Per-challenge decode speed, tokens/s (§7.2 formula).
+    /// Per-challenge **content-phase** decode speed, tokens/s (CF-49: the
+    /// committed answer's token frames over the content window, not the
+    /// blended think+write rate).
     pub tg_speeds: Vec<f64>,
     pub score: ReasoningScore,
 }
 
 impl ReasoningResult {
-    /// Mean decode speed across challenges that produced tokens.
+    /// Mean content-phase decode speed across challenges that produced a
+    /// committed answer (CF-49).
     pub fn avg_tg_speed(&self) -> f64 {
         let vals: Vec<f64> = self
             .tg_speeds
@@ -485,34 +506,29 @@ impl ReasoningEngine {
             Some(n) => n as f64 / 1e9,
             None => stream_time,
         };
-        // Authoritative count: the server's `usage.completion_tokens`
-        // first; re-tokenize the accumulated (content-only) response with
-        // the model's exact tokenizer when a proxy omits usage; the
-        // observed frame count as a last-resort estimate.
-        let completion = match outcome
-            .usage
-            .map(|u| u.completion_tokens)
-            .filter(|&n| n > 0)
-        {
-            Some(n) => n,
-            None => match self
-                .tokenizer
-                .as_deref()
-                .and_then(|t| t.try_count(&response))
-                .filter(|&n| n > 0)
-            {
-                Some(n) => n as u64,
-                None => outcome.frames.max(1),
-            },
+        // CF-49: the decode speed is the **content (answer) phase** rate —
+        // the committed content token frames over the content window
+        // (first → last content frame), NOT the blended think+write rate.
+        // The request suppresses the chain-of-thought (CF-16), so in the
+        // common case the content phase is the whole generation; when a
+        // model emits CoT despite suppression, the thinking phase is
+        // excluded from both the count and the window. (The server's
+        // `usage.completion_tokens` includes reasoning tokens, so it is not
+        // a clean content count; the observed content frame count is.)
+        let (c_first, c_last, content_frames) = content_phase(&events);
+        let tg_speed = if content_frames == 0 {
+            // No committed answer phase (pure CoT / failure / empty
+            // content): no meaningful content decode rate.
+            0.0
+        } else {
+            let content_time = match (c_first, c_last) {
+                (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+                // A single content frame (no span) → attribute the full
+                // post-TTFT generation time to it.
+                _ => (stream_time - ttft).max(0.001),
+            };
+            content_frames as f64 / content_time
         };
-        // Decode window: first → last content/reasoning token (prefill /
-        // TTFT excluded) — the research's Timing Boundary Rule.
-        let (t_first, t_last) = token_window(&events);
-        let generation_time = match (t_first, t_last) {
-            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
-            _ => (stream_time - ttft).max(0.001),
-        };
-        let tg_speed = completion as f64 / generation_time;
         (response, ttft, tg_speed)
     }
 
@@ -574,68 +590,113 @@ impl ReasoningEngine {
 
 // ── Extraction helpers (pure, deterministic) ─────────────────────────────
 
-/// The last numeric value in `text` (integers and decimals), `None` when
-/// the text contains no number.
-///
-/// The bank's math prompts ask for "the number only", so the *last* number
-/// in the response is the model's answer (prose like "the answer is N"
-/// yields N; a trailing explanation containing numbers would be a
-/// genuine model failure — strict by design).
-pub fn extract_last_number(text: &str) -> Option<f64> {
-    let bytes = text.as_bytes();
-    let mut last: Option<f64> = None;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let is_number_start = bytes[i].is_ascii_digit()
-            || (bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit());
-        if !is_number_start {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        if bytes[i] == b'-' {
-            i += 1;
-        }
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'.' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-        }
-        if let Ok(v) = text[start..i].parse::<f64>() {
-            last = Some(v);
+/// Iterator over every maximal numeric token in `text` (integers and
+/// decimals, optionally signed), in order of appearance. A token is a run
+/// of digits with an optional leading `-` and a single optional `.`-decimal
+/// part; malformed fragments (a lone `-`, a trailing `.` with no digits)
+/// are skipped.
+struct Numbers<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Numbers<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+            i: 0,
         }
     }
-    last
 }
-/// The last whole-word yes/no verdict in `text` (case-insensitive):
-/// `true` for "yes", `false` for "no", `None` when neither occurs as a
-/// whole word (so "none" / "normal" / "yeses" never match).
+
+impl<'a> Iterator for Numbers<'a> {
+    type Item = f64;
+    fn next(&mut self) -> Option<f64> {
+        let n = self.bytes.len();
+        loop {
+            // Advance to the next number start (a digit, or a `-`
+            // immediately followed by a digit).
+            while self.i < n {
+                let b = self.bytes[self.i];
+                let is_start = b.is_ascii_digit()
+                    || (b == b'-' && self.i + 1 < n && self.bytes[self.i + 1].is_ascii_digit());
+                if is_start {
+                    break;
+                }
+                self.i += 1;
+            }
+            if self.i >= n {
+                return None;
+            }
+            let start = self.i;
+            if self.bytes[self.i] == b'-' {
+                self.i += 1;
+            }
+            while self.i < n && self.bytes[self.i].is_ascii_digit() {
+                self.i += 1;
+            }
+            if self.i < n && self.bytes[self.i] == b'.' {
+                self.i += 1;
+                while self.i < n && self.bytes[self.i].is_ascii_digit() {
+                    self.i += 1;
+                }
+            }
+            if let Ok(v) = self.text[start..self.i].parse::<f64>() {
+                return Some(v);
+            }
+            // A malformed fragment (e.g. "3." with no following digit) is
+            // skipped: the loop keeps scanning from `self.i`.
+        }
+    }
+}
+
+/// The **answer-position** number in `text` — the *first* numeric token
+/// (CF-33). The bank's math prompts ask for "the number only", so the
+/// model's answer is the first number it commits; a trailing explanation
+/// that restates *other* numbers ("1161, which is 27 × 43") must not
+/// override it. `None` when the text contains no number.
+pub fn extract_answer_number(text: &str) -> Option<f64> {
+    Numbers::new(text).next()
+}
+
+/// `true` when `value` occurs in `text` as a whole number — i.e. some
+/// maximal numeric token parses to `value` (within tolerance). CF-33:
+/// accepts the expected value even when it is not the first token, so a
+/// chatty-but-correct answer ("…the result is 1161") is not false-failed.
+pub fn contains_number(text: &str, value: f64) -> bool {
+    Numbers::new(text).any(|n| (n - value).abs() < 1e-6)
+}
+/// The **answer-position** whole-word yes/no verdict in `text` (CF-34) —
+/// the *first* whole-word "yes" (`true`) or "no" (`false`),
+/// case-insensitive. The bank's logic prompts ask for "yes or no only", so
+/// the model's committed verdict is the first one it states; a trailing
+/// elaboration that contradicts it ("No, but actually yes") must not
+/// override the answer. `None` when neither occurs as a whole word (so
+/// "none" / "normal" / "yeses" never match).
+///
+/// The runner feeds this the committed **content span** only (CF-16), so a
+/// verdict that appears only in the chain-of-thought is out of scope by
+/// construction — this reads the answer, not scattered reasoning.
 pub fn extract_verdict(text: &str) -> Option<bool> {
     let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
-    let mut last: Option<bool> = None;
+    let n = bytes.len();
     let mut i = 0usize;
-    while i < bytes.len() {
+    while i < n {
         match bytes[i] {
             b'y' if lower[i..].starts_with("yes") && word_boundary(bytes, i, i + 3) => {
-                last = Some(true);
-                i += 3;
-                continue;
+                return Some(true);
             }
             b'n' if lower[i..].starts_with("no") && word_boundary(bytes, i, i + 2) => {
-                last = Some(false);
-                i += 2;
-                continue;
+                return Some(false);
             }
             _ => {}
         }
         i += 1;
     }
-    last
+    None
 }
 
 /// `true` when the span `bytes[start..end]` is a whole word: the
@@ -687,45 +748,169 @@ pub fn extract_code_fence(text: &str) -> Option<String> {
 /// `true` when every `()` / `[]` / `{}` in `code` is balanced and
 /// properly nested.
 ///
-/// Structural (lexical) check — string/comment contents are not
-/// excluded (a documented approximation; the required-signature markers
-/// plus balanced delimiters are what gate a code answer).
+/// **CF-47:** string literals (`"…"` / `'…'`) and comments (`// …` /
+/// `/* … */`) are *skipped*, so a delimiter inside a string or comment
+/// (e.g. `let s = "unbalanced )";` or `// fix ( this`) no longer
+/// false-fails a correct answer. The check remains structural (lexical) —
+/// full AST parsing is a post-v1 extension; raw strings (`r"…"`) with
+/// embedded quotes are a documented limitation.
 pub fn delimiters_balanced(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    let n = bytes.len();
     let mut stack: Vec<char> = Vec::new();
-    for c in code.chars() {
-        match c {
-            '(' | '[' | '{' => stack.push(c),
-            ')' if stack.pop() != Some('(') => return false,
-            ']' if stack.pop() != Some('[') => return false,
-            '}' if stack.pop() != Some('{') => return false,
-            _ => {}
+    let mut i = 0usize;
+    while i < n {
+        let b = bytes[i];
+        match b {
+            // `//` line comment → skip to (not including) the newline.
+            b'/' if i + 1 < n && bytes[i + 1] == b'/' => {
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // `/*` block comment → skip to (and past) the closing `*/`.
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // `"…"` string literal → skip to the unescaped closing quote.
+            b'"' => {
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            // `'…'` char literal (or a lifetime) → skip a real literal.
+            b'\'' => {
+                if i + 1 < n && bytes[i + 1] == b'\\' {
+                    // escape form `'\n'` / `'\''` … → closing `'` at i+3
+                    if i + 3 < n && bytes[i + 3] == b'\'' {
+                        i += 4;
+                    } else {
+                        i += 1;
+                    }
+                } else if i + 2 < n && bytes[i + 2] == b'\'' {
+                    // single-char form `'a'` → closing `'` at i+2
+                    i += 3;
+                } else {
+                    // not a char literal → a lifetime / normal code
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                stack.push(b as char);
+                i += 1;
+            }
+            b')' => {
+                if stack.pop() != Some('(') {
+                    return false;
+                }
+                i += 1;
+            }
+            b']' => {
+                if stack.pop() != Some('[') {
+                    return false;
+                }
+                i += 1;
+            }
+            b'}' => {
+                if stack.pop() != Some('{') {
+                    return false;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
     stack.is_empty()
 }
 
+/// CF-49: the **(first, last) content token-arrival instants** and the
+/// **content frame count** across a stream's events — the *answer-phase*
+/// decode window and token count. It excludes the thinking phase (the
+/// `Chunk::Reasoning` frames before the first content frame), so the
+/// resulting rate is a clean *write* speed, not a blended think+write
+/// rate. `(None, None, 0)` when no content frame arrived (a pure-CoT
+/// stream, a failure, or an empty answer).
+fn content_phase(
+    events: &[StreamEvent],
+) -> (Option<MonotonicInstant>, Option<MonotonicInstant>, u64) {
+    let mut first: Option<MonotonicInstant> = None;
+    let mut last: Option<MonotonicInstant> = None;
+    let mut count = 0u64;
+    for e in events {
+        if let StreamEvent::Frame { frame, at, .. } = e {
+            if matches!(frame.chunk, Chunk::Content(_)) {
+                if first.is_none() {
+                    first = Some(*at);
+                }
+                last = Some(*at);
+                count += 1;
+            }
+        }
+    }
+    (first, last, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::StreamError;
+    use crate::client::{StreamError, StreamEvent};
+    use crate::sse::{Chunk, ParsedFrame};
+    use crate::timing::{MonotonicInstant, StreamTimestamps};
 
     #[test]
-    fn extract_last_number_finds_the_answer() {
-        assert_eq!(extract_last_number("The answer is 1161."), Some(1161.0));
-        assert_eq!(extract_last_number("2, 4, 8, 16, 32, 64"), Some(64.0));
-        assert_eq!(extract_last_number("3.5"), Some(3.5));
-        assert_eq!(extract_last_number("no numbers here"), None);
-        // The LAST number wins (a trailing "999" corrupts the answer).
-        assert_eq!(extract_last_number("1161 then 999"), Some(999.0));
+    fn extract_answer_number_finds_the_answer() {
+        // CF-33: the *first* (answer-position) number is extracted.
+        assert_eq!(extract_answer_number("The answer is 1161."), Some(1161.0));
+        assert_eq!(extract_answer_number("3.5"), Some(3.5));
+        assert_eq!(extract_answer_number("no numbers here"), None);
+        // The FIRST number is the answer position — a trailing restatement
+        // of *other* numbers does not override it.
+        assert_eq!(extract_answer_number("1161 then 999"), Some(1161.0));
+        assert_eq!(extract_answer_number("1161 (27 × 43)"), Some(1161.0));
+        assert_eq!(
+            extract_answer_number("64. The sequence doubles each time."),
+            Some(64.0)
+        );
     }
 
     #[test]
-    fn extract_verdict_last_whole_word_wins() {
+    fn contains_number_accepts_the_expected_value_present_whole() {
+        // CF-33: the expected value is accepted when present whole anywhere
+        // in the span, not only at the answer position.
+        assert!(contains_number("The result is 1161.", 1161.0));
+        assert!(contains_number("1161, which is 27 × 43", 1161.0));
+        // A value that is only a *substring* of a larger number does not
+        // count (1161 is not in 21161 or 11610).
+        assert!(!contains_number("The total is 21161.", 1161.0));
+        assert!(!contains_number("11610 tokens", 1161.0));
+        // A different value is not present.
+        assert!(!contains_number("The answer is 999.", 1161.0));
+    }
+
+    #[test]
+    fn extract_verdict_answer_position_wins() {
+        // CF-34: the *first* (answer-position) whole-word verdict is
+        // extracted.
         assert_eq!(extract_verdict("No, that's not valid."), Some(false));
         assert_eq!(extract_verdict("Yes"), Some(true));
-        // Last occurrence wins.
-        assert_eq!(extract_verdict("yes... no"), Some(false));
-        assert_eq!(extract_verdict("no, but yes"), Some(true));
+        // The FIRST whole-word verdict is the committed answer — a trailing
+        // flip in prose does not override it.
+        assert_eq!(extract_verdict("yes... no"), Some(true));
+        assert_eq!(extract_verdict("no, but yes"), Some(false));
         // Whole-word only: none / normal / yeses do not count.
         assert_eq!(extract_verdict("none of the above"), None);
         assert_eq!(extract_verdict("a normal day"), None);
@@ -738,6 +923,48 @@ mod tests {
         assert!(!delimiters_balanced("fn f() { let x = [1); }"));
         assert!(!delimiters_balanced("fn f() {"));
         assert!(delimiters_balanced("no delimiters at all"));
+    }
+
+    // ── CF-47: the balance check skips strings and comments ──────────────
+
+    #[test]
+    fn cf47_delimiters_skip_strings_and_comments() {
+        // A `}` / `)` inside a string literal must not break the balance
+        // check (the old lexical scan counted it and false-failed).
+        let string = "fn f() -> String {\n    let s = \"unbalanced ) { here\";\n    s\n}";
+        assert!(
+            delimiters_balanced(string),
+            "a delimiter inside a \"string\" literal is ignored"
+        );
+        // A `(` in a line comment must not break the balance check.
+        let line_comment = "fn g() {\n    // fix ( this later\n}";
+        assert!(
+            delimiters_balanced(line_comment),
+            "a ( inside a // comment is ignored"
+        );
+        // A `{` in a block comment must not break the balance check.
+        let block_comment = "fn h() {\n    /* a { block comment */\n}";
+        assert!(
+            delimiters_balanced(block_comment),
+            "a {{ inside a /* */ comment is ignored"
+        );
+        // A `}` in a char literal must not break the balance check.
+        let char_literal = "fn c() {\n    let ch = '}';\n}";
+        assert!(
+            delimiters_balanced(char_literal),
+            "a }} inside a 'char' literal is ignored"
+        );
+        // The canonical code answers must keep passing the balance check.
+        for c in REASONING_BANK.iter().filter(|c| c.category == "code") {
+            let code = extract_code_fence(c.canonical_answer).unwrap();
+            assert!(
+                delimiters_balanced(&code),
+                "canonical {} must stay balanced",
+                c.id
+            );
+        }
+        // Genuine imbalance in real code (outside strings/comments) fails.
+        assert!(!delimiters_balanced("fn f() { let x = (1 + 2; }"));
     }
 
     #[test]
@@ -858,7 +1085,7 @@ mod tests {
         // the runner feeds the checkers the content span (empty here), so
         // the latent "1161" in the thought is out of scope by construction.
         assert!(
-            extract_last_number("I am fairly sure the answer is 1161, let me stop thinking")
+            extract_answer_number("I am fairly sure the answer is 1161, let me stop thinking")
                 .is_some(),
             "the value is present in the CoT text itself"
         );
@@ -883,6 +1110,166 @@ mod tests {
         let s = score_responses(&none);
         assert_eq!(s.solved, 0);
         assert_eq!(s.label(), "0/13 solved (0.0%)");
+    }
+
+    // ── CF-33: answer-position number + whole-value acceptance ───────────
+
+    #[test]
+    fn cf33_expected_number_early_and_restated_is_solved() {
+        // CF-33: the expected number appears at the answer position
+        // (first) AND is restated in a trailing explanation. The old
+        // "last number wins" read the restated value and false-failed; the
+        // answer-position read (plus whole-value acceptance) solves it.
+        let math = REASONING_BANK.iter().find(|c| c.id == "math-mul").unwrap(); // 1161
+        assert!(
+            math.is_solved("1161 (27 × 43)"),
+            "the answer-position number is the answer"
+        );
+        assert!(
+            math.is_solved("The answer is 1161. To verify: 27 × 43 = 1161."),
+            "the expected value present whole is accepted"
+        );
+        // A genuinely wrong answer (no 1161 anywhere) still fails.
+        assert!(
+            !math.is_solved("1160 (27 × 43)"),
+            "a wrong number is not solved"
+        );
+        assert!(!math.is_solved("I don't know."), "no number is not solved");
+    }
+
+    // ── CF-34: the verdict is read at the answer position in content ─────
+
+    #[test]
+    fn cf34_verdict_reads_the_answer_position_in_content() {
+        // CF-34: the committed verdict is the *first* whole-word yes/no in
+        // the content span. A trailing elaboration that contradicts it must
+        // not override the answer. (The runner feeds the checkers the
+        // content span only — CF-16 — so scattered reasoning is excluded.)
+        let syllogism = REASONING_BANK
+            .iter()
+            .find(|c| c.id == "logic-syllogism")
+            .unwrap(); // expected: No
+        let content = "No. (Although one could argue yes in some readings.)";
+        assert_eq!(
+            extract_verdict(content),
+            Some(false),
+            "the answer-position verdict is No"
+        );
+        assert!(
+            syllogism.is_solved(content),
+            "the committed No is judged, not the trailing yes"
+        );
+        assert_eq!(
+            extract_verdict("No, I think. (Though one might argue yes.)"),
+            Some(false),
+            "a trailing flip does not override the committed verdict"
+        );
+    }
+
+    #[test]
+    fn cf34_content_verdict_wins_over_reasoning() {
+        // CF-34: a verdict that appears only in the chain-of-thought must
+        // not be judged — the runner feeds the checkers the committed
+        // content span. Here the CoT says "yes" but the model commits "No".
+        let knights = REASONING_BANK
+            .iter()
+            .find(|c| c.id == "logic-knights")
+            .unwrap(); // expected: No
+        let content = "No"; // the committed answer span
+        let cot = "Hmm, can both be knights? Yes, if they were both lying…";
+        assert_eq!(extract_verdict(content), Some(false));
+        assert!(
+            knights.is_solved(content),
+            "the committed content verdict (No) is judged"
+        );
+        // Had the old combined span (CoT + content) been judged, the
+        // scattered CoT verdict would be in play — the content span differs:
+        assert_ne!(
+            extract_verdict(&format!("{cot}{content}")),
+            extract_verdict(content),
+            "the CoT carries a different verdict than the committed content"
+        );
+    }
+
+    // ── CF-48: the denominator is the number actually scored ─────────────
+
+    #[test]
+    fn cf48_partial_run_reports_an_honest_denominator() {
+        // CF-48: a partial / interrupted run provides fewer responses than
+        // the bank has challenges. The denominator is the number actually
+        // scored, not the full bank length.
+        let partial: Vec<String> = REASONING_BANK
+            .iter()
+            .take(5)
+            .map(|c| c.canonical_answer.to_string())
+            .collect();
+        assert_eq!(partial.len(), 5);
+        let s = score_responses(&partial);
+        assert_eq!(s.total, 5, "total is the number actually scored");
+        assert_eq!(s.solved, 5, "the 5 provided canonical answers all solve");
+        assert_eq!(s.by_category, [(5, 5), (0, 0), (0, 0)]);
+        assert_eq!(s.label(), "5/5 solved (100.0%)");
+
+        // A partial run with a mix of solved / unsolved.
+        let mixed: Vec<String> = vec![
+            "1161".to_string(),          // math-mul: solved
+            "I don't know.".to_string(), // math-frac: unsolved
+        ];
+        let s = score_responses(&mixed);
+        assert_eq!(s.total, 2, "total is the 2 responses scored");
+        assert_eq!(s.solved, 1);
+        assert_eq!(s.label(), "1/2 solved (50.0%)");
+
+        // An empty run reports 0/0 (not 0/13).
+        let s = score_responses(&[]);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.solved, 0);
+        assert_eq!(s.label(), "0/0 solved (0.0%)");
+    }
+
+    // ── CF-49: the decode speed is the content (answer) phase only ───────
+
+    #[test]
+    fn cf49_content_phase_excludes_the_thinking_phase() {
+        // CF-49: `content_phase` counts and windows the *content* frames
+        // only — the reasoning (CoT) frames are excluded, so the decode
+        // speed is a clean write rate, not a blended think+write rate.
+        let now = MonotonicInstant::now();
+        let frame = |chunk: Chunk| StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk,
+                t_nanos: 0,
+                done: false,
+            },
+            at: now,
+            timestamps: StreamTimestamps::default(),
+        };
+        // 1 control + 2 reasoning (CoT) + 3 content (answer) frames.
+        let events = vec![
+            frame(Chunk::Control),
+            frame(Chunk::Reasoning("thinking ".into())),
+            frame(Chunk::Reasoning("more ".into())),
+            frame(Chunk::Content("answ".into())),
+            frame(Chunk::Content("ing ".into())),
+            frame(Chunk::Content("now".into())),
+        ];
+        let (first, last, count) = content_phase(&events);
+        // The 2 CoT frames are excluded: only the 3 content frames count.
+        assert_eq!(count, 3, "content frames only — the CoT is not counted");
+        // The window is anchored on a content frame (all frames share
+        // `now` here, so the returned instants equal it).
+        assert_eq!(first, Some(now), "the window starts on a content frame");
+        assert_eq!(last, Some(now), "the window ends on a content frame");
+
+        // A pure-CoT stream (no content frames) yields an empty window and
+        // a zero count → no content decode speed (the 0.0 guard).
+        let cot_only = vec![
+            frame(Chunk::Control),
+            frame(Chunk::Reasoning("still thinking ".into())),
+        ];
+        let (f, l, c) = content_phase(&cot_only);
+        assert_eq!(c, 0, "no content frames → no content phase");
+        assert!(f.is_none() && l.is_none());
     }
 
     #[test]
