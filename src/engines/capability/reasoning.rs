@@ -17,6 +17,17 @@
 //!   contain every required structural marker (the function signature,
 //!   key identifiers).
 //!
+//! **The judged span (CF-16).** Every checker runs on the model's
+//! *committed content span* only. The request suppresses the
+//! chain-of-thought (per-backend, graceful — `StreamWorker::disable_thinking`,
+//! CF-01), and the runner accumulates `Chunk::Content` deltas only, never
+//! `Chunk::Reasoning`: a value that appears *only* in the CoT is latent
+//! reasoning, not a demonstrated answer (judging the combined stream would
+//! false-pass it), and a CoT truncated mid-thought leaves an intermediate
+//! value where the answer belongs (judging the combined stream would
+//! false-fail it). The CoT is still forwarded to the live snapshot /
+//! metrics — just not to the checkers.
+//!
 //! **Dependency note:** all checkers are pure `std` (no `regex` or
 //! parser crates) to preserve the §3.1 dependency gate. The code checker
 //! is a *structural* (lexical) validator; full AST parsing is a
@@ -216,7 +227,7 @@ pub const REASONING_BANK: &[Challenge] = &[
     },
 ];
 
-/// The deterministic accuracy score over the bank.
+/// The deterministic accuracy score over the committed content spans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReasoningScore {
     pub total: usize,
@@ -266,7 +277,8 @@ pub fn score_responses(responses: &[String]) -> ReasoningScore {
 /// score alongside speed").
 #[derive(Debug, Clone)]
 pub struct ReasoningResult {
-    /// One response per bank entry (index-aligned).
+    /// One committed content span per bank entry (index-aligned; the
+    /// chain-of-thought is excluded from the judged text — CF-16).
     pub responses: Vec<String>,
     /// Per-challenge TTFT, seconds (`T3 − T1`).
     pub ttfts: Vec<f64>,
@@ -377,7 +389,8 @@ impl ReasoningEngine {
     }
 
     /// Run one challenge: spawn a worker, drain its channel, and return
-    /// the concatenated response text plus the §7 timing deltas.
+    /// the committed content span (the chain-of-thought is excluded —
+    /// CF-16) plus the §7 timing deltas.
     async fn run_challenge(&self, challenge: &Challenge) -> (String, f64, f64) {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
@@ -395,17 +408,33 @@ impl ReasoningEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
+        // CF-16: suppress the model's chain-of-thought so the 512-token
+        // budget goes to the committed answer. Without this, a reasoning
+        // model spends the *entire* budget on CoT (`content = 0`,
+        // `finish_reason = length`) and the checkers read a truncated
+        // intermediate — a false failure of a reasoning capability the
+        // model actually has (the C2 face of the C1 root cause, CF-01).
+        // The suppression is per-backend and graceful (see
+        // `StreamWorker::disable_thinking`), so non-reasoning models and
+        // backends without a switch are unaffected.
+        worker = worker.disable_thinking(true);
 
         // Spawn without awaiting: drain the channel concurrently to avoid
         // the >capacity deadlock (server-agnostic fix).
         let handle = spawn_worker(worker, tx);
+        // CF-16: the committed answer only. The checkers judge the
+        // model's *visible content span*, not its chain-of-thought:
+        // reasoning deltas are deliberately NOT accumulated into
+        // `response` (a value only in the CoT must not be credited, and a
+        // truncated CoT must not supply the "last" number/verdict). The
+        // CoT is still forwarded to the live snapshot / metrics.
         let mut response = String::new();
         let mut events = Vec::new();
         let mut batch = 0u32;
         while let Some(event) = rx.recv().await {
             if let StreamEvent::Frame { frame, .. } = &event {
                 if !frame.done {
-                    if let Chunk::Content(text) | Chunk::Reasoning(text) = &frame.chunk {
+                    if let Chunk::Content(text) = &frame.chunk {
                         response.push_str(text);
                     }
                 }
@@ -457,9 +486,9 @@ impl ReasoningEngine {
             None => stream_time,
         };
         // Authoritative count: the server's `usage.completion_tokens`
-        // first; re-tokenize the full response with the model's exact
-        // tokenizer when a proxy omits usage; the observed frame count as
-        // a last-resort estimate.
+        // first; re-tokenize the accumulated (content-only) response with
+        // the model's exact tokenizer when a proxy omits usage; the
+        // observed frame count as a last-resort estimate.
         let completion = match outcome
             .usage
             .map(|u| u.completion_tokens)
@@ -771,6 +800,69 @@ mod tests {
         assert!(!fib.is_solved(missing), "missing marker must fail");
         // No fence at all fails.
         assert!(!fib.is_solved("fn fib(n: u32) -> u32 { n }"));
+    }
+
+    // ── CF-16: the checkers judge the committed content span ────────────
+
+    #[test]
+    fn content_span_passes_where_the_combined_span_fails() {
+        // Math (math-mul: 27 * 43 = 1161). A CoT that ends on a digit
+        // fuses with the answer's first digit in the old reasoning+content
+        // concatenation — "…running total 7" + "1161" reads as "71161", so
+        // the *last* number is a corrupted intermediate (false-fail). The
+        // committed content span alone is clean.
+        let math = REASONING_BANK.iter().find(|c| c.id == "math-mul").unwrap();
+        let cot = "Let me work it out step by step, keeping track of the running total 7";
+        let content = "1161";
+        assert!(
+            math.is_solved(content),
+            "the committed content span solves it"
+        );
+        assert!(
+            !math.is_solved(&format!("{cot}{content}")),
+            "the old concatenated span must fail (digit-boundary fusion)"
+        );
+
+        // Logic (logic-syllogism: expected "No"). A CoT that ends on the
+        // word "no" fuses with the answer's "No" — "noNo" contains no
+        // *whole-word* verdict, so the old last-verdict read yields
+        // `None` (false-fail). The content span alone is a clean "No".
+        let logic = REASONING_BANK
+            .iter()
+            .find(|c| c.id == "logic-syllogism")
+            .unwrap();
+        let cot2 = "All engineers are programmers, some programmers are designers, so no";
+        let content2 = "No";
+        assert!(
+            logic.is_solved(content2),
+            "the committed content span solves it"
+        );
+        assert!(
+            !logic.is_solved(&format!("{cot2}{content2}")),
+            "the old concatenated span must fail (word-boundary fusion)"
+        );
+    }
+
+    #[test]
+    fn cot_only_is_not_credited() {
+        // The old false-pass: the model computes the answer inside its
+        // chain-of-thought but commits nothing visible. When the CoT eats
+        // the whole budget the content span is empty — judging it must NOT
+        // credit the latent value.
+        let math = REASONING_BANK.iter().find(|c| c.id == "math-mul").unwrap();
+        assert!(
+            !math.is_solved(""),
+            "an empty committed span (CoT ate the budget) is not solved"
+        );
+        // And a CoT that states the value but commits no answer span:
+        // the runner feeds the checkers the content span (empty here), so
+        // the latent "1161" in the thought is out of scope by construction.
+        assert!(
+            extract_last_number("I am fairly sure the answer is 1161, let me stop thinking")
+                .is_some(),
+            "the value is present in the CoT text itself"
+        );
+        assert!(!math.is_solved(""));
     }
 
     #[test]
