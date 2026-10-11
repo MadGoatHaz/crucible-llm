@@ -925,11 +925,17 @@ impl BenchmarkSequence {
         let mut metrics: Vec<StreamMetricRow> = Vec::new();
         if let Some(results) = (*self.slots.speed.load()).clone() {
             for r in &results {
-                metrics.push(StreamMetricRow::from_speed_result(
+                let mut row = StreamMetricRow::from_speed_result(
                     r,
                     &session.session_id,
                     1,
-                ));
+                );
+                // CF-02 parity with the headless path: populate
+                // `reasoning_tokens` when the server reported the detail.
+                if let Some(t) = r.reasoning_tokens {
+                    row = row.with_reasoning_tokens(t);
+                }
+                metrics.push(row);
             }
         }
 

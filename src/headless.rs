@@ -33,8 +33,9 @@ use crate::engines::speed::{
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, ReasoningEngine,
-    ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult, SweepResult,
+    build_sweep, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine, NiahResult,
+    ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine, StructuredResult,
+    SweepResult,
 };
 use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crate::log::{Context, RunLogger};
@@ -362,6 +363,10 @@ pub fn run_headless(
         // `engine_results` column (CF-14: they used to be lost — only A +
         // C1 were persisted).
         let mut sweep_result: Option<SweepResult> = None;
+        // C1 NIAH: captured so the persistence block can write the
+        // `needle_evaluations` rows (the headless path used to run C1 and
+        // drop the result — the TUI/sequence path persists it).
+        let mut niah_result: Option<NiahResult> = None;
         let mut reasoning_result: Option<ReasoningResult> = None;
         let mut structured_result: Option<StructuredResult> = None;
         let mut flatout_result: Option<FlatOutResult> = None;
@@ -416,6 +421,7 @@ pub fn run_headless(
                         }
                         let r = engine.logger(logger.clone()).run().await;
                         term.info(&format!("  [C1] {}", r.accuracy_label()));
+                        niah_result = Some(r);
                     }
                     Err(e) => {
                         term.warning(&format!("[C1] niah init failed: {e}"));
@@ -534,6 +540,14 @@ pub fn run_headless(
             .enumerate()
             .map(|(i, r)| {
                 let mut row = StreamMetricRow::from_speed_result(r, &session.session_id, 1);
+                // CF-02: populate `stream_metrics.reasoning_tokens` when the
+                // server reported the detail (the seam is now closed). A
+                // reported `0` (thinking suppressed) is distinct from `None`
+                // (the backend did not report it), so only the `Some` case is
+                // written — the `NULL` no-longer.
+                if let Some(t) = r.reasoning_tokens {
+                    row = row.with_reasoning_tokens(t);
+                }
                 row.joules_per_token = windows[i]
                     .and_then(|w| joules_per_token(&hw_trace, Some(w), r.completion_tokens));
                 row
@@ -543,6 +557,24 @@ pub fn run_headless(
             Ok(mut db) => {
                 match db.persist_run(&session, &rows) {
                     Ok(()) => {
+                        // Engine C1 (NIAH): persist the needle evaluations —
+                        // mirroring the TUI/`sequence.rs` path. The headless
+                        // run used to execute C1 and drop the result, leaving
+                        // `needle_evaluations` empty (and the DB-built export
+                        // without per-size retrieval reliability).
+                        let needles = niah_result
+                            .as_ref()
+                            .map(|n| n.to_needle_rows(&session.session_id))
+                            .unwrap_or_default();
+                        for n in &needles {
+                            if let Err(e) = db.insert_needle_evaluation(n) {
+                                logger.warn(
+                                    Context::EngineC1,
+                                    format!("persist needle failed: {e}"),
+                                );
+                                break;
+                            }
+                        }
                         let id = &session.session_id;
                         term.dim(&format!(
                             "  saved → {} (session {})",
