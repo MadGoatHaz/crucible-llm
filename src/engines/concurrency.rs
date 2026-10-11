@@ -1393,11 +1393,7 @@ impl StreamTracker {
     /// available to re-count the text. An authoritative `usage` (or a
     /// tokenizer re-count) is **not** an estimate.
     fn estimated(&self) -> bool {
-        if self
-            .usage
-            .as_ref()
-            .is_some_and(|u| u.completion_tokens > 0)
-        {
+        if self.usage.as_ref().is_some_and(|u| u.completion_tokens > 0) {
             return false;
         }
         count_tokens(&self.text, self.tokenizer.as_deref()).estimated
@@ -2088,7 +2084,10 @@ mod tests {
         acc.trackers[0].text = "hello world this is some text for counting".to_string();
         assert!(acc.trackers[0].estimated(), "chars/4 fallback is flagged");
         let level = acc.finish(1_000_000, false);
-        assert!(level.estimated, "a level with an estimated stream is flagged");
+        assert!(
+            level.estimated,
+            "a level with an estimated stream is flagged"
+        );
     }
 
     #[test]
@@ -2783,8 +2782,8 @@ mod tests {
                 loop_excluded_tokens: 0,
             });
             let level = acc.finish(1_000_000_000, false); // 1 s wall
-            // Only stream 0's 10 tokens count; stream 1's partial tokens
-            // are tracked separately and excluded from the aggregate.
+                                                          // Only stream 0's 10 tokens count; stream 1's partial tokens
+                                                          // are tracked separately and excluded from the aggregate.
             assert_eq!(level.total_tokens, 10);
             assert!(level.timed_out_tokens > 0, "partial tokens tracked");
             assert_eq!(level.timed_out_streams, 1);
@@ -3172,7 +3171,10 @@ mod tests {
         let sweep = Sweep::new(pool, vec![1, 4]).with_matrix(None, vec![8000, 32000], 50);
         let result = sweep.run().await;
         assert_eq!(result.levels.len(), 2);
-        assert_eq!(result.levels[0].context, 8000, "no zero-context leg → first leg");
+        assert_eq!(
+            result.levels[0].context, 8000,
+            "no zero-context leg → first leg"
+        );
         let matrix = result.matrix.expect("multi-context sweep carries a matrix");
         assert_eq!(matrix.contexts, vec![8000, 32000]);
     }
