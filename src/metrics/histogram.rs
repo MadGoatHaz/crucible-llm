@@ -154,14 +154,14 @@ impl Default for LatencyHistogram {
 mod tests {
     use super::*;
 
-    /// CF-09 (de-polluting the ITL from MTP / speculative-decoding *batched*
-    /// frames) is exercised at the **stamping** site —
-    /// `StreamWorker::emit_frames` (see the `stream` module tests), which
-    /// stamps one `now()` per frame so batched frames never collapse to a 0
-    /// (→1 ns) delta. It is deliberately *not* done here: `record(0)` keeps
-    /// its generic clamp-to-1 contract that other callers (and
-    /// `tests/metrics_test.rs`) rely on. This module's CF-24 work — the cap +
-    /// clamp count — is tested below.
+    // CF-09 (de-polluting the ITL from MTP / speculative-decoding *batched*
+    // frames) is exercised at the *stamping* site —
+    // `StreamWorker::emit_frames` (see the `stream` module tests), which
+    // stamps one `now()` per frame so batched frames never collapse to a 0
+    // (->1 ns) delta. It is deliberately *not* done here: `record(0)` keeps
+    // its generic clamp-to-1 contract that other callers (and
+    // `tests/metrics_test.rs`) rely on. This module's CF-24 work — the cap +
+    // clamp count — is tested below.
 
     /// CF-24: the default cap is 60 s, so long inter-token gaps (well under
     /// 60 s) are captured as real measurements rather than clamped to a 1 s
