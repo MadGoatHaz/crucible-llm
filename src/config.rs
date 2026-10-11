@@ -192,6 +192,14 @@ pub struct EngineSelection {
     /// Engine C3 — Structured output / JSON-grammar compliance.
     pub structured: bool,
     /// Engine D — Hardware & Energy profiler.
+    ///
+    /// CF-39: this is the *selection* of the energy engine. The entry
+    /// point keeps it consistent with the poller toggle
+    /// ([`Config::hardware`]): when the operator did **not** pick engines
+    /// explicitly, `hardware` is derived as `hardware && gpu_present` (see
+    /// `main::resolve_engine_d`) — so `--no-hardware` and a driverless
+    /// host both turn Engine D off. An explicit `--engine` selection is
+    /// respected as-is.
     pub hardware: bool,
     /// Engine F — Flat Out (sustained max-speed, one continuous 60s
     /// stream). On by default (like A–C3); only Engine D (Energy) is
@@ -298,8 +306,7 @@ impl EngineSelection {
     /// The JSON array of enabled engine names (e.g. `["speed","niah"]`),
     /// for the `benchmark_sessions.engines` traceability column.
     pub fn selected_names_json(&self) -> String {
-        serde_json::to_string(&self.selected_names())
-            .unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string(&self.selected_names()).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// `true` when no engine is selected.
@@ -404,8 +411,7 @@ impl<'de> Deserialize<'de> for EngineSelectionFile {
             }
             // The canonical 7-bool object.
             serde_json::Value::Object(_) => {
-                let sel =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                let sel = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Self(sel))
             }
             other => Err(serde::de::Error::custom(format!(
@@ -496,8 +502,10 @@ pub struct Cli {
     /// `structured` (C3), `hardware` (D), `flatout` (F).
     #[arg(long, value_name = "ENGINE")]
     pub engine: Vec<String>,
-    /// Disable the hardware/energy telemetry poller (Engine D; on by
-    /// default — it degrades to N/A on a driverless host).
+    /// Disable the hardware/energy telemetry. CF-39: this turns off
+    /// **both** the 100 ms poller *and* the Engine D (energy) selection
+    /// (on by default — it degrades to N/A on a driverless host), so the
+    /// two can never disagree.
     #[arg(long)]
     pub no_hardware: bool,
     /// Directory for the run log (`latest.log` + `run-<timestamp>.log`
@@ -544,8 +552,17 @@ pub struct Config {
     /// `1→2→3→4→8→12→16→24→32` — granular at the low end where home
     /// users operate).
     pub ladder: Vec<usize>,
-    /// Enable the hardware/energy telemetry poller (Engine D, Chunk 17/18).
-    /// On by default; a driverless host degrades to N/A, never a failure.
+    /// Enable the hardware/energy telemetry **poller** (the 100 ms sampler,
+    /// Chunk 17/18). On by default; a driverless host degrades to N/A,
+    /// never a failure.
+    ///
+    /// CF-39: this is the single master switch for hardware telemetry.
+    /// `--no-hardware` disables **both** the poller *and* the Engine D
+    /// (energy) selection: the entry point derives
+    /// `engines.hardware = hardware && gpu_present` when the operator did
+    /// not pick engines explicitly, so the two booleans can never disagree
+    /// (a `--no-hardware` run can no longer select Engine D and starve it
+    /// of data).
     pub hardware: bool,
     /// Which engines a single run orchestrates (Chunk 18).
     pub engines: EngineSelection,
@@ -1275,6 +1292,45 @@ mod tests {
         layer(&cli, &matches, &[], None).unwrap()
     }
 
+    // ── hardware / energy telemetry (CF-39) ──────────────────────────────
+
+    #[test]
+    fn hardware_poller_defaults_to_on() {
+        // The poller is on by default (a driverless host degrades to N/A).
+        assert!(Config::default().hardware);
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert!(cfg.hardware, "no `--no-hardware` → the poller stays on");
+    }
+
+    #[test]
+    fn no_hardware_flag_beats_env() {
+        // The `--no-hardware` flag is a hard disable: it is checked first
+        // in `layer`, so it wins over an env `true`.
+        let env = [(env_vars::HARDWARE.to_string(), "true".to_string())];
+        let cli = cli_from(&["crucible-llm", "--no-hardware"]);
+        let matches = matches_from(&["crucible-llm", "--no-hardware"]);
+        let cfg = layer(&cli, &matches, &env, None).unwrap();
+        assert!(
+            !cfg.hardware,
+            "`--no-hardware` disables the poller even with env=true"
+        );
+    }
+
+    #[test]
+    fn engine_d_selection_defaults_to_off_and_is_independent_of_the_poller() {
+        // The two booleans have distinct defaults: the poller is on, the
+        // Engine D *selection* is off (opt-in). CF-39 unifies them at the
+        // entry point (`engines.hardware = hardware && gpu_present` when
+        // not explicit) — the config layer keeps them separate so an
+        // explicit `--engine hardware` is respected.
+        let cfg = Config::default();
+        assert!(cfg.hardware, "poller on by default");
+        assert!(
+            !cfg.engines.hardware,
+            "Engine D selection off by default (opt-in)"
+        );
+    }
+
     // ── TUI theme ────────────────────────────────────────────────────────
 
     #[test]
@@ -1831,9 +1887,15 @@ mod tests {
         };
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("\"speed\":true"), "object form: {json}");
-        assert!(!json.contains("\"engines\":\"all\""), "not the string: {json}");
+        assert!(
+            !json.contains("\"engines\":\"all\""),
+            "not the string: {json}"
+        );
         let back: ConfigFile = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.engines, Some(EngineSelectionFile::explicit(EngineSelection::all())));
+        assert_eq!(
+            back.engines,
+            Some(EngineSelectionFile::explicit(EngineSelection::all()))
+        );
     }
 
     #[test]
@@ -1847,10 +1909,7 @@ mod tests {
             hardware: false,
             flatout: true,
         };
-        assert_eq!(
-            e.selected_names(),
-            vec!["speed", "niah", "flatout"]
-        );
+        assert_eq!(e.selected_names(), vec!["speed", "niah", "flatout"]);
         assert_eq!(e.selected_names_json(), r#"["speed","niah","flatout"]"#);
         // The JSON list re-parses to the same selection.
         let back = EngineSelection::from_names(
