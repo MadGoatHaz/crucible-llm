@@ -46,7 +46,8 @@ pub fn methodology_block(overhead_ns: u64) -> Value {
             "method": "quanta TSC",
             "overhead_ns": overhead_ns
         },
-        "prefill_throughput": "prompt_tokens / (T_first_content - T_request_sent)",
+        "ttft": "dual: perceived = T3 - T0 (first token − request start; the full client round-trip, incl. network + server queue/prefill/first-decode); server-side = T3 - T1 (first token − response-headers; excludes the request-send network leg, isolates server prefill). T1 is stamped when the server's response headers arrive, not when the last request byte is written.",
+        "prefill_throughput": "prompt_tokens / (T3 - T1) — measured over the server-side TTFT window (response-headers → first token)",
         "decode_throughput": "completion_tokens / (T_last_content - T_first_content)",
         "e2e_throughput": "total_tokens / total_wall_time",
         "itl": "(T_last_content - T_first_content) / (output_tokens - 1)",

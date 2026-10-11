@@ -11,8 +11,10 @@
 //! 2. records the `T0..Tn` lifecycle milestones (blueprint §4.1 / §7) on the
 //!    `quanta` monotonic clock:
 //!    * `T0` — just before the request is sent (socket connection start);
-//!    * `T1` — request write complete (`send()` resolves on response
-//!      headers);
+//!    * `T1` — response headers received (`send()` resolves when the
+//!      server's headers arrive — the request is accepted; this is NOT the
+//!      moment the last request byte left the socket, so the T1→T3 window
+//!      excludes the request-send network leg);
 //!    * `T2` — first body byte received;
 //!    * `T3` — first token frame decoded (the first `Reasoning` /
 //!      `Content` chunk; a role-only opener is *not* a token);
@@ -431,7 +433,15 @@ impl StreamWorker {
                     .await;
             }
         };
-        // T1 — request write complete (`send` resolved on response headers).
+        // T1 — response headers received. `reqwest`'s `send()` resolves when
+        // the server's response headers arrive (the request is accepted and
+        // the server begins responding); it is NOT stamped when the last
+        // request byte is written to the socket. The T1→T3 window therefore
+        // excludes the request-send network leg and approximates the server's
+        // queue/schedule + prefill + first-decode time (the "server-side"
+        // TTFT, [`StreamTimestamps::ttft_server_nanos`]); T0→T3 is the
+        // "perceived" TTFT (the full client-visible round-trip,
+        // [`StreamTimestamps::ttft_perceived_nanos`]).
         ts.t1 = Some(MonotonicInstant::now());
 
         if !resp.status().is_success() {

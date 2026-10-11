@@ -97,8 +97,8 @@ pub fn measure_timestamp_overhead() -> u64 {
 
 /// Per-stream lifecycle timestamps (blueprint §4.1 / §7).
 ///
-/// `T0` socket start · `T1` request write complete · `T2` first byte ·
-/// `T3` first token frame · `Tn` stream close.
+/// `T0` socket start · `T1` response headers received · `T2` first body
+/// byte · `T3` first token frame · `Tn` stream close.
 ///
 /// Every milestone is optional because not every request records every point:
 /// a non-SSE plain-JSON fallback has no `T3`, and a connection refused never
@@ -107,7 +107,14 @@ pub fn measure_timestamp_overhead() -> u64 {
 pub struct StreamTimestamps {
     /// T0 — socket connection start.
     pub t0: Option<MonotonicInstant>,
-    /// T1 — request write complete.
+    /// T1 — response headers received.
+    ///
+    /// `reqwest`'s `send()` resolves when the server's response *headers*
+    /// arrive (the request is accepted and the server begins responding) —
+    /// NOT when the last request byte left the socket. So the `T1 → T3`
+    /// window excludes the request-send network leg and approximates the
+    /// server's queue/schedule + prefill + first-decode time. (CF-06: the
+    /// historical "request write complete" label was misleading.)
     pub t1: Option<MonotonicInstant>,
     /// T2 — first byte received.
     pub t2: Option<MonotonicInstant>,
@@ -123,13 +130,50 @@ impl StreamTimestamps {
         Self::default()
     }
 
-    /// `TTFT` in nanoseconds = `T3 - T1` (first token arrival − request
-    /// dispatched, blueprint §7.1). `None` if either milestone is missing.
-    pub fn ttft_nanos(&self) -> Option<u64> {
+    /// **Perceived (client-side) TTFT** in nanoseconds = `T3 − T0`: the
+    /// first token frame arrival minus the request start (socket open).
+    ///
+    /// This is the headline "how long until I see output" number. It spans
+    /// the *entire* client-visible round-trip: the request-send network leg
+    /// (`T0 → T1`), the server's queue/schedule + prefill + first decode
+    /// (`T1 → T3`). `None` if either milestone is missing.
+    #[must_use]
+    pub fn ttft_perceived_nanos(&self) -> Option<u64> {
+        match (self.t0, self.t3) {
+            (Some(t0), Some(t3)) => Some(t0.delta_nanos(&t3)),
+            _ => None,
+        }
+    }
+
+    /// **Server-side TTFT** in nanoseconds = `T3 − T1`: the first token
+    /// frame arrival minus the response-headers receipt.
+    ///
+    /// Because `T1` is stamped when the server's response headers arrive
+    /// (not when the last request byte was written), this window *excludes*
+    /// the request-send network leg and approximates the server's own
+    /// queue/schedule + prefill + first-decode time. It is the figure to
+    /// compare across backends for prefill behavior (it isolates the server
+    /// from the network); backends that expose their internal timings
+    /// (llama.cpp `timings`, LM Studio `stats`) can be cross-referenced
+    /// against it. `None` if either milestone is missing.
+    #[must_use]
+    pub fn ttft_server_nanos(&self) -> Option<u64> {
         match (self.t1, self.t3) {
             (Some(t1), Some(t3)) => Some(t1.delta_nanos(&t3)),
             _ => None,
         }
+    }
+
+    /// The **server-side** TTFT (`T3 − T1`) — the historical name.
+    ///
+    /// Every engine has consumed this as "TTFT"; it is kept (delegating to
+    /// [`ttft_server_nanos`](Self::ttft_server_nanos)) so the existing T1→T3
+    /// semantics are unchanged for all callers. Use
+    /// [`ttft_perceived_nanos`](Self::ttft_perceived_nanos) for the
+    /// client-perceived headline that includes the network leg.
+    #[must_use]
+    pub fn ttft_nanos(&self) -> Option<u64> {
+        self.ttft_server_nanos()
     }
 
     /// First-byte arrival in nanoseconds = `T2 - T1` (write complete → first

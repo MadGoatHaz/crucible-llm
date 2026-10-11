@@ -117,8 +117,64 @@ fn stream_timestamps_ttft_and_total() {
 fn stream_timestamps_missing_milestones_yield_none() {
     let ts = StreamTimestamps::new();
     assert_eq!(ts.ttft_nanos(), None);
+    assert_eq!(ts.ttft_perceived_nanos(), None);
+    assert_eq!(ts.ttft_server_nanos(), None);
     assert_eq!(ts.total_nanos(), None);
     assert_eq!(ts.first_byte_nanos(), None);
+}
+
+#[test]
+fn dual_ttft_perceived_vs_server_side() {
+    // CF-06: the one conflated "TTFT" is split into two correctly-labeled
+    // metrics. `perceived` = T3 − T0 (the full client round-trip, incl. the
+    // request-send network leg); `server-side` = T3 − T1 (response-headers →
+    // first token, the server's queue/prefill/first-decode). The mock clock
+    // gives exact nanosecond control.
+    let (clock, mock) = quanta::Clock::mock();
+    quanta::with_clock(&clock, || {
+        let t0 = MonotonicInstant::now(); // 0 ms
+        mock.increment(10_000_000); // 10 ms → response headers (T1)
+        let t1 = MonotonicInstant::now();
+        mock.increment(40_000_000); // 50 ms → first token (T3)
+        let t3 = MonotonicInstant::now();
+
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t1),
+            t2: None,
+            t3: Some(t3),
+            t_end: None,
+        };
+
+        // Perceived = T3 − T0 = 50 ms.
+        assert_eq!(ts.ttft_perceived_nanos(), Some(50_000_000));
+        // Server-side = T3 − T1 = 40 ms (excludes the 10 ms network leg).
+        assert_eq!(ts.ttft_server_nanos(), Some(40_000_000));
+        // The historical `ttft_nanos` is the server-side figure (unchanged).
+        assert_eq!(ts.ttft_nanos(), Some(40_000_000));
+        // Perceived always >= server-side (T0 <= T1): the network leg is a
+        // non-negative add-on, never a subtraction.
+        assert!(ts.ttft_perceived_nanos().unwrap() >= ts.ttft_server_nanos().unwrap());
+    });
+}
+
+#[test]
+fn dual_ttft_partial_milestones_yield_none() {
+    // Perceived needs T0 + T3; server-side needs T1 + T3. A missing either
+    // milestone degrades to `None` (N/A-never-panic).
+    let mut ts = StreamTimestamps::new();
+    ts.t0 = Some(MonotonicInstant::now()); // T0 only, no T3
+    assert_eq!(ts.ttft_perceived_nanos(), None);
+
+    let mut ts = StreamTimestamps::new();
+    ts.t1 = Some(MonotonicInstant::now()); // T1 only, no T3
+    assert_eq!(ts.ttft_server_nanos(), None);
+
+    // T3 present but neither T0 nor T1: both are None.
+    let mut ts = StreamTimestamps::new();
+    ts.t3 = Some(MonotonicInstant::now());
+    assert_eq!(ts.ttft_perceived_nanos(), None);
+    assert_eq!(ts.ttft_server_nanos(), None);
 }
 
 // ---------------------------------------------------------------------------
