@@ -36,16 +36,22 @@
 //!    measures the cost of a prompt hint (≈0 where the backend drops the
 //!    field).
 //!
-//! **Reasoning-model suppression (CF-18).** Every run sets
+//! **Reasoning-model handling (hybrid, R2 — Option C).** Every run sets
 //! `disable_thinking` on the shared worker (per-backend and graceful —
-//! `StreamWorker::disable_thinking`, CF-01). Without it, a reasoning model
-//! spends the 256-token budget on chain-of-thought, which the content-only
-//! accumulation deliberately excludes, and emits *empty* content — a false
-//! "not valid JSON" failure of a structured capability the model has.
-//! Once the CoT no longer competes for the budget, the existing 256-token
-//! budget is ample for the JSON answers: the largest case (Complex) needs
-//! well under half of it, and in `json_schema` mode the decoder is
-//! constrained to the case's exact shape (no rambling).
+//! `StreamWorker::disable_thinking`, CF-01/CF-18) as a **best-effort speed
+//! optimization, not a correctness dependency**: on servers that honor it
+//! (vLLM/SGLang/LM Studio/Ollama) the model answers without CoT and the
+//! budget is a rarely-hit ceiling. A *config-only* server silently drops the
+//! per-request fields (OpenAI-spec graceful degradation) and the model
+//! thinks by default — which is why **the 2048-token budget is the
+//! correctness guarantee** (`max_tokens` is honored by every server). It
+//! leaves headroom for chain-of-thought *before* the JSON, so a
+//! suppression-ignoring model can finish its CoT and still commit the
+//! answer, while the content-only accumulation keeps judging the visible
+//! span. A stream that exhausts the budget in CoT with zero content is the
+//! distinct [`CaseVerdict::Truncated`] (`truncated_by_reasoning`) outcome —
+//! an honest "inconclusive (budget)", never a false capability failure
+//! (`work/plans/REASONING_DESIGN.md` §5).
 //!
 //! **Checker hardening (Phase 3, CF-17/36/50/51).** With a real
 //! `json_schema` in place (CF-08), the scoring was hardened to report what it
@@ -96,8 +102,19 @@ use crate::timing::StreamTimestamps;
 /// Bounded worker→engine channel capacity (same as Engine A).
 const CHANNEL_CAPACITY: usize = 256;
 
-/// Max generation tokens per structured run (a small JSON value).
-pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 256;
+/// Max generation tokens per structured run.
+///
+/// **Hybrid reasoning (R2, Option C):** 2048 is the *correctness
+/// guarantee*. The JSON answer itself is small (the largest case, Complex,
+/// needs well under 200 tokens) and is further constrained by the case's
+/// strict `json_schema`; 2048 is headroom for a reasoning model's
+/// chain-of-thought *before* the JSON on a server that ignores our
+/// best-effort `disable_thinking` suppression (R1: the budget carries
+/// correctness, suppression is only a speed optimization). A stream that
+/// exhausts the budget in CoT with zero content is the distinct
+/// `truncated_by_reasoning` outcome ([`CaseVerdict::Truncated`]), not a
+/// capability failure.
+pub const STRUCTURED_MAX_GEN_TOKENS: u32 = 2048;
 
 /// CF-51: how many times each constrained case is repeated. The stability
 /// rate (the fraction of repeats that are fully compliant) turns C3's old
@@ -665,9 +682,9 @@ impl StructuredEngine {
 
     /// One run: spawn a worker (optionally with the case's `response_format`
     /// constraint), drain its channel, and synthesize the §7 metrics.
-    /// Thinking is suppressed on every run (CF-18) so the 256-token budget
-    /// goes to the JSON answer, and only `Chunk::Content` deltas are
-    /// accumulated into the judged body.
+    /// Thinking is suppressed on every run (CF-18, best-effort speed) so the
+    /// 2048-token budget mostly goes to the JSON answer, and only
+    /// `Chunk::Content` deltas are accumulated into the judged body.
     async fn run_once(&self, case_idx: usize, constrained: bool) -> (String, f64, f64) {
         let case = &STRUCTURED_CASES[case_idx];
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
@@ -690,13 +707,16 @@ impl StructuredEngine {
         if let Some(logger) = &self.logger {
             worker = worker.logger(logger.clone());
         }
-        // CF-18: suppress the model's chain-of-thought so the 256-token
-        // budget goes to the JSON answer. Without this, a reasoning model
-        // spends the *entire* budget on CoT (which the content-only
-        // accumulation below deliberately excludes) and emits *empty*
-        // content → "not valid JSON" → a false failure of a structured
-        // capability the model has (the C3 face of the C1 root cause,
-        // CF-01). The suppression is per-backend and graceful (see
+        // CF-18 (hybrid, R2): suppress the model's chain-of-thought so the
+        // 2048-token budget goes to the JSON answer. This is a **best-effort
+        // speed optimization, not a correctness dependency** (R1): a
+        // config-only server silently drops the per-request fields and the
+        // model thinks by default — the *raised budget* is what then lets it
+        // finish its CoT and still commit content, and a stream that
+        // exhausts the budget in CoT with zero content is reported as the
+        // distinct `truncated_by_reasoning` outcome (not a false "not valid
+        // JSON" failure of a structured capability the model has). The
+        // suppression is per-backend and graceful (see
         // `StreamWorker::disable_thinking`), so non-reasoning models and
         // backends without a switch are unaffected. Set on the free-form
         // baseline too, so both legs of the penalty measurement judge
@@ -1189,6 +1209,19 @@ fn strip_json_fence(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── hybrid reasoning (R2): the budget is the correctness guarantee ──
+
+    #[test]
+    fn budget_is_raised_to_2048_for_reasoning_headroom() {
+        // R2 (Option C, `work/plans/REASONING_DESIGN.md` §5.1): the 2048
+        // generation budget is the *correctness guarantee* — headroom for a
+        // reasoning model's chain-of-thought before the JSON on a server
+        // that ignores our best-effort `disable_thinking` suppression. The
+        // JSON body itself is still constrained by the case's strict schema
+        // (the largest case needs well under 200 tokens).
+        assert_eq!(STRUCTURED_MAX_GEN_TOKENS, 2048);
+    }
 
     // ── is_json_compliant (general helper) ───────────────────────────────
 
