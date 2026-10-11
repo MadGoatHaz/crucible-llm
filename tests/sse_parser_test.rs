@@ -298,7 +298,10 @@ fn keepalive_preamble_is_skipped_and_data_frames_parse() {
 
     // Only the four `data:` frames become frames; the preamble is skipped.
     assert_eq!(frames.len(), 4, "preamble produces no frames");
-    assert!(matches!(frames[0].chunk, Chunk::Control), "role-only opener");
+    assert!(
+        matches!(frames[0].chunk, Chunk::Control),
+        "role-only opener"
+    );
     assert_eq!(frames[1].chunk, Chunk::Content("hello".to_string()));
     assert_eq!(
         frames[2].chunk,
@@ -426,8 +429,14 @@ fn usage_details_reads_vllm_openai_reasoning_and_cached() {
         }
     });
     let d = UsageDetails::from_value(&value);
-    assert_eq!(d.reasoning_tokens, 256, "reasoning_tokens read from completion_tokens_details");
-    assert_eq!(d.cached_tokens, 12, "cached_tokens read from prompt_tokens_details");
+    assert_eq!(
+        d.reasoning_tokens, 256,
+        "reasoning_tokens read from completion_tokens_details"
+    );
+    assert_eq!(
+        d.cached_tokens, 12,
+        "cached_tokens read from prompt_tokens_details"
+    );
     // The whole 256-token completion budget is CoT (Strawberry smoking gun).
     assert!(d.is_reasoning_dominated(256));
 }
@@ -446,7 +455,10 @@ fn usage_details_reads_sglang_output_tokens_details() {
         }
     });
     let d = UsageDetails::from_value(&value);
-    assert_eq!(d.reasoning_tokens, 45, "SGLang output_tokens_details.reasoning_tokens");
+    assert_eq!(
+        d.reasoning_tokens, 45,
+        "SGLang output_tokens_details.reasoning_tokens"
+    );
     assert_eq!(d.cached_tokens, 28);
     assert!(!d.is_reasoning_dominated(112), "45 < 112 → not dominated");
 }

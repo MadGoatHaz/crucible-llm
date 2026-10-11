@@ -1062,6 +1062,7 @@ impl StreamWorker {
     /// absent/ambiguous). Only if that also fails do we surface a real
     /// [`StreamError::InvalidTransport`] — never a silent retrieval miss
     /// (Issue #1).
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_sse_end(
         &self,
         tx: &mut mpsc::Sender<StreamEvent>,

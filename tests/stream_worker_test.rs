@@ -119,8 +119,11 @@ async fn respond(sock: &mut TcpStream, mock: Mock) {
             // SSE headers, then keep-alive / comment preamble lines, then the
             // full vLLM frames, then the terminating chunk.
             write_all(sock, SSE_HEADERS).await;
-            write_chunk(sock, b":keep-alive\n\n: server warming up\n\nevent: message\nid: 1\n\n")
-                .await;
+            write_chunk(
+                sock,
+                b":keep-alive\n\n: server warming up\n\nevent: message\nid: 1\n\n",
+            )
+            .await;
             for frame in VLLM_STREAM {
                 write_chunk(sock, frame.as_bytes()).await;
             }
@@ -131,8 +134,11 @@ async fn respond(sock: &mut TcpStream, mock: Mock) {
             // SSE headers (so we route to the SSE path) but a body that is
             // neither valid SSE (no parseable `data:` frame) nor valid JSON.
             write_all(sock, SSE_HEADERS).await;
-            write_chunk(sock, b"this is not a valid sse stream nor json\n\n\x01\x02\x03garbage\n\n")
-                .await;
+            write_chunk(
+                sock,
+                b"this is not a valid sse stream nor json\n\n\x01\x02\x03garbage\n\n",
+            )
+            .await;
             write_chunk(sock, b"").await; // terminating chunk
             let _ = sock.shutdown().await;
         }
@@ -493,11 +499,15 @@ async fn keepalive_preamble_stream_is_parsed_as_sse_not_json() {
         2
     );
     assert_eq!(
-        fr.iter().filter(|f| matches!(f.chunk, Chunk::Content(_))).count(),
+        fr.iter()
+            .filter(|f| matches!(f.chunk, Chunk::Content(_)))
+            .count(),
         2
     );
     assert_eq!(
-        fr.iter().filter(|f| matches!(f.chunk, Chunk::Usage(_))).count(),
+        fr.iter()
+            .filter(|f| matches!(f.chunk, Chunk::Usage(_)))
+            .count(),
         1
     );
     assert!(fr.last().unwrap().done, "[DONE] terminator");
@@ -527,11 +537,7 @@ async fn garbage_body_is_a_real_transport_error_not_a_silent_miss() {
     assert!(frames(&events).is_empty());
     assert!(matches!(events.last().unwrap(), StreamEvent::Failed { .. }));
     // Not retriable: a definitive protocol fault, not a transient connect.
-    assert!(!outcome
-        .error
-        .as_ref()
-        .unwrap()
-        .is_retriable());
+    assert!(!outcome.error.as_ref().unwrap().is_retriable());
 }
 
 #[tokio::test]
@@ -542,7 +548,10 @@ async fn json_completion_with_absent_content_type_is_rescued_not_errored() {
     // Absent content type + we requested `stream: true` → routed to SSE, then
     // the end-of-stream rescue parses the JSON completion. Not an error.
     assert!(outcome.is_ok(), "outcome: {:?}", outcome.error);
-    assert!(!outcome.premature, "a complete JSON response is not premature");
+    assert!(
+        !outcome.premature,
+        "a complete JSON response is not premature"
+    );
     let fr = frames(&events);
     assert_eq!(fr.len(), 2);
     assert_eq!(fr[0].chunk, Chunk::Content("Hello, world!".to_string()));
