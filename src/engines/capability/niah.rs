@@ -290,15 +290,23 @@ pub enum NiahCellState {
     Failed,
 }
 
-/// Classify one cell.
+/// Classify one cell's *prefill* state against the baseline.
 ///
 /// * `!retrieved` (or no TTFT) → [`NiahCellState::Failed`];
-/// * the baseline row itself (`tokens <= base_tokens`), or a missing
-///   baseline (the smallest-size cell failed) → [`NiahCellState::Nominal`]
-///   (nothing to compare — never a false throttle);
+/// * the baseline row itself (`tokens <= base_tokens`) →
+///   [`NiahCellState::Nominal`] (nothing to compare — never a false throttle);
+/// * a **missing / failed baseline** (`base_ttft_s <= 0.0`) on a larger cell →
+///   [`NiahCellState::Nominal`] here, *but* [`NiahResult::compute_states`]
+///   records that on the cell as `no_baseline = true` so it is **not** read as
+///   a confirmed-healthy nominal (CF-45 — a failed smallest-size row used to
+///   mask real prefill degradation by classifying every larger cell nominal);
 /// * TTFT within `PREFILL_THROTTLE_FACTOR`× the linear expectation
 ///   (`base_ttft × tokens / base_tokens`) → [`NiahCellState::Nominal`];
 /// * beyond that → [`NiahCellState::Throttled`].
+///
+/// The 3-state [`NiahCellState`] cannot express "no baseline" (the sibling
+/// View-3 render matches it exhaustively), so that distinction is carried on
+/// the cell itself, not the enum.
 pub fn classify(
     retrieved: bool,
     ttft_s: f64,
@@ -333,6 +341,19 @@ pub struct NiahCell {
     pub prefill_tps: f64,
     /// The ANSI class View 3 renders (assigned by [`NiahResult::compute_states`]).
     pub state: NiahCellState,
+    /// `true` when this cell retrieved the needle but had **no valid baseline**
+    /// to anchor the prefill comparison against — the smallest-size cell at this
+    /// depth failed (`ttft_s == 0.0`), so the prefill-degradation verdict is
+    /// *unknown*, not a confirmed-healthy nominal (CF-45). Set by
+    /// [`NiahResult::compute_states`].
+    pub no_baseline: bool,
+    /// `true` when this cell's context size came from the `chars/4` estimate
+    /// (no `--tokenizer` supplied) rather than an exact token count. Without a
+    /// tokenizer the haystack is low-entropy repeated sentences sized by that
+    /// heuristic, so the "128k" label is *approximate* — [`context_label`]
+    /// surfaces that so the size is never presented as exact (CF-46). Set by
+    /// [`NiahEngine::run_cell`] from the document's `estimated` flag.
+    pub approximate: bool,
 }
 
 impl NiahCell {
@@ -345,6 +366,22 @@ impl NiahCell {
             ttft_s: 0.0,
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
+            no_baseline: false,
+            approximate: false,
+        }
+    }
+
+    /// The context-size label for this cell. A size measured with an exact
+    /// `--tokenizer` reads `"{n}k"`; a size that came from the `chars/4`
+    /// estimate reads `"{n}k (approx.)"` so the context length is never
+    /// presented as exact (CF-46 — the low-entropy repeated-sentence haystack
+    /// is an estimate, and the label keeps that honest).
+    pub fn context_label(&self) -> String {
+        let k = self.target_tokens / 1000;
+        if self.approximate {
+            format!("{k}k (approx.)")
+        } else {
+            format!("{k}k")
         }
     }
 }
@@ -377,22 +414,46 @@ impl NiahResult {
         Some(&self.cells[si * self.depths.len() + di])
     }
 
-    /// `(retrieved, total)` over all cells.
+    /// `(retrieved, run)` over the cells that actually *ran*.
+    ///
+    /// Unrun cells (the [`NiahCell::unrun`] placeholder, `target_tokens == 0`)
+    /// are excluded from the denominator — exactly like
+    /// [`size_pass_rate`]. This keeps the headline honest on a partial /
+    /// interrupted matrix: it reports the pass rate over the cells evaluated,
+    /// not one diluted by cells that never ran (CF-31 — the old version
+    /// counted every grid slot, so an unrun cell read as a failure and the
+    /// two "pass rate" numbers disagreed).
     pub fn accuracy(&self) -> (usize, usize) {
-        let total = self.cells.len();
-        let retrieved = self.cells.iter().filter(|c| c.retrieved).count();
+        let total = self.cells.iter().filter(|c| c.target_tokens > 0).count();
+        let retrieved = self
+            .cells
+            .iter()
+            .filter(|c| c.target_tokens > 0 && c.retrieved)
+            .count();
         (retrieved, total)
     }
 
-    /// `71/77 retrieved (92.2%)` — the headline accuracy figure.
+    /// The headline accuracy figure, e.g. `71/77 retrieved (92.2%)`.
+    ///
+    /// Over a *partial* matrix (some cells never ran) the denominator is the
+    /// run cells only, and the label makes that explicit — `30/42 of 77 run
+    /// (71.4%)` — so an interrupted run is never read as a fleet of failures
+    /// (CF-31, consistent with [`size_pass_rate`]).
     pub fn accuracy_label(&self) -> String {
         let (r, t) = self.accuracy();
+        let grid = self.cells.len();
         let pct = if t > 0 {
             r as f64 / t as f64 * 100.0
         } else {
             0.0
         };
-        format!("{r}/{t} retrieved ({pct:.1}%)")
+        if t == 0 {
+            "No cells run yet".to_string()
+        } else if t == grid {
+            format!("{r}/{t} retrieved ({pct:.1}%)")
+        } else {
+            format!("{r}/{t} of {grid} run ({pct:.1}%)")
+        }
     }
 
     /// The pass rate (0..=100) for one context size across all its depths —
@@ -465,6 +526,14 @@ impl NiahResult {
                     base_size,
                     *size,
                 );
+                // CF-45: an accurate *larger* cell whose baseline (same depth,
+                // smallest size) failed has no valid anchor — its prefill
+                // verdict is unknown, NOT a confirmed-healthy nominal. Record
+                // that distinctly on the cell (the 3-state enum can't carry it,
+                // and the sibling View-3 match is exhaustive over the 3).
+                cell.no_baseline = cell.state == NiahCellState::Nominal
+                    && *size > base_size
+                    && base_ttfts[di] <= 0.0;
             }
         }
     }
@@ -767,6 +836,11 @@ impl NiahEngine {
             prefill_tps,
             // Assigned by `compute_states` once the whole matrix is in.
             state: NiahCellState::Failed,
+            no_baseline: false,
+            // CF-46: propagate the document's estimate flag so the cell's
+            // context size is labeled approximate (chars/4) when no tokenizer
+            // was supplied, never presented as exact.
+            approximate: doc.estimated,
         }
     }
 }
@@ -1024,6 +1098,8 @@ mod tests {
             ttft_s: ttft,
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
+            no_baseline: false,
+            approximate: false,
         }
     }
 
@@ -1034,17 +1110,40 @@ mod tests {
         assert!(r.cell(8000, 0).is_none(), "absent size → None");
         assert!(r.cell(2000, 70).is_none(), "absent depth → None");
 
-        for c in r.cells.iter_mut() {
+        // Mark every slot as *run* (target_tokens set) and retrieved, then
+        // make 4000 @ 50 (row 1, col 1) miss.
+        for (i, c) in r.cells.iter_mut().enumerate() {
+            c.target_tokens = r.sizes[i / r.depths.len()];
             c.retrieved = true;
             c.ttft_s = 0.1;
         }
-        // 4000 @ 50 (row 1, col 1) misses.
         r.cells[4].retrieved = false;
 
+        // All 6 slots ran, so the headline is the classic full-matrix form.
         assert_eq!(r.accuracy(), (5, 6));
         assert_eq!(r.accuracy_label(), "5/6 retrieved (83.3%)");
         assert!(!r.cell(4000, 50).unwrap().retrieved);
         assert!(r.cell(2000, 100).unwrap().retrieved);
+    }
+
+    #[test]
+    fn accuracy_counts_only_run_cells_cf31() {
+        // 2 sizes × 3 depths = 6 grid slots.
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 50, 100]);
+        // 2k row: 2 of 3 ran (2k @ 100 never ran); 1 of the 2 run retrieved.
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        r.cells[1] = cell(2000, 50, false, 0.1);
+        // r.cells[2] (2k @ 100) stays an unrun placeholder (target_tokens 0).
+        // 4k row: nothing ran.
+
+        // CF-31: the denominator is the 2 run cells, not all 6 — so the
+        // headline now agrees with size_pass_rate(2000) (both 1/2 = 50%).
+        assert_eq!(r.accuracy(), (1, 2));
+        assert!((r.size_pass_rate(2000).unwrap() - 50.0).abs() < 0.1);
+        assert_eq!(r.size_pass_rate(4000), None);
+        // The label is honest about the partial run: 1 of the 2 that ran,
+        // out of the 6-cell grid (50.0%).
+        assert_eq!(r.accuracy_label(), "1/2 of 6 run (50.0%)");
     }
 
     #[test]
@@ -1067,6 +1166,52 @@ mod tests {
         r.cells[2].ttft_s = 0.5;
         r.compute_states();
         assert_eq!(r.cells[2].state, NiahCellState::Throttled);
+    }
+
+    #[test]
+    fn compute_states_flags_missing_baseline_distinctly_cf45() {
+        // 2k is the baseline row. The 2k @ 0 cell FAILED (no retrieval, no
+        // TTFT), so there is no valid anchor for the 4k @ 0 cell at that depth.
+        let mut r = NiahResult::new(vec![2000, 4000], vec![0, 100]);
+        // Baseline row (2k): @0 failed, @100 fine.
+        r.cells[0] = cell(2000, 0, false, 0.0);
+        r.cells[1] = cell(2000, 100, true, 0.1);
+        // Larger row (4k): @0 retrieved+fast, @100 fine.
+        r.cells[2] = cell(4000, 0, true, 0.2);
+        r.cells[3] = cell(4000, 100, true, 0.2);
+
+        r.compute_states();
+
+        // CF-45: the 4k @ 0 cell retrieved the needle, but its baseline (2k @ 0)
+        // failed → its prefill verdict is *unknown*, flagged distinctly (not a
+        // silent, confirmed-healthy nominal).
+        assert!(r.cells[2].no_baseline, "4k@0 has no valid baseline (CF-45)");
+        assert_eq!(r.cells[2].state, NiahCellState::Nominal);
+        // The 4k @ 100 cell HAS a valid baseline (2k @ 100 = 0.1) → not flagged.
+        assert!(!r.cells[3].no_baseline, "4k@100 has a valid baseline");
+        assert_eq!(r.cells[3].state, NiahCellState::Nominal);
+        // The baseline row itself is never flagged (nothing to compare).
+        assert!(
+            !r.cells[0].no_baseline,
+            "baseline row is never 'no baseline'"
+        );
+        assert!(
+            !r.cells[1].no_baseline,
+            "baseline row is never 'no baseline'"
+        );
+    }
+
+    #[test]
+    fn context_label_marks_approximate_haystack_cf46() {
+        // A size measured with an exact tokenizer reads plain (not approximate).
+        let measured = cell(128000, 50, true, 0.5);
+        assert!(!measured.approximate);
+        assert_eq!(measured.context_label(), "128k");
+        // A size that came from the `chars/4` estimate is labeled approximate —
+        // the context length is not presented as exact (CF-46).
+        let mut estimated = cell(128000, 50, true, 0.5);
+        estimated.approximate = true;
+        assert_eq!(estimated.context_label(), "128k (approx.)");
     }
 
     #[test]
