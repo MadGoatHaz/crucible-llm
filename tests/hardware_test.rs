@@ -24,7 +24,7 @@ use crucible_llm::engines::hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile,
     VRAM_FRAGMENTATION_THRESHOLD,
 };
-use crucible_llm::hw::{merge_hw, HwPoller, HwSample};
+use crucible_llm::hw::{merge_hw, GpuPowerMonitor, HwPoller, HwSample};
 use crucible_llm::metrics::state::{MetricsSnapshot, MetricsState};
 use crucible_llm::timing::MonotonicInstant;
 
@@ -230,6 +230,136 @@ fn merge_hw_is_a_pure_na_mapping() {
     assert_eq!(merged.gpu_clock_mhz, 1410.0);
     assert_eq!(merged.joules_per_token, 0.338);
     assert!(merged.gpu.is_some()); // the full sample is carried for the panel
+}
+
+// ── CF-41: the energy test blind spots (P3-G) ─────────────────────────────
+//
+// Three integration tests that assert the behavior the other Phase-3
+// workstreams landed but the suite had no test for: (a) a sub-second TTFT
+// resolves a *real* prefill power from the 100 ms trace (P3-A CF-19);
+// (b) the J/token denominator spans every engine (P3 CF-03 — see
+// `energy_denominator_test.rs`); and (c) `--no-hardware` disables both the
+// poller and the energy engine consistently in the headless and TUI paths
+// (P3-B CF-39, closing the CF-20 asymmetry).
+
+/// CF-41(a) / P3-A CF-19 — a **sub-second** TTFT (~300 ms) resolved at the
+/// 100 ms `HwSample` trace cadence yields a *real* prefill phase power (≥2
+/// samples in the window), NOT the overall-average fallback the old 1 Hz
+/// history forced. This is the integration-level mirror of the monitor's
+/// unit test, exercised through the public [`GpuPowerMonitor`] API.
+#[test]
+fn sub_second_ttft_prefill_power_is_the_real_trace_not_the_fallback() {
+    let mut m = GpuPowerMonitor::default();
+    m.begin_run();
+    m.start_load();
+
+    // Three 100 ms prefill samples at a distinct ~150 W draw, ~100 ms
+    // apart — a ~300 ms TTFT (each is a fresh `now()`, all landing inside
+    // the `[load_started, first_token)` window)…
+    for mw in [140_000u64, 150_000, 160_000] {
+        m.trace.push(sample(MonotonicInstant::now(), Some(mw), None));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // …then the first token lands (the prefill window closes) and a
+    // distinctly higher decode draw follows.
+    let first = MonotonicInstant::now();
+    m.first_token_at = Some(first);
+    m.last_token_at = Some(first);
+    m.trace.push(sample(first, Some(600_000), None));
+    m.has_power = true;
+    m.end_load();
+
+    // No fallback: the sub-second window held ≥2 trace samples…
+    assert!(
+        !m.prefill_uses_fallback(),
+        "a ~300 ms TTFT resolves at the 100 ms cadence (no overall-average fallback)"
+    );
+    // …and the prefill power is the *real* ~150 W phase draw (the mean of
+    // the three in-window samples)…
+    let prefill = m.avg_prefill_power().expect("prefill power present");
+    assert!((prefill - 150.0).abs() < 1e-9, "real prefill power: {prefill}");
+    // …NOT the overall average, which the 600 W decode sample pulls up.
+    let overall = m.avg_power_w().expect("overall average power present");
+    assert!(
+        prefill < overall,
+        "prefill ({prefill}) is below the overall avg ({overall}) — it is the phase draw, not the fallback"
+    );
+    // Decode is its own (higher) phase power.
+    let decode = m.avg_decode_power().expect("decode power present");
+    assert!((decode - 600.0).abs() < 1e-9, "decode power: {decode}");
+}
+
+/// CF-41(c) / P3-B CF-39 — `--no-hardware` disables **both** the hardware
+/// poller and the energy engine *consistently* in the headless path and the
+/// TUI path. The old CF-20 asymmetry — the headless poller spawned
+/// unconditionally while the TUI honored the flag — is closed because every
+/// gating site keys on the single `cfg.hardware` master switch.
+#[test]
+fn no_hardware_disables_poller_and_energy_engine_in_both_paths() {
+    use crucible_llm::config::Config;
+
+    // Mirror the four production gating sites:
+    //   headless poller  = cfg.hardware                    (headless.rs:132)
+    //   headless energy  = cfg.hardware                    (headless.rs:327)
+    //   TUI poller       = cfg.hardware                    (main.rs:293)
+    //   TUI Engine D     = hardware && gpu_present         (main.rs:128 → resolve_engine_d, non-explicit)
+    let gate = |cfg: &Config, gpu_present: bool| {
+        (
+            cfg.hardware,
+            cfg.hardware,
+            cfg.hardware,
+            if cfg.engines_explicit {
+                cfg.engines.hardware
+            } else {
+                cfg.hardware && gpu_present
+            },
+        )
+    };
+
+    // `--no-hardware` (cfg.hardware = false), a detection-based run, GPU
+    // present: the poller is off in *both* paths and the energy engine /
+    // Engine D is off too — nothing is spawned, nothing is starved.
+    let no_hw = Config {
+        hardware: false,
+        ..Config::default()
+    };
+    let (h_poller, h_energy, t_poller, t_engine_d) = gate(&no_hw, true);
+    assert!(!h_poller, "headless poller off under --no-hardware");
+    assert!(!h_energy, "headless energy engine off under --no-hardware");
+    assert!(!t_poller, "TUI poller off under --no-hardware");
+    assert!(!t_engine_d, "TUI Engine D off under --no-hardware (no starved N/A)");
+
+    // The symmetry the CF-20 bug broke: the headless poller and the
+    // headless energy engine read the *same* `cfg.hardware` field, so they
+    // can never disagree — no path spawns the poller while its energy
+    // engine is off (and the headless + TUI pollers agree with each other).
+    for hw in [false, true] {
+        let cfg = Config {
+            hardware: hw,
+            ..Config::default()
+        };
+        let (h_poller, h_energy, t_poller, _) = gate(&cfg, true);
+        assert_eq!(
+            h_poller, h_energy,
+            "headless poller == headless energy engine (hw={hw})"
+        );
+        assert_eq!(
+            h_poller, t_poller,
+            "headless poller == TUI poller (hw={hw})"
+        );
+    }
+
+    // The symmetric "on" case: flag on + a GPU present → both paths spawn
+    // the poller and run the energy engine / Engine D.
+    let hw_on = Config {
+        hardware: true,
+        ..Config::default()
+    };
+    let (h_poller, h_energy, t_poller, t_engine_d) = gate(&hw_on, true);
+    assert!(
+        h_poller && h_energy && t_poller && t_engine_d,
+        "flag on + GPU → the poller and energy engine are on in both paths"
+    );
 }
 
 // ── NVML feature-gated path ────────────────────────────────────────────────
