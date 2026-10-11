@@ -3,7 +3,11 @@
 //!
 //! A *needle* — a unique, cryptographically random key-value fact — is
 //! inserted at a chosen depth (0%…100%) of a synthetic long-context
-//! *haystack* document scaled to 2k/4k/8k/16k/32k/64k/128k tokens. The
+//! *haystack* document scaled to a set of context sizes (the default ladder
+//! is 2k/4k/8k/16k/32k/64k/128k tokens, but the ladder and depths are
+//! **runtime-configurable** via `--niah-contexts` / `--niah-depths` and can
+//! scale to 256k/500k/1M+; a single size can be probed with
+//! `--niah-custom` — Issue #5). The
 //! retrieval query asks the model to state the needle's value; two things
 //! are measured simultaneously (blueprint §5 C1):
 //!
@@ -66,6 +70,38 @@ pub const NIAH_DEPTHS: [u8; 11] = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
 /// depth) is classified as *throttled* (yellow) instead of nominal
 /// (green).
 pub const PREFILL_THROTTLE_FACTOR: f64 = 2.0;
+
+/// Format a token count as a compact human label: `2k`, `128k`, `256k`,
+/// `1M`, … — the **shared** size formatter for the C1 grid labels, the
+/// headless run log, and the per-cell worker tags (Issue #3: the headless
+/// log used to render `128000k`; this renders `128k`).
+///
+/// Sizes ≥ 1 000 000 use `M`; sizes ≥ 1 000 use `k`; smaller counts are
+/// shown as-is. A whole number is shown with no decimal (`128k`, `1M`);
+/// a fractional one gets a single decimal (`1.5k`, `1.2M`).
+///
+/// `128000 → "128k"`, `1000000 → "1M"`, `256000 → "256k"`,
+/// `500000 → "500k"`, `1500 → "1.5k"`, `999 → "999"`.
+#[must_use]
+pub fn human_size(tokens: u32) -> String {
+    if tokens >= 1_000_000 {
+        let m = tokens as f64 / 1_000_000.0;
+        if m.fract().abs() < 1e-9 {
+            format!("{m:.0}M")
+        } else {
+            format!("{m:.1}M")
+        }
+    } else if tokens >= 1000 {
+        let k = tokens as f64 / 1000.0;
+        if k.fract().abs() < 1e-9 {
+            format!("{k:.0}k")
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        format!("{tokens}")
+    }
+}
 
 // ── The needle ────────────────────────────────────────────────────────────
 
@@ -148,6 +184,16 @@ pub struct NiahDocument {
 /// insertion position stays correct. Without one, the sentence-rotation
 /// filler's `chars/4` length is used and the count is flagged
 /// `estimated` (graceful degradation — never panic).
+///
+/// **Scales to arbitrarily large targets (Issue #5):** both padding paths
+/// are unbounded — the sentence rotation fills to `target_tokens * 4`
+/// chars and the `" apple"` filler repeats to the exact count — so a
+/// 256k / 500k / 1M+ context builds the same way a 2k one does. The needle
+/// is placed at `depth_percent` of the *total* document, so depth placement
+/// stays correct at any size (depth 0 = front, 100 = end, 50 = middle).
+/// A 1M-token haystack is a ~4–6 MB prompt string; build time is linear in
+/// the size (a few hundred ms at 1M) — memory and time are not a
+/// practical constraint well past the old 128k ceiling.
 pub fn build_document(
     target_tokens: u32,
     depth_percent: u8,
@@ -185,8 +231,16 @@ pub fn build_document(
 
 /// Rotate the sentence bank until `target_tokens * 4` chars (the chars/4
 /// notion of "target_tokens worth of text").
+///
+/// **Scales to arbitrarily large targets (Issue #5):** the loop is a plain
+/// `chars/4` fill — no fixed ceiling — so a 256k / 500k / 1M+ context is
+/// just more rotated sentences. Practical limits: the assembled prompt is
+/// ~`4 bytes / token` (the sentence rotation), so a 1M-token haystack is a
+/// ~4 MB string (~90k rotated sentences); 1M+ is memory-trivial, and the
+/// build time is linear in the size (a few hundred ms at 1M). The `u64`
+/// intermediate keeps `target * 4` overflow-safe for any `u32` target.
 fn haystack_sentences(target_tokens: u32) -> Vec<String> {
-    let target_chars = (target_tokens * 4) as usize;
+    let target_chars = (target_tokens as u64 * 4) as usize;
     let mut out: Vec<String> = Vec::new();
     let mut total = 0usize;
     let mut i = 0usize;
@@ -371,17 +425,23 @@ impl NiahCell {
         }
     }
 
-    /// The context-size label for this cell. A size measured with an exact
-    /// `--tokenizer` reads `"{n}k"`; a size that came from the `chars/4`
-    /// estimate reads `"{n}k (approx.)"` so the context length is never
-    /// presented as exact (CF-46 — the low-entropy repeated-sentence haystack
-    /// is an estimate, and the label keeps that honest).
+    /// The context-size label for this cell, rendered with the shared
+    /// [`human_size`] formatter (`2k`, `128k`, `256k`, `1M`, …).
+    ///
+    /// **C1 token-honesty (Issue #4 / CF-46):** a NIAH context is built to a
+    /// *target* token count. With an exact `--tokenizer` the haystack is
+    /// padded to that count and the label reads plain (`128k`); without one,
+    /// the size comes from the `chars/4` heuristic (the low-entropy
+    /// repeated-sentence haystack), so the label reads `"{size} (approx.)"`
+    /// (`128k (approx.)`, `1M (approx.)`) — the context length is never
+    /// presented as exact. The `approximate` flag is set by
+    /// [`NiahEngine::run_cell`] from the document's `estimated` flag.
     pub fn context_label(&self) -> String {
-        let k = self.target_tokens / 1000;
+        let size = human_size(self.target_tokens);
         if self.approximate {
-            format!("{k}k (approx.)")
+            format!("{size} (approx.)")
         } else {
-            format!("{k}k")
+            size
         }
     }
 }
@@ -593,7 +653,16 @@ pub struct NiahEngine {
 
 impl NiahEngine {
     /// Build from the resolved config (same client/tokenizer policy as
-    /// Engines A/C2) with the default 7×11 matrix.
+    /// Engines A/C2).
+    ///
+    /// **Issue #5 — runtime-configurable ladders:** the context-size and
+    /// needle-depth ladders come from the resolved config
+    /// (`--niah-contexts` / `--niah-depths`, layered CLI > env > file >
+    /// default), not the compile-time [`NIAH_SIZES`] / [`NIAH_DEPTHS`]
+    /// constants (those remain the defaults). The focused "count test" mode
+    /// (`--niah-custom <size>`) takes precedence: it collapses the matrix to
+    /// a **single size row** at exactly that context (across the depth
+    /// ladder) — for probing a RoPE/YaRN-extended limit beyond 128k.
     pub fn new(cfg: &Config) -> Result<Self, EngineError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(cfg.timeout.max(1)))
@@ -602,6 +671,11 @@ impl NiahEngine {
             Some(path) => Some(Arc::new(Tokenizer::from_file(path)?)),
             None => None,
         };
+        let sizes = match cfg.niah_custom {
+            Some(size) => vec![size],
+            None => cfg.niah_contexts.clone(),
+        };
+        let depths = cfg.niah_depths.clone();
         Ok(Self {
             client,
             url: cfg.url.clone(),
@@ -609,8 +683,8 @@ impl NiahEngine {
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
             tokenizer,
-            sizes: NIAH_SIZES.to_vec(),
-            depths: NIAH_DEPTHS.to_vec(),
+            sizes,
+            depths,
             progress: None,
             metrics: None,
             pause: None,
@@ -734,7 +808,10 @@ impl NiahEngine {
             NIAH_MAX_GEN_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
-        .tag(format!("C1:{size}k-d{depth}"));
+        // Issue #3: the shared human-size formatter (was `C1:{size}k-…`,
+        // which rendered a 128 000-token cell as `C1:128000k-d50` in the
+        // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI).
+        .tag(format!("C1:{}-d{depth}", human_size(size)));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -908,6 +985,13 @@ pub struct NiahEngineConfig {
     pub api_key: Option<String>,
     pub timeout: u64,
     pub tokenizer: Option<std::path::PathBuf>,
+    /// The NIAH context-size ladder (Issue #5; default 2k→128k).
+    pub niah_contexts: Vec<u32>,
+    /// The NIAH needle-depth ladder (Issue #5; default 0%…100% step 10).
+    pub niah_depths: Vec<u8>,
+    /// The focused single-size "count test" mode (Issue #5). When `Some`,
+    /// it takes precedence over `niah_contexts`.
+    pub niah_custom: Option<u32>,
 }
 
 impl NiahEngineConfig {
@@ -919,10 +1003,14 @@ impl NiahEngineConfig {
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
             tokenizer: cfg.tokenizer.clone(),
+            niah_contexts: cfg.niah_contexts.clone(),
+            niah_depths: cfg.niah_depths.clone(),
+            niah_custom: cfg.niah_custom,
         }
     }
 
-    /// Build a default-matrix runner from this config.
+    /// Build a runner from this config (Issue #5: the resolved ladders plus
+    /// the focused single-size "count test" mode).
     pub fn engine(&self) -> Result<NiahEngine, EngineError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(self.timeout.max(1)))
@@ -931,6 +1019,11 @@ impl NiahEngineConfig {
             Some(path) => Some(Arc::new(Tokenizer::from_file(path)?)),
             None => None,
         };
+        let sizes = match self.niah_custom {
+            Some(size) => vec![size],
+            None => self.niah_contexts.clone(),
+        };
+        let depths = self.niah_depths.clone();
         Ok(NiahEngine {
             client,
             url: self.url.clone(),
@@ -938,8 +1031,8 @@ impl NiahEngineConfig {
             api_key: self.api_key.clone(),
             timeout: self.timeout,
             tokenizer,
-            sizes: NIAH_SIZES.to_vec(),
-            depths: NIAH_DEPTHS.to_vec(),
+            sizes,
+            depths,
             progress: None,
             metrics: None,
             pause: None,
