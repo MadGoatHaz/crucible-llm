@@ -428,6 +428,17 @@ pub struct NiahCell {
     pub depth_percent: u8,
     /// `true` when the needle value was retrieved from the response.
     pub retrieved: bool,
+    /// **Hybrid reasoning (Option C):** `true` when the stream completed OK
+    /// but the model spent its entire generation budget on chain-of-thought —
+    /// at least one `Chunk::Reasoning` frame and **zero** `Chunk::Content`
+    /// frames. This is a distinct, **non-fail** outcome: an honest
+    /// *inconclusive (budget)*. The model *was* generating, we just never saw
+    /// it commit an answer. Content-only scoring is preserved — a value seen
+    /// only in CoT is never credited as `retrieved`; this flag explains *why*
+    /// a non-retrieved cell produced no answer (the over-thinker case). Set by
+    /// [`NiahEngine::run_cell`] from
+    /// [`StreamOutcome::is_truncated_by_reasoning`].
+    pub truncated_by_reasoning: bool,
     /// Time-to-first-token, seconds (`T3 − T1`; `0.0` on stream failure).
     pub ttft_s: f64,
     /// Prefill throughput, tokens/s (prompt tokens ÷ TTFT).
@@ -456,6 +467,7 @@ impl NiahCell {
             target_tokens: 0,
             depth_percent: 0,
             retrieved: false,
+            truncated_by_reasoning: false,
             ttft_s: 0.0,
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
@@ -986,8 +998,17 @@ impl NiahEngine {
         // Channel closed: collect the outcome.
         let outcome = join_worker(handle).await;
 
+        // **Hybrid reasoning (Option C):** a stream that completed OK but spent
+        // its whole budget on chain-of-thought (all-CoT / zero-content) is a
+        // distinct, non-fail outcome — *inconclusive (budget)*. The verdict is
+        // frame-based (the wire truth the SSE parser already classified), so it
+        // works on every server with no `usage` dependency.
+        let truncated_by_reasoning = outcome.is_truncated_by_reasoning(&events);
+
         // Content-only verdict (CF-01): the needle is retrieved iff it appears
-        // in the model's visible answer, not in its chain-of-thought.
+        // in the model's visible answer, not in its chain-of-thought. A value
+        // seen only in CoT is never credited — content-only scoring is
+        // preserved unchanged by the hybrid.
         let retrieved = needle.is_retrieved(&content_text);
         // §7 timing deltas (the worker owns the quanta stamps).
         let ts: StreamTimestamps = outcome.timestamps;
@@ -1005,6 +1026,7 @@ impl NiahEngine {
             target_tokens: size,
             depth_percent: depth,
             retrieved,
+            truncated_by_reasoning,
             ttft_s: ttft,
             prefill_tps,
             // Assigned by `compute_states` once the whole matrix is in.
@@ -1284,12 +1306,24 @@ mod tests {
             target_tokens: size,
             depth_percent: depth,
             retrieved,
+            truncated_by_reasoning: false,
             ttft_s: ttft,
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
             no_baseline: false,
             approximate: false,
         }
+    }
+
+    /// A cell that was *truncated by reasoning* (Option C): the stream
+    /// completed OK but the model spent its whole budget on chain-of-thought —
+    /// no content was committed, so the needle is not `retrieved`, but the cell
+    /// is **not** a capability failure. It has a real TTFT (the first CoT
+    /// frame arrived) so the prefill timing is measurable.
+    fn truncated_cell(size: u32, depth: u8, ttft: f64) -> NiahCell {
+        let mut c = cell(size, depth, false, ttft);
+        c.truncated_by_reasoning = true;
+        c
     }
 
     #[test]
