@@ -29,7 +29,8 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::engines::capability::niah::{NIAH_DEPTHS, NIAH_SIZES};
+use crate::engines::capability::niah::{NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS, NIAH_SIZES};
+use crate::engines::capability::structured::STRUCTURED_MAX_GEN_TOKENS;
 use crate::engines::concurrency::DEFAULT_LADDER;
 
 /// Default endpoint.
@@ -96,6 +97,13 @@ pub mod env_vars {
     /// focused "count test" mode: run NIAH at exactly that size across the
     /// depth ladder (Issue #5 / RoPE·YaRN probing).
     pub const NIAH_CUSTOM: &str = "CRUCIBLE_NIAH_CUSTOM";
+    /// The C1 (NIAH) per-cell generation budget in tokens (R3). Overrides
+    /// the built-in [`NIAH_MAX_GEN_TOKENS`] hybrid-reasoning safety net.
+    pub const NIAH_MAX_TOKENS: &str = "CRUCIBLE_NIAH_MAX_TOKENS";
+    /// The C3 (structured) per-run generation budget in tokens (R3).
+    /// Overrides the built-in [`STRUCTURED_MAX_GEN_TOKENS`] hybrid-reasoning
+    /// safety net.
+    pub const STRUCTURED_MAX_TOKENS: &str = "CRUCIBLE_STRUCTURED_MAX_TOKENS";
 }
 
 /// The default electricity rate for the View 4 cost estimate ($/kWh).
@@ -548,6 +556,19 @@ pub struct Cli {
     /// RoPE/YaRN-extended limit beyond the default 128k top (Issue #5).
     #[arg(long, value_name = "SIZE")]
     pub niah_custom: Option<String>,
+    /// The C1 (NIAH) per-cell generation budget in tokens (R3). Overrides
+    /// the built-in default (the hybrid-reasoning safety-net budget): a
+    /// larger value gives a verbose reasoner room to finish its
+    /// chain-of-thought *and* commit the answer; a tiny value force-tests
+    /// the `truncated_by_reasoning` outcome.
+    #[arg(long, value_name = "N")]
+    pub niah_max_tokens: Option<u32>,
+    /// The C3 (structured) per-run generation budget in tokens (R3).
+    /// Overrides the built-in default (the hybrid-reasoning safety-net
+    /// budget): a larger value gives a verbose reasoner room to finish its
+    /// chain-of-thought *and* commit the JSON answer.
+    #[arg(long, value_name = "N")]
+    pub structured_max_tokens: Option<u32>,
 }
 
 /// The resolved runtime configuration — what the headless, TUI, and export
@@ -645,6 +666,17 @@ pub struct Config {
     /// limit). When `Some`, it takes precedence over `niah_contexts`
     /// (the matrix collapses to one row) (Issue #5).
     pub niah_custom: Option<u32>,
+    /// The C1 (NIAH) per-cell generation budget in tokens (R3). Default
+    /// [`NIAH_MAX_GEN_TOKENS`] — the hybrid-reasoning safety net (a
+    /// verbose reasoner must be able to finish its chain-of-thought *and*
+    /// commit the answer within the budget). Overridden by
+    /// `--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config file.
+    pub niah_max_tokens: u32,
+    /// The C3 (structured) per-run generation budget in tokens (R3).
+    /// Default [`STRUCTURED_MAX_GEN_TOKENS`] — the hybrid-reasoning safety
+    /// net for the JSON answer. Overridden by `--structured-max-tokens` /
+    /// `CRUCIBLE_STRUCTURED_MAX_TOKENS` / the config file.
+    pub structured_max_tokens: u32,
 }
 
 impl Default for Config {
@@ -680,6 +712,8 @@ impl Default for Config {
             niah_contexts: NIAH_SIZES.to_vec(),
             niah_depths: NIAH_DEPTHS.to_vec(),
             niah_custom: None,
+            niah_max_tokens: NIAH_MAX_GEN_TOKENS,
+            structured_max_tokens: STRUCTURED_MAX_GEN_TOKENS,
         }
     }
 }
@@ -766,6 +800,10 @@ pub struct ConfigFile {
     pub niah_depths: Option<Vec<u8>>,
     /// The NIAH (C1) focused single-size "count test" mode (Issue #5).
     pub niah_custom: Option<u32>,
+    /// The C1 (NIAH) per-cell generation budget in tokens (R3).
+    pub niah_max_tokens: Option<u32>,
+    /// The C3 (structured) per-run generation budget in tokens (R3).
+    pub structured_max_tokens: Option<u32>,
 }
 
 impl ConfigFile {
@@ -855,6 +893,16 @@ impl ConfigFile {
         }
         if let Some(v) = self.niah_custom.filter(|n| *n > 0) {
             c.niah_custom = Some(v);
+        }
+        // C1/C3 generation budgets (R3): a file value overrides the
+        // built-in default; a zero value is treated as absent (the
+        // resolution layer clamps any explicit zero to the 1-token
+        // minimum).
+        if let Some(v) = self.niah_max_tokens.filter(|n| *n > 0) {
+            c.niah_max_tokens = v;
+        }
+        if let Some(v) = self.structured_max_tokens.filter(|n| *n > 0) {
+            c.structured_max_tokens = v;
         }
         c.target_explicit = self.url.is_some();
         c
@@ -1165,6 +1213,41 @@ pub fn layer(
             .filter(|n| *n > 0)
     };
 
+    // ── C1 / C3 generation budgets (R3) ─────────────────────────────────
+    // Per field: CLI > env > config file > the engine's built-in default
+    // (the hybrid-reasoning safety-net budget). An invalid (non-numeric)
+    // env value is a hard error (the `tokens` / `iterations` policy); a
+    // zero value clamps to the 1-token minimum (the worker clamps too).
+    let niah_max_tokens = if explicit("niah_max_tokens") {
+        cli.niah_max_tokens
+    } else {
+        match env_get(env_vars::NIAH_MAX_TOKENS) {
+            Some(raw) => Some(raw.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+                var: env_vars::NIAH_MAX_TOKENS.to_string(),
+                value: raw,
+                reason: "not a valid u32".to_string(),
+            })?),
+            None => file.and_then(|f| f.niah_max_tokens),
+        }
+    }
+    .unwrap_or(NIAH_MAX_GEN_TOKENS)
+    .max(1);
+
+    let structured_max_tokens = if explicit("structured_max_tokens") {
+        cli.structured_max_tokens
+    } else {
+        match env_get(env_vars::STRUCTURED_MAX_TOKENS) {
+            Some(raw) => Some(raw.parse::<u32>().map_err(|_| ConfigError::InvalidEnv {
+                var: env_vars::STRUCTURED_MAX_TOKENS.to_string(),
+                value: raw,
+                reason: "not a valid u32".to_string(),
+            })?),
+            None => file.and_then(|f| f.structured_max_tokens),
+        }
+    }
+    .unwrap_or(STRUCTURED_MAX_GEN_TOKENS)
+    .max(1);
+
     // ── concurrency ladder (Chunk 18) ──
     let ladder = if explicit("ladder") {
         cli.ladder
@@ -1260,6 +1343,8 @@ pub fn layer(
         niah_contexts,
         niah_depths,
         niah_custom,
+        niah_max_tokens,
+        structured_max_tokens,
     })
 }
 
@@ -1924,6 +2009,8 @@ mod tests {
             "--niah-contexts",
             "--niah-depths",
             "--niah-custom",
+            "--niah-max-tokens",
+            "--structured-max-tokens",
         ] {
             assert!(help.contains(flag), "help missing {flag}");
         }
@@ -2334,5 +2421,110 @@ mod tests {
         assert_eq!(parse_size("512"), Some(512));
         assert_eq!(parse_size("8x"), None);
         assert_eq!(parse_size(""), None);
+    }
+
+    // ── C1 / C3 generation budgets (R3) ───────────────────────────────
+
+    #[test]
+    fn niah_and_structured_budgets_default_to_the_builtin_values() {
+        // The built-in safety-net budgets (the engine constants) are the
+        // default when no layer names a value.
+        let cfg = resolve_bare(&["crucible-llm"]);
+        assert_eq!(cfg.niah_max_tokens, NIAH_MAX_GEN_TOKENS);
+        assert_eq!(cfg.structured_max_tokens, STRUCTURED_MAX_GEN_TOKENS);
+        // `Config::default()` agrees with the layering (no env / file).
+        assert_eq!(Config::default().niah_max_tokens, NIAH_MAX_GEN_TOKENS);
+        assert_eq!(
+            Config::default().structured_max_tokens,
+            STRUCTURED_MAX_GEN_TOKENS
+        );
+    }
+
+    #[test]
+    fn cli_niah_max_tokens_overrides_the_default() {
+        let cfg = resolve_bare(&["crucible-llm", "--niah-max-tokens", "2048"]);
+        assert_eq!(cfg.niah_max_tokens, 2048);
+        // The C3 budget is untouched.
+        assert_eq!(cfg.structured_max_tokens, STRUCTURED_MAX_GEN_TOKENS);
+    }
+
+    #[test]
+    fn cli_structured_max_tokens_overrides_the_default() {
+        let cfg = resolve_bare(&["crucible-llm", "--structured-max-tokens", "4096"]);
+        assert_eq!(cfg.structured_max_tokens, 4096);
+        // The C1 budget is untouched.
+        assert_eq!(cfg.niah_max_tokens, NIAH_MAX_GEN_TOKENS);
+    }
+
+    #[test]
+    fn budgets_layer_from_env_and_file() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        // env wins over file.
+        let env = vec![
+            (env_vars::NIAH_MAX_TOKENS.to_string(), "777".to_string()),
+            (
+                env_vars::STRUCTURED_MAX_TOKENS.to_string(),
+                "888".to_string(),
+            ),
+        ];
+        let f = file(r#"{"niah_max_tokens": 111, "structured_max_tokens": 222}"#);
+        let cfg = layer(&cli, &matches, &env, Some(&f)).unwrap();
+        assert_eq!(cfg.niah_max_tokens, 777);
+        assert_eq!(cfg.structured_max_tokens, 888);
+        // file only (no env).
+        let cfg = layer(&cli, &matches, &[], Some(&f)).unwrap();
+        assert_eq!(cfg.niah_max_tokens, 111);
+        assert_eq!(cfg.structured_max_tokens, 222);
+    }
+
+    #[test]
+    fn cli_budget_beats_env_and_file() {
+        // The layering order (CLI > env > file > default) for a budget.
+        let cli = cli_from(&["crucible-llm", "--niah-max-tokens", "32"]);
+        let matches = matches_from(&["crucible-llm", "--niah-max-tokens", "32"]);
+        let env = vec![(env_vars::NIAH_MAX_TOKENS.to_string(), "555".to_string())];
+        let f = file(r#"{"niah_max_tokens": 111}"#);
+        let cfg = layer(&cli, &matches, &env, Some(&f)).unwrap();
+        assert_eq!(cfg.niah_max_tokens, 32, "the CLI value wins");
+    }
+
+    #[test]
+    fn invalid_budget_env_value_is_an_error() {
+        let cli = cli_from(&["crucible-llm"]);
+        let matches = matches_from(&["crucible-llm"]);
+        let env = vec![(env_vars::NIAH_MAX_TOKENS.to_string(), "abc".to_string())];
+        let e = layer(&cli, &matches, &env, None).unwrap_err();
+        assert!(matches!(e, ConfigError::InvalidEnv { .. }));
+        assert!(e.to_string().contains("CRUCIBLE_NIAH_MAX_TOKENS"));
+    }
+
+    #[test]
+    fn a_zero_budget_clamps_to_one() {
+        // A zero budget is meaningless (a 0-token generation); the layer
+        // clamps it to the 1-token minimum (the worker clamps too —
+        // `max_tokens.max(1)`).
+        let cfg = resolve_bare(&["crucible-llm", "--niah-max-tokens", "0"]);
+        assert_eq!(cfg.niah_max_tokens, 1);
+        let cfg = resolve_bare(&["crucible-llm", "--structured-max-tokens", "0"]);
+        assert_eq!(cfg.structured_max_tokens, 1);
+    }
+
+    #[test]
+    fn config_file_round_trips_the_budgets() {
+        let f = ConfigFile {
+            niah_max_tokens: Some(2048),
+            structured_max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&f).expect("serialize");
+        assert!(json.contains("\"niah_max_tokens\":2048"), "{json}");
+        assert!(json.contains("\"structured_max_tokens\":4096"), "{json}");
+        let back: ConfigFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.niah_max_tokens, Some(2048));
+        assert_eq!(back.structured_max_tokens, Some(4096));
+        let c = back.to_config();
+        assert_eq!(c.niah_max_tokens, 2048);
+        assert_eq!(c.structured_max_tokens, 4096);
     }
 }

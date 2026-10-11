@@ -454,6 +454,11 @@ impl ConfigState {
             niah_contexts: None,
             niah_depths: None,
             niah_custom: None,
+            // The C1/C3 generation budgets (R3) are CLI/env concerns — the
+            // form has no inputs for them, so they are persisted as absent
+            // (the built-in safety-net defaults apply on reload).
+            niah_max_tokens: None,
+            structured_max_tokens: None,
         };
         let json = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         if let Some(parent) = self.config_path.parent() {

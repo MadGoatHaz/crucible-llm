@@ -175,6 +175,7 @@ fn cell(size: u32, depth: u8, retrieved: bool, ttft: f64) -> NiahCell {
         depth_percent: depth,
         retrieved,
         truncated_by_reasoning: false,
+        reasoning_tokens: None,
         ttft_s: ttft,
         prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
         state: NiahCellState::Nominal,

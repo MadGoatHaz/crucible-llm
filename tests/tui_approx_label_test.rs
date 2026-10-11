@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use common::render::render_text;
 use crucible_llm::engines::capability::{
-    NiahCell, NiahCellState, NiahEngineConfig, NiahResult, NIAH_DEPTHS, NIAH_SIZES,
+    NiahCell, NiahCellState, NiahEngineConfig, NiahResult, NIAH_DEPTHS, NIAH_MAX_GEN_TOKENS,
+    NIAH_SIZES,
 };
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::{live, needle};
@@ -64,6 +65,7 @@ fn app_with_tokenizer() -> App {
         niah_contexts: NIAH_SIZES.to_vec(),
         niah_depths: NIAH_DEPTHS.to_vec(),
         niah_custom: None,
+        max_gen_tokens: NIAH_MAX_GEN_TOKENS,
     });
     app
 }

@@ -2199,6 +2199,7 @@ mod tests {
             repeats: 1,
             compliant_repeats: 0,
             truncated_by_reasoning: true,
+            reasoning_tokens: None,
         }
     }
 

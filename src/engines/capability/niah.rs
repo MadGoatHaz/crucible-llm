@@ -439,6 +439,13 @@ pub struct NiahCell {
     /// [`NiahEngine::run_cell`] from
     /// [`StreamOutcome::is_truncated_by_reasoning`].
     pub truncated_by_reasoning: bool,
+    /// The server-reported chain-of-thought tokens for this cell (R3
+    /// calibration measurement): `usage.completion_tokens_details.
+    /// reasoning_tokens`. `None` when the backend did not report a usage
+    /// block (the honest "not reported" case); `Some(0)` when it reported
+    /// zero CoT (thinking suppression worked). Set by
+    /// [`NiahEngine::run_cell`] from [`StreamOutcome::usage_details`].
+    pub reasoning_tokens: Option<u64>,
     /// Time-to-first-token, seconds (`T3 − T1`; `0.0` on stream failure).
     pub ttft_s: f64,
     /// Prefill throughput, tokens/s (prompt tokens ÷ TTFT).
@@ -468,6 +475,7 @@ impl NiahCell {
             depth_percent: 0,
             retrieved: false,
             truncated_by_reasoning: false,
+            reasoning_tokens: None,
             ttft_s: 0.0,
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
@@ -635,8 +643,7 @@ impl NiahResult {
         }
         // Option C: truncate the denominator to the *measurable* cells (ran
         // and not truncated-by-reasoning). An all-truncated row → `None`.
-        let measurable =
-            run - cells.iter().filter(|c| c.truncated_by_reasoning).count();
+        let measurable = run - cells.iter().filter(|c| c.truncated_by_reasoning).count();
         if measurable == 0 {
             return None;
         }
@@ -780,6 +787,11 @@ impl NiahResult {
                     "depth": c.depth_percent,
                     "retrieved": c.retrieved,
                     "truncated_by_reasoning": c.truncated_by_reasoning,
+                    // R3: the server-reported CoT tokens for the cell
+                    // (`null` when the backend reported no usage block) —
+                    // the calibration measurement of a model's reasoning
+                    // usage.
+                    "reasoning_tokens": c.reasoning_tokens,
                     "ttft_s": c.ttft_s,
                     "prefill_tps": c.prefill_tps,
                     "state": state_name(c.state),
@@ -825,6 +837,12 @@ pub struct NiahEngine {
     /// an explicit `--tokenizer` that fails to load is a hard error;
     /// without one, counts are `chars/4` estimates).
     tokenizer: Option<Arc<Tokenizer>>,
+    /// The per-cell generation budget in tokens (R3). The resolved config
+    /// value (`--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config
+    /// file > the built-in [`NIAH_MAX_GEN_TOKENS`] hybrid-reasoning safety
+    /// net). This is the budget a verbose reasoner must fit its
+    /// chain-of-thought *and* the answer into.
+    max_gen_tokens: u32,
     sizes: Vec<u32>,
     depths: Vec<u8>,
     /// Optional sequence seam: publish `Size …, Depth …` to the
@@ -874,6 +892,7 @@ impl NiahEngine {
             api_key: cfg.api_key.clone(),
             timeout: cfg.timeout,
             tokenizer,
+            max_gen_tokens: cfg.niah_max_tokens,
             sizes,
             depths,
             progress: None,
@@ -881,6 +900,12 @@ impl NiahEngine {
             pause: None,
             logger: None,
         })
+    }
+
+    /// The configured per-cell generation budget in tokens (R3).
+    #[must_use]
+    pub fn max_gen_tokens(&self) -> u32 {
+        self.max_gen_tokens
     }
 
     /// Override the context sizes (tests / custom matrices).
@@ -996,7 +1021,7 @@ impl NiahEngine {
             &self.url,
             &self.model,
             &doc.text,
-            NIAH_MAX_GEN_TOKENS,
+            self.max_gen_tokens,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
         // Issue #3 + Issue #4: the shared size formatter (was `C1:{size}k-…`,
@@ -1004,7 +1029,10 @@ impl NiahEngine {
         // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI) plus
         // the `(approx.)` qualifier when the haystack is the `chars/4`
         // estimate (`doc.estimated` — no `--tokenizer`): `C1:128k (approx.)-d50`.
-        .tag(format!("C1:{}-d{depth}", context_size_label(size, doc.estimated)));
+        .tag(format!(
+            "C1:{}-d{depth}",
+            context_size_label(size, doc.estimated)
+        ));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -1064,7 +1092,7 @@ impl NiahEngine {
                         &self.model,
                         "NIAH",
                         &events,
-                        NIAH_MAX_GEN_TOKENS,
+                        self.max_gen_tokens,
                         self.tokenizer.as_deref(),
                     ));
                     batch = 0;
@@ -1078,13 +1106,18 @@ impl NiahEngine {
                 &self.model,
                 "NIAH",
                 &events,
-                NIAH_MAX_GEN_TOKENS,
+                self.max_gen_tokens,
                 self.tokenizer.as_deref(),
             ));
         }
 
         // Channel closed: collect the outcome.
         let outcome = join_worker(handle).await;
+
+        // R3: the server-reported CoT token count for this cell (the
+        // calibration measurement). `None` when the backend reported no
+        // usage block (the honest "not reported" case).
+        let reasoning_tokens = outcome.usage_details.map(|d| d.reasoning_tokens);
 
         // **Hybrid reasoning (Option C):** a stream that completed OK but spent
         // its whole budget on chain-of-thought (all-CoT / zero-content) is a
@@ -1115,6 +1148,7 @@ impl NiahEngine {
             depth_percent: depth,
             retrieved,
             truncated_by_reasoning,
+            reasoning_tokens,
             ttft_s: ttft,
             prefill_tps,
             // Assigned by `compute_states` once the whole matrix is in.
@@ -1198,6 +1232,9 @@ pub struct NiahEngineConfig {
     /// The focused single-size "count test" mode (Issue #5). When `Some`,
     /// it takes precedence over `niah_contexts`.
     pub niah_custom: Option<u32>,
+    /// The per-cell generation budget in tokens (R3; default
+    /// [`NIAH_MAX_GEN_TOKENS`]).
+    pub max_gen_tokens: u32,
 }
 
 impl NiahEngineConfig {
@@ -1212,6 +1249,7 @@ impl NiahEngineConfig {
             niah_contexts: cfg.niah_contexts.clone(),
             niah_depths: cfg.niah_depths.clone(),
             niah_custom: cfg.niah_custom,
+            max_gen_tokens: cfg.niah_max_tokens,
         }
     }
 
@@ -1237,6 +1275,7 @@ impl NiahEngineConfig {
             api_key: self.api_key.clone(),
             timeout: self.timeout,
             tokenizer,
+            max_gen_tokens: self.max_gen_tokens,
             sizes,
             depths,
             progress: None,
@@ -1395,6 +1434,7 @@ mod tests {
             depth_percent: depth,
             retrieved,
             truncated_by_reasoning: false,
+            reasoning_tokens: None,
             ttft_s: ttft,
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
@@ -1912,5 +1952,56 @@ mod tests {
         let engine = nec.engine().unwrap();
         assert_eq!(engine.sizes_list(), &[1_000_000]);
         assert_eq!(engine.depths_list(), &[10, 90]);
+    }
+
+    // ── R3: the configurable generation budget ─────────────────────────
+
+    #[test]
+    fn engine_honors_the_configured_generation_budget() {
+        // The resolved config budget (R3) reaches the engine and is used
+        // for the per-cell worker / snapshots (not the compile-time
+        // default).
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            niah_max_tokens: 2048,
+            ..Config::default()
+        };
+        let engine = NiahEngine::new(&cfg).unwrap();
+        assert_eq!(engine.max_gen_tokens(), 2048);
+        // The default config carries the built-in safety-net budget.
+        let engine = NiahEngine::new(&Config::default()).unwrap();
+        assert_eq!(engine.max_gen_tokens(), NIAH_MAX_GEN_TOKENS);
+    }
+
+    #[test]
+    fn niah_engine_config_carries_the_generation_budget() {
+        // The TUI `n`-key path carries the budget through
+        // `NiahEngineConfig` too.
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            niah_max_tokens: 4096,
+            ..Config::default()
+        };
+        let nec = NiahEngineConfig::from_config(&cfg);
+        assert_eq!(nec.max_gen_tokens, 4096);
+        let engine = nec.engine().unwrap();
+        assert_eq!(engine.max_gen_tokens(), 4096);
+    }
+
+    #[test]
+    fn to_dict_carries_the_per_cell_reasoning_tokens() {
+        // R3: the `--json` niah section carries each cell's
+        // server-reported CoT tokens (`null` when the backend reported no
+        // usage block) — the calibration measurement.
+        let mut r = NiahResult::new(vec![2000], vec![0, 100]);
+        r.cells[0] = cell(2000, 0, true, 0.1);
+        let mut c = cell(2000, 100, false, 0.1);
+        c.reasoning_tokens = Some(37);
+        c.truncated_by_reasoning = true;
+        r.cells[1] = c;
+        let v = r.to_dict();
+        let cells = v["cells"].as_array().expect("cells array");
+        assert_eq!(cells[0]["reasoning_tokens"], serde_json::Value::Null);
+        assert_eq!(cells[1]["reasoning_tokens"], 37);
     }
 }

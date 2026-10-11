@@ -385,6 +385,13 @@ pub struct StructuredCaseResult {
     /// repeated case it marks that *any* repeat was truncated (the folded
     /// verdict is `Truncated` only when *all* repeats were).
     pub truncated_by_reasoning: bool,
+    /// The server-reported chain-of-thought tokens for this case (R3
+    /// calibration measurement): `usage.completion_tokens_details.
+    /// reasoning_tokens`. For a repeated case this is the **max** over its
+    /// repeats (the headroom-relevant worst case). `None` when the backend
+    /// did not report a usage block (the honest "not reported" case);
+    /// `Some(0)` when it reported zero CoT (thinking suppression worked).
+    pub reasoning_tokens: Option<u64>,
 }
 
 impl StructuredCaseResult {
@@ -690,6 +697,11 @@ impl StructuredResult {
                     "name": case.name,
                     "verdict": case.verdict,
                     "truncated_by_reasoning": case.truncated_by_reasoning,
+                    // R3: the server-reported CoT tokens for the case
+                    // (`null` when the backend reported no usage block) —
+                    // the calibration measurement of a model's reasoning
+                    // usage.
+                    "reasoning_tokens": case.reasoning_tokens,
                     "valid_json": case.is_valid_json(),
                     "compliant": case.is_compliant(),
                     "repeats": case.repeats,
@@ -736,6 +748,9 @@ struct RunOutput {
     /// `truncated_by_reasoning` outcome (R1 seam:
     /// `StreamOutcome::is_truncated_by_reasoning`).
     truncated_by_reasoning: bool,
+    /// The server-reported CoT tokens for this run (R3 calibration
+    /// measurement). `None` when the backend reported no usage block.
+    reasoning_tokens: Option<u64>,
 }
 
 /// The live runner: a free-form baseline plus the three constrained cases.
@@ -754,6 +769,11 @@ pub struct StructuredEngine {
     /// Optional HF tokenizer for re-tokenizing output when a proxy omits
     /// `usage` (the research's fallback counting method).
     tokenizer: Option<Arc<crate::prompt::Tokenizer>>,
+    /// The per-run generation budget in tokens (R3). The resolved config
+    /// value (`--structured-max-tokens` / `CRUCIBLE_STRUCTURED_MAX_TOKENS` /
+    /// the config file > the built-in [`STRUCTURED_MAX_GEN_TOKENS`]
+    /// hybrid-reasoning safety net).
+    max_gen_tokens: u32,
     /// Optional sequence seam: publish `Run {n}/{total}` to the
     /// [`ProgressBus`] the Benchmark Sequence mirrors into the TUI.
     progress: Option<Arc<ProgressBus>>,
@@ -787,11 +807,18 @@ impl StructuredEngine {
             timeout: cfg.timeout,
             repeats: 1,
             tokenizer,
+            max_gen_tokens: cfg.structured_max_tokens,
             progress: None,
             metrics: None,
             pause: None,
             logger: None,
         })
+    }
+
+    /// The configured per-run generation budget in tokens (R3).
+    #[must_use]
+    pub fn max_gen_tokens(&self) -> u32 {
+        self.max_gen_tokens
     }
 
     /// CF-51: set how many times each constrained case is repeated. The
@@ -852,7 +879,7 @@ impl StructuredEngine {
             &self.url,
             &self.model,
             case.prompt,
-            STRUCTURED_MAX_GEN_TOKENS,
+            self.max_gen_tokens,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
         .tag(if constrained {
@@ -938,7 +965,7 @@ impl StructuredEngine {
                         &self.model,
                         "Structured",
                         &events,
-                        STRUCTURED_MAX_GEN_TOKENS,
+                        self.max_gen_tokens,
                         self.tokenizer.as_deref(),
                     ));
                     batch = 0;
@@ -952,13 +979,18 @@ impl StructuredEngine {
                 &self.model,
                 "Structured",
                 &events,
-                STRUCTURED_MAX_GEN_TOKENS,
+                self.max_gen_tokens,
                 self.tokenizer.as_deref(),
             ));
         }
 
         // Channel closed: collect the outcome.
         let outcome = join_worker(handle).await;
+
+        // R3: the server-reported CoT token count for this run (the
+        // calibration measurement). `None` when the backend reported no
+        // usage block.
+        let reasoning_tokens = outcome.usage_details.map(|d| d.reasoning_tokens);
 
         // R2 hybrid reasoning: a *completed* (OK) stream that spent the
         // whole budget on chain-of-thought — all-CoT, zero content — is the
@@ -1008,6 +1040,7 @@ impl StructuredEngine {
             ttft,
             tps,
             truncated_by_reasoning,
+            reasoning_tokens,
         }
     }
 
@@ -1080,11 +1113,14 @@ impl StructuredEngine {
                 }
                 // R2: the distinct `truncated_by_reasoning` outcome (all-CoT,
                 // zero content on a completed stream) is marked on the case
-                // — not folded into the compliance failure buckets.
+                // — not folded into the compliance failure buckets. R3: the
+                // run's server-reported CoT count rides along for the
+                // `--json` per-case detail.
                 evals.push(evaluate_case_with(
                     case.name,
                     &out.body,
                     out.truncated_by_reasoning,
+                    out.reasoning_tokens,
                 ));
             }
             case_evals.push(evals);
@@ -1145,10 +1181,11 @@ fn is_int(v: &serde_json::Value) -> bool {
 /// (a ` ```json ` fence is stripped first), and each case checks its own
 /// schema shape, fields, and types.
 pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
-    evaluate_case_with(name, body, false)
+    evaluate_case_with(name, body, false, None)
 }
 
-/// `evaluate_case` with the hybrid-reasoning flag (R2).
+/// `evaluate_case` with the hybrid-reasoning flag (R2) and the
+/// server-reported CoT token count (R3).
 ///
 /// `truncated` is `true` when the run's stream **completed OK** but the
 /// model spent the entire budget on chain-of-thought — all-CoT, zero
@@ -1161,7 +1198,15 @@ pub fn evaluate_case(name: &str, body: &str) -> StructuredCaseResult {
 /// truncated — the seam's `is_ok()` gate keeps it a plain [`Failed`]
 /// verdict, and `truncated` must only ever be `true` for a completed
 /// all-CoT stream.
-fn evaluate_case_with(name: &str, body: &str, truncated: bool) -> StructuredCaseResult {
+///
+/// `reasoning_tokens` is the run's server-reported CoT count (R3
+/// calibration) — carried on the result for the `--json` per-case detail.
+fn evaluate_case_with(
+    name: &str,
+    body: &str,
+    truncated: bool,
+    reasoning_tokens: Option<u64>,
+) -> StructuredCaseResult {
     if truncated {
         return StructuredCaseResult {
             name: name.to_string(),
@@ -1174,6 +1219,7 @@ fn evaluate_case_with(name: &str, body: &str, truncated: bool) -> StructuredCase
             repeats: 1,
             compliant_repeats: 0,
             truncated_by_reasoning: true,
+            reasoning_tokens,
         };
     }
     let normalized = strip_json_fence(body);
@@ -1340,6 +1386,7 @@ fn evaluate_case_with(name: &str, body: &str, truncated: bool) -> StructuredCase
             0
         },
         truncated_by_reasoning: false,
+        reasoning_tokens,
     }
 }
 
@@ -1366,6 +1413,10 @@ fn fold_case_repeats(name: &str, evals: Vec<StructuredCaseResult>) -> Structured
     let repeats = evals.len();
     let compliant_repeats = evals.iter().filter(|e| e.is_compliant()).count();
     let truncated_repeats = evals.iter().filter(|e| e.truncated_by_reasoning).count();
+    // R3: the case's CoT usage is the **max** over its repeats (the
+    // headroom-relevant worst case); `None` when no repeat's backend
+    // reported a usage block.
+    let reasoning_tokens = evals.iter().filter_map(|e| e.reasoning_tokens).max();
     let mut rep = match evals.into_iter().next() {
         Some(r) => r,
         None => return evaluate_case(name, ""),
@@ -1392,6 +1443,8 @@ fn fold_case_repeats(name: &str, evals: Vec<StructuredCaseResult>) -> Structured
     // R2: mark the case when *any* repeat was truncated (the folded verdict
     // above is `Truncated` only when *all* repeats were).
     rep.truncated_by_reasoning = truncated_repeats > 0;
+    // R3: the max-CoT figure (the worst case across the repeats).
+    rep.reasoning_tokens = reasoning_tokens;
     rep
 }
 
@@ -1974,7 +2027,7 @@ mod tests {
             outcome.is_truncated_by_reasoning(&events),
             "reasoning>0 && content==0 && is_ok ⇒ truncated (R1 seam)"
         );
-        let r = evaluate_case_with("Simple", "", true);
+        let r = evaluate_case_with("Simple", "", true, None);
         assert_eq!(
             r.verdict,
             CaseVerdict::Truncated,
@@ -2001,7 +2054,12 @@ mod tests {
             !outcome.is_truncated_by_reasoning(&events),
             "content>0 ⇒ not truncated"
         );
-        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": "thirty-six"}"#, false);
+        let r = evaluate_case_with(
+            "Simple",
+            r#"{"name": "Ada", "age": "thirty-six"}"#,
+            false,
+            None,
+        );
         assert_eq!(
             r.verdict,
             CaseVerdict::Partial,
@@ -2014,7 +2072,7 @@ mod tests {
     fn compliant_case_passes_and_is_not_truncated() {
         // (c) A case with committed, schema-correct content → Compliant,
         // never marked truncated.
-        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false);
+        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, None);
         assert_eq!(r.verdict, CaseVerdict::Compliant);
         assert!(!r.truncated_by_reasoning);
         assert!(r.is_compliant());
@@ -2036,7 +2094,7 @@ mod tests {
             !outcome.is_truncated_by_reasoning(&events),
             "an error is a fail, not a truncation"
         );
-        let r = evaluate_case_with("Simple", "", false);
+        let r = evaluate_case_with("Simple", "", false, None);
         assert_eq!(r.verdict, CaseVerdict::Failed);
         assert!(!r.truncated_by_reasoning);
     }
@@ -2051,7 +2109,7 @@ mod tests {
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
             "nope",
         );
-        r.cases[2] = evaluate_case_with("Complex", "", true);
+        r.cases[2] = evaluate_case_with("Complex", "", true, None);
         assert_eq!(
             r.score(),
             (2, 0, 0),
@@ -2071,7 +2129,7 @@ mod tests {
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
             "nope",
         );
-        r.cases[2] = evaluate_case_with("Complex", "", true);
+        r.cases[2] = evaluate_case_with("Complex", "", true, None);
         let s = r.summary_line();
         assert!(
             s.contains("2/3 schema, 1 truncated_by_reasoning"),
@@ -2094,9 +2152,9 @@ mod tests {
             free_ttft: 0.2,
             constrained_ttft: 0.21,
             cases: vec![
-                evaluate_case_with("Simple", "", true),
-                evaluate_case_with("Medium", "", true),
-                evaluate_case_with("Complex", "", true),
+                evaluate_case_with("Simple", "", true, None),
+                evaluate_case_with("Medium", "", true, None),
+                evaluate_case_with("Complex", "", true, None),
             ],
             constrained_body: String::new(),
             free_body: String::new(),
@@ -2130,7 +2188,7 @@ mod tests {
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
             r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
         );
-        r.cases[0] = evaluate_case_with("Simple", "", true);
+        r.cases[0] = evaluate_case_with("Simple", "", true, None);
         assert!(!r.constraint_effective(), "no content ⇒ not effective");
         let s = r.summary_line();
         assert!(
@@ -2146,9 +2204,9 @@ mod tests {
         // the distinct `Truncated` verdict (not `Failed`), flagged
         // `truncated_by_reasoning`, and never reads as a pass.
         let evals = vec![
-            evaluate_case_with("Simple", "", true),
-            evaluate_case_with("Simple", "", true),
-            evaluate_case_with("Simple", "", true),
+            evaluate_case_with("Simple", "", true, None),
+            evaluate_case_with("Simple", "", true, None),
+            evaluate_case_with("Simple", "", true, None),
         ];
         let folded = fold_case_repeats("Simple", evals);
         assert_eq!(
@@ -2167,8 +2225,8 @@ mod tests {
         // (Partial) and the case carries the truncation flag — but it never
         // reads as a compliance failure.
         let evals = vec![
-            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false),
-            evaluate_case_with("Simple", "", true),
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, None),
+            evaluate_case_with("Simple", "", true, None),
         ];
         let folded = fold_case_repeats("Simple", evals);
         assert_eq!(
@@ -2193,7 +2251,7 @@ mod tests {
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
             "nope",
         );
-        r.cases[2] = evaluate_case_with("Complex", "", true);
+        r.cases[2] = evaluate_case_with("Complex", "", true, None);
         let d = r.to_dict();
         assert_eq!(d["score"]["compliant"], 2);
         assert_eq!(d["score"]["failed"], 0);
@@ -2209,5 +2267,79 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("truncated_by_reasoning"));
+    }
+
+    // ── R3: the configurable generation budget + CoT measurement ────────
+
+    #[test]
+    fn engine_honors_the_configured_generation_budget() {
+        // The resolved config budget (R3) reaches the engine and is used
+        // for the per-run worker / snapshots (not the compile-time
+        // default).
+        let cfg = Config {
+            url: "http://127.0.0.1:9".to_string(),
+            structured_max_tokens: 4096,
+            ..Config::default()
+        };
+        let engine = StructuredEngine::new(&cfg).unwrap();
+        assert_eq!(engine.max_gen_tokens(), 4096);
+        // The default config carries the built-in safety-net budget.
+        let engine = StructuredEngine::new(&Config::default()).unwrap();
+        assert_eq!(engine.max_gen_tokens(), STRUCTURED_MAX_GEN_TOKENS);
+    }
+
+    #[test]
+    fn evaluate_case_carries_the_reasoning_tokens() {
+        // R3: the server-reported CoT count rides on the case result (the
+        // `--json` per-case detail), for both the truncated and the
+        // content-present paths.
+        let r = evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, Some(12));
+        assert_eq!(r.reasoning_tokens, Some(12));
+        let t = evaluate_case_with("Simple", "", true, Some(64));
+        assert_eq!(t.reasoning_tokens, Some(64));
+        // No usage block reported → `None` (honest "not reported").
+        let r = evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#);
+        assert_eq!(r.reasoning_tokens, None);
+    }
+
+    #[test]
+    fn fold_case_repeats_takes_the_max_reasoning_tokens() {
+        // R3: the folded case reports the worst-case CoT usage across its
+        // repeats (the headroom-relevant number).
+        let evals = vec![
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, Some(10)),
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, Some(25)),
+            evaluate_case_with("Simple", "", true, Some(64)),
+        ];
+        let folded = fold_case_repeats("Simple", evals);
+        assert_eq!(folded.reasoning_tokens, Some(64));
+        // A `None` among `Some`s is ignored; all-`None` stays `None`.
+        let evals = vec![
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, None),
+            evaluate_case_with("Simple", r#"{"name": "Ada", "age": 36}"#, false, Some(7)),
+        ];
+        assert_eq!(fold_case_repeats("Simple", evals).reasoning_tokens, Some(7));
+        let evals = vec![
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+            evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+        ];
+        assert_eq!(fold_case_repeats("Simple", evals).reasoning_tokens, None);
+    }
+
+    #[test]
+    fn to_dict_carries_the_per_case_reasoning_tokens() {
+        // R3: the `--json` structured section carries each case's
+        // server-reported CoT tokens (`null` when the backend reported no
+        // usage block) — the calibration measurement.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            "nope",
+        );
+        r.cases[0].reasoning_tokens = Some(14);
+        let d = r.to_dict();
+        assert_eq!(d["cases"][0]["reasoning_tokens"], 14);
+        assert_eq!(d["cases"][1]["reasoning_tokens"], serde_json::Value::Null);
+        assert_eq!(d["cases"][2]["reasoning_tokens"], serde_json::Value::Null);
     }
 }
