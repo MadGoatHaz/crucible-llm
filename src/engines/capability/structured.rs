@@ -448,18 +448,44 @@ impl StructuredResult {
         )
     }
 
+    /// CF-36: `true` when the constrained case-0 run produced valid JSON, so
+    /// the `penalty_pct` is a genuine constrained-decoding measurement.
+    ///
+    /// The old code computed `(free − constrained) / free` unconditionally, so
+    /// a *crashed/empty* constrained run read as +100% (indistinguishable from
+    /// "total failure") and a *dropped* schema (the backend ignored the
+    /// constraint) read as ~0% (indistinguishable from "the constraint is
+    /// free"). Both are meaningless. The penalty is only *effective* when the
+    /// constrained run actually emitted valid JSON; otherwise it is flagged
+    /// "constraint not effective" and never read as a number.
+    ///
+    /// Derived from the stored cases (not a new field) so the external
+    /// `StructuredResult` construction sites are unaffected.
+    #[must_use]
+    pub fn constraint_effective(&self) -> bool {
+        self.cases
+            .first()
+            .is_some_and(|c| c.is_valid_json())
+    }
+
     /// One-line summary for the sequence header / headless output.
     ///
     /// CF-17: the compliance part is the *split* `valid JSON … / schema-
     /// correct …` label (a response can parse as JSON yet violate the
-    /// schema). CF-08: the constraint mode is flagged inline so a ~0%
-    /// penalty on a backend that drops `response_format` is never misread as
-    /// "constrained decoding is free" (the old code's silent false-negative).
+    /// schema). CF-36: the penalty is reported only when the constraint was
+    /// *effective* (the constrained run produced valid JSON); otherwise it is
+    /// flagged "constraint not effective". CF-08: the constraint mode is
+    /// flagged inline so a ~0% penalty on a backend that drops
+    /// `response_format` is never misread as "constrained decoding is free".
     #[must_use]
     pub fn summary_line(&self) -> String {
+        let penalty = if self.constraint_effective() {
+            format!("{:+.1}% penalty", self.penalty_pct)
+        } else {
+            "penalty N/A (constraint not effective)".to_string()
+        };
         format!(
-            "{:+.1}% penalty · {} · [{}]",
-            self.penalty_pct,
+            "{penalty} · {} · [{}]",
             self.compliance_label(),
             self.constraint_mode().label()
         )
@@ -1254,6 +1280,45 @@ mod tests {
         assert!(valid > correct, "valid-JSON must exceed schema-correct");
         assert!(r.compliance_label().contains("valid JSON 3/3"));
         assert!(r.compliance_label().contains("schema-correct 1/3"));
+    }
+
+    #[test]
+    fn penalty_flagged_not_effective_when_constrained_run_not_valid_json() {
+        // CF-36: when the constrained case-0 run did NOT produce valid JSON
+        // (the backend dropped the schema and the model returned prose, or the
+        // run crashed/emptied), the penalty must be flagged "not effective"
+        // rather than read as a real constrained-decoding cost.
+        let r = result_with(
+            "this is not json at all",
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+        );
+        assert!(
+            !r.constraint_effective(),
+            "case-0 not valid JSON → constraint not effective"
+        );
+        assert!(
+            r.summary_line().contains("constraint not effective"),
+            "summary flags the ineffective constraint: {}",
+            r.summary_line()
+        );
+        assert!(
+            !r.summary_line().contains("% penalty"),
+            "no numeric penalty when the constraint is not effective"
+        );
+    }
+
+    #[test]
+    fn penalty_reported_when_constrained_run_is_valid_json() {
+        // The inverse of CF-36: when case-0 IS valid JSON, the numeric
+        // penalty is reported.
+        let r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+            r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+        );
+        assert!(r.constraint_effective(), "case-0 valid JSON → effective");
+        assert!(r.summary_line().contains("+5.2% penalty"));
     }
 
     // ── CF-08: real constrained decoding (mode selection + flagging) ─────
