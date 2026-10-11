@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-676%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-849%20green-brightgreen)](#)
 
 </div>
 
@@ -34,7 +34,7 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 - **Comprehensive** — seven benchmark engines covering speed, concurrency scale, reasoning intelligence, long-context retrieval, structured-output fidelity, real-world maximum throughput, and silicon energy efficiency.
 - **Portable** — a single static binary. Run it from any terminal on any Linux box. No install, no venv, no system libraries.
 - **Honest metrics** — measures what actually matters for a *user*: per-stream experience and practical capacity, not just aggregate throughput. A server that serves 64 users at 2.6 t/s each is not "fast" — it is slow for everyone. Crucible reports the difference.
-- **Rigorous timing** — all latency is captured on a hardware cycle clock (`quanta`) in isolated worker rings and is never perturbed by UI repaints, allocation churn, or database writes (the *measurement-isolation* invariant).
+- **Rigorous timing** — all latency is captured on a hardware cycle clock (`quanta`) in isolated worker rings and is never perturbed by UI repaints, allocation churn, or database writes (the *measurement-isolation* invariant). Every run starts with a **discarded warmup** (Engine A's iterations, Engine B's first ladder level) so cold-start / KV-cache effects never pollute the first measured sample.
 
 ---
 
@@ -260,14 +260,14 @@ Token counts use the **server's reported `usage.completion_tokens`** as the auth
 - **Prompt throughput (prefill / PP)** — `prompt_tokens / TTFT`; how fast the server ingests your input.
 - **TTFT** — time from sending the request to the first token arriving.
 - **ITL p50 / p99** — median and worst-case gap between consecutive output tokens.
-- **MTP ratio** — `output_tokens / SSE_packets`; `1.0` = standard auto-regressive, `> 1` quantifies speculative-decoding acceptance.
+- **MTP ratio (η)** — `completion_tokens / total_token_frames` (all token frames, Reasoning + Content); `1.0` = one token per frame (standard auto-regressive), `> 1` quantifies multi-token / speculative-decoding acceptance (vLLM MTP, EAGLE).
 
 ### Concurrency (Engine B)
 
 - **Practical sweet spot** — the most users where **each** still gets ≥ **30 t/s** (29.4 t/s effective with the 2% margin — comfortable for chat / agents / RAG).
 - **Maximum usable** — the most users where each gets ≥ **15 t/s** (workable, noticeably slower).
 - **Throughput knee** — where *aggregate* t/s stops increasing (a reference point, not the recommendation).
-- **Per-stream t/s** — `aggregate ÷ users`; what each individual user actually experiences.
+- **Per-stream t/s** — dual denominators: `aggregate ÷ completed streams` (capacity — what the healthy streams got) and `aggregate ÷ requested streams` (user-experience — a failed stream dilutes it); levels with > 20 % failed streams are flagged.
 
 ### NIAH (Engine C1)
 
@@ -292,6 +292,7 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 - GPU **power draw** (watts) sampled at 100 ms during inference.
 - **Joules/token** = `∫P(t)dt / total_tokens` — the silicon-efficiency metric for comparing quantizations and hardware.
 - **Requires a local GPU with driver support** — Crucible auto-detects **NVIDIA (NVML, on by default), AMD (sysfs/hwmon), or Intel (Level Zero, with a sysfs fallback)** at startup and activates the matching backend. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
+- **Effectively Linux-only, by design** — every GPU power backend reads Linux interfaces (NVML, sysfs/hwmon, Level Zero), so the energy feature is a Linux feature: on a non-Linux host it degrades to N/A (with the CPU-side estimate labeled) while the rest of the suite runs unchanged.
 
 ### Flat Out (Engine F)
 
