@@ -285,6 +285,24 @@ impl WorkerPool {
         self.worker_timeout
     }
 
+    /// CF-28: the per-worker max lifetime scaled with the *expected*
+    /// generation time (not a fixed count). `base` is the configured floor
+    /// (a genuinely hung stream is still bounded); the cap grows with
+    /// `max_tokens` at a conservative decode rate so a **slow-but-healthy**
+    /// long-context stream is not killed mid-generation. The *stall*
+    /// detector (not this cap) is what distinguishes a hung stream (no
+    /// tokens at all) from a slow one (tokens, just slow).
+    pub fn scaled_worker_timeout(base: Duration, max_tokens: u32) -> Duration {
+        // A conservative home-decode rate: 10 tokens/sec (0.1 s/token). A
+        // stream asked to generate `max_tokens` tokens needs at least this
+        // long, so the cap is never shorter than the expected generation
+        // window.
+        const ASSUMED_DECODE_TPS: f64 = 10.0;
+        let expected_secs = max_tokens as f64 / ASSUMED_DECODE_TPS;
+        let secs = base.as_secs_f64().max(expected_secs);
+        Duration::from_secs_f64(secs.ceil().max(1.0))
+    }
+
     /// Disallow the model's own end-token from stopping generation on
     /// every worker (`"ignore_eos": true`; honored by llama.cpp servers,
     /// unknown to — and ignored by — other backends). Engine F sets this

@@ -1756,6 +1756,7 @@ mod tests {
                 completed_streams: 1,
                 failed_streams: 0,
                 timed_out_streams: 0,
+                timed_out_tokens: 0,
                 aborted: false,
                 wall_ns: 0,
                 streams: Vec::new(),

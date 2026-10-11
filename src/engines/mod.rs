@@ -210,11 +210,16 @@ pub fn build_sweep(
         speed::MAX_GEN_TOKENS,
     )
     .read_timeout(Duration::from_secs(cfg.timeout.max(1)))
-    // Per-worker max lifetime: a worker that outlives the configured
-    // timeout is killed and recorded as a timeout failure (partial
-    // results are kept). This is what prevents a hung connection from
-    // freezing the sweep at a high concurrency level.
-    .worker_timeout(Duration::from_secs(cfg.timeout.max(1)))
+    // Per-worker max lifetime (CF-28): scaled with the *expected*
+    // generation time (the configured timeout as a floor, grown with
+    // `max_tokens`) so a slow-but-healthy long-context stream is not
+    // killed mid-generation — a genuinely hung stream is still bounded,
+    // and the stall detector distinguishes it from a slow one. This is
+    // what prevents a hung connection from freezing the sweep.
+    .worker_timeout(WorkerPool::scaled_worker_timeout(
+        Duration::from_secs(cfg.timeout.max(1)),
+        speed::MAX_GEN_TOKENS,
+    ))
     // CF-13: thread the optional tokenizer into the pool so per-stream
     // token counts can be authoritative.
     .with_tokenizer(pool_tokenizer);

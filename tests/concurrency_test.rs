@@ -189,6 +189,7 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         completed_streams: concurrency,
         failed_streams: 0,
         timed_out_streams: 0,
+        timed_out_tokens: 0,
         aborted: false,
         wall_ns: 1_000_000_000,
         loop_excluded_streams: 0,
