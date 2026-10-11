@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::log::RunLogger;
+use crate::prompt::Tokenizer;
 use crate::sse::{ParsedFrame, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -186,6 +187,10 @@ pub struct WorkerPool {
     /// by other backends). Engine F sets this so the 60-second window —
     /// not the model — is the only stop.
     ignore_eos: bool,
+    /// The optional tokenizer (CF-13): when the server omits `usage`, the
+    /// sweep re-counts a stream's text with it so the token count is
+    /// authoritative instead of a silent `chars/4` estimate.
+    tokenizer: Option<Arc<Tokenizer>>,
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -200,6 +205,7 @@ impl std::fmt::Debug for WorkerPool {
             .field("logger", &self.logger.is_some())
             .field("worker_timeout", &self.worker_timeout)
             .field("ignore_eos", &self.ignore_eos)
+            .field("tokenizer", &self.tokenizer.is_some())
             .finish()
     }
 }
@@ -229,6 +235,7 @@ impl WorkerPool {
             logger: None,
             worker_timeout: None,
             ignore_eos: false,
+            tokenizer: None,
         }
     }
 
@@ -278,6 +285,24 @@ impl WorkerPool {
         self.worker_timeout
     }
 
+    /// CF-28: the per-worker max lifetime scaled with the *expected*
+    /// generation time (not a fixed count). `base` is the configured floor
+    /// (a genuinely hung stream is still bounded); the cap grows with
+    /// `max_tokens` at a conservative decode rate so a **slow-but-healthy**
+    /// long-context stream is not killed mid-generation. The *stall*
+    /// detector (not this cap) is what distinguishes a hung stream (no
+    /// tokens at all) from a slow one (tokens, just slow).
+    pub fn scaled_worker_timeout(base: Duration, max_tokens: u32) -> Duration {
+        // A conservative home-decode rate: 10 tokens/sec (0.1 s/token). A
+        // stream asked to generate `max_tokens` tokens needs at least this
+        // long, so the cap is never shorter than the expected generation
+        // window.
+        const ASSUMED_DECODE_TPS: f64 = 10.0;
+        let expected_secs = max_tokens as f64 / ASSUMED_DECODE_TPS;
+        let secs = base.as_secs_f64().max(expected_secs);
+        Duration::from_secs_f64(secs.ceil().max(1.0))
+    }
+
     /// Disallow the model's own end-token from stopping generation on
     /// every worker (`"ignore_eos": true`; honored by llama.cpp servers,
     /// unknown to — and ignored by — other backends). Engine F sets this
@@ -285,6 +310,22 @@ impl WorkerPool {
     pub fn ignore_eos(mut self, v: bool) -> Self {
         self.ignore_eos = v;
         self
+    }
+
+    /// Attach the optional tokenizer (CF-13). When the server omits a
+    /// terminal `usage` frame, the sweep re-counts a stream's text with it
+    /// so the token count is authoritative instead of a silent `chars/4`
+    /// estimate (which is flagged `estimated`). `None` (the default) keeps
+    /// the `chars/4` fallback.
+    pub fn with_tokenizer(mut self, tokenizer: Option<Arc<Tokenizer>>) -> Self {
+        self.tokenizer = tokenizer;
+        self
+    }
+
+    /// The pool's optional tokenizer (CF-13), for the sweep's per-stream
+    /// token counts.
+    pub fn tokenizer(&self) -> Option<&Arc<Tokenizer>> {
+        self.tokenizer.as_ref()
     }
 
     /// The pool's target endpoint.

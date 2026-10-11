@@ -189,10 +189,12 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         completed_streams: concurrency,
         failed_streams: 0,
         timed_out_streams: 0,
+        timed_out_tokens: 0,
         aborted: false,
         wall_ns: 1_000_000_000,
         loop_excluded_streams: 0,
         loop_excluded_tokens: 0,
+        estimated: false,
         streams: (0..concurrency as u32)
             .map(|id| StreamMetric {
                 id,
@@ -670,8 +672,11 @@ async fn hung_workers_are_killed_by_the_per_worker_timeout() {
     assert_eq!(lvl.timed_out_streams, 2, "both workers hit the cap");
     assert_eq!(lvl.failed_streams, 2);
     assert_eq!(lvl.completed_streams, 0);
-    // Partial results were collected before the kill (3 frames each).
-    assert_eq!(lvl.total_tokens, 6);
+    // CF-28: the partial tokens collected before the kill (3 frames each)
+    // are tracked in `timed_out_tokens` and EXCLUDED from `total_tokens` /
+    // the aggregate throughput (a killed stream is not a healthy generator).
+    assert_eq!(lvl.total_tokens, 0);
+    assert_eq!(lvl.timed_out_tokens, 6);
 }
 
 #[tokio::test]
