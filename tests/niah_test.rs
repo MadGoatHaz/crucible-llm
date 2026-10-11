@@ -131,8 +131,12 @@ async fn respond(sock: &mut TcpStream, mock: Mock, prompt: String) {
         Mock::Reasons => {
             let answer =
                 extract_needle_value(&prompt).unwrap_or_else(|| "I don't know.".to_string());
-            frames.push(reasoning_frame("Let me think about where the secret code is…"));
-            frames.push(reasoning_frame("Scanning the document… I believe I found it."));
+            frames.push(reasoning_frame(
+                "Let me think about where the secret code is…",
+            ));
+            frames.push(reasoning_frame(
+                "Scanning the document… I believe I found it.",
+            ));
             frames.push(content_frame(&answer));
         }
         // CF-15: the needle appears ONLY in the CoT; no visible answer.
@@ -174,6 +178,7 @@ fn cell(size: u32, depth: u8, retrieved: bool, ttft: f64) -> NiahCell {
         prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
         state: NiahCellState::Nominal,
         no_baseline: false,
+        approximate: false,
     }
 }
 
@@ -253,6 +258,25 @@ async fn superlinear_prefill_is_classified_throttled() {
             "super-linear prefill must throttle"
         );
     }
+}
+
+#[tokio::test]
+async fn cells_are_flagged_approximate_without_a_tokenizer_cf46() {
+    // The mock config has no `--tokenizer`, so every document is sized by the
+    // `chars/4` estimate; `run_cell` must propagate that to each cell (CF-46)
+    // so the context size is labeled approximate, never presented as exact.
+    let (url, _server) = start_mock(Mock::Retrieves).await;
+    let engine = crucible_llm::engines::NiahEngine::new(&test_config(&url))
+        .unwrap()
+        .sizes(vec![2000])
+        .depths(vec![0, 50]);
+    let result = engine.run().await;
+    assert!(
+        result.cells.iter().all(|c| c.approximate),
+        "no-tokenizer cells must be flagged approximate (CF-46)"
+    );
+    // And the cell's context label surfaces the approximation.
+    assert_eq!(result.cells[0].context_label(), "2k (approx.)");
 }
 
 // ── CF-01 / CF-15 / CF-23: reasoning-model matching ──────────────────────

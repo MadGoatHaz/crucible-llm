@@ -347,6 +347,13 @@ pub struct NiahCell {
     /// *unknown*, not a confirmed-healthy nominal (CF-45). Set by
     /// [`NiahResult::compute_states`].
     pub no_baseline: bool,
+    /// `true` when this cell's context size came from the `chars/4` estimate
+    /// (no `--tokenizer` supplied) rather than an exact token count. Without a
+    /// tokenizer the haystack is low-entropy repeated sentences sized by that
+    /// heuristic, so the "128k" label is *approximate* — [`context_label`]
+    /// surfaces that so the size is never presented as exact (CF-46). Set by
+    /// [`NiahEngine::run_cell`] from the document's `estimated` flag.
+    pub approximate: bool,
 }
 
 impl NiahCell {
@@ -360,6 +367,21 @@ impl NiahCell {
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
             no_baseline: false,
+            approximate: false,
+        }
+    }
+
+    /// The context-size label for this cell. A size measured with an exact
+    /// `--tokenizer` reads `"{n}k"`; a size that came from the `chars/4`
+    /// estimate reads `"{n}k (approx.)"` so the context length is never
+    /// presented as exact (CF-46 — the low-entropy repeated-sentence haystack
+    /// is an estimate, and the label keeps that honest).
+    pub fn context_label(&self) -> String {
+        let k = self.target_tokens / 1000;
+        if self.approximate {
+            format!("{k}k (approx.)")
+        } else {
+            format!("{k}k")
         }
     }
 }
@@ -815,6 +837,10 @@ impl NiahEngine {
             // Assigned by `compute_states` once the whole matrix is in.
             state: NiahCellState::Failed,
             no_baseline: false,
+            // CF-46: propagate the document's estimate flag so the cell's
+            // context size is labeled approximate (chars/4) when no tokenizer
+            // was supplied, never presented as exact.
+            approximate: doc.estimated,
         }
     }
 }
@@ -1073,6 +1099,7 @@ mod tests {
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
             no_baseline: false,
+            approximate: false,
         }
     }
 
@@ -1164,8 +1191,27 @@ mod tests {
         assert!(!r.cells[3].no_baseline, "4k@100 has a valid baseline");
         assert_eq!(r.cells[3].state, NiahCellState::Nominal);
         // The baseline row itself is never flagged (nothing to compare).
-        assert!(!r.cells[0].no_baseline, "baseline row is never 'no baseline'");
-        assert!(!r.cells[1].no_baseline, "baseline row is never 'no baseline'");
+        assert!(
+            !r.cells[0].no_baseline,
+            "baseline row is never 'no baseline'"
+        );
+        assert!(
+            !r.cells[1].no_baseline,
+            "baseline row is never 'no baseline'"
+        );
+    }
+
+    #[test]
+    fn context_label_marks_approximate_haystack_cf46() {
+        // A size measured with an exact tokenizer reads plain (not approximate).
+        let measured = cell(128000, 50, true, 0.5);
+        assert!(!measured.approximate);
+        assert_eq!(measured.context_label(), "128k");
+        // A size that came from the `chars/4` estimate is labeled approximate —
+        // the context length is not presented as exact (CF-46).
+        let mut estimated = cell(128000, 50, true, 0.5);
+        estimated.approximate = true;
+        assert_eq!(estimated.context_label(), "128k (approx.)");
     }
 
     #[test]
