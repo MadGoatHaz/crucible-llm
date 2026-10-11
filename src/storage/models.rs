@@ -341,7 +341,24 @@ pub struct FlatOutSummary {
     pub total_tokens: u64,
     pub duration_secs: f64,
     pub aggregate_tps: f64,
+    /// Back-compat alias of [`tps_per_requested_stream`](Self::tps_per_requested_stream).
     pub per_stream_tps: f64,
+    /// CF-04 dual per-stream denominators, now carried in the persisted /
+    /// exported summary (Wave 6a gap: they were in the `--json` stdout
+    /// `flat_out` but omitted here, so the DB-built export lost them).
+    /// **Capacity view** — `aggregate_tps ÷ completed streams` (failed /
+    /// zero-token streams excluded). `#[serde(default)]` keeps pre-existing
+    /// stored `engine_results` (without the field) deserializing.
+    #[serde(default)]
+    pub tps_per_completed_stream: f64,
+    /// **User-experience view** — `aggregate_tps ÷ requested streams`
+    /// (failures included; equals [`per_stream_tps`](Self::per_stream_tps)).
+    #[serde(default)]
+    pub tps_per_requested_stream: f64,
+    /// (CF-04) `failed_streams ÷ requested_streams` — flagged in the run
+    /// log when above the 0.20 threshold.
+    #[serde(default)]
+    pub failed_stream_ratio: f64,
 }
 
 impl FlatOutSummary {
@@ -353,6 +370,9 @@ impl FlatOutSummary {
             duration_secs: r.duration_secs,
             aggregate_tps: r.aggregate_tps,
             per_stream_tps: r.per_stream_tps,
+            tps_per_completed_stream: r.tps_per_completed_stream,
+            tps_per_requested_stream: r.tps_per_requested_stream,
+            failed_stream_ratio: r.failed_stream_ratio,
         }
     }
 }

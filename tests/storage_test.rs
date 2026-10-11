@@ -138,6 +138,9 @@ fn engine_results_column_round_trips() {
             duration_secs: 60.0,
             aggregate_tps: 150.0,
             per_stream_tps: 9.4,
+            tps_per_completed_stream: 12.5,
+            tps_per_requested_stream: 9.4,
+            failed_stream_ratio: 0.2,
         }),
         ..Default::default()
     };
