@@ -40,7 +40,7 @@ use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamMetric, StreamStatus};
-use crate::prompt::{count_tokens, PromptGenerator};
+use crate::prompt::{count_tokens, PromptGenerator, Tokenizer};
 use crate::sse::{Chunk, Usage};
 use crate::timing::MonotonicInstant;
 
@@ -119,6 +119,10 @@ pub struct SweepLevel {
     pub loop_excluded_streams: usize,
     /// Tokens excluded with those streams.
     pub loop_excluded_tokens: u64,
+    /// CF-13: `true` when any non-looping stream's token count is a
+    /// `chars/4` estimate (no server `usage` **and** no tokenizer) — the
+    /// level's throughput then carries an estimate flag.
+    pub estimated: bool,
     /// Per-stream detail (View 1 stream-matrix rows; blueprint §8
     /// `stream_metrics`).
     pub streams: Vec<StreamMetric>,
@@ -235,6 +239,10 @@ pub struct MatrixCell {
     pub itl_p99_ns: u64,
     /// Total non-looping tokens generated in the cell.
     pub total_tokens: u64,
+    /// CF-13: `true` when any non-looping stream's token count in the cell
+    /// is a `chars/4` estimate (no server `usage` and no tokenizer).
+    #[serde(default)]
+    pub estimated: bool,
     /// Wall time of the cell (spawn → last worker finished), ns.
     pub wall_ns: u64,
     /// Streams the loop guard excluded in this cell.
@@ -851,6 +859,7 @@ impl Sweep {
                     itl_p50_ns: level.p50_tpot_ns,
                     itl_p99_ns: level.p99_tpot_ns,
                     total_tokens: level.total_tokens,
+                    estimated: level.estimated,
                     wall_ns: level.wall_ns,
                     loop_excluded_streams: level.loop_excluded_streams,
                     loop_excluded_tokens: level.loop_excluded_tokens,
@@ -957,7 +966,10 @@ impl Sweep {
             });
         }
         let (mut rx, supervisor) = self.pool.clone().spawn_tagged(n, &format!("B{step}"));
-        let mut acc = LevelAccumulator::new(n, self.pool.max_tokens(), context);
+        // CF-13: thread the pool's optional tokenizer into the level so
+        // per-stream token counts can be authoritative.
+        let mut acc = LevelAccumulator::new(n, self.pool.max_tokens(), context)
+            .with_tokenizer(self.pool.tokenizer().cloned());
         let budget = self.effective_step_budget(prev_wall_ns);
         let mut stall_tick = tokio::time::interval(STALL_CHECK_INTERVAL);
         stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1333,6 +1345,10 @@ struct StreamTracker {
     looping: bool,
     /// The stream's total token count when looping (the exclusion amount).
     loop_excluded_tokens: u64,
+    /// The optional tokenizer (CF-13): re-counts `text` when the server
+    /// omits `usage`, so the token count is authoritative (not a silent
+    /// `chars/4` estimate).
+    tokenizer: Option<Arc<Tokenizer>>,
 }
 
 impl StreamTracker {
@@ -1357,7 +1373,23 @@ impl StreamTracker {
             timed_out: false,
             looping: false,
             loop_excluded_tokens: 0,
+            tokenizer: None,
         }
+    }
+
+    /// `true` when this stream's token count is a `chars/4` estimate
+    /// (CF-13): no server `usage` frame arrived AND no tokenizer is
+    /// available to re-count the text. An authoritative `usage` (or a
+    /// tokenizer re-count) is **not** an estimate.
+    fn estimated(&self) -> bool {
+        if self
+            .usage
+            .as_ref()
+            .is_some_and(|u| u.completion_tokens > 0)
+        {
+            return false;
+        }
+        count_tokens(&self.text, self.tokenizer.as_deref()).estimated
     }
 
     /// Token frames seen (reasoning + content) — the **total** count of
@@ -1387,13 +1419,15 @@ impl StreamTracker {
     }
 
     /// Tokens generated: server-reported `usage` when available (the
-    /// **primary** source), else the re-tokenized text (`chars/4` without a
-    /// tokenizer file). Counting raw frames is not used — it undercounts
-    /// servers that batch several tokens per frame (vLLM MTP).
+    /// **primary** source), else the re-tokenized text (CF-13: with the
+    /// pooled `tokenizer` when present — authoritative — or the `chars/4`
+    /// heuristic when not — flagged `estimated`). Counting raw frames is
+    /// not used — it undercounts servers that batch several tokens per
+    /// frame (vLLM MTP).
     fn tokens(&self) -> u64 {
         match self.usage.map(|u| u.completion_tokens).filter(|&n| n > 0) {
             Some(n) => n,
-            None => count_tokens(&self.text, None).tokens as u64,
+            None => count_tokens(&self.text, self.tokenizer.as_deref()).tokens as u64,
         }
     }
 
@@ -1459,6 +1493,9 @@ struct LevelAccumulator {
     /// The context size (target prompt tokens) this level ran with
     /// (v0.1.1 matrix axis; `0` = the configured prompt).
     context: u32,
+    /// The optional tokenizer (CF-13), threaded from the pool into each
+    /// tracker for authoritative per-stream token counts.
+    tokenizer: Option<Arc<Tokenizer>>,
     /// Inter-token latencies pooled across all streams (TPOT).
     itl: LatencyHistogram,
     /// One TTFT sample per stream.
@@ -1472,10 +1509,23 @@ impl LevelAccumulator {
             n,
             max_tokens,
             context,
+            tokenizer: None,
             itl: LatencyHistogram::default(),
             ttft: LatencyHistogram::default(),
             trackers: (0..n).map(|i| StreamTracker::new(i as u32)).collect(),
         }
+    }
+
+    /// CF-13: thread the pool's optional tokenizer into the level (and
+    /// every tracker) so per-stream token counts can be authoritative
+    /// (a `chars/4` estimate only when there is no tokenizer **and** no
+    /// server `usage`).
+    fn with_tokenizer(mut self, tokenizer: Option<Arc<Tokenizer>>) -> Self {
+        for t in &mut self.trackers {
+            t.tokenizer = tokenizer.clone();
+        }
+        self.tokenizer = tokenizer;
+        self
     }
 
     /// Fold one pooled event (the sweep's drain-loop hot path).
@@ -1707,6 +1757,14 @@ impl LevelAccumulator {
             .filter(|t| !t.looping)
             .map(|t| t.tokens())
             .sum();
+        // CF-13: the level's token counts are an estimate when any
+        // non-looping stream fell back to `chars/4` (no server `usage`
+        // **and** no tokenizer).
+        let estimated = self
+            .trackers
+            .iter()
+            .filter(|t| !t.looping)
+            .any(|t| t.estimated());
         for t in &self.trackers {
             if let Some(ns) = t.ttft_ns {
                 self.ttft.record(ns);
@@ -1736,6 +1794,7 @@ impl LevelAccumulator {
             wall_ns,
             loop_excluded_streams: self.loop_excluded_streams(),
             loop_excluded_tokens: self.loop_excluded_tokens(),
+            estimated,
             streams: self.stream_rows(),
         }
     }
@@ -1996,6 +2055,95 @@ mod tests {
         assert!(acc.trackers[0].mtp_eta().is_none());
     }
 
+    // ── CF-13: the tokenizer is threaded into the pool; estimates flagged ──
+
+    #[test]
+    fn estimated_flag_is_true_without_usage_or_tokenizer() {
+        // No server usage AND no tokenizer → the count is a `chars/4`
+        // estimate, and both the tracker and the level are flagged.
+        let mut acc = LevelAccumulator::new(1, 16, 0);
+        acc.trackers[0].text = "hello world this is some text for counting".to_string();
+        assert!(acc.trackers[0].estimated(), "chars/4 fallback is flagged");
+        let level = acc.finish(1_000_000, false);
+        assert!(level.estimated, "a level with an estimated stream is flagged");
+    }
+
+    #[test]
+    fn estimated_flag_is_false_with_authoritative_usage() {
+        // A server usage frame (completion_tokens > 0) is authoritative —
+        // not an estimate, even with no tokenizer.
+        let mut acc = LevelAccumulator::new(1, 16, 0);
+        acc.trackers[0].text = "some text".to_string();
+        acc.trackers[0].usage = Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+        });
+        assert!(!acc.trackers[0].estimated(), "usage is authoritative");
+        assert_eq!(acc.trackers[0].tokens(), 5);
+        let level = acc.finish(1_000_000, false);
+        assert!(!level.estimated);
+    }
+
+    #[test]
+    fn tokenizer_threads_to_the_pool_and_makes_the_count_authoritative() {
+        // CF-13: with a tokenizer (no server usage), the text is re-counted
+        // authoritatively — NOT flagged estimated.
+        let raw = match std::fs::read_to_string("tests/fixtures/mini_tokenizer.json") {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("note: mini_tokenizer.json not found; skipping tokenizer assertion");
+                return;
+            }
+        };
+        let tokenizer = match crate::prompt::Tokenizer::from_json(&raw).ok() {
+            Some(t) => Arc::new(t),
+            None => {
+                eprintln!("note: mini_tokenizer.json failed to parse; skipping");
+                return;
+            }
+        };
+        let text = "the apple".to_string();
+        let tc = count_tokens(&text, Some(&tokenizer));
+        assert!(!tc.estimated, "the fixture tokenizer counted the text");
+        let mut acc = LevelAccumulator::new(1, 16, 0).with_tokenizer(Some(tokenizer));
+        acc.trackers[0].text = text;
+        assert!(
+            !acc.trackers[0].estimated(),
+            "a tokenizer re-count is not an estimate"
+        );
+        let level = acc.finish(1_000_000, false);
+        assert!(!level.estimated);
+    }
+
+    #[test]
+    fn matrix_cell_json_carries_the_estimated_flag() {
+        // The JSON `matrix` block exposes the CF-13 `estimated` flag.
+        let cell = MatrixCell {
+            context: 0,
+            concurrency: 2,
+            aggregate_tps: 100.0,
+            per_stream_tps: 50.0,
+            tps_per_completed_stream: 50.0,
+            tps_per_requested_stream: 50.0,
+            failed_stream_ratio: 0.0,
+            high_failure: false,
+            ttft_p50_ns: 0,
+            itl_p50_ns: 0,
+            itl_p99_ns: 0,
+            total_tokens: 0,
+            estimated: true,
+            wall_ns: 1_000_000_000,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+        };
+        let v = serde_json::to_value(&cell).unwrap();
+        assert!(v["estimated"].as_bool().unwrap(), "estimated flag in JSON");
+        // A legacy document without the field parses (defaults to false).
+        let legacy = r#"{"context":0,"concurrency":2,"aggregate_tps":1.0,"per_stream_tps":0.5,"ttft_p50_ns":0,"itl_p50_ns":0,"itl_p99_ns":0,"total_tokens":0,"wall_ns":1,"loop_excluded_streams":0,"loop_excluded_tokens":0}"#;
+        let back: MatrixCell = serde_json::from_str(legacy).unwrap();
+        assert!(!back.estimated);
+    }
+
     #[test]
     fn fold_level_counts_failed_streams() {
         let (clock, mock) = quanta::Clock::mock();
@@ -2110,6 +2258,7 @@ mod tests {
             wall_ns: 0,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
+            estimated: false,
             streams: Vec::new(),
         };
         let result = SweepResult::from_levels(
@@ -2141,6 +2290,7 @@ mod tests {
             wall_ns: 1_000_000_000,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
+            estimated: false,
             streams: Vec::new(),
         }
     }
@@ -2735,6 +2885,7 @@ mod tests {
             itl_p50_ns: 10_000_000,
             itl_p99_ns: 30_000_000,
             total_tokens: 1000,
+            estimated: false,
             wall_ns: 1_000_000_000,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
@@ -2778,6 +2929,7 @@ mod tests {
             wall_ns: 1_000_000_000,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
+            estimated: false,
             streams: Vec::new(),
         }
     }
@@ -2824,6 +2976,7 @@ mod tests {
             itl_p50_ns: 0,
             itl_p99_ns: 0,
             total_tokens: 0,
+            estimated: false,
             wall_ns: 1_000_000_000,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,

@@ -1764,6 +1764,7 @@ mod tests {
                 per_stream_tps: 0.0,
                 loop_excluded_streams: 0,
                 loop_excluded_tokens: 0,
+                estimated: false,
             }],
             None,
         ));

@@ -121,6 +121,7 @@ fn lvl(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         wall_ns: 0,
         loop_excluded_streams: 0,
         loop_excluded_tokens: 0,
+        estimated: false,
         streams: Vec::new(),
     }
 }

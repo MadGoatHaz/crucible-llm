@@ -193,6 +193,7 @@ fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
         wall_ns: 1_000_000_000,
         loop_excluded_streams: 0,
         loop_excluded_tokens: 0,
+        estimated: false,
         streams: (0..concurrency as u32)
             .map(|id| StreamMetric {
                 id,

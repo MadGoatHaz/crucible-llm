@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::log::RunLogger;
+use crate::prompt::Tokenizer;
 use crate::sse::{ParsedFrame, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
@@ -186,6 +187,10 @@ pub struct WorkerPool {
     /// by other backends). Engine F sets this so the 60-second window —
     /// not the model — is the only stop.
     ignore_eos: bool,
+    /// The optional tokenizer (CF-13): when the server omits `usage`, the
+    /// sweep re-counts a stream's text with it so the token count is
+    /// authoritative instead of a silent `chars/4` estimate.
+    tokenizer: Option<Arc<Tokenizer>>,
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -200,6 +205,7 @@ impl std::fmt::Debug for WorkerPool {
             .field("logger", &self.logger.is_some())
             .field("worker_timeout", &self.worker_timeout)
             .field("ignore_eos", &self.ignore_eos)
+            .field("tokenizer", &self.tokenizer.is_some())
             .finish()
     }
 }
@@ -229,6 +235,7 @@ impl WorkerPool {
             logger: None,
             worker_timeout: None,
             ignore_eos: false,
+            tokenizer: None,
         }
     }
 
@@ -285,6 +292,22 @@ impl WorkerPool {
     pub fn ignore_eos(mut self, v: bool) -> Self {
         self.ignore_eos = v;
         self
+    }
+
+    /// Attach the optional tokenizer (CF-13). When the server omits a
+    /// terminal `usage` frame, the sweep re-counts a stream's text with it
+    /// so the token count is authoritative instead of a silent `chars/4`
+    /// estimate (which is flagged `estimated`). `None` (the default) keeps
+    /// the `chars/4` fallback.
+    pub fn with_tokenizer(mut self, tokenizer: Option<Arc<Tokenizer>>) -> Self {
+        self.tokenizer = tokenizer;
+        self
+    }
+
+    /// The pool's optional tokenizer (CF-13), for the sweep's per-stream
+    /// token counts.
+    pub fn tokenizer(&self) -> Option<&Arc<Tokenizer>> {
+        self.tokenizer.as_ref()
     }
 
     /// The pool's target endpoint.

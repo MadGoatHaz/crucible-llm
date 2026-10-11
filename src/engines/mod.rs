@@ -192,6 +192,16 @@ pub fn build_sweep(
         crate::config::Mode::Short => generator.short(),
         crate::config::Mode::Long => generator.long(cfg.tokens),
     };
+    // CF-13: a shared tokenizer for the pool's per-stream token counts —
+    // when the server omits a terminal `usage` frame, the sweep re-counts
+    // the text with it (authoritative) instead of falling to a silent
+    // `chars/4` estimate (flagged `estimated`). Loaded independently of the
+    // generator (which consumes an owned `Tokenizer`); the `?` in the
+    // generator construction above guarantees the file is valid here.
+    let pool_tokenizer: Option<Arc<crate::prompt::Tokenizer>> = match &cfg.tokenizer {
+        Some(path) => crate::prompt::Tokenizer::from_file(path).ok().map(Arc::new),
+        None => None,
+    };
     let pool = WorkerPool::new(
         client,
         &cfg.url,
@@ -204,7 +214,10 @@ pub fn build_sweep(
     // timeout is killed and recorded as a timeout failure (partial
     // results are kept). This is what prevents a hung connection from
     // freezing the sweep at a high concurrency level.
-    .worker_timeout(Duration::from_secs(cfg.timeout.max(1)));
+    .worker_timeout(Duration::from_secs(cfg.timeout.max(1)))
+    // CF-13: thread the optional tokenizer into the pool so per-stream
+    // token counts can be authoritative.
+    .with_tokenizer(pool_tokenizer);
     let pool = match &cfg.api_key {
         Some(key) => pool.api_key(key.clone()),
         None => pool,

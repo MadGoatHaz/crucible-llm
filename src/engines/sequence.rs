@@ -1857,6 +1857,7 @@ mod tests {
             per_stream_tps: 0.0,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
+            estimated: false,
         };
         // Per-stream: 100 @ 1 user, 175 @ 2 → the practical sweet spot
         // (≥29.4 t/s each — 30 with a 2% margin) is 2. No knee on a
@@ -1893,6 +1894,7 @@ mod tests {
             per_stream_tps: 100.0,
             loop_excluded_streams: 0,
             loop_excluded_tokens: 0,
+            estimated: false,
         };
         SweepResult::from_levels(vec![level], None)
     }
