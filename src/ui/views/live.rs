@@ -600,7 +600,21 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, th: Theme, f: &mut Fr
         stat_row(th, "TTFT", &ttft.0, &ttft.1, &ttft.2, None),
         stat_row(th, "ITL p50", &itl50.0, &itl50.1, &itl50.2, None),
         stat_row(th, "ITL p99", &itl99.0, &itl99.1, &itl99.2, None),
-        simple_row(th, "Total Tokens", &fmt::format_tokens(o.total_tokens)),
+        // CF-30: show the estimated portion of the all-engine blend so a
+        // `chars/4` count is never presented as a server-authoritative total.
+        simple_row(
+            th,
+            "Total Tokens",
+            &if o.estimated_tokens > 0 {
+                format!(
+                    "{} (est. {})",
+                    fmt::format_tokens(o.total_tokens),
+                    fmt::format_tokens(o.estimated_tokens)
+                )
+            } else {
+                fmt::format_tokens(o.total_tokens)
+            },
+        ),
         simple_row(
             th,
             "Streams",
@@ -611,8 +625,11 @@ fn render_overall_metrics(area: Rect, m: &MetricsSnapshot, th: Theme, f: &mut Fr
             ),
         ),
         simple_row(th, "Total Duration", &fmt::format_duration(o.duration_sec)),
+        // CF-30: label the two sampling regimes so the all-engine blend is
+        // never read as one homogeneous distribution (gen/TTFT are
+        // per-completed-stream; prompt/ITL are ~1 Hz time-weighted).
         Line::from(Span::styled(
-            "ℹ All engines. p5 = 5th percentile (worst 5%).",
+            "ℹ All engines. gen/TTFT per-stream · prompt/ITL 1 Hz · p5 = 5th percentile (worst 5%).",
             style::info(th),
         )),
     ];
@@ -959,23 +976,48 @@ fn build_capability_scores(
         }
     }
 
-    // Long Context (C1, NIAH) — retrieved/total cells as a percentage.
+    // Long Context (C1, NIAH) — CF-32: surface the *reliable-up-to* threshold
+    // (the per-size pass-rate curve) INSTEAD of the flat all-cells average,
+    // which hides that retrieval degrades as context length grows. The bar is
+    // how far the model is *reliably* retrievable, as a fraction of the max
+    // context tested; the flat average survives only as secondary context.
     if sel.niah {
         if let Some(r) = app.niah.load().as_ref() {
             let (retrieved, total) = r.accuracy();
-            let pct = if total > 0 {
+            let flat = if total > 0 {
                 retrieved as f64 / total as f64 * 100.0
             } else {
                 0.0
             };
+            // The largest context size that clears the 80% reliability bar
+            // (P3-E's `reliable_up_to` — the actionable "how far" number).
+            let reliable = r.reliable_up_to(80.0);
+            let max_size = r.sizes.iter().copied().max().unwrap_or(0);
+            // Bar fill = reliable ÷ max tested. `None` (no size ≥ 80%) → 0:
+            // the model is not dependable for retrieval at any tested length.
+            let pct = match (reliable, max_size) {
+                (Some(s), m) if m > 0 => s as f64 / m as f64 * 100.0,
+                _ => 0.0,
+            };
+            let detail = match reliable {
+                Some(s) => format!(
+                    "≤ {}k reliable · {} avg ({retrieved}/{total})",
+                    s / 1000,
+                    fmt::format_pct(flat)
+                ),
+                None => format!(
+                    "no size ≥80% · {} avg ({retrieved}/{total})",
+                    fmt::format_pct(flat)
+                ),
+            };
             v.push(CapScore {
                 label: "Long Context",
                 pct: Some(pct),
-                detail: format!("{}  ({retrieved}/{total})", fmt::format_pct(pct)),
+                detail,
                 detail_style: style::value(th),
                 color: score_color(th, Some(pct)),
-                info: "Retrieval from large documents. Critical for RAG / chat history.",
-                warn: (pct < 50.0).then_some("LOW: the model loses information in long contexts."),
+                info: "Retrieval degrades with context length — bar = reliable up to (of max tested).",
+                warn: (pct < 50.0).then_some("degrades fast — not reliable for long-context RAG"),
             });
         }
     }
@@ -2009,6 +2051,98 @@ mod tests {
 
         // No scores at all → the empty-state hint.
         assert!(capability_overall(&[]).contains("Run benchmarks to see capability scores"));
+    }
+
+    /// One NIAH cell for the CF-32 tests: `target_tokens` = the context size
+    /// (a run cell), `retrieved` set, a nominal TTFT when retrieved.
+    ///
+    /// Built from `NiahCell::unrun()` (not a full struct literal) so it stays
+    /// compiling if a sibling (P3-E) adds fields to `NiahCell` — `unrun()`
+    /// carries the new defaults and we override only what the test needs.
+    fn niah_cell(size: u32, retrieved: bool) -> crate::engines::capability::NiahCell {
+        use crate::engines::capability::NiahCellState;
+        let mut c = crate::engines::capability::NiahCell::unrun();
+        c.target_tokens = size;
+        c.depth_percent = 50;
+        c.retrieved = retrieved;
+        c.ttft_s = if retrieved { 0.5 } else { 0.0 };
+        c.prefill_tps = 0.0;
+        c.state = if retrieved {
+            NiahCellState::Nominal
+        } else {
+            NiahCellState::Failed
+        };
+        c
+    }
+
+    #[test]
+    fn long_context_score_surfaces_reliable_up_to_not_the_flat_average() {
+        // CF-32: the Long Context bar/detail must surface the per-size
+        // pass-rate curve (`reliable_up_to`), not the flat all-cells average
+        // which hides that retrieval degrades at long context.
+        let app = App::new();
+        // 3 context sizes × 1 depth. Small + mid contexts retrieve (100%);
+        // the largest fails (0%) — a 66.7% flat average that *hides* the
+        // long-context collapse.
+        app.niah.store(crate::engines::capability::NiahResult {
+            sizes: vec![2_000, 8_000, 32_000],
+            depths: vec![50],
+            cells: vec![
+                niah_cell(2_000, true),
+                niah_cell(8_000, true),
+                niah_cell(32_000, false),
+            ],
+        });
+        let m = crate::metrics::state::MetricsSnapshot::default();
+        let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
+        let lc = scores
+            .iter()
+            .find(|s| s.label == "Long Context")
+            .expect("long-context score present");
+        // The bar reflects *reliability* (8k of 32k = 25%), not the flat 66.7%.
+        assert!(
+            (lc.pct.unwrap() - 25.0).abs() < 1e-9,
+            "pct = reliable ÷ max tested: {}",
+            lc.pct.unwrap()
+        );
+        // The detail leads with the reliable-up-to threshold…
+        assert!(lc.detail.contains("≤ 8k reliable"), "detail: {}", lc.detail);
+        // …and keeps the flat average only as secondary context.
+        assert!(
+            lc.detail.contains("66.7%"),
+            "detail carries the flat avg: {}",
+            lc.detail
+        );
+        // A sub-50% reliability carries the degradation warning.
+        assert!(lc.warn.is_some(), "poor reliability warns: {:?}", lc.warn);
+    }
+
+    #[test]
+    fn live_view_long_context_panel_shows_reliable_up_to() {
+        // CF-32 render-level (TestBackend): the full Live view's capability
+        // panel shows the reliable-up-to threshold (the per-size curve), not
+        // just the flat all-cells average.
+        let app = App::new();
+        app.niah.store(crate::engines::capability::NiahResult {
+            sizes: vec![2_000, 8_000, 32_000],
+            depths: vec![50],
+            cells: vec![
+                niah_cell(2_000, true),
+                niah_cell(8_000, true),
+                niah_cell(32_000, false),
+            ],
+        });
+        let text = render_live_text(&app, 120, 40);
+        assert!(
+            text.contains("CAPABILITY ASSESSMENT"),
+            "panel present: {text}"
+        );
+        assert!(text.contains("Long Context"), "the row is present: {text}");
+        // The reliable-up-to threshold is surfaced in the panel.
+        assert!(
+            text.contains("≤ 8k reliable"),
+            "reliable-up-to shown in the panel: {text}"
+        );
     }
 
     // ── energy line (Engine D) ───────────────────────────────────────────
