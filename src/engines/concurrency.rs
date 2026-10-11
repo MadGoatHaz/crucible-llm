@@ -1302,9 +1302,30 @@ impl StreamTracker {
         }
     }
 
-    /// Token frames seen (reasoning + content).
+    /// Token frames seen (reasoning + content) — the **total** count of
+    /// token-carrying frames, the canonical MTP denominator (CF-12).
     fn token_frames(&self) -> u64 {
         self.reasoning_frames + self.content_frames
+    }
+
+    /// The **canonical MTP multiplier** (CF-12, mirrored from Engine A):
+    /// `completion_tokens / total_token_frames` over ALL token frames
+    /// (Reasoning + Content). `> 1` is legitimate — it is the *batch size*
+    /// when the server (vLLM MTP / speculative decoding) emits several
+    /// tokens in one frame — not an error. `None` when no token frame was
+    /// observed (a pure-control or failed stream).
+    ///
+    /// The numerator is the authoritative `completion_tokens`
+    /// ([`Self::tokens`]: server `usage` when present, else the re-counted
+    /// text), so the ratio is self-consistent regardless of the counting
+    /// source.
+    fn mtp_eta(&self) -> Option<f64> {
+        let frames = self.token_frames();
+        if frames > 0 {
+            Some(self.tokens() as f64 / frames as f64)
+        } else {
+            None
+        }
     }
 
     /// Tokens generated: server-reported `usage` when available (the
@@ -1346,16 +1367,10 @@ impl StreamTracker {
             }
             _ => None,
         };
-        // MTP = output tokens / token-carrying packets (blueprint §7.4;
-        // matches the Chunk 7 single-stream formula).
-        let mtp = {
-            let pk = self.token_frames();
-            if pk > 0 {
-                Some(tg as f64 / pk as f64)
-            } else {
-                None
-            }
-        };
+        // MTP η (CF-12, canonical): `completion_tokens / total_token_frames`
+        // over ALL token frames (Reasoning + Content). `> 1` is legitimate
+        // (the server batched several tokens per frame), not an error.
+        let mtp = self.mtp_eta();
         let progress = if self.finished {
             1.0
         } else if max_tokens > 0 {
@@ -1856,6 +1871,71 @@ mod tests {
         assert!(s0.gen_tps.is_some());
         assert!(s1.gen_tps.is_some());
         assert_eq!(s0.progress, 1.0);
+    }
+
+    // ── CF-12: the canonical MTP η (completion_tokens / total_token_frames) ──
+
+    #[test]
+    fn mtp_eta_is_the_canonical_ratio_and_allows_batching() {
+        // A stream that observes 2 token frames but generates 4 completion
+        // tokens (the server batched 2 tokens per frame, e.g. vLLM MTP):
+        // η = 4 / 2 = 2.0. `> 1` is legitimate — it is the batch size, not
+        // an error. The denominator is ALL token frames (Reasoning + Content).
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let mut acc = LevelAccumulator::new(1, 16, 0);
+            acc.on_event(&frame_event(0, ts_with_ttft(t0, t0)));
+            acc.on_event(&frame_event(0, ts_with_ttft(t0, t0)));
+            acc.on_event(&PoolEvent::Complete {
+                stream: 0,
+                timestamps: StreamTimestamps {
+                    t0: Some(t0),
+                    t1: Some(t0),
+                    t2: Some(t0),
+                    t3: Some(t0),
+                    t_end: Some(t0),
+                },
+                usage: Some(Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                }),
+                premature: false,
+                malformed_frames: 0,
+                looping: false,
+                loop_excluded_tokens: 0,
+            });
+            let tracker = &acc.trackers[0];
+            // Canonical: completion_tokens (4) / total_token_frames (2).
+            assert!((tracker.mtp_eta().unwrap() - 2.0).abs() < 1e-9);
+            // The stream row carries the same canonical value.
+            let row = tracker.row(16);
+            assert!((row.mtp.unwrap() - 2.0).abs() < 1e-9);
+        });
+    }
+
+    #[test]
+    fn mtp_eta_counts_reasoning_and_content_frames_together() {
+        // The denominator is Reasoning + Content frames (not content-only):
+        // 2 reasoning + 1 content = 3 frames; 3 completion tokens → η = 1.0.
+        let mut acc = LevelAccumulator::new(1, 16, 0);
+        let t = &mut acc.trackers[0];
+        t.reasoning_frames = 2;
+        t.content_frames = 1;
+        t.usage = Some(Usage {
+            prompt_tokens: 10,
+            completion_tokens: 3,
+        });
+        assert_eq!(t.token_frames(), 3, "Reasoning + Content frames");
+        assert!((t.mtp_eta().unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mtp_eta_is_none_without_token_frames() {
+        // A stream with no token frames (pure control / a failure) has no
+        // MTP ratio (`None`, never `0`).
+        let acc = LevelAccumulator::new(1, 16, 0);
+        assert!(acc.trackers[0].mtp_eta().is_none());
     }
 
     #[test]
