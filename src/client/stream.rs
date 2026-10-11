@@ -148,6 +148,20 @@ pub enum StreamError {
     /// A non-streaming response body that is not valid JSON.
     #[error("non-streaming response is not valid JSON: {0}")]
     InvalidJson(String),
+    /// The response body was **neither a valid SSE stream nor valid JSON**.
+    ///
+    /// This is a genuine transport/protocol fault, not a measurement: the
+    /// worker asked for `stream: true`, the server answered `200`, but the
+    /// body carried no parseable `data:` frame (so it is not usable SSE) and
+    /// does not decode as a JSON completion (so it is not the non-streaming
+    /// fallback). The canonical cause it guards against is a stream whose
+    /// preamble (keep-alive `:comment` lines, `event:`/`id:`/`retry:` fields)
+    /// is followed by nothing but garbage — which the old first-byte sniff
+    /// would have misrouted to the JSON path and reported as a spurious
+    /// "retrieval miss". Surfacing it as a real error keeps a broken
+    /// endpoint out of the throughput/accuracy results.
+    #[error("response body is neither valid SSE nor valid JSON: {0}")]
+    InvalidTransport(String),
 }
 
 impl StreamError {

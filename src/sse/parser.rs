@@ -55,6 +55,15 @@ pub struct SseParser {
     bom_seen: bool,
     /// Count of malformed-JSON frames skipped (tolerance counter).
     malformed: u64,
+    /// Total `data:` frames dispatched so far (valid + malformed + `[DONE]`).
+    /// A `data:`-only count: comment / `event:` / `id:` / `retry:` / blank
+    /// lines are preamble, not frames. Used by the worker to tell a real
+    /// stream (≥1 `data:` frame) from a preamble-only / garbage body.
+    data_frames: u64,
+    /// `data:` frames that parsed (valid JSON, or the `[DONE]` terminator).
+    /// `0` when every `data:` frame was malformed — the "neither valid SSE
+    /// nor valid JSON" signal the worker turns into a real transport error.
+    valid_frames: u64,
     /// Last `usage` object seen anywhere in the stream, captured even on
     /// frames that also carry a content delta (matches the Python prototype).
     usage: Option<Usage>,
@@ -79,6 +88,8 @@ impl SseParser {
             out: Vec::new(),
             bom_seen: false,
             malformed: 0,
+            data_frames: 0,
+            valid_frames: 0,
             usage: None,
             details: UsageDetails::default(),
         }
@@ -130,6 +141,8 @@ impl SseParser {
         self.out.clear();
         self.bom_seen = false;
         self.malformed = 0;
+        self.data_frames = 0;
+        self.valid_frames = 0;
         self.usage = None;
         self.details = UsageDetails::default();
     }
@@ -138,6 +151,30 @@ impl SseParser {
     #[must_use]
     pub fn malformed_frames(&self) -> u64 {
         self.malformed
+    }
+
+    /// Total `data:` frames dispatched so far (valid + malformed + `[DONE]`).
+    /// Preamble lines (`:comment`, `event:`, `id:`, `retry:`, blank) are not
+    /// counted — they carry no payload.
+    #[must_use]
+    pub fn data_frame_count(&self) -> u64 {
+        self.data_frames
+    }
+
+    /// `data:` frames that parsed (valid JSON or the `[DONE]` terminator).
+    #[must_use]
+    pub fn valid_frame_count(&self) -> u64 {
+        self.valid_frames
+    }
+
+    /// `true` when at least one `data:` frame parsed as valid SSE (a real
+    /// token / usage / `[DONE]` frame). `false` for a preamble-only stream
+    /// (keep-alive comments, no payload) or one whose `data:` frames are all
+    /// malformed JSON — the two "this is not a usable SSE stream" shapes the
+    /// worker must distinguish from a normal (possibly premature) completion.
+    #[must_use]
+    pub fn has_valid_frame(&self) -> bool {
+        self.valid_frames > 0
     }
 
     /// Last `usage` object seen in the stream, if any.
@@ -176,6 +213,8 @@ impl SseParser {
         if self.data_lines.is_empty() {
             return; // keepalive / control-only frame: nothing to classify
         }
+        // A `data:` frame is being dispatched (valid, malformed, or `[DONE]`).
+        self.data_frames += 1;
         let mut joined = String::new();
         for (i, line) in self.data_lines.iter().enumerate() {
             if i > 0 {
@@ -187,6 +226,7 @@ impl SseParser {
 
         let trimmed = joined.trim();
         if trimmed == "[DONE]" {
+            self.valid_frames += 1;
             self.out.push(ParsedFrame {
                 chunk: Chunk::Control,
                 t_nanos: 0,
@@ -197,6 +237,7 @@ impl SseParser {
 
         match serde_json::from_str::<Value>(trimmed) {
             Ok(value) => {
+                self.valid_frames += 1;
                 if let Some(usage) = Usage::from_value(&value) {
                     self.usage = Some(usage);
                     // CF-02: capture the reasoning / cache detail fields

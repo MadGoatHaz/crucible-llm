@@ -1034,6 +1034,9 @@ pub fn aggregate(
             StreamError::WorkerTimeout(d) => format!("Worker killed after {d:?} (timeout)"),
             StreamError::Read(msg) => format!("Network error: {msg}"),
             StreamError::InvalidJson(msg) => format!("Invalid JSON response: {msg}"),
+            StreamError::InvalidTransport(msg) => {
+                format!("Unreadable response (neither SSE nor JSON): {msg}")
+            }
         }),
         None if total_chunks == 0 && outcome.usage.is_none() => {
             Some("No data received from server".to_string())
