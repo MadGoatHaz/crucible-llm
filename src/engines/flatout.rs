@@ -1087,6 +1087,12 @@ impl FlatOutEngine {
         // Pooled ITL + one stream row per stream.
         let mut itl = LatencyHistogram::default();
         let mut active = 0usize;
+        // CF-30: the estimated-token seam — tainted when any stream's
+        // count is the `chars/4` fallback (the 60 s window aborts before
+        // the terminal `usage` frame arrives, so without a tokenizer this
+        // is the norm — the same rule `from_events` applies to
+        // `FlatOutResult.tokens_estimated`).
+        let mut any_estimated = false;
         let mut streams: Vec<StreamMetric> = Vec::with_capacity(n);
         for (id, events) in per_stream.iter().enumerate() {
             let mut prev: Option<MonotonicInstant> = None;
@@ -1120,12 +1126,15 @@ impl FlatOutEngine {
                     StreamEvent::Failed { .. } => failed = true,
                 }
             }
-            let (tokens, gen_tps) = Self::stream_rate(
+            let (tokens, gen_tps, estimated) = Self::stream_rate(
                 events,
                 first_token,
                 last_token,
                 self.generator.tokenizer().as_deref(),
             );
+            if estimated {
+                any_estimated = true;
+            }
             let state = if finished {
                 StreamStatus::Done
             } else if failed {
@@ -1174,6 +1183,7 @@ impl FlatOutEngine {
             } else {
                 StreamStatus::Streaming
             },
+            estimated: any_estimated,
             streams,
             ..Default::default()
         }
@@ -1181,14 +1191,16 @@ impl FlatOutEngine {
 
     /// One stream's authoritative token count + its decode rate over its
     /// own first→last token window (`tokens / span` — the same formula
-    /// the Overall Metrics panel records per stream).
+    /// the Overall Metrics panel records per stream) + the CF-30
+    /// estimated flag (`true` when the count is the `chars/4` fallback —
+    /// no server `usage` and no exact tokenizer).
     fn stream_rate(
         events: &[StreamEvent],
         first_token: Option<MonotonicInstant>,
         last_token: Option<MonotonicInstant>,
         tokenizer: Option<&Tokenizer>,
-    ) -> (u64, f64) {
-        let (tokens, _) = authoritative_tokens(events, stream_usage(events), tokenizer);
+    ) -> (u64, f64, bool) {
+        let (tokens, estimated) = authoritative_tokens(events, stream_usage(events), tokenizer);
         let gen_tps = match (first_token, last_token) {
             (Some(f), Some(l)) => {
                 let span_s = f.delta_nanos(&l) as f64 / 1e9;
@@ -1200,7 +1212,7 @@ impl FlatOutEngine {
             }
             _ => 0.0,
         };
-        (tokens, gen_tps)
+        (tokens, gen_tps, estimated)
     }
 }
 

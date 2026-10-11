@@ -616,7 +616,7 @@ impl SpeedEngine {
         // `usage.completion_tokens` once it arrives (the primary source),
         // else the re-tokenized text (exact tokenizer, else `chars/4`).
         // Never the raw frame tally — batched vLLM frames undercount.
-        let (tokens_received, _est) = authoritative_tokens(events, usage, tokenizer);
+        let (tokens_received, estimated) = authoritative_tokens(events, usage, tokenizer);
         let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
         let ttft_s = ttft_ns.map(|ns| ns as f64 / 1_000_000_000.0);
 
@@ -698,6 +698,12 @@ impl SpeedEngine {
             // The decode-rate numerator: the authoritative token count
             // (usage → text estimate), matching `completion_tokens`.
             observed_frames: tokens_received,
+            // CF-30: the estimated-token seam — `true` when this stream's
+            // count is the `chars/4` fallback (no server `usage` and no
+            // exact tokenizer). The `OverallAccumulator` uses it to tag
+            // the estimated portion of the blended token total so an
+            // estimate is never presented as a server-authoritative count.
+            estimated,
             status: state,
             loop_excluded_streams: looping as usize,
             loop_excluded_tokens,

@@ -1362,6 +1362,15 @@ impl Sweep {
         } else {
             0.0
         };
+        // CF-30: the estimated-token seam — `true` when any non-looping
+        // stream's count is the `chars/4` fallback (no server `usage` and
+        // no tokenizer); the same rule `finish()` applies to the level's
+        // `estimated` flag.
+        let estimated = acc
+            .trackers
+            .iter()
+            .filter(|t| !t.looping)
+            .any(|t| t.estimated());
         let snapshot = MetricsSnapshot {
             endpoint: self.pool.endpoint().to_string(),
             model: self.pool.model().to_string(),
@@ -1393,6 +1402,7 @@ impl Sweep {
             status,
             loop_excluded_streams: acc.loop_excluded_streams(),
             loop_excluded_tokens: acc.loop_excluded_tokens(),
+            estimated,
             streams: acc.stream_rows(),
             ..Default::default()
         };

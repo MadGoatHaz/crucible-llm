@@ -269,6 +269,16 @@ pub struct StructuredSummary {
     pub compliant: usize,
     pub partial: usize,
     pub failed: usize,
+    /// CF-36: `true` only when the constrained case-0 run produced valid
+    /// JSON — the `penalty_pct` above is meaningful (and rendered) only
+    /// in that case; otherwise the constraint was not effective.
+    #[serde(default)]
+    pub constraint_effective: bool,
+    /// CF-51: the mean per-case stability rate ([0.0, 1.0]) — the fraction
+    /// of repeated runs that were fully compliant (the McNemar/Wilson
+    /// A/B-comparator data prerequisite).
+    #[serde(default)]
+    pub stability_rate: f64,
 }
 
 impl StructuredSummary {
@@ -282,6 +292,8 @@ impl StructuredSummary {
             compliant,
             partial,
             failed,
+            constraint_effective: r.constraint_effective(),
+            stability_rate: r.stability_rate(),
         }
     }
 }

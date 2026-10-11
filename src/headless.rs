@@ -772,6 +772,11 @@ mod tests {
             avg_utilization_pct: Some(90.0),
             vendor: Some("NVIDIA".into()),
             model: Some("RTX A4000".into()),
+            // P3-A CF-53 soft-contract field (default `false` — the JSON
+            // flag under test comes from the `build_energy_json` parameter,
+            // which is what the production path captures from
+            // `CpuPowerBackend::is_estimated()`).
+            cpu_power_estimated: false,
         };
 
         // Estimated CPU power → the flag is `true` in the JSON object.
