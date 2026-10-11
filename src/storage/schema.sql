@@ -43,5 +43,10 @@ CREATE TABLE IF NOT EXISTS needle_evaluations (
     context_length INTEGER,
     depth_percent REAL,
     retrieved_successfully BOOLEAN,
+    -- Option C (hybrid reasoning): the cell's stream completed OK but the
+    -- model spent its whole budget on chain-of-thought (all-CoT / zero-
+    -- content) — an inconclusive (budget) outcome, NOT a retrieval failure.
+    -- NULL for rows written before the column existed.
+    truncated_by_reasoning BOOLEAN,
     latency_ms REAL
 );

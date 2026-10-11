@@ -174,6 +174,7 @@ fn cell(size: u32, depth: u8, retrieved: bool, ttft: f64) -> NiahCell {
         target_tokens: size,
         depth_percent: depth,
         retrieved,
+        truncated_by_reasoning: false,
         ttft_s: ttft,
         prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
         state: NiahCellState::Nominal,
@@ -396,8 +397,9 @@ fn view3_renders_color_coded_grid_from_published_result() {
     );
 
     // The legend reports the headline accuracy (cells 0, 1, 2 retrieved;
-    // cell 3 failed).
-    assert!(text.contains("Accuracy: 3/4 retrieved (75.0%)"));
+    // cell 3 is a genuine fail — not truncated — so the Option C label
+    // breaks the fail count out).
+    assert!(text.contains("Accuracy: 3/4 retrieved, 1 failed (75.0%)"));
     assert!(text.contains("LEGEND"));
 }
 

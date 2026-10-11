@@ -240,6 +240,25 @@ fn migration_upgrades_a_preexisting_db() {
         );
     }
 
+    // Option C: the `needle_evaluations` table (created without the column in
+    // the legacy schema above) is upgraded in place with
+    // `truncated_by_reasoning`.
+    {
+        let mut stmt = db
+            .conn()
+            .prepare("PRAGMA table_info(needle_evaluations)")
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            cols.contains(&"truncated_by_reasoning".to_string()),
+            "needle_evaluations missing truncated_by_reasoning: {cols:?}"
+        );
+    }
+
     // The legacy row survives, with the new columns NULL.
     let legacy = db.get_session("legacy-1").unwrap().expect("legacy row");
     assert_eq!(legacy.model_name, "old-model");
@@ -397,21 +416,26 @@ fn needle_evaluations_round_trip() {
     {
         let mut db = Database::open(&path).unwrap();
         db.insert_session(&sample_session("sess-3")).unwrap();
+        // A clean retrieval (not truncated).
         db.insert_needle_evaluation(&NeedleEvaluation {
             eval_id: None,
             session_id: "sess-3".into(),
             context_length: Some(8192),
             depth_percent: Some(30.0),
             retrieved_successfully: Some(true),
+            truncated_by_reasoning: Some(false),
             latency_ms: Some(950.0),
         })
         .unwrap();
+        // Option C: an over-thinker — the stream completed OK but spent its
+        // whole budget on CoT (not retrieved, and NOT a retrieval failure).
         db.insert_needle_evaluation(&NeedleEvaluation {
             eval_id: None,
             session_id: "sess-3".into(),
             context_length: Some(32768),
             depth_percent: Some(90.0),
             retrieved_successfully: Some(false),
+            truncated_by_reasoning: Some(true),
             latency_ms: Some(4100.0),
         })
         .unwrap();
@@ -423,8 +447,11 @@ fn needle_evaluations_round_trip() {
     assert_eq!(rows[0].context_length, Some(8192));
     assert!((rows[0].depth_percent.unwrap() - 30.0).abs() < 1e-9);
     assert_eq!(rows[0].retrieved_successfully, Some(true));
+    assert_eq!(rows[0].truncated_by_reasoning, Some(false));
     assert!((rows[0].latency_ms.unwrap() - 950.0).abs() < 1e-9);
     assert_eq!(rows[1].retrieved_successfully, Some(false));
+    // The truncated flag survives the round-trip (the Option C distinction).
+    assert_eq!(rows[1].truncated_by_reasoning, Some(true));
     cleanup(&dir);
 }
 

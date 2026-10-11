@@ -727,6 +727,7 @@ mod tests {
             context_length: Some(8192),
             depth_percent: Some(50.0),
             retrieved_successfully: Some(true),
+            truncated_by_reasoning: Some(false),
             latency_ms: Some(123.4),
         }];
         let md = payload.to_markdown();
@@ -858,6 +859,7 @@ mod tests {
             context_length: Some(4096),
             depth_percent: Some(10.0),
             retrieved_successfully: Some(false),
+            truncated_by_reasoning: Some(false),
             latency_ms: Some(99.0),
         })
         .unwrap();

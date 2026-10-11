@@ -165,6 +165,14 @@ pub struct NeedleEvaluation {
     pub depth_percent: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieved_successfully: Option<bool>,
+    /// **Option C (hybrid reasoning):** `true` when this cell's stream
+    /// completed OK but the model spent its whole generation budget on
+    /// chain-of-thought (all-CoT / zero-content) — an *inconclusive (budget)*
+    /// outcome, distinct from a retrieval failure. `None` for rows written
+    /// before the column existed (pre-Option-C databases / exports), so old
+    /// data reads back cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_by_reasoning: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
 }

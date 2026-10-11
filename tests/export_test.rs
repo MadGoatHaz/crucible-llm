@@ -109,6 +109,7 @@ fn persist_then_export_json_round_trips_through_sqlite() {
         context_length: Some(8192),
         depth_percent: Some(50.0),
         retrieved_successfully: Some(true),
+        truncated_by_reasoning: Some(false),
         latency_ms: Some(210.0),
     });
 
@@ -149,6 +150,7 @@ fn persist_then_export_markdown_renders_gfm_tables() {
         context_length: Some(8192),
         depth_percent: Some(50.0),
         retrieved_successfully: Some(true),
+        truncated_by_reasoning: Some(false),
         latency_ms: Some(210.0),
     })
     .unwrap();

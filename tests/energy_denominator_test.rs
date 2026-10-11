@@ -147,7 +147,7 @@ fn flatout_with_total_tokens(total_tokens: u64) -> FlatOutResult {
 
 /// Mirror of `BenchmarkSequence::all_engines_tokens` (sequence.rs:1213):
 /// the J/token denominator spans every engine that produced tokens — real
-/// counts for A/B/F, the labeled `chars/4` / 64-cap estimates for C1/C2/C3
+/// counts for A/B/F, the labeled `chars/4` / NIAH-cap estimates for C1/C2/C3
 /// (whose result types carry no output count). The production method is
 /// private, so this re-states the same summing rule over the public result
 /// types.
@@ -164,7 +164,8 @@ fn all_engines_tokens(
     total += speed.iter().map(|r| r.completion_tokens).sum::<u64>();
     // Engine B — real sweep total tokens.
     total += sweep.levels.iter().map(|l| l.total_tokens).sum::<u64>();
-    // Engine C1 (NIAH) — estimate: run cells × the 64-token gen cap.
+    // Engine C1 (NIAH) — estimate: run cells × the NIAH gen cap
+    // (`NIAH_MAX_GEN_TOKENS` — 1024 after the Option C budget raise).
     let run_cells = niah.cells.iter().filter(|c| c.target_tokens > 0).count();
     total += (run_cells as u64) * NIAH_MAX_GEN_TOKENS as u64;
     // Engine C2 (Reasoning) — estimate: chars/4 over the response text.
@@ -207,9 +208,9 @@ fn power_trace() -> Vec<HwSample> {
 #[test]
 fn all_engine_joules_per_token_denominator_spans_every_engine() {
     // Populate every engine with a known token contribution:
-    //   A: 256 (real)  B: 1000 (real)  C1: 1 run cell × 64 (est.)
-    //   C2: 400 chars / 4 = 100 (est.)  C3: 800 chars / 4 = 200 (est.)
-    //   F: 5000 (real)
+    //   A: 256 (real)  B: 1000 (real)  C1: 1 run cell × NIAH_MAX_GEN_TOKENS
+    //   (est.)  C2: 400 chars / 4 = 100 (est.)  C3: 800 chars / 4 = 200
+    //   (est.)  F: 5000 (real)
     let speed = vec![speed_with_tokens(256)];
     let sweep = sweep_with_total_tokens(1000);
     let niah = niah_with_run_cells(1);
@@ -227,10 +228,12 @@ fn all_engine_joules_per_token_denominator_spans_every_engine() {
     );
 
     // The honest all-engine denominator (mirrors sequence.rs::all_engines_tokens).
+    // The C1 term references `NIAH_MAX_GEN_TOKENS` so it tracks the budget
+    // (1024 after the Option C raise) instead of hard-coding a stale value.
     let all = all_engines_tokens(&speed, &sweep, &niah, &reasoning, &structured, &flatout);
     assert_eq!(
         all,
-        256 + 1000 + 64 + 100 + 200 + 5000,
+        256 + 1000 + NIAH_MAX_GEN_TOKENS as u64 + 100 + 200 + 5000,
         "the denominator spans A+B+C1+C2+C3+F, not just A+B"
     );
     assert!(

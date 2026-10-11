@@ -727,6 +727,10 @@ impl NiahResult {
                 context_length: Some(c.target_tokens as i64),
                 depth_percent: Some(c.depth_percent as f64),
                 retrieved_successfully: Some(c.retrieved),
+                // Option C: persist the per-cell truncated-by-reasoning state
+                // so the `needle_evaluations` row distinguishes an
+                // inconclusive (budget) cell from a genuine retrieval fail.
+                truncated_by_reasoning: Some(c.truncated_by_reasoning),
                 latency_ms: Some(c.ttft_s * 1000.0),
             })
             .collect()
@@ -1536,6 +1540,9 @@ mod tests {
         assert_eq!(row.context_length, Some(2000));
         assert_eq!(row.depth_percent, Some(50.0));
         assert_eq!(row.retrieved_successfully, Some(true));
+        // Option C: the per-cell truncated state is persisted (false for a
+        // clean retrieval).
+        assert_eq!(row.truncated_by_reasoning, Some(false));
         assert_eq!(row.latency_ms, Some(250.0));
     }
 

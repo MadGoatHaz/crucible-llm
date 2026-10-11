@@ -1565,6 +1565,10 @@ impl App {
                         context_length: Some(cell.target_tokens as i64),
                         depth_percent: Some(cell.depth_percent as f64),
                         retrieved_successfully: Some(cell.retrieved),
+                        // Option C: persist the per-cell truncated-by-
+                        // reasoning state (inconclusive (budget), not a
+                        // retrieval fail).
+                        truncated_by_reasoning: Some(cell.truncated_by_reasoning),
                         latency_ms: Some(cell.ttft_s * 1000.0),
                     })
                     .collect()

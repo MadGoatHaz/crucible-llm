@@ -84,6 +84,31 @@ impl Database {
         // COLUMN` only when they are absent. Old rows read back as `NULL`
         // (current users never break).
         self.migrate_sessions_columns()?;
+        self.migrate_needle_columns()?;
+        Ok(())
+    }
+
+    /// Add the `needle_evaluations` Option C column if a pre-existing
+    /// database lacks it. `PRAGMA table_info` is the version-independent way
+    /// to check (no schema-version table needed); the `ADD COLUMN` is guarded
+    /// so the step is idempotent. Old rows read back as `NULL` (pre-Option-C
+    /// cells had no truncation concept — current users never break).
+    fn migrate_needle_columns(&self) -> Result<(), StorageError> {
+        let mut existing = std::collections::HashSet::new();
+        let mut stmt = self.conn.prepare("PRAGMA table_info(needle_evaluations)")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for name in names {
+            existing.insert(name);
+        }
+        if !existing.contains("truncated_by_reasoning") {
+            self.conn.execute(
+                "ALTER TABLE needle_evaluations \
+                 ADD COLUMN truncated_by_reasoning BOOLEAN",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -229,7 +254,7 @@ impl Database {
     ) -> Result<Vec<NeedleEvaluation>, StorageError> {
         let mut stmt = self.conn.prepare(
             "SELECT eval_id, session_id, context_length, depth_percent,
-                    retrieved_successfully, latency_ms
+                    retrieved_successfully, truncated_by_reasoning, latency_ms
               FROM needle_evaluations
               WHERE session_id = ?1
               ORDER BY eval_id",
@@ -343,13 +368,14 @@ fn insert_needle_conn(conn: &Connection, e: &NeedleEvaluation) -> rusqlite::Resu
     conn.execute(
         "INSERT INTO needle_evaluations
             (session_id, context_length, depth_percent,
-             retrieved_successfully, latency_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+             retrieved_successfully, truncated_by_reasoning, latency_ms)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             e.session_id,
             e.context_length,
             e.depth_percent,
             e.retrieved_successfully,
+            e.truncated_by_reasoning,
             e.latency_ms,
         ],
     )?;
@@ -396,6 +422,7 @@ fn row_to_needle(row: &Row) -> rusqlite::Result<NeedleEvaluation> {
         context_length: row.get(2)?,
         depth_percent: row.get(3)?,
         retrieved_successfully: row.get(4)?,
-        latency_ms: row.get(5)?,
+        truncated_by_reasoning: row.get(5)?,
+        latency_ms: row.get(6)?,
     })
 }

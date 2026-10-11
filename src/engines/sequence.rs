@@ -949,6 +949,9 @@ impl BenchmarkSequence {
                     context_length: Some(cell.target_tokens as i64),
                     depth_percent: Some(cell.depth_percent as f64),
                     retrieved_successfully: Some(cell.retrieved),
+                    // Option C: persist the per-cell truncated-by-reasoning
+                    // state (inconclusive (budget), not a retrieval fail).
+                    truncated_by_reasoning: Some(cell.truncated_by_reasoning),
                     latency_ms: Some(cell.ttft_s * 1000.0),
                 });
             }
@@ -2032,10 +2035,12 @@ mod tests {
 
         // The old A+B-only denominator would be 256 + 1000 = 1256.
         let a_b_only = 256u64 + 1000;
-        // The honest all-engine denominator:
-        //   256 + 1000 + (1×64) + (400/4) + (800/4) + 5000 = 6620.
+        // The honest all-engine denominator (the C1 contribution is
+        // `run_cells × NIAH_MAX_GEN_TOKENS` — 1024 after the Option C budget
+        // raise):
+        //   256 + 1000 + (1×1024) + (400/4) + (800/4) + 5000 = 7580.
         let all = s.all_engines_tokens();
-        assert_eq!(all, 6620, "denominator spans A+B+C1+C2+C3+F, not just A+B");
+        assert_eq!(all, 7580, "denominator spans A+B+C1+C2+C3+F, not just A+B");
         assert!(
             all > a_b_only,
             "the all-engine denominator ({all}) must exceed the old A+B-only ({a_b_only})"
