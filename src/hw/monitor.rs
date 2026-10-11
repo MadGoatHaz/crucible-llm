@@ -146,35 +146,35 @@ pub struct TokenCosts {
 
 /// The $/1M-token cost math (pure — unit-testable without any hardware).
 ///
-/// Each phase's energy is its **measured average power** applied over the
-/// **time that phase actually occupied** during the run:
+/// Each phase's energy is its **measured average power × the total time that
+/// phase occupied during the run** (power × total phase time):
 ///
 /// ```text
-/// primary (throughput model — the multi-request-correct one):
-///   prefill_J = prompt_tokens   × avg_prefill_power_W / prefill_throughput
-///   decode_J  = completion_tokens × avg_decode_power_W / decode_throughput
+/// total phase time:
+///   prefill_time = prompt_tokens   / prefill_throughput   (the run aggregate)
+///   decode_time  = completion_tokens / decode_throughput
+///   (a single-request run: prefill_time = TTFT, decode_time = the decode span)
 ///
-/// fallback (no throughput measured yet — a single-request run):
-///   prefill_J = avg_prefill_power_W × TTFT_s
-///   decode_J  = avg_decode_power_W  × decode_s
+/// prefill_J = avg_prefill_power_W × prefill_time
+/// decode_J  = avg_decode_power_W  × decode_time
 ///
 /// $/1M input  = prefill_kWh × rate / (prompt_tokens / 1e6)
 /// $/1M output = decode_kWh  × rate / (completion_tokens / 1e6)
 /// blended     = (prefill_kWh + decode_kWh) × rate / (total_tokens / 1e6)
 /// ```
 ///
-/// The throughput model is a **strict generalization** of the old
-/// `power × duration` formula: for a single request, `throughput =
-/// tokens / duration`, so the two are identical. For a multi-engine run
-/// (the case that produced the "$0 input" bug), the cumulative input token
-/// total is matched against the *total* prefill time across every request —
-/// not just the first request's TTFT — so the input cost is a real,
-/// non-zero number.
+/// `tokens / throughput` *is* the total phase time (throughput = tokens ÷
+/// time). For a single request that is exactly the measured window, so the
+/// formula reduces to `power × duration`. For a multi-request run it is the
+/// *total* phase time across every request — not just the first request's
+/// TTFT — which is what keeps the input cost a real, non-zero number (the
+/// old "first-request-TTFT only" model divided ~0.4 s of prefill energy by
+/// 2 M tokens → $0).
 ///
 /// The **blended** rate is the token-count-weighted mean of the input and
 /// output rates (`(in·N_in + out·N_out) / (N_in + N_out)`), which is always
 /// *between* the two — it can never fall below the cheaper phase (the
-/// "blended < output" bug is now structurally impossible).
+/// "blended < output" bug is structurally impossible).
 ///
 /// A phase with zero tokens yields a `0.0` rate (nothing to normalize);
 /// the N/A *display* decision (show `N/A` vs `0.00`) is the UI's, made on
@@ -195,10 +195,10 @@ pub fn calculate_token_costs(
     decode_throughput: f64,
     rate_per_kwh: f64,
 ) -> TokenCosts {
-    // Each phase's energy in joules. Primary: the throughput model (total
-    // phase tokens × measured phase power ÷ measured phase throughput =
-    // the energy that phase consumed over the whole run). Fallback (no
-    // throughput measured yet): phase power × the measured phase window.
+    // Each phase's energy in joules = measured phase power × total phase
+    // time. The total phase time is `phase_tokens / phase_throughput` (the
+    // run aggregate); when no throughput is measured yet (a single-request
+    // run) it is the measured phase window (TTFT / decode span).
     let prefill_joules = if prefill_throughput > 0.0 && prompt_tokens > 0 {
         prompt_tokens as f64 * avg_prefill_power_w / prefill_throughput
     } else {
