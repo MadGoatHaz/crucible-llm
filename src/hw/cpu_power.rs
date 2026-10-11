@@ -146,6 +146,9 @@ impl CpuPowerBackend {
                 last_watts: ESTIMATED_CPU_W,
             }));
         }
+        // No real sensor (RAPL / Super-I-O): the clearly-labeled fixed
+        // estimate. `is_estimated()` is `true` here — the source of the
+        // energy-summary `cpu_power_estimated` flag (CF-53).
         Some(Box::new(Self {
             method: CpuPowerMethod::Estimated,
             source: Source::Estimated,
@@ -167,6 +170,12 @@ impl CpuPowerBackend {
 
     /// `true` when the accepted method is the fixed estimate (the UI flags
     /// non-measured CPU power).
+    ///
+    /// This is the source of the energy-summary `cpu_power_estimated` flag
+    /// (CF-53): the caller that builds the `--json` energy object
+    /// ([`crate::engines::hardware::EnergyResult`]) copies this into
+    /// [`EnergyResult::cpu_power_estimated`] so consumers know the CPU
+    /// component of the total draw is a constant, not a measurement.
     #[must_use]
     pub fn is_estimated(&self) -> bool {
         self.method.is_estimated()

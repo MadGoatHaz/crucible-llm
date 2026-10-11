@@ -20,11 +20,15 @@
 //!   meaningful, not "the whole draw").
 //! * **Phase power** — the prefill window (load start → first token) and
 //!   the decode window (first token → last token) are measured
-//!   *separately* from the 1 Hz power history: `avg_prefill_power` and
-//!   `avg_decode_power`. This is what makes input vs output token costs
-//!   meaningful (prefill and decode draw very different power).
-//! * **Energy** — `∫P(t)dt` over the 1 Hz power history (trapezoidal rule),
-//!   in joules / kWh, and a `$` estimate at a user-set `$/kWh` rate.
+//!   *separately* from the 100 ms `HwSample` trace: `avg_prefill_power` and
+//!   `avg_decode_power`. The 100 ms cadence resolves sub-second phases (a
+//!   short-prompt TTFT), which the old 1 Hz history could not. This is what
+//!   makes input vs output token costs meaningful (prefill and decode draw
+//!   very different power).
+//! * **Energy** — `∫P(t)dt` over the 100 ms `HwSample` trace (trapezoidal
+//!   rule), windowed to the load, in joules / kWh, and a `$` estimate at a
+//!   user-set `$/kWh` rate. The 1 Hz power history is kept only for the
+//!   power-over-time graph.
 //! * **Cost per 1M tokens** — [`calculate_token_costs`] turns the phase
 //!   power + phase durations + token counts into **separate** $/1M rates
 //!   for *input* (prefill) and *output* (decode) tokens, plus a blended
@@ -39,7 +43,7 @@
 
 use crate::timing::MonotonicInstant;
 
-use super::GpuSample;
+use super::{GpuSample, HwSample, HW_TRACE_CAPACITY};
 
 /// The idle-baseline sampling window (seconds) taken **before** load begins.
 pub const IDLE_WINDOW_SECS: u64 = 5;
@@ -146,35 +150,35 @@ pub struct TokenCosts {
 
 /// The $/1M-token cost math (pure — unit-testable without any hardware).
 ///
-/// Each phase's energy is its **measured average power** applied over the
-/// **time that phase actually occupied** during the run:
+/// Each phase's energy is its **measured average power × the total time that
+/// phase occupied during the run** (power × total phase time):
 ///
 /// ```text
-/// primary (throughput model — the multi-request-correct one):
-///   prefill_J = prompt_tokens   × avg_prefill_power_W / prefill_throughput
-///   decode_J  = completion_tokens × avg_decode_power_W / decode_throughput
+/// total phase time:
+///   prefill_time = prompt_tokens   / prefill_throughput   (the run aggregate)
+///   decode_time  = completion_tokens / decode_throughput
+///   (a single-request run: prefill_time = TTFT, decode_time = the decode span)
 ///
-/// fallback (no throughput measured yet — a single-request run):
-///   prefill_J = avg_prefill_power_W × TTFT_s
-///   decode_J  = avg_decode_power_W  × decode_s
+/// prefill_J = avg_prefill_power_W × prefill_time
+/// decode_J  = avg_decode_power_W  × decode_time
 ///
 /// $/1M input  = prefill_kWh × rate / (prompt_tokens / 1e6)
 /// $/1M output = decode_kWh  × rate / (completion_tokens / 1e6)
 /// blended     = (prefill_kWh + decode_kWh) × rate / (total_tokens / 1e6)
 /// ```
 ///
-/// The throughput model is a **strict generalization** of the old
-/// `power × duration` formula: for a single request, `throughput =
-/// tokens / duration`, so the two are identical. For a multi-engine run
-/// (the case that produced the "$0 input" bug), the cumulative input token
-/// total is matched against the *total* prefill time across every request —
-/// not just the first request's TTFT — so the input cost is a real,
-/// non-zero number.
+/// `tokens / throughput` *is* the total phase time (throughput = tokens ÷
+/// time). For a single request that is exactly the measured window, so the
+/// formula reduces to `power × duration`. For a multi-request run it is the
+/// *total* phase time across every request — not just the first request's
+/// TTFT — which is what keeps the input cost a real, non-zero number (the
+/// old "first-request-TTFT only" model divided ~0.4 s of prefill energy by
+/// 2 M tokens → $0).
 ///
 /// The **blended** rate is the token-count-weighted mean of the input and
 /// output rates (`(in·N_in + out·N_out) / (N_in + N_out)`), which is always
 /// *between* the two — it can never fall below the cheaper phase (the
-/// "blended < output" bug is now structurally impossible).
+/// "blended < output" bug is structurally impossible).
 ///
 /// A phase with zero tokens yields a `0.0` rate (nothing to normalize);
 /// the N/A *display* decision (show `N/A` vs `0.00`) is the UI's, made on
@@ -195,10 +199,10 @@ pub fn calculate_token_costs(
     decode_throughput: f64,
     rate_per_kwh: f64,
 ) -> TokenCosts {
-    // Each phase's energy in joules. Primary: the throughput model (total
-    // phase tokens × measured phase power ÷ measured phase throughput =
-    // the energy that phase consumed over the whole run). Fallback (no
-    // throughput measured yet): phase power × the measured phase window.
+    // Each phase's energy in joules = measured phase power × total phase
+    // time. The total phase time is `phase_tokens / phase_throughput` (the
+    // run aggregate); when no throughput is measured yet (a single-request
+    // run) it is the measured phase window (TTFT / decode span).
     let prefill_joules = if prefill_throughput > 0.0 && prompt_tokens > 0 {
         prompt_tokens as f64 * avg_prefill_power_w / prefill_throughput
     } else {
@@ -315,8 +319,13 @@ pub struct GpuPowerMonitor {
     /// updated on every poll that reports `TokenPhase::active`.
     pub last_token_at: Option<MonotonicInstant>,
 
-    // ---- 1 Hz power history (the power-over-time graph) ----
+    // ---- 1 Hz power history (the power-over-time graph only) ----
     pub history: Vec<PowerSample>,
+    /// The 100 ms `HwSample` power trace — the **source** for the energy /
+    /// cost integration and the prefill / decode phase-power measurements
+    /// (CF-19 / CF-37: re-based off the 1 Hz history, which now serves only
+    /// the graph). Bounded to [`HW_TRACE_CAPACITY`].
+    pub trace: Vec<HwSample>,
     /// When the load (post-idle) window began; `None` while idle / before a
     /// run. The history and `duration` are measured from here.
     pub load_started: Option<MonotonicInstant>,
@@ -373,6 +382,7 @@ impl Default for GpuPowerMonitor {
             first_token_at: None,
             last_token_at: None,
             history: Vec::new(),
+            trace: Vec::new(),
             load_started: None,
             load_ended: None,
             run_started: None,
@@ -425,6 +435,7 @@ impl GpuPowerMonitor {
         self.first_token_at = None;
         self.last_token_at = None;
         self.history.clear();
+        self.trace.clear();
         self.idle_samples.clear();
         self.idle_finalized = false;
         self.measure_idle = false;
@@ -615,8 +626,12 @@ impl GpuPowerMonitor {
             self.throttle_events += 1;
         }
 
-        // 1 Hz history (only once the load window is open).
+        // Once the load window is open: record a 100 ms trace point (the
+        // energy / cost integration source — CF-37, so a sub-second phase
+        // resolves at 10× the cadence) and, once per second, a 1 Hz history
+        // point (the power-over-time graph only).
         if self.load_started.is_some() {
+            self.record_trace_point(agg);
             let due = self
                 .history
                 .last()
@@ -667,6 +682,33 @@ impl GpuPowerMonitor {
         }
     }
 
+    /// Append one 100 ms [`HwSample`] to the bounded trace (the energy /
+    /// cost integration source). The oldest samples drop first once the
+    /// trace exceeds [`HW_TRACE_CAPACITY`].
+    fn push_trace(&mut self, sample: &HwSample) {
+        self.trace.push(sample.clone());
+        if self.trace.len() > HW_TRACE_CAPACITY {
+            self.trace.drain(0..self.trace.len() - HW_TRACE_CAPACITY);
+        }
+    }
+
+    /// Record one 100 ms trace point from the aggregate GPU sample + the
+    /// current CPU draw (the system-draw component). Called on every
+    /// [`Self::record`] during the load window — the 100 ms cadence that
+    /// resolves sub-second phases (CF-19 / CF-37).
+    fn record_trace_point(&mut self, agg: &GpuSample) {
+        let sample = HwSample {
+            t: MonotonicInstant::now(),
+            power_mw: agg
+                .power_watts
+                .map(|w| (w * 1000.0).round().max(0.0) as u64),
+            cpu_power_mw: (self.cpu_power_w > 0.0)
+                .then_some((self.cpu_power_w * 1000.0).round().max(0.0) as u64),
+            ..HwSample::default()
+        };
+        self.push_trace(&sample);
+    }
+
     // ── run-window lifecycle ──────────────────────────────────────────────
 
     /// Close the load window (the run is over): freeze the duration at its
@@ -699,6 +741,10 @@ impl GpuPowerMonitor {
 
     /// Total energy `∫P(t)dt` over the **test window**, joules.
     ///
+    /// Integrated from the **100 ms `HwSample` trace** (CF-37 — not the 1 Hz
+    /// history, which now serves only the power-over-time graph), so a short
+    /// / sub-second run resolves at 10× the cadence.
+    ///
     /// Window-based (the "statistics only count what happened during the
     /// test" rule): the integral spans `[load_started, load_ended]`.
     /// While the run is live (`load_ended` is `None`) that is everything
@@ -708,37 +754,13 @@ impl GpuPowerMonitor {
     /// derived from it, are final the moment the window closes.
     pub fn energy_joules(&self) -> f64 {
         match (self.load_started, self.load_ended) {
-            (Some(start), Some(end)) => {
-                // Single pass, no allocation: trapezoids over consecutive
-                // in-window samples (the same math as `integrate_power`,
-                // with the window filter applied). A sample outside the
-                // window breaks the chain, so no interval ever bridges
-                // across an edge.
-                let mut joules = 0.0f64;
-                let mut prev: Option<&PowerSample> = None;
-                for s in &self.history {
-                    // `start <= s.t <= end` (clamped-delta ordering, the
-                    // same predicate `phase_avg_power` uses).
-                    let in_window = s.t.delta_nanos(&start) == 0 && end.delta_nanos(&s.t) == 0;
-                    if in_window {
-                        if let Some(p) = prev {
-                            let dt = p.t.delta_nanos(&s.t) as f64 / 1e9;
-                            // Total *system* draw (GPU + CPU) at each end
-                            // of the interval.
-                            let p0 = p.power_w + p.cpu_power_w;
-                            let p1 = s.power_w + s.cpu_power_w;
-                            joules += (p0 + p1) / 2.0 * dt;
-                        }
-                        prev = Some(s);
-                    } else {
-                        prev = None;
-                    }
-                }
-                joules
-            }
-            // No closed window (live run, or no load window yet): the
-            // whole history is in scope.
-            _ => integrate_power(&self.history),
+            // Closed window: integrate only `[load_started, load_ended]` —
+            // a completed run's energy is final the moment the window closes
+            // (post-completion samples are excluded).
+            (Some(start), Some(end)) => integrate_trace(&self.trace, Some((start, end))),
+            // No closed window (live run, or no load window yet): the whole
+            // trace is in scope.
+            _ => integrate_trace(&self.trace, None),
         }
     }
 
@@ -801,14 +823,15 @@ impl GpuPowerMonitor {
     }
 
     /// The **average power draw during the prefill phase** (load start →
-    /// first token), watts, from the 1 Hz history.
+    /// first token), watts, from the 100 ms `HwSample` trace (CF-19).
     ///
     /// The window is **half-open** (`[load_start, first_token)`): a sample
     /// sitting exactly on the first-token instant belongs to the decode
-    /// phase. A sub-second TTFT rarely contains a whole 1 Hz sample; when
-    /// fewer than 2 samples fall in the window the **overall average
-    /// power** stands in (see [`Self::prefill_uses_fallback`] for the UI
-    /// warning). `None` when the history is empty (the N/A rule).
+    /// phase. The 100 ms cadence resolves a sub-second TTFT (which the old
+    /// 1 Hz history could not); when fewer than 2 trace samples fall in the
+    /// window the **overall average power** stands in (see
+    /// [`Self::prefill_uses_fallback`] for the UI warning). `None` when the
+    /// trace is empty (the N/A rule).
     pub fn avg_prefill_power(&self) -> Option<f64> {
         let first = self.first_token_at?;
         let start = self.load_started.unwrap_or(first);
@@ -816,23 +839,23 @@ impl GpuPowerMonitor {
             // Fewer than 2 samples in the TTFT window: use the overall
             // average power (the best available estimate).
             self.avg_power_w()
-                .or_else(|| self.history.first().map(|s| s.power_w))
+                .or_else(|| self.trace.first().map(trace_system_watts))
         } else {
             self.phase_avg_power(start, first, false)
         }
     }
 
-    /// `true` when the prefill window contains fewer than 2 power samples
-    /// (a sub-second TTFT at 1 Hz sampling). The UI shows a warning note
-    /// when this is set: the prefill power is the overall average, not a
-    /// phase-specific measurement.
+    /// `true` when the prefill window contains fewer than 2 trace samples
+    /// (a TTFT too short to resolve even at the 100 ms cadence). The UI
+    /// shows a warning note when this is set: the prefill power is the
+    /// overall average, not a phase-specific measurement.
     pub fn prefill_uses_fallback(&self) -> bool {
         let Some(first) = self.first_token_at else {
             return true; // no first token → no prefill measurement possible
         };
         let start = self.load_started.unwrap_or(first);
         let count = self
-            .history
+            .trace
             .iter()
             .filter(|s| {
                 let in_window = s.t.delta_nanos(&start) == 0 && first.delta_nanos(&s.t) == 0;
@@ -843,19 +866,20 @@ impl GpuPowerMonitor {
     }
 
     /// The **average power draw during the decode phase** (first token →
-    /// last token activity), watts, from the 1 Hz history (the window is
-    /// **closed**: a sample on the first-token instant is decode's).
+    /// last token activity), watts, from the 100 ms `HwSample` trace
+    /// (CF-19) (the window is **closed**: a sample on the first-token
+    /// instant is decode's).
     ///
-    /// When the window is empty (a very short decode) the **last** history
-    /// sample stands in. `None` when the history is empty (the N/A rule).
+    /// When the window is empty (a very short decode) the **last** trace
+    /// sample stands in. `None` when the trace is empty (the N/A rule).
     pub fn avg_decode_power(&self) -> Option<f64> {
         let first = self.first_token_at?;
         let last = self.last_token_at.unwrap_or(first);
         self.phase_avg_power(first, last, true)
-            .or_else(|| self.history.last().map(|s| s.power_w))
+            .or_else(|| self.trace.last().map(trace_system_watts))
     }
 
-    /// Mean power of the 1 Hz history samples inside `[start, end]`
+    /// Mean power of the 100 ms trace samples inside `[start, end]`
     /// (`end` included only when `end_inclusive`; monotonic ordering via
     /// the clamped `delta_nanos`, the same test `within()` in
     /// `engines/hardware.rs` uses). `None` when no sample falls in the
@@ -867,7 +891,7 @@ impl GpuPowerMonitor {
         end_inclusive: bool,
     ) -> Option<f64> {
         let vals: Vec<f64> = self
-            .history
+            .trace
             .iter()
             .filter(|s| {
                 // `start <= s.t <= end` (clamped deltas are `0` exactly
@@ -879,7 +903,7 @@ impl GpuPowerMonitor {
             })
             // Total *system* draw (GPU + CPU) — the phase powers that feed
             // the `$/1M` cost math include the CPU, not just the GPU.
-            .map(|s| s.power_w + s.cpu_power_w)
+            .map(trace_system_watts)
             .collect();
         (!vals.is_empty()).then(|| vals.iter().sum::<f64>() / vals.len() as f64)
     }
@@ -955,6 +979,48 @@ pub fn integrate_power(history: &[PowerSample]) -> f64 {
     joules
 }
 
+/// The total *system* draw (watts) of one 100 ms trace sample: GPU + CPU.
+fn trace_system_watts(s: &HwSample) -> f64 {
+    s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+        + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+}
+
+/// Trapezoidal integration of the 100 ms [`HwSample`] trace over the total
+/// *system* draw (GPU + CPU): `∫P(t)dt` in joules (CF-37 — the energy /
+/// cost integration source, at 10× the 1 Hz cadence).
+///
+/// `window` (optional) restricts the integral to `[start, end]`. A sample
+/// outside the window, or without a power reading, **breaks the trapezoid
+/// chain** (the standard treatment for a missing / out-of-scope sensor
+/// sample), so no interval ever bridges across an edge or a gap. An empty
+/// trace, or a window with no power-bearing samples, integrates to `0.0`
+/// (the N/A rule).
+#[must_use]
+fn integrate_trace(
+    trace: &[HwSample],
+    window: Option<(MonotonicInstant, MonotonicInstant)>,
+) -> f64 {
+    let mut joules = 0.0f64;
+    let mut prev: Option<&HwSample> = None;
+    for s in trace {
+        let in_window = match window {
+            Some((start, end)) => s.t.delta_nanos(&start) == 0 && end.delta_nanos(&s.t) == 0,
+            None => true,
+        };
+        let p_w = trace_system_watts(s);
+        if !in_window || p_w <= 0.0 {
+            prev = None;
+            continue;
+        }
+        if let Some(p) = prev {
+            let dt = p.t.delta_nanos(&s.t) as f64 / 1e9;
+            joules += (trace_system_watts(p) + p_w) / 2.0 * dt;
+        }
+        prev = Some(s);
+    }
+    joules
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +1033,17 @@ mod tests {
             active,
             tokens_seen: seen,
             ..Default::default()
+        }
+    }
+
+    /// A 100 ms [`HwSample`] trace-point test helper: the total *system*
+    /// draw is `power_w + cpu_w` (the CF-37 integration source).
+    fn trace_sample(t: MonotonicInstant, power_w: f64, cpu_w: f64) -> HwSample {
+        HwSample {
+            t,
+            power_mw: (power_w > 0.0).then_some((power_w * 1000.0).round().max(0.0) as u64),
+            cpu_power_mw: (cpu_w > 0.0).then_some((cpu_w * 1000.0).round().max(0.0) as u64),
+            ..HwSample::default()
         }
     }
 
@@ -1031,17 +1108,12 @@ mod tests {
         let mut m = GpuPowerMonitor::default();
         m.begin_run();
         m.start_load();
-        // Two samples ~50 ms apart at 100 W: a small but positive joule count.
-        let a = PowerSample {
-            power_w: 100.0,
-            ..Default::default()
-        };
+        // Two 100 ms trace samples ~50 ms apart at 100 W: a small but
+        // positive joule count (the CF-37 integration source).
+        let a = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let b = PowerSample {
-            power_w: 100.0,
-            ..Default::default()
-        };
-        m.history = vec![a, b];
+        let b = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        m.trace = vec![a, b];
         let j = m.energy_joules();
         assert!(j > 0.0, "positive energy: {j}");
         let kwh = m.energy_kwh();
@@ -1069,16 +1141,10 @@ mod tests {
         m.total_tokens = 1000;
         // A real (small) time gap so the trapezoid integrates to a positive
         // energy (two back-to-back reads can land on the same instant).
-        let a = PowerSample {
-            power_w: 100.0,
-            ..Default::default()
-        };
+        let a = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let b = PowerSample {
-            power_w: 100.0,
-            ..Default::default()
-        };
-        m.history = vec![a, b];
+        let b = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        m.trace = vec![a, b];
         let jpt = m.joules_per_token().unwrap();
         assert!(jpt > 0.0);
         // J/ktoken is exactly 1000× J/token.
@@ -1559,10 +1625,22 @@ mod tests {
             &[],
             &phase(1000, 100, true, true),
         );
+        // A second poll ~50 ms later so the 100 ms trace has a real time gap
+        // (the energy integral is non-zero, not a single-point 0.0).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        m.record(
+            &agg,
+            std::slice::from_ref(&g0),
+            &[],
+            &phase(1000, 100, true, true),
+        );
         let history_before = m.history.len();
+        let trace_before = m.trace.len();
         let peak_before = m.peak_power_w;
         let energy_before = m.energy_joules();
         assert!(history_before > 0, "a history point was recorded");
+        assert!(trace_before > 1, "two 100 ms trace points were recorded");
+        assert!(energy_before > 0.0, "non-zero integral over the trace gap");
 
         // Close the load window, then a *higher* reading arrives after the
         // run ends.
@@ -1583,6 +1661,7 @@ mod tests {
 
         // The run aggregates are frozen…
         assert_eq!(m.history.len(), history_before, "history is frozen");
+        assert_eq!(m.trace.len(), trace_before, "trace is frozen");
         assert_eq!(m.peak_power_w, peak_before, "peak is frozen");
         assert_eq!(m.energy_joules(), energy_before, "energy is frozen");
         assert_eq!(m.prompt_tokens, 1000, "run input-token total is frozen");
@@ -1611,18 +1690,12 @@ mod tests {
         m.start_load();
         m.has_power = true;
 
-        // Two in-window samples ~50 ms apart at 300 W (a real gap so the
-        // trapezoid integrates to a positive energy).
-        let a = PowerSample {
-            power_w: 300.0,
-            ..Default::default()
-        };
+        // Two in-window 100 ms trace samples ~50 ms apart at 300 W (a real
+        // gap so the trapezoid integrates to a positive energy).
+        let a = trace_sample(MonotonicInstant::now(), 300.0, 0.0);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let b = PowerSample {
-            power_w: 300.0,
-            ..Default::default()
-        };
-        m.history = vec![a, b];
+        let b = trace_sample(MonotonicInstant::now(), 300.0, 0.0);
+        m.trace = vec![a, b];
 
         // Close the window (the run is over)…
         m.end_load();
@@ -1642,21 +1715,15 @@ mod tests {
         // …then the *still-running* poller records more samples after
         // `load_ended` (a higher draw, to make any drift obvious).
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let c = PowerSample {
-            power_w: 999.0,
-            ..Default::default()
-        };
-        m.history.push(c);
+        let c = trace_sample(MonotonicInstant::now(), 999.0, 0.0);
+        m.trace.push(c);
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let d = PowerSample {
-            power_w: 999.0,
-            ..Default::default()
-        };
-        m.history.push(d);
+        let d = trace_sample(MonotonicInstant::now(), 999.0, 0.0);
+        m.trace.push(d);
 
         // Every statistic is locked to the window: the post-end samples
-        // are recorded in `history` but change nothing.
-        assert_eq!(m.history.len(), 4, "the poller's samples are recorded");
+        // are recorded in `trace` but change nothing.
+        assert_eq!(m.trace.len(), 4, "the poller's samples are recorded");
         assert!(
             (m.energy_joules() - frozen_energy).abs() < 1e-9,
             "energy is final: {} vs {frozen_energy}",
@@ -1708,7 +1775,7 @@ mod tests {
         assert!((m.idle_power_w - before).abs() < 1e-9, "baseline unchanged");
     }
 
-    /// The monitor derives the phase powers from its 1 Hz history:
+    /// The monitor derives the phase powers from its 100 ms trace (CF-19):
     /// samples inside [load_start, first_token) average the prefill draw,
     /// samples inside [first_token, last_token] the decode draw.
     #[test]
@@ -1722,21 +1789,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let first = MonotonicInstant::now();
         m.first_token_at = Some(first);
-        // History: two prefill samples (100 W) before the first token…
+        // Trace: two prefill samples (100 W) before the first token…
         for w in [100.0, 110.0] {
-            m.history.push(PowerSample {
-                t: load_start,
-                power_w: w,
-                ..Default::default()
-            });
+            m.trace.push(trace_sample(load_start, w, 0.0));
         }
         // …and three decode samples (300 W) after it.
         for w in [300.0, 310.0, 320.0] {
-            m.history.push(PowerSample {
-                t: first,
-                power_w: w,
-                ..Default::default()
-            });
+            m.trace.push(trace_sample(first, w, 0.0));
         }
         m.last_token_at = Some(first);
         m.has_power = true;
@@ -1744,9 +1803,8 @@ mod tests {
         assert!((m.avg_decode_power().unwrap() - 310.0).abs() < 1e-9);
     }
 
-    /// A sub-second prefill phase (fewer than 2 samples inside the window)
-    /// falls back to the overall average power — never `None` while power
-    /// exists.
+    /// A prefill phase too short to hold 2 trace samples (CF-19) falls back
+    /// to the overall average power — never `None` while power exists.
     #[test]
     fn monitor_prefill_falls_back_to_overall_average() {
         let mut m = GpuPowerMonitor::default();
@@ -1755,20 +1813,12 @@ mod tests {
         let load_start = m.load_started.unwrap();
         // One sample right at load start, the first token a few ms later
         // (only 1 sample inside the prefill window → fallback triggered).
-        m.history.push(PowerSample {
-            t: load_start,
-            power_w: 80.0,
-            ..Default::default()
-        });
+        m.trace.push(trace_sample(load_start, 80.0, 0.0));
         std::thread::sleep(std::time::Duration::from_millis(50));
         let first = MonotonicInstant::now();
         m.first_token_at = Some(first);
         m.last_token_at = Some(first);
-        m.history.push(PowerSample {
-            t: first,
-            power_w: 250.0,
-            ..Default::default()
-        });
+        m.trace.push(trace_sample(first, 250.0, 0.0));
         m.has_power = true;
         // Freeze the duration so `avg_power_w` is stable across calls.
         m.end_load();
@@ -1797,16 +1847,8 @@ mod tests {
         m.start_load();
         let load_start = m.load_started.unwrap();
         // Two prefill samples (100 W, 200 W) before the first token.
-        m.history.push(PowerSample {
-            t: load_start,
-            power_w: 100.0,
-            ..Default::default()
-        });
-        m.history.push(PowerSample {
-            t: load_start,
-            power_w: 200.0,
-            ..Default::default()
-        });
+        m.trace.push(trace_sample(load_start, 100.0, 0.0));
+        m.trace.push(trace_sample(load_start, 200.0, 0.0));
         std::thread::sleep(std::time::Duration::from_millis(50));
         let first = MonotonicInstant::now();
         m.first_token_at = Some(first);
@@ -1818,23 +1860,20 @@ mod tests {
     }
 
     /// `token_costs` is `None` (the N/A rule) without power, without a
-    /// first-token latch, without tokens, or without a power history.
+    /// first-token latch, without tokens, or without a power trace.
     #[test]
     fn token_costs_is_na_without_the_prerequisites() {
         // No power.
         let m = GpuPowerMonitor::default();
         assert_eq!(m.token_costs(), None);
-        // Power + history, but no first token.
+        // Power + trace, but no first token.
         let m = GpuPowerMonitor {
             has_power: true,
-            history: vec![PowerSample {
-                power_w: 100.0,
-                ..Default::default()
-            }],
+            trace: vec![trace_sample(MonotonicInstant::now(), 100.0, 0.0)],
             ..Default::default()
         };
         assert_eq!(m.token_costs(), None);
-        // First token + tokens, but no history.
+        // First token + tokens, but no trace.
         let m = GpuPowerMonitor {
             has_power: true,
             first_token_at: Some(MonotonicInstant::now()),
@@ -1860,11 +1899,7 @@ mod tests {
 
         // Prefill: 0.5 s at ~300 W (two samples at load start).
         for w in [295.0, 305.0] {
-            m.history.push(PowerSample {
-                t: load_start,
-                power_w: w,
-                ..Default::default()
-            });
+            m.trace.push(trace_sample(load_start, w, 0.0));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
         let first = MonotonicInstant::now();
@@ -1873,11 +1908,7 @@ mod tests {
 
         // Decode: 1.5 s at ~600 W (three samples at the first-token mark).
         for w in [590.0, 600.0, 610.0] {
-            m.history.push(PowerSample {
-                t: first,
-                power_w: w,
-                ..Default::default()
-            });
+            m.trace.push(trace_sample(first, w, 0.0));
         }
         std::thread::sleep(std::time::Duration::from_millis(1500));
         m.last_token_at = Some(MonotonicInstant::now());
@@ -1903,6 +1934,93 @@ mod tests {
         assert!(c.total_cost > 0.0, "total cost: {}", c.total_cost);
         // Decode's longer window at 2× the power → the output rate wins.
         assert!(c.cost_per_1m_output > c.cost_per_1m_input);
+    }
+
+    /// CF-19: a **sub-second** TTFT (~300 ms) now yields a *real* prefill
+    /// phase power from the 100 ms trace — no overall-average fallback. The
+    /// old 1 Hz history had <2 samples in such a window and always fell back
+    /// to the run average; the 100 ms cadence resolves the phase.
+    #[test]
+    fn sub_second_ttft_yields_real_prefill_power_not_fallback() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        // ~300 ms TTFT sampled at the 100 ms cadence: three prefill samples
+        // (a distinct ~150 W draw) before the first token…
+        for w in [140.0, 150.0, 160.0] {
+            m.trace.push(trace_sample(MonotonicInstant::now(), w, 0.0));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // …then the first token lands (the prefill window closes) and a
+        // distinctly higher decode draw follows.
+        let first = MonotonicInstant::now();
+        m.first_token_at = Some(first);
+        m.last_token_at = Some(first);
+        m.trace.push(trace_sample(first, 600.0, 0.0));
+        m.has_power = true;
+        m.end_load();
+        // No fallback: the sub-second window held ≥2 trace samples…
+        assert!(
+            !m.prefill_uses_fallback(),
+            "sub-second TTFT resolves at 100 ms"
+        );
+        // …and the prefill power is the real ~150 W phase draw, NOT the
+        // overall average (which the 600 W decode sample pulls up).
+        let prefill = m.avg_prefill_power().unwrap();
+        let overall = m.avg_power_w().unwrap();
+        assert!(
+            (prefill - 150.0).abs() < 1e-9,
+            "real prefill power: {prefill}"
+        );
+        assert!(
+            prefill < overall,
+            "prefill ({prefill}) below overall avg ({overall}) — not the fallback"
+        );
+        // Decode is its own (higher) phase power.
+        assert!((m.avg_decode_power().unwrap() - 600.0).abs() < 1e-9);
+    }
+
+    /// CF-37: `energy_joules()` integrates the 100 ms trace **only within**
+    /// `[load_start, load_end]` — samples recorded before the load window
+    /// opens (idle) and after it closes do not contribute, so a completed
+    /// run's energy is final the moment the window closes.
+    #[test]
+    fn energy_joules_is_windowed_to_the_load_window() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        // A high-draw sample *before* the load window (idle).
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
+        // Open the load window.
+        m.start_load();
+        let load_start = m.load_started.unwrap();
+        // Two in-window samples ~50 ms apart at 100 W → ~5 J.
+        m.trace.push(trace_sample(load_start, 100.0, 0.0));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 100.0, 0.0));
+        // Close the window.
+        m.end_load();
+        // A high-draw sample *after* the window closes.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        m.trace
+            .push(trace_sample(MonotonicInstant::now(), 999.0, 0.0));
+        m.has_power = true;
+
+        // The in-window 100 W samples integrate to ~5 J; the 999 W idle /
+        // post-end samples are excluded.
+        let windowed = m.energy_joules();
+        assert!(
+            (4.0..6.5).contains(&windowed),
+            "windowed energy is the two 100 W in-window samples (~5 J): {windowed}"
+        );
+        // …whereas the full (unwindowed) trace, which includes the 999 W
+        // edges, is much larger.
+        let full = integrate_trace(&m.trace, None);
+        assert!(
+            windowed < full,
+            "windowed ({windowed}) < full-trace ({full}) — the 999 W edges are excluded"
+        );
     }
 
     // ── CPU power integration (the system-draw component) ────────────────
@@ -1946,35 +2064,16 @@ mod tests {
         m.begin_run();
         m.start_load();
         let load_start = m.load_started.unwrap();
-        m.set_cpu_power(40.0);
-        m.history.push(PowerSample {
-            t: load_start,
-            power_w: 300.0,
-            cpu_power_w: 40.0,
-            ..Default::default()
-        });
+        m.trace.push(trace_sample(load_start, 300.0, 40.0));
         std::thread::sleep(std::time::Duration::from_millis(50));
         let now = MonotonicInstant::now();
-        m.history.push(PowerSample {
-            t: now,
-            power_w: 300.0,
-            cpu_power_w: 40.0,
-            ..Default::default()
-        });
+        m.trace.push(trace_sample(now, 300.0, 40.0));
         let with_cpu = m.energy_joules();
         // The identical samples with no CPU draw.
         let gpu_only = GpuPowerMonitor {
-            history: vec![
-                PowerSample {
-                    t: load_start,
-                    power_w: 300.0,
-                    ..Default::default()
-                },
-                PowerSample {
-                    t: now,
-                    power_w: 300.0,
-                    ..Default::default()
-                },
+            trace: vec![
+                trace_sample(load_start, 300.0, 0.0),
+                trace_sample(now, 300.0, 0.0),
             ],
             ..Default::default()
         }

@@ -61,6 +61,26 @@ pub struct EnergyResult {
     pub vendor: Option<String>,
     /// The GPU's model / driver label, when known.
     pub model: Option<String>,
+    /// `true` when the CPU component of the system draw is the fixed
+    /// estimate (no RAPL / Super-I-O sensor), so the energy total includes a
+    /// constant, not a measurement (CF-53). The pure trace math never knows
+    /// the CPU power method — the caller sets this from
+    /// [`crate::hw::cpu_power::CpuPowerBackend::is_estimated`] so the
+    /// `--json` energy object and the methodology block can flag it.
+    pub cpu_power_estimated: bool,
+}
+
+impl EnergyResult {
+    /// Mark the CPU component as the fixed estimate (CF-53). The pure trace
+    /// math never knows the CPU power method, so the caller that holds the
+    /// [`crate::hw::cpu_power::CpuPowerBackend`] sets this from
+    /// [`CpuPowerBackend::is_estimated`] before the result reaches the
+    /// `--json` energy object / methodology block.
+    #[must_use]
+    pub fn with_cpu_power_estimated(mut self, estimated: bool) -> Self {
+        self.cpu_power_estimated = estimated;
+        self
+    }
 }
 
 /// True when `t` lies within the closed window `[start, end]`.
@@ -222,6 +242,9 @@ pub fn profile(
         // produced the samples) — the pure trace math never knows them.
         vendor: None,
         model: None,
+        // The CPU "estimated" flag is set by the caller from the CPU power
+        // backend (the pure trace math never knows it) — default `false`.
+        cpu_power_estimated: false,
     }
 }
 
@@ -358,6 +381,26 @@ mod tests {
         ];
         assert_eq!(joules_per_token(&samples, None, 0), None);
         assert_eq!(profile(&samples, None, 0).joules_per_token, None);
+    }
+
+    /// CF-53: the CPU "estimated" flag defaults to `false` on a profile (the
+    /// pure trace math never knows the CPU method) and is settable via the
+    /// builder — the caller copies it from
+    /// [`crate::hw::cpu_power::CpuPowerBackend::is_estimated`].
+    #[test]
+    fn cpu_power_estimated_flag_defaults_false_and_is_settable() {
+        let a = MonotonicInstant::now();
+        let b = MonotonicInstant::now();
+        let samples = vec![
+            hw_sample(a, Some(50_000), None, None),
+            hw_sample(b, Some(50_000), None, None),
+        ];
+        // `profile` defaults the flag to `false`.
+        let r = profile(&samples, None, 100);
+        assert!(!r.cpu_power_estimated, "profile defaults the flag to false");
+        // The builder sets it (what the caller does from `is_estimated`).
+        let r_est = r.with_cpu_power_estimated(true);
+        assert!(r_est.cpu_power_estimated, "builder sets the flag true");
     }
 
     #[test]

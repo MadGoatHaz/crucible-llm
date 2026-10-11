@@ -1148,6 +1148,18 @@ mod tests {
                 vram_gb: 32.0,
             });
         }
+        // The 100 ms power trace (the CF-37/CF-19 energy + phase-power
+        // source): a few points in the decode window so the cost panel's
+        // phase powers resolve (the prefill window is sub-second → the
+        // fallback, the real-world shape the panel renders).
+        for i in 0..10 {
+            mon.trace.push(crate::hw::HwSample {
+                t: crate::timing::MonotonicInstant::now(),
+                power_mw: Some(((1000.0 + (i as f64) * 20.0) * 1000.0) as u64),
+                cpu_power_mw: Some(73_000),
+                ..Default::default()
+            });
+        }
         // Decode runs until "now" (the last-token clock).
         std::thread::sleep(std::time::Duration::from_millis(250));
         mon.last_token_at = Some(crate::timing::MonotonicInstant::now());
