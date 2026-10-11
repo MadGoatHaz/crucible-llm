@@ -331,14 +331,17 @@ fn case_schema(i: usize) -> serde_json::Value {
 }
 
 /// The per-case compliance verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseVerdict {
     /// Every check passed.
     Compliant,
     /// Valid JSON, but one or more checks failed.
     Partial,
-    /// Not valid JSON — cannot be evaluated.
+    /// Not valid JSON — cannot be evaluated. The conservative `Default`
+    /// (a missing/unknown verdict in a persisted summary must never read
+    /// as compliant).
+    #[default]
     Failed,
     /// **R2 hybrid reasoning (`truncated_by_reasoning`).** The stream
     /// completed OK but the model spent the entire generation budget on

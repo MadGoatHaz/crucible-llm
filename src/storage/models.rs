@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engines::capability::{ReasoningResult, StructuredResult};
+use crate::engines::capability::{CaseVerdict, ReasoningResult, StructuredResult};
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::FlatOutResult;
 use crate::engines::hardware::EnergyResult;
@@ -269,6 +269,19 @@ pub struct StructuredSummary {
     pub compliant: usize,
     pub partial: usize,
     pub failed: usize,
+    /// **R2 hybrid reasoning:** the number of cases
+    /// `truncated_by_reasoning` (all-CoT / zero-content completions) — the
+    /// distinct "inconclusive (budget)" bucket, reported *separately* from
+    /// `failed` (a budget exhaustion is not a capability failure).
+    /// `#[serde(default)]` keeps pre-existing stored `engine_results`
+    /// documents deserializing.
+    #[serde(default)]
+    pub truncated: usize,
+    /// **R2:** the per-case detail (verdict + the `truncated_by_reasoning`
+    /// flag + the valid-JSON signal) so the DB headline is self-contained.
+    /// `#[serde(default)]` keeps pre-existing documents deserializing.
+    #[serde(default)]
+    pub cases: Vec<StructuredCaseSummary>,
     /// CF-36: `true` only when the constrained case-0 run produced valid
     /// JSON — the `penalty_pct` above is meaningful (and rendered) only
     /// in that case; otherwise the constraint was not effective.
@@ -279,6 +292,28 @@ pub struct StructuredSummary {
     /// A/B-comparator data prerequisite).
     #[serde(default)]
     pub stability_rate: f64,
+}
+
+/// One C3 case in the persisted `engine_results` JSON column (R2): the
+/// folded verdict + the distinct `truncated_by_reasoning` flag, so a
+/// truncated case is reported separately from a compliance failure.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StructuredCaseSummary {
+    /// The case name (`Simple` / `Medium` / `Complex`).
+    pub name: String,
+    /// The folded per-case verdict (`compliant` / `partial` / `failed` /
+    /// `truncated`).
+    #[serde(default)]
+    pub verdict: CaseVerdict,
+    /// `true` when a repeat's stream completed OK but committed no content
+    /// (budget exhausted in chain-of-thought) — the distinct
+    /// `truncated_by_reasoning` outcome.
+    #[serde(default)]
+    pub truncated_by_reasoning: bool,
+    /// The CF-17 valid-JSON signal (a truncated case is `false` — there is
+    /// no content to parse).
+    #[serde(default)]
+    pub valid_json: bool,
 }
 
 impl StructuredSummary {
@@ -292,6 +327,17 @@ impl StructuredSummary {
             compliant,
             partial,
             failed,
+            truncated: r.truncated_count(),
+            cases: r
+                .cases
+                .iter()
+                .map(|c| StructuredCaseSummary {
+                    name: c.name.clone(),
+                    verdict: c.verdict,
+                    truncated_by_reasoning: c.truncated_by_reasoning,
+                    valid_json: c.is_valid_json(),
+                })
+                .collect(),
             constraint_effective: r.constraint_effective(),
             stability_rate: r.stability_rate(),
         }
@@ -383,5 +429,89 @@ impl FlatOutSummary {
             tps_per_requested_stream: r.tps_per_requested_stream,
             failed_stream_ratio: r.failed_stream_ratio,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engines::capability::{evaluate_case, CaseCheck, StructuredCaseResult};
+
+    /// A C3 result with one compliant case, one partial case, and one
+    /// **truncated** case (the R2 `truncated_by_reasoning` bucket).
+    fn result_with_truncated() -> StructuredResult {
+        StructuredResult {
+            free_tps: 65.2,
+            constrained_tps: 61.8,
+            penalty_pct: 5.2,
+            free_ttft: 0.2,
+            constrained_ttft: 0.21,
+            cases: vec![
+                evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+                evaluate_case("Medium", r#"[{"id":1,"label":"a","active":true}]"#),
+                StructuredCaseResult {
+                    name: "Complex".to_string(),
+                    checks: vec![CaseCheck {
+                        label: "Valid JSON".to_string(),
+                        passed: false,
+                    }],
+                    verdict: CaseVerdict::Truncated,
+                    output: String::new(),
+                    repeats: 1,
+                    compliant_repeats: 0,
+                    truncated_by_reasoning: true,
+                },
+            ],
+            constrained_body: String::new(),
+            free_body: "prose".to_string(),
+        }
+    }
+
+    #[test]
+    fn structured_summary_carries_the_truncated_bucket_and_per_case_flags() {
+        // R2: the persisted C3 headline reports `truncated` separately from
+        // `failed`, and the per-case detail carries the flag.
+        let s = StructuredSummary::from_structured(&result_with_truncated());
+        assert_eq!(s.compliant, 1);
+        assert_eq!(s.partial, 1);
+        assert_eq!(s.failed, 0, "a truncated case is not a compliance failure");
+        assert_eq!(s.truncated, 1);
+        assert_eq!(s.cases.len(), 3);
+        assert_eq!(s.cases[2].name, "Complex");
+        assert_eq!(s.cases[2].verdict, CaseVerdict::Truncated);
+        assert!(s.cases[2].truncated_by_reasoning);
+        assert!(!s.cases[2].valid_json, "no content ⇒ not valid JSON");
+        assert!(!s.cases[0].truncated_by_reasoning);
+        assert!(s.cases[0].valid_json);
+    }
+
+    #[test]
+    fn legacy_structured_summary_document_still_deserializes() {
+        // `#[serde(default)]` on the R2 fields: a pre-R2 `engine_results`
+        // document (no `truncated`, no `cases`) parses with honest zeros.
+        let legacy = r#"{
+            "free_tps": 65.2,
+            "constrained_tps": 61.8,
+            "penalty_pct": 5.2,
+            "compliant": 3,
+            "partial": 0,
+            "failed": 0,
+            "constraint_effective": true,
+            "stability_rate": 1.0
+        }"#;
+        let s: StructuredSummary = serde_json::from_str(legacy).unwrap();
+        assert_eq!(s.compliant, 3);
+        assert_eq!(s.truncated, 0);
+        assert!(s.cases.is_empty());
+    }
+
+    #[test]
+    fn structured_summary_round_trips_through_json() {
+        let s = StructuredSummary::from_structured(&result_with_truncated());
+        let json = serde_json::to_string(&s).unwrap();
+        let back: StructuredSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.truncated, 1);
+        assert_eq!(back.cases[2].verdict, CaseVerdict::Truncated);
+        assert!(back.cases[2].truncated_by_reasoning);
     }
 }

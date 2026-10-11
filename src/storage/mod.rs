@@ -14,5 +14,5 @@ pub mod models;
 pub use db::{Database, StorageError, DB_FILE_NAME};
 pub use models::{
     BenchmarkSession, ConcurrencySummary, EngineResults, EnergySummary, FlatOutSummary,
-    NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredSummary,
+    NeedleEvaluation, ReasoningSummary, StreamMetricRow, StructuredCaseSummary, StructuredSummary,
 };
