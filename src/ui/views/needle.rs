@@ -1,7 +1,10 @@
 //! View 3 — Context Needle Matrix (NIAH, blueprint §6): an N×M grid of
 //! context token sizes (2k…128k) × needle depths (0%…100% in 10% steps),
 //! color-coded: green = accurate + nominal prefill, yellow = accurate +
-//! throttled prefill, red = retrieval failed / hallucinated.
+//! throttled prefill, red = retrieval failed / hallucinated, and (Option C
+//! hybrid reasoning) blue `◌` = truncated by reasoning — the stream completed
+//! but the model spent its whole budget on chain-of-thought (an inconclusive
+//! (budget) outcome, distinct from a retrieval failure).
 //!
 //! The grid renders from the lock-free [`NiahSlot`] (Chunk 15): the `n`
 //! key spawns a background matrix run that *publishes* the result, and
@@ -34,8 +37,8 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 }
 
 /// N×M grid; each cell shows its state glyph (green `●` = nominal,
-/// yellow `●` = throttled, red `✗` = failed) or `···` (dimmed) until the
-/// matrix has been run.
+/// yellow `●` = throttled, red `✗` = failed, blue `◌` = truncated by
+/// reasoning) or `···` (dimmed) until the matrix has been run.
 fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // Lock-free read of the published result (the runner's write seam is
     // the `n` key, never this path).
@@ -65,6 +68,15 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
         let mut cells = vec![Cell::from(label).style(style::value(th))];
         for &depth in &DEPTHS {
             let (glyph, st) = match result.as_ref().and_then(|r| r.cell(NIAH_SIZES[i], depth)) {
+                // Option C: a truncated-by-reasoning cell (all-CoT /
+                // zero-content) renders as a distinct 4th marker — it is NOT a
+                // retrieval failure (red `✗`), it's an inconclusive (budget)
+                // over-thinker. Checked *before* the prefill state, whose
+                // `Failed` arm (a truncated cell's `retrieved == false`) would
+                // otherwise paint it red.
+                Some(cell) if cell.truncated_by_reasoning => {
+                    ("◌", Style::default().fg(th.info()))
+                }
                 Some(cell) => match cell.state {
                     NiahCellState::Nominal => ("●", Style::default().fg(th.success())),
                     NiahCellState::Throttled => ("●", Style::default().fg(th.warn())),
@@ -153,6 +165,14 @@ fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
             Span::styled("✗ ", Style::default().fg(th.danger())),
             Span::styled("retrieval failed / hallucinated", style::label(th)),
         ]),
+        // Option C: the 4th marker — an over-thinker that spent its whole
+        // budget on chain-of-thought (all-CoT / zero-content). It is an
+        // inconclusive (budget) outcome, NOT a retrieval failure; the
+        // truncated count is also broken out in the `Accuracy:` status line.
+        Line::from(vec![
+            Span::styled("◌ ", Style::default().fg(th.info())),
+            Span::styled("truncated by reasoning (over-thought, no answer)", style::label(th)),
+        ]),
         Line::from(Span::styled(status, style::footer(th))),
     ];
     // Empty state: no result yet and nothing in flight → say what will
@@ -191,6 +211,21 @@ fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The (symbol, foreground-color) pairs present in a rendered buffer
+    /// (skips blank cells) — for asserting a specific glyph renders in a
+    /// specific color.
+    fn buf_colors(buf: &ratatui::buffer::Buffer) -> Vec<(String, Color)> {
+        buf.content()
+            .iter()
+            .filter(|c| c.symbol() != " ")
+            .map(|c| (c.symbol().to_string(), c.fg))
+            .collect()
+    }
+
+    fn buf_text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
 
     #[test]
     fn legend_shows_the_long_context_info_note() {
@@ -253,5 +288,55 @@ mod tests {
         assert!(text.contains("50.0%"), "4k row is 50%: {text}");
         // The practical interpretation line names the reliable threshold.
         assert!(text.contains("Reliable retrieval up to"), "{text}");
+    }
+
+    #[test]
+    fn grid_renders_truncated_by_reasoning_as_a_distinct_marker() {
+        use crate::engines::capability::NiahResult;
+        let mut app = crate::ui::app::App::new();
+        app.view = crate::ui::app::View::Needle;
+
+        // 2k row: one clean pass (nominal) and one truncated-by-reasoning cell
+        // (all-CoT / zero-content — NOT a retrieval failure).
+        let mut r = NiahResult::new(vec![2000], vec![0, 100]);
+        r.cells[0].target_tokens = 2000;
+        r.cells[0].retrieved = true;
+        r.cells[0].ttft_s = 0.1;
+        r.cells[0].state = NiahCellState::Nominal;
+        r.cells[1].target_tokens = 2000;
+        r.cells[1].retrieved = false;
+        r.cells[1].truncated_by_reasoning = true;
+        r.cells[1].ttft_s = 0.1;
+        // Its prefill state is `Failed` (retrieved == false) — but the grid
+        // must render it as the distinct truncated marker, not red `✗`.
+        r.cells[1].state = NiahCellState::Failed;
+        app.niah.store(r);
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let buf = terminal.backend().buffer().clone();
+
+        // The truncated cell renders the blue `◌` marker (th.info()), NOT the
+        // red `✗` failure glyph.
+        assert!(
+            buf_colors(&buf)
+                .iter()
+                .any(|(s, c)| s == "◌" && *c == Theme::Cyberpunk.info()),
+            "a truncated-by-reasoning cell must render the ◌ marker"
+        );
+        // The clean pass still renders the green `●`.
+        assert!(
+            buf_colors(&buf)
+                .iter()
+                .any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.success()),
+            "a nominal pass cell must render"
+        );
+        // The legend explains the 4th marker.
+        assert!(buf_text(&buf).contains("truncated by reasoning"));
+        // The panel's Accuracy line breaks out the truncated count (Option C).
+        assert!(buf_text(&buf).contains("1 truncated-by-reasoning"));
     }
 }
