@@ -13,12 +13,12 @@ mod common;
 
 use std::path::PathBuf;
 
+use common::render::render_text;
 use crucible_llm::engines::capability::{
     NiahCell, NiahCellState, NiahEngineConfig, NiahResult, NIAH_DEPTHS, NIAH_SIZES,
 };
 use crucible_llm::ui::app::App;
 use crucible_llm::ui::views::{live, needle};
-use common::render::render_text;
 
 /// One NIAH cell: `target_tokens` = the context size (a run cell), a
 /// nominal TTFT when retrieved (built from `unrun()` so added fields keep
@@ -76,7 +76,7 @@ fn without_tokenizer_the_niah_grid_and_long_context_bar_show_approx() {
     app.niah.store(test_result());
 
     // View 3 (the NIAH grid): every row label carries the qualifier.
-    let grid = render_text(|area, app, f| needle::render(area, app, f), &app, 120, 40);
+    let grid = render_text(needle::render, &app, 120, 40);
     assert!(grid.contains("2k (approx.)"), "2k row qualified: {grid}");
     assert!(grid.contains("8k (approx.)"), "8k row qualified: {grid}");
     assert!(grid.contains("32k (approx.)"), "32k row qualified: {grid}");
@@ -87,7 +87,7 @@ fn without_tokenizer_the_niah_grid_and_long_context_bar_show_approx() {
 
     // View 1 (the Live capability bar): the reliable-up-to threshold is
     // qualified the same way.
-    let live_text = render_text(|area, app, f| live::render(area, app, f), &app, 120, 40);
+    let live_text = render_text(live::render, &app, 120, 40);
     assert!(
         live_text.contains("≤ 8k (approx.) reliable"),
         "long-context bar qualified: {live_text}"
@@ -100,7 +100,7 @@ fn with_tokenizer_the_niah_grid_and_long_context_bar_show_exact_labels() {
     app.niah.store(test_result());
 
     // View 3: the row labels are plain sizes — no qualifier.
-    let grid = render_text(|area, app, f| needle::render(area, app, f), &app, 120, 40);
+    let grid = render_text(needle::render, &app, 120, 40);
     assert!(grid.contains("2k"), "2k row present: {grid}");
     assert!(grid.contains("32k"), "32k row present: {grid}");
     assert!(
@@ -109,7 +109,7 @@ fn with_tokenizer_the_niah_grid_and_long_context_bar_show_exact_labels() {
     );
 
     // View 1: the reliable-up-to threshold is exact.
-    let live_text = render_text(|area, app, f| live::render(area, app, f), &app, 120, 40);
+    let live_text = render_text(live::render, &app, 120, 40);
     assert!(
         live_text.contains("≤ 8k reliable"),
         "long-context bar exact: {live_text}"

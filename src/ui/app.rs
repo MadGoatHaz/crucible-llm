@@ -451,7 +451,7 @@ impl App {
                 .config
                 .tokenizer
                 .as_deref()
-                .map_or(true, |t| t.trim().is_empty()),
+                .is_none_or(|t| t.trim().is_empty()),
         }
     }
 
