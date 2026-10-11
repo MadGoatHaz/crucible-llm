@@ -170,7 +170,7 @@ Shows comprehensive hardware telemetry during and after benchmark runs:
 
 - **System Power**: Total (GPU + CPU), idle, compute, and peak power draw; energy (kWh); estimated cost; and run duration — which **freezes at its final value when the benchmark completes** (shows `--` when idle)
 - **Power Graph**: Real-time power over time (1 Hz sampling), auto-scaled, with mean and peak markers
-- **Per-GPU Table**: Full names (no truncation), individual power, utilization, avg utilization, temp, avg temp, max temp, VRAM, clocks for each GPU
+- **Per-GPU Table**: full names in a fixed 24-char column (longer names truncate with `…` so the columns stay aligned), plus individual power, utilization, avg utilization, temp, avg temp, max temp, VRAM, clocks for each GPU
 - **Auto-scaled Graphs**: Utilization and temperature over time render against the data's real range (a narrow 85–97% band shows its variation, not a flat line), each with grid lines, an area fill, a dashed mean line, and a peak marker
 - **Efficiency**: Joules/token, tokens/watt, $/1M tokens (blended)
 - **Energy**: Total kWh consumed during the run (GPU + CPU)
@@ -291,7 +291,7 @@ The C1 matrix's context sizes and needle depths are **runtime-configurable** (de
 ## Exporting Results
 
 ### From TUI
-Press `e` during or after a run. Choose format: JSON, Markdown, or CSV.
+Press `e` during or after a run. There is no format menu — the export is written in the **configured** format (JSON by default; set it with `--export`, the config file's `export` field, or `CRUCIBLE_EXPORT`), named `live-<unix-timestamp>.<ext>` in the exports directory.
 
 ### From CLI
 ```bash

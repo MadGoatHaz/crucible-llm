@@ -58,7 +58,7 @@ The application will be compiled as a standalone, zero-dependency static binary 
 | **TUI Interface** | `ratatui` + `crossterm` | Industry-standard terminal rendering with rich widget sets (sparklines, gauges, layout constraints, custom canvas graphs) running at 60 FPS without terminal flicker. |
 | **Async Engine** | `tokio` | Multi-threaded runtime with dedicated work-stealing thread pools for network I/O, background hardware telemetry, and UI rendering. |
 | **Networking & SSE** | `reqwest` (+ a manual SSE state machine — `eventsource-stream` was evaluated and dropped: the manual parser keeps zero extra dependencies on the hot path and gives full control over `[DONE]`, BOM stripping, and malformed-JSON tolerance; see `ARCHITECTURE.md`) | HTTP/2-enabled asynchronous client supporting connection pooling, byte-level streaming, custom socket-level timeout enforcement, and low-allocation Server-Sent Events (SSE) parsing. |
-| **Tokenization** | Hugging Face `tokenizers` | Embedded, client-side BPE/WordPiece tokenization engine. Eliminates reliance on server usage chunks and guarantees deterministic input token counts and pre-computation of needle positions. |
+| **Tokenization** | Hugging Face `tokenizers` | Embedded, client-side BPE/WordPiece tokenization engine (optional at runtime). Supplies exact input token counts and pre-computed needle positions, and the re-tokenization fallback when a stream ends without a server `usage` frame — the server's `usage.completion_tokens` remains the primary, authoritative count. |
 | **Timing & Statistics** | `quanta` + `hdrhistogram` | High-precision time measurement using CPU cycle counters (RDTSC) without syscall overhead; generates high-dynamic-range histograms for latency percentiles ($p50, p90, p99, p99.9$). |
 | **Hardware Monitoring** | `nvml-wrapper` + `sysinfo` + in-tree sysfs/Level Zero backends | Direct, vendor-level GPU telemetry: NVIDIA via NVML (VRAM, clocks, temperature, power), AMD via `amdgpu` sysfs/hwmon (zero-dependency, no ROCm stack), Intel Arc via Level Zero Sysman (dlopen'd at runtime, no link dependency) with an i915/xe sysfs fallback — plus cross-platform CPU/RAM counters. Energy telemetry is Linux-only by design (all power sources are Linux interfaces) and degrades to a clearly-labeled N/A elsewhere. |
 | **Persistence** | `rusqlite` + `serde` | Embedded local relational storage for zero-setup benchmark persistence, cross-run comparisons, and structured export (JSON, Markdown tables, CSV). |
@@ -67,7 +67,7 @@ The application will be compiled as a standalone, zero-dependency static binary 
 
 ## 4. Concurrent Architecture & Data Flow
 
-To ensure that high-frequency UI repaints or heavy network streams never introduce artificial measurement latency, `Crucible-LLM` decouples its workload: all timing lives in the stream workers (nothing on the UI, storage, or hardware path touches the clock), the engines consume tagged events and synthesize metrics, and the TUI reads a lock-free double-buffered snapshot. The hardware poller runs on its own dedicated thread (a Tokio task in the TUI, a `std::thread` in headless) so it can never contend with the measured workload:
+To ensure that high-frequency UI repaints or heavy network streams never introduce artificial measurement latency, `Crucible-LLM` decouples its workload: all timing lives in the stream workers (nothing on the UI, storage, or hardware path touches the clock), the engines consume tagged events and synthesize metrics, and the TUI reads a lock-free double-buffered snapshot. The hardware poller runs on its own dedicated OS `std::thread` in **both** the TUI and the headless path so it can never contend with the measured workload:
 
 ```
 +---------------------------------------------------------------------------------+
@@ -91,7 +91,7 @@ To ensure that high-frequency UI repaints or heavy network streams never introdu
 * As chunks arrive, they are decoded without heap re-allocations and pushed to the Engine Core via bounded channels.
 
 ### 2. The Engine Core & Metric Synthesizer
-* Aggregates packet deltas, classifies them into `Reasoning`, `Content`, or `Control` categories, and tracks Inter-Token Latencies (ITL).
+* Aggregates packet deltas, classifies them into `Reasoning`, `Content`, `Usage`, or `Control` categories, and tracks Inter-Token Latencies (ITL).
 * Calculates rolling statistics and pushes unified snapshots to an atomic, double-buffered state cache read by the UI.
 
 ### 3. Hardware Profiler
@@ -226,7 +226,7 @@ Bridges the gap between software performance and physical compute. **Linux-only 
 * **Rolling Chart:** Continuous real-time charting of system throughput across the testing epoch, with engine-transition markers and a live event log.
 
 #### View 2: Concurrency & Saturation Curve Analysis
-* Displays the sweep curve (aggregate t/s and per-stream t/s per ladder level, log₂ x-axis) with the **practical sweet spot** marked (green) and the throughput knee (red).
+* Displays the sweep curve (aggregate t/s and per-stream t/s per ladder level, log₂ x-axis) with the **practical sweet spot** highlighted (green in the level table; the theme primary color on the curve, where measured levels are `◆` points) and the throughput knee marked `▲` (red).
 * Highlights the "Optimal Operational Envelope"—the recommended load for hosting this model on the target hardware without overwhelming latency budgets — plus the dual per-stream denominators and the > 20 % failure flag per level.
 
 #### View 3: Context Needle Matrix (NIAH)
@@ -360,7 +360,7 @@ All four phases below are **shipped** (v0.1.1 → v0.1.4): the Rust core with si
 +----------------------------------------------------------------------------------+
 | PHASE 4: Capability Suites & Hardware Telemetry                                  |
 |  * Embedded Needle-In-A-Haystack (NIAH) runner with automated verification.      |
-|  * NVML / Apple Silicon hardware bindings for VRAM and wattage profiling.        |
+|  * NVML / AMD sysfs / Intel Level Zero backends for VRAM & watts (Linux-only).   |
 |  * SQLite database engine, historical diffing view, and CI/CD export tooling.   |
 +----------------------------------------------------------------------------------+
 ```

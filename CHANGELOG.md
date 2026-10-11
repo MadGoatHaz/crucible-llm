@@ -19,6 +19,10 @@ The NIAH expansion + SSE keep-alive cycle: long-context NIAH becomes runtime-con
 - **SSE keep-alive misroute (Issue #1)** — the stream-vs-JSON route is now decided by the response **`Content-Type` + request intent** (`text/event-stream` → SSE, `application/json` → JSON, absent/other → SSE since we always send `stream: true`), not by sniffing the first body byte; a `:keep-alive` comment preamble can no longer push a valid stream onto the JSON path and poison the result. A stream ending with zero valid `data:` frames first tries a **JSON rescue** on the retained body (1 MiB inspection cap), and a body that is genuinely neither surfaces as a real `StreamError::InvalidTransport` — never a silent retrieval miss. The SSE parser gains `data_frames` / `valid_frames` counters to drive that resolution.
 - **TUI token-honest labeling (completes Issue #4)** — the interactive TUI now renders the `(approx.)` qualifier: the NIAH grid (View 3) row labels (`128k (approx.)`) and the Live view's Long Context capability bar (`≤ 128k (approx.) reliable`). Both read through the same shared `context_size_label` the headless run log and the `--json` `niah` section use, so a no-`--tokenizer` run is never presented as exact on any output surface (with a `--tokenizer`, all labels are plain).
 
+### Code Quality
+- 919 tests, 0 failures (21 suites: unit + integration + e2e, fully offline via the in-process mock SSE server)
+- `cargo build --release` 0 warnings; `cargo clippy --all-targets` 0 warnings
+
 ## [0.1.4] - 2026-10-11
 
 The full remediation cycle: metric integrity, reasoning-model correctness, engine selection, and traceability.

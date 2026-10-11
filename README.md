@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-893%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-919%20green-brightgreen)](#)
 
 </div>
 
@@ -62,7 +62,7 @@ By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enable
 - Full TUI panel (shown only when GPU is active)
 - **Dedicated GPU & Power tab** — multi-GPU table, power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), cost estimation, efficiency metrics (J/token, $/1M tokens)
 - **$/1M token cost** — separate input (prefill) and output (decode) rates, plus a token-weighted blended rate. Throughput-based energy model; user sets $/kWh in Config
-- **Multi-GPU** — all cards detected and displayed (NVIDIA, AMD, Intel), full names with no truncation
+- **Multi-GPU** — all cards detected and displayed (NVIDIA, AMD, Intel); full names in a fixed 24-char column (longer names truncate with `…` so the table stays aligned)
 - **CPU power included** — total system energy (GPU + CPU) for accurate cost calculation. Intel RAPL, AMD Super I/O, or estimated fallback
 - **Idle baseline** — auto 5-second measurement before the test; press `[i]` in the GPU tab for a fresh 10-second manual baseline
 - **Duration** — starts at the first engine, freezes at completion (shows `--` when idle)
@@ -76,7 +76,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
 - **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
 - **View 3 · NIAH** — the long-context retrieval matrix (default 7 sizes × 11 depths; both ladders are runtime-configurable), color-coded green / yellow / red.
-- **View 4 · GPU & Power** — multi-GPU telemetry table (full names, power, util, avg util, temp, avg temp, max temp, VRAM, clocks), power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), $/1M token cost analysis (input/output/blended), efficiency metrics (J/token, tokens/watt), system power (GPU + CPU), idle baseline (auto 5s / manual `[i]` 10s), and duration (freezes at completion).
+- **View 4 · GPU & Power** — multi-GPU telemetry table (name in a 24-char column, power, util, avg util, temp, avg temp, max temp, VRAM, clocks), power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), $/1M token cost analysis (input/output/blended), efficiency metrics (J/token, tokens/watt), system power (GPU + CPU), idle baseline (auto 5s / manual `[i]` 10s), and duration (freezes at completion).
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
@@ -217,7 +217,7 @@ CLI flag  >  environment variable  >  config file  >  built-in default
 
 ### Environment Variables
 
-Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`.
+Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`, `CRUCIBLE_NIAH_CONTEXTS`, `CRUCIBLE_NIAH_DEPTHS`, `CRUCIBLE_NIAH_CUSTOM`, `CRUCIBLE_RATE_KWH`. (The last four have no CLI flag — the NIAH ladders and the $/kWh rate are layered from env / config file only.)
 
 ### CLI Reference
 
@@ -237,7 +237,7 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact token counts; without it, counts are `chars/4` estimates (flagged `estimated`). |
 | `--tui` | off | Force the interactive dashboard (default mode on a TTY). |
 | `--headless` | off | Run the classic headless benchmark instead of the TUI. |
-| `--engine <NAME>` | A,B,C1,C2,C3,F (D auto) | Select which engines a run orchestrates (repeatable): `all` (every engine), `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`f`. An explicit selection always wins over GPU auto-detection. |
+| `--engine <NAME>` | A,B,C1,C2,C3,F (D auto) | Select which engines a run orchestrates (repeatable): `all` (every engine), `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`flat`/`f`. An explicit selection always wins over GPU auto-detection. |
 | `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
 | `--matrix-context <CSV>` | `0,8k,32k` | Context sizes for Engine B's 2D concurrency × context matrix (`0` = the configured prompt). |
 | `--niah-contexts <CSV>` | `2k,4k,8k,16k,32k,64k,128k` | Engine C1's context-size ladder (`k`/`M` suffixes; `0` not allowed), e.g. `16k,64k,256k,1M`. |
