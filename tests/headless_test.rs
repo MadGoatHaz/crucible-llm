@@ -145,9 +145,9 @@ async fn json_report_matches_prototype_key_set() {
     assert_eq!(top["iterations"], 1);
 
     // Per-run keys: the prototype `to_dict` set + v0.1.1 `looping` +
-    // CF-25 `degraded`.
+    // CF-25 `degraded` + the P2-A integrity flags (CF-10/24/44).
     let rj = top["results"][0].as_object().unwrap();
-    assert_eq!(rj.len(), 16);
+    assert_eq!(rj.len(), 19);
     for key in [
         "ttft_s",
         "prompt_tokens",
@@ -165,6 +165,9 @@ async fn json_report_matches_prototype_key_set() {
         "error",
         "looping",
         "degraded",
+        "usage_discrepancy",
+        "e2e_only",
+        "itl_clamped",
     ] {
         assert!(rj.contains_key(key), "missing {key}");
     }

@@ -2162,6 +2162,10 @@ mod tests {
             mode: "short".into(),
             error: None,
             looping: false,
+            // P2-A surfacing (CF-10/24/44): a clean fixture run.
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
         }]);
         // A C2 reasoning result in its slot (no dedicated table → it lives
         // in `engine_results`).

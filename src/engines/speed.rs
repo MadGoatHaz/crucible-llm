@@ -109,6 +109,17 @@ pub struct SpeedResult {
     /// The decode-loop guard (v0.1.1) flagged this run: its throughput
     /// numbers are zeroed (excluded) and it is kept out of summaries.
     pub looping: bool,
+    /// CF-10 (P2-A surfacing): the server's `usage.completion_tokens`
+    /// exceeded ~4× the token frames observed on the wire (a
+    /// max_tokens-inflating backend) — the decode-rate layer corrected the
+    /// count toward the wire truth.
+    pub usage_discrepancy: bool,
+    /// CF-44 (P2-A surfacing): a non-streaming (plain-JSON) result — its
+    /// "TTFT" is total response latency and it is excluded from ITL/decode.
+    pub e2e_only: bool,
+    /// CF-24 (P2-A surfacing): ITL samples clamped at the histogram's
+    /// 60 s bound — the ITL percentiles are capped, not exact.
+    pub itl_clamped: u64,
 }
 
 impl SpeedResult {
@@ -149,6 +160,11 @@ impl SpeedResult {
             "error": self.error,
             "looping": self.looping,
             "degraded": self.is_degraded(),
+            // P2-A surfacing (CF-10 / CF-24 / CF-44): the stream-integrity
+            // flags the worker computed for this run.
+            "usage_discrepancy": self.usage_discrepancy,
+            "e2e_only": self.e2e_only,
+            "itl_clamped": self.itl_clamped,
         })
     }
 }
@@ -256,6 +272,28 @@ fn content_window(events: &[StreamEvent]) -> (Option<MonotonicInstant>, Option<M
         }
     }
     (first, last)
+}
+
+/// The run's **inter-token latency histogram** (CF-09/CF-24): one sample
+/// per token-frame gap, recorded from the worker's per-frame arrival
+/// stamps (CF-09: a batched MTP frame no longer collapses to a zero
+/// delta). Shared by the live snapshot and [`aggregate`], which reads
+/// [`LatencyHistogram::clamp_count`] for the CF-24 surfacing.
+#[must_use]
+fn itl_histogram(events: &[StreamEvent]) -> LatencyHistogram {
+    let mut itl = LatencyHistogram::default();
+    let mut last: Option<MonotonicInstant> = None;
+    for event in events {
+        if let StreamEvent::Frame { frame, at, .. } = event {
+            if frame.chunk.is_token() {
+                if let Some(prev) = last {
+                    itl.record(prev.delta_nanos(at));
+                }
+                last = Some(*at);
+            }
+        }
+    }
+    itl
 }
 
 /// Engine construction errors.
@@ -492,7 +530,6 @@ impl SpeedEngine {
         max_tokens: u32,
         tokenizer: Option<&Tokenizer>,
     ) -> MetricsSnapshot {
-        let mut itl = LatencyHistogram::default();
         let mut reasoning_frames = 0u64;
         let mut content_frames = 0u64;
         let mut first_token_at: Option<MonotonicInstant> = None;
@@ -514,9 +551,6 @@ impl SpeedEngine {
                     timestamps,
                 } => {
                     if frame.chunk.is_token() {
-                        if let Some(prev) = last_token_at {
-                            itl.record(prev.delta_nanos(at));
-                        }
                         match &frame.chunk {
                             Chunk::Reasoning(_) => reasoning_frames += 1,
                             _ => content_frames += 1,
@@ -568,6 +602,10 @@ impl SpeedEngine {
                 }
             }
         }
+
+        // CF-24/CF-09: the ITL histogram from the worker's per-frame
+        // stamps (shared with `aggregate`).
+        let itl = itl_histogram(events);
 
         // The authoritative token count: the server's
         // `usage.completion_tokens` once it arrives (the primary source),
@@ -938,6 +976,10 @@ pub fn aggregate(
     let total_token_frames = content_chunks + reasoning_chunks;
     let mtp_efficiency = mtp_eta(completion_tokens, total_token_frames);
 
+    // CF-24 (P2-A surfacing): ITL samples clamped at the histogram's
+    // 60 s bound — the percentile figures are capped, not exact.
+    let itl_clamped = itl_histogram(events).clamp_count();
+
     // Error surface (prototype wording).
     let error = match &outcome.error {
         Some(e) => Some(match e {
@@ -975,6 +1017,11 @@ pub fn aggregate(
         mode: cfg.mode.label().to_string(),
         error,
         looping,
+        // P2-A surfacing (CF-10/CF-24/CF-44): the outcome's computed
+        // stream-integrity flags, published in the JSON + result lines.
+        usage_discrepancy: outcome.has_usage_discrepancy(),
+        e2e_only: outcome.is_e2e_only(),
+        itl_clamped,
     }
 }
 
@@ -1341,6 +1388,20 @@ pub fn format_result_box(
             &result.reasoning_chunks.to_string(),
         );
     }
+    // P2-A surfacing: the stream-integrity flags (CF-44 / CF-10 / CF-24).
+    if result.e2e_only {
+        row(&mut lines, "  e2e-only:", "non-streaming (total latency)");
+    }
+    if result.usage_discrepancy {
+        row(&mut lines, "  usage check:", "⚠ > 4× frames (corrected)");
+    }
+    if result.itl_clamped > 0 {
+        row(
+            &mut lines,
+            "  ITL clamped:",
+            &format!("{} sample(s) at the 60 s cap", result.itl_clamped),
+        );
+    }
     if result.looping {
         row(&mut lines, "  loop guard:", "EXCLUDED (repeating pattern)");
     }
@@ -1704,9 +1765,10 @@ mod tests {
         assert!(v.get("loop_guard").is_none(), "no looping runs → no block");
 
         // Result keys: the prototype `to_dict` set + v0.1.1 `looping`
+        // + CF-25 `degraded` + the P2-A integrity flags (CF-10/24/44)
         // (no `other_chunks`).
         let rj = v["results"][0].as_object().unwrap();
-        assert_eq!(rj.len(), 16);
+        assert_eq!(rj.len(), 19);
         for key in [
             "ttft_s",
             "prompt_tokens",
@@ -1724,11 +1786,20 @@ mod tests {
             "error",
             "looping",
             "degraded",
+            "usage_discrepancy",
+            "e2e_only",
+            "itl_clamped",
         ] {
             assert!(rj.contains_key(key), "missing {key}");
         }
         assert!(!rj.contains_key("other_chunks"));
         assert_eq!(rj["looping"], false);
+        // P2-A surfacing: `completed_run` reports 34 usage tokens over 3
+        // observed frames (34 > 3×4) → the CF-10 guard trips; it is a
+        // streaming result (not E2E-only) with no clamped ITL samples.
+        assert_eq!(rj["usage_discrepancy"], true);
+        assert_eq!(rj["e2e_only"], false);
+        assert_eq!(rj["itl_clamped"], 0);
 
         // The v0.1.1 blocks carry the published methodology.
         assert_eq!(v["timing"]["resolution"], "nanosecond");
@@ -2432,5 +2503,148 @@ mod tests {
         assert!(!cache_hit(Some(&UsageDetails::default())));
         // No detail at all (backend doesn't report) → no hit.
         assert!(!cache_hit(None));
+    }
+
+    // ── P2-A surfacing: CF-10 / CF-24 / CF-44 ─────────────────────────────
+
+    /// CF-44: a plain-JSON (non-streaming) result — no token frames with a
+    /// usage present and no error — is labeled E2E-only in the result, the
+    /// JSON, and the result box.
+    #[test]
+    fn e2e_only_result_is_labeled_in_the_result_and_json() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now();
+            mock.increment(45_000_000);
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: None, // no token frame — the plain-JSON signature
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 12,
+            };
+            let events = vec![StreamEvent::Complete {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                looping: false,
+                loop_excluded_tokens: 0,
+            }];
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 0,
+            };
+            let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+            assert!(r.e2e_only, "frames==0 + usage + no error → E2E-only");
+            assert!(!r.is_failed());
+            // The label is published in the JSON and the result box.
+            let v = json_report(&cfg(), std::slice::from_ref(&r));
+            assert_eq!(v["results"][0]["e2e_only"], true);
+            let box_ = format_result_box(&r, 1, 1, false).unwrap();
+            assert!(box_.contains("e2e-only:"), "{box_}");
+            assert!(box_.contains("non-streaming (total latency)"), "{box_}");
+        });
+    }
+
+    /// CF-10: a usage count exceeding ~4× the observed token frames is
+    /// flagged in the result and the JSON; a plausible usage is not.
+    #[test]
+    fn usage_discrepancy_is_flagged_in_the_result_and_json() {
+        let (outcome, events) = completed_run();
+        // 34 usage tokens over 3 frames (34 > 3×4) → the guard trips.
+        assert!(outcome.has_usage_discrepancy());
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+        assert!(r.usage_discrepancy);
+        let v = json_report(&cfg(), std::slice::from_ref(&r));
+        assert_eq!(v["results"][0]["usage_discrepancy"], true);
+        let box_ = format_result_box(&r, 1, 1, false).unwrap();
+        assert!(box_.contains("usage check:"), "{box_}");
+        // A plausible usage (12 tokens over 12 frames) is not flagged.
+        let plausible = StreamOutcome {
+            frames: 12,
+            ..outcome
+        };
+        assert!(!plausible.has_usage_discrepancy());
+    }
+
+    /// CF-24: an inter-token gap beyond the 60 s histogram bound is clamped
+    /// and counted; the count is published in the result and the JSON.
+    #[test]
+    fn clamped_itl_samples_are_counted_in_the_result() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now();
+            mock.increment(5_000_000);
+            let t3 = MonotonicInstant::now(); // first token
+            mock.increment(90_000_000_000); // 90 s gap → clamped at 60 s
+            let t_last = MonotonicInstant::now();
+            mock.increment(10_000_000);
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 2,
+            };
+            let frames = [
+                (Chunk::Content("a".into()), t3),
+                (Chunk::Content("b".into()), t_last),
+            ];
+            let events: Vec<StreamEvent> = frames
+                .iter()
+                .map(|(chunk, at)| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: chunk.clone(),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 2,
+            };
+            let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
+            assert_eq!(r.itl_clamped, 1, "the 90 s gap clamps and counts");
+            let v = json_report(&cfg(), std::slice::from_ref(&r));
+            assert_eq!(v["results"][0]["itl_clamped"], 1);
+        });
     }
 }
