@@ -4,6 +4,12 @@ All notable changes to Crucible LLM.
 
 ## [Unreleased]
 
+### Added
+- **NIAH (C1) matrix configurable in the TUI** — `niah_contexts` / `niah_depths` / `niah_custom` are now first-class editable fields in the Config view (View 6) and the Setup flow's stage-3 form, with `k`/`M` suffix support matching the CLI. The ladders display through the engine's shared `human_size` formatter, blank/invalid input falls back to the built-in defaults (lenient, not a hard error), and a single `parsed_niah()` helper keeps the run (`to_config`) and persist (`save`) paths in lockstep.
+
+### Fixed
+- **`F2` no longer wipes the NIAH ladders** — `save()` previously hard-coded `niah_contexts` / `niah_depths` / `niah_custom` to `None`, so saving from the TUI reset any file-set ladder back to the built-in defaults. It now writes the **parsed** values, so a TUI-set ladder persists to `~/.config/crucible/config.json` and reloads on the next launch. The R3 budgets (`niah_max_tokens` / `structured_max_tokens`) intentionally remain `None` (out of scope).
+
 ## [0.1.5] - 2026-10-12
 
 The NIAH expansion + SSE keep-alive + hybrid-reasoning cycle: long-context NIAH becomes runtime-configurable, 1M+ scalable, and token-honest (and lands in `--json`); the stream transport stops misrouting valid SSE (Issue #1) and the TUI labels approximate sizes honestly (Issue #4); and the C1/C3 capability engines adopt the **hybrid reasoning design** — the generation budget carries correctness, `disable_thinking` is best-effort, and a new `truncated_by_reasoning` outcome replaces the false capability failures — with live-calibrated defaults (C1 2048 / C3 4096) sized for verbose reasoners.

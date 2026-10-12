@@ -75,10 +75,10 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **Interactive setup** with live model auto-discovery (`GET /v1/models`) and a type-to-filter picker (first run only; a saved config skips straight to the dashboard).
 - **View 1 · Live Monitor** — real-time throughput graph with auto-scaling y-axis, engine-transition markers, a live event log, and a per-engine benchmark queue panel.
 - **View 2 · Concurrency** — the sweep curve with a **practical sweet-spot** recommendation (per-stream ≥ 30 t/s, 2% margin), not just the aggregate throughput knee.
-- **View 3 · NIAH** — the long-context retrieval matrix (default 7 sizes × 11 depths; both ladders are runtime-configurable), color-coded green / yellow / red.
+- **View 3 · NIAH** — the long-context retrieval matrix (default 7 sizes × 11 depths; both ladders and the single-size "count test" are runtime-configurable via CLI / env / config file **or the TUI**), color-coded green / yellow / red.
 - **View 4 · GPU & Power** — multi-GPU telemetry table (name in a 24-char column, power, util, avg util, temp, avg temp, max temp, VRAM, clocks), power-over-time graph (1 Hz, auto-scaled), auto-scaled utilization/temperature charts with mean & peak markers, energy (kWh), $/1M token cost analysis (input/output/blended), efficiency metrics (J/token, tokens/watt), system power (GPU + CPU), idle baseline (auto 5s / manual `[i]` 10s), and duration (freezes at completion).
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
-- **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; save to the config file, reset, or launch a run from it.
+- **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; now includes the **NIAH (C1) matrix ladders** (contexts / depths / custom size, `k`/`M` suffixes) alongside the URL, model, mode, ladder, engines, theme, and $/kWh; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
 - **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 

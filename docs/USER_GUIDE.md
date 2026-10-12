@@ -166,6 +166,9 @@ The Config view has an **edit gate**: you land on a read-only screen showing the
 | Theme | TUI color theme — Cyberpunk / Vampire / Monochrome Pastel; `←`/`→` cycles, `1`/`2`/`3` selects |
 | Engine A–F | Six toggle rows — `Engine A — Speed`, `Engine B — Concurrency`, `Engine C1 — NIAH`, `Engine C2 — Reasoning`, `Engine C3 — Structured`, `Engine F — Flat Out` (plus the Hardware telemetry row for D: all seven engines are individually selectable; D auto-selects with GPU detection and your explicit choice always wins) |
 | $/kWh | Electricity rate for cost estimation in the GPU & Power view (default $0.16) |
+| NIAH contexts | Engine C1's context-size ladder, comma-separated with `k`/`M` suffixes (default `2k,4k,8k,16k,32k,64k,128k`); blank/invalid falls back to the default |
+| NIAH depths | Engine C1's needle-depth ladder, percentages 0–100, comma-separated (default `0,10,…,100`); blank/invalid falls back to the default |
+| NIAH custom size | Optional single size for a focused "count test" (e.g. `256k`, `1M`); when set it **overrides** the contexts ladder and collapses the matrix to one row — blank = run the full ladder |
 
 ## GPU & Power Monitor (Tab 4)
 
@@ -248,7 +251,7 @@ For scripting, CI/CD, or when you don't want a TUI. **Headless honors engine sel
 
 ### Configuring the NIAH (C1) matrix
 
-The C1 matrix's context sizes and needle depths are **runtime-configurable** (defaults: `2k,4k,8k,16k,32k,64k,128k` × `0…100` step 10 = 77 cells). All three options accept `k` / `M` suffixes (`16k`, `1M`) as well as plain numbers, and layer **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS` / `CRUCIBLE_NIAH_CUSTOM`) > config file > default**:
+The C1 matrix's context sizes and needle depths are **runtime-configurable** (defaults: `2k,4k,8k,16k,32k,64k,128k` × `0…100` step 10 = 77 cells). All three options accept `k` / `M` suffixes (`16k`, `1M`) as well as plain numbers, and layer **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS` / `CRUCIBLE_NIAH_CUSTOM`) > config file > default**. They are **no longer CLI-only**: the same three values are editable in the **TUI** — the Config view (View 6) and the Setup flow's stage-3 form — and `F2` persists them to the config file (so a TUI-set ladder survives into the next launch). The table below is the CLI / env form:
 
 | Flag | Example | Effect |
 |------|---------|--------|
