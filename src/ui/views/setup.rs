@@ -38,9 +38,10 @@ use ratatui::Frame;
 
 use crate::client::models::ModelInfo;
 use crate::config::EngineSelection;
+use crate::engines::{human_size, NIAH_DEPTHS, NIAH_SIZES};
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
-use crate::ui::views::config::ConfigState;
+use crate::ui::views::config::{is_niah_size_char, ConfigState};
 
 /// The four stages of the setup flow (stage 2 has two sub-states: the
 /// in-flight `Discover` spinner and the `Model` picker).
@@ -114,11 +115,14 @@ pub enum SetupField {
     EngineStructured,
     EngineHardware,
     EngineFlatOut,
+    NiahContexts,
+    NiahDepths,
+    NiahCustom,
 }
 
 impl SetupField {
     /// Every field in cursor order.
-    pub const ALL: [SetupField; 11] = [
+    pub const ALL: [SetupField; 14] = [
         SetupField::Mode,
         SetupField::Tokens,
         SetupField::Iterations,
@@ -130,6 +134,9 @@ impl SetupField {
         SetupField::EngineStructured,
         SetupField::EngineHardware,
         SetupField::EngineFlatOut,
+        SetupField::NiahContexts,
+        SetupField::NiahDepths,
+        SetupField::NiahCustom,
     ];
 
     /// The short form label (value column carries the detail).
@@ -146,6 +153,9 @@ impl SetupField {
             SetupField::EngineStructured => "Engine C3",
             SetupField::EngineHardware => "Engine D",
             SetupField::EngineFlatOut => "Engine F",
+            SetupField::NiahContexts => "NIAH ctx",
+            SetupField::NiahDepths => "NIAH depth",
+            SetupField::NiahCustom => "NIAH custom",
         }
     }
 
@@ -184,6 +194,15 @@ impl SetupField {
             ),
             SetupField::Ladder => Some(
                 "Concurrency levels to test, in order. Each level spawns that many\nsimultaneous requests. The sweep finds where per-user speed degrades.\nDefault: 1,2,3,4,8,12,16,24,32 (fine at the low end); custom: 1,4,16,64.",
+            ),
+            SetupField::NiahContexts => Some(
+                "Context sizes for the NIAH (C1) matrix, comma-separated,\nk/M suffixes (e.g. 16k,64k,128k,256k). Blank/invalid →\nbuilt-in 2k→128k. Each row = one haystack size.",
+            ),
+            SetupField::NiahDepths => Some(
+                "Needle depths (% of the haystack), comma-separated, 0–100\n(e.g. 0,25,50,75,100). Blank/invalid → built-in 0…100\nin 10% steps. Each column = one needle position.",
+            ),
+            SetupField::NiahCustom => Some(
+                "Optional single size for a focused 'count test' (e.g. 256k).\nWhen set, it OVERRIDES the contexts ladder and\ncollapses the matrix to one row. Blank = full ladder.",
             ),
             _ => None,
         }
@@ -578,6 +597,22 @@ impl SetupState {
                     cfg.iterations = cfg.iterations.saturating_mul(10).saturating_add(d);
                 }
             }
+            // NIAH (C1) ladders: digits, k/M (any case), comma, space.
+            SetupField::NiahContexts => {
+                if is_niah_size_char(c) {
+                    cfg.niah_contexts_text.push(c);
+                }
+            }
+            SetupField::NiahDepths => {
+                if is_niah_size_char(c) {
+                    cfg.niah_depths_text.push(c);
+                }
+            }
+            SetupField::NiahCustom => {
+                if is_niah_size_char(c) {
+                    cfg.niah_custom_text.push(c);
+                }
+            }
             _ => {}
         }
     }
@@ -593,6 +628,15 @@ impl SetupState {
             }
             SetupField::Iterations => {
                 cfg.iterations /= 10;
+            }
+            SetupField::NiahContexts => {
+                cfg.niah_contexts_text.pop();
+            }
+            SetupField::NiahDepths => {
+                cfg.niah_depths_text.pop();
+            }
+            SetupField::NiahCustom => {
+                cfg.niah_custom_text.pop();
             }
             _ => {}
         }
@@ -983,6 +1027,49 @@ fn form_value(
             format!("[{}] Flat Out", tick(c.engine_flatout)),
             bool_style(th, c.engine_flatout),
         ),
+        // NIAH (C1) ladders: the live buffer, or the built-in default
+        // (formatted through `human_size`) when blank.
+        SetupField::NiahContexts => {
+            let text = c.niah_contexts_text.trim();
+            (
+                if text.is_empty() {
+                    NIAH_SIZES
+                        .iter()
+                        .map(|n| human_size(*n))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    text.to_string()
+                },
+                style::value(th),
+            )
+        }
+        SetupField::NiahDepths => {
+            let text = c.niah_depths_text.trim();
+            (
+                if text.is_empty() {
+                    NIAH_DEPTHS
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    text.to_string()
+                },
+                style::value(th),
+            )
+        }
+        SetupField::NiahCustom => {
+            let text = c.niah_custom_text.trim();
+            (
+                if text.is_empty() {
+                    "off".to_string()
+                } else {
+                    text.to_string()
+                },
+                style::value(th),
+            )
+        }
     }
 }
 
@@ -1021,6 +1108,32 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
         .map(|l| l.to_string())
         .collect::<Vec<_>>()
         .join(" · ");
+    // The NIAH (C1) ladders for the summary: the live buffer, or the
+    // built-in default when blank — so the summary always shows what will
+    // actually run (a blank custom size = "off" = the full ladder).
+    let niah_ctx_summary = if c.niah_contexts_text.trim().is_empty() {
+        NIAH_SIZES
+            .iter()
+            .map(|n| human_size(*n))
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        c.niah_contexts_text.trim().to_string()
+    };
+    let niah_depth_summary = if c.niah_depths_text.trim().is_empty() {
+        NIAH_DEPTHS
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    } else {
+        c.niah_depths_text.trim().to_string()
+    };
+    let niah_custom_summary = if c.niah_custom_text.trim().is_empty() {
+        "off".to_string()
+    } else {
+        c.niah_custom_text.trim().to_string()
+    };
     let lines = vec![
         Line::from(Span::styled("Benchmark summary", style::title(th))),
         Line::raw(""),
@@ -1045,6 +1158,9 @@ fn render_confirm(area: Rect, s: &SetupState, app: &App, f: &mut Frame) {
             style::value(th),
         ),
         summary_line(th, "Ladder", &c.ladder, style::value(th)),
+        summary_line(th, "NIAH ctx", &niah_ctx_summary, style::value(th)),
+        summary_line(th, "NIAH depth", &niah_depth_summary, style::value(th)),
+        summary_line(th, "NIAH custom", &niah_custom_summary, style::value(th)),
         summary_line(th, "Engines", &engine_labels, style::highlight(th)),
         Line::raw(""),
         Line::from(Span::styled(

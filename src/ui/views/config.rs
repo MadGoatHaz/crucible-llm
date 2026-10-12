@@ -1245,8 +1245,9 @@ fn parse_rate(s: &str) -> f64 {
 /// superset filter is the safe, lenient choice (design decision §4.6): a
 /// `k`/`M` typed into the *depths* buffer simply fails `parse_niah_depths`
 /// and falls back to the built-in default ("a typo never silently shrinks
-/// the matrix"), rather than a hard error.
-fn is_niah_size_char(c: char) -> bool {
+/// the matrix"), rather than a hard error. Shared with the setup flow so the
+/// two surfaces filter identically (no drift).
+pub(crate) fn is_niah_size_char(c: char) -> bool {
     c.is_ascii_digit() || matches!(c, 'k' | 'K' | 'm' | 'M' | ',' | ' ')
 }
 
