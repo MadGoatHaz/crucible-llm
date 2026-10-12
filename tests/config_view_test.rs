@@ -88,6 +88,9 @@ fn render_shows_every_editable_field() {
         "Engine C1 — NIAH",
         "Engine C2 — Reasoning",
         "Engine C3 — Structured",
+        "NIAH contexts",
+        "NIAH depths",
+        "NIAH custom size",
     ] {
         assert!(text.contains(label), "missing field {label}");
     }
@@ -258,6 +261,10 @@ fn f2_saves_and_a_reload_reads_the_values_back() {
     s.nocache = true;
     s.engine_concurrency = true;
     s.ladder = "1,8,64".to_string();
+    // The NIAH (C1) ladders persist too (the save() wipe trap is resolved).
+    s.niah_contexts_text = "16k,64k,256k".to_string();
+    s.niah_depths_text = "0,50,100".to_string();
+    s.niah_custom_text = "1M".to_string();
 
     // F2 saves.
     let result = s.handle_key(&key(KeyCode::F(2)));
@@ -276,6 +283,10 @@ fn f2_saves_and_a_reload_reads_the_values_back() {
     assert!(reloaded.nocache);
     assert!(reloaded.engines.concurrency);
     assert_eq!(reloaded.ladder, vec![1, 8, 64]);
+    // The NIAH ladders persisted (parsed) and reloaded intact.
+    assert_eq!(reloaded.niah_contexts, vec![16000, 64000, 256000]);
+    assert_eq!(reloaded.niah_depths, vec![0, 50, 100]);
+    assert_eq!(reloaded.niah_custom, Some(1_000_000));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

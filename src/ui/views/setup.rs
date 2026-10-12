@@ -597,21 +597,17 @@ impl SetupState {
                     cfg.iterations = cfg.iterations.saturating_mul(10).saturating_add(d);
                 }
             }
-            // NIAH (C1) ladders: digits, k/M (any case), comma, space.
-            SetupField::NiahContexts => {
-                if is_niah_size_char(c) {
-                    cfg.niah_contexts_text.push(c);
-                }
+            // NIAH (C1) ladders: digits, k/M (any case), comma, space. A
+            // rejected char fails the guard and falls through to the no-op
+            // arm below (identical to the `if`-body behavior).
+            SetupField::NiahContexts if is_niah_size_char(c) => {
+                cfg.niah_contexts_text.push(c);
             }
-            SetupField::NiahDepths => {
-                if is_niah_size_char(c) {
-                    cfg.niah_depths_text.push(c);
-                }
+            SetupField::NiahDepths if is_niah_size_char(c) => {
+                cfg.niah_depths_text.push(c);
             }
-            SetupField::NiahCustom => {
-                if is_niah_size_char(c) {
-                    cfg.niah_custom_text.push(c);
-                }
+            SetupField::NiahCustom if is_niah_size_char(c) => {
+                cfg.niah_custom_text.push(c);
             }
             _ => {}
         }
@@ -1714,6 +1710,86 @@ mod tests {
         assert!(text.contains('ℹ'), "{text}");
         assert!(text.contains("1,2,3,4,8,12,16,24,32"), "{text}");
         assert!(text.contains("1,4,16,64"), "{text}");
+    }
+
+    // ── stage 3: NIAH (C1) matrix fields ────────────────────────────────
+
+    #[test]
+    fn setup_niah_fields_render_in_stage_3() {
+        let app = setup_app_at_config(11); // NiahContexts
+        let text = render_setup_text(&app, 120, 40);
+        assert!(text.contains("NIAH ctx"), "contexts label: {text}");
+        assert!(text.contains("NIAH depth"), "depths label: {text}");
+        assert!(text.contains("NIAH custom"), "custom label: {text}");
+        // The default display shows the human_size-formatted ladder.
+        assert!(
+            text.contains("2k,4k,8k,16k,32k,64k,128k"),
+            "default contexts: {text}"
+        );
+    }
+
+    #[test]
+    fn setup_niah_contexts_shows_its_explanation() {
+        let app = setup_app_at_config(11); // NiahContexts
+        let text = render_setup_text(&app, 120, 40);
+        assert!(
+            text.contains('ℹ'),
+            "focused NIAH field gets an info note: {text}"
+        );
+        assert!(text.contains("haystack"), "contexts explanation: {text}");
+    }
+
+    #[test]
+    fn setup_niah_typing_edits_the_shared_buffer() {
+        let mut s = SetupState::new();
+        s.phase = SetupPhase::Config;
+        let mut c = cfg();
+        c.niah_custom_text.clear();
+        s.form_field = 13; // NiahCustom
+        for ch in "256k".chars() {
+            s.handle_key(&char_key(ch), &mut c);
+        }
+        assert_eq!(c.niah_custom_text, "256k");
+        // Junk is rejected by the shared char filter.
+        s.handle_key(&char_key('x'), &mut c);
+        assert_eq!(c.niah_custom_text, "256k");
+        // Backspace removes from the buffer.
+        s.handle_key(&key(KeyCode::Backspace), &mut c);
+        assert_eq!(c.niah_custom_text, "256");
+    }
+
+    #[test]
+    fn setup_niah_nav_reaches_the_new_fields() {
+        let mut s = SetupState::new();
+        s.phase = SetupPhase::Config;
+        let mut c = cfg();
+        // Tab from the last engine field (10) reaches the three NIAH fields.
+        s.form_field = 10;
+        s.handle_key(&key(KeyCode::Tab), &mut c);
+        assert_eq!(s.form_field, 11);
+        s.handle_key(&key(KeyCode::Tab), &mut c);
+        assert_eq!(s.form_field, 12);
+        s.handle_key(&key(KeyCode::Tab), &mut c);
+        assert_eq!(s.form_field, 13);
+        // Tab at the last field wraps to the start.
+        s.handle_key(&key(KeyCode::Tab), &mut c);
+        assert_eq!(s.form_field, 0, "Tab wraps to the start");
+    }
+
+    #[test]
+    fn setup_confirm_shows_the_niah_summary() {
+        let mut app = crate::ui::app::App::new();
+        app.phase = crate::ui::app::Phase::Setup;
+        app.setup.phase = SetupPhase::Confirm;
+        let text = render_setup_text(&app, 120, 40);
+        assert!(text.contains("NIAH ctx"), "summary contexts: {text}");
+        assert!(text.contains("NIAH depth"), "summary depths: {text}");
+        assert!(text.contains("NIAH custom"), "summary custom: {text}");
+        // The default (blank) custom size shows "off" (the full ladder).
+        assert!(
+            text.contains("off"),
+            "default custom (off) in summary: {text}"
+        );
     }
 
     // ── step indicator ───────────────────────────────────────────────────

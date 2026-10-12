@@ -397,7 +397,7 @@ impl ConfigState {
                 .map(|d| d.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
-            niah_custom_text: cfg.niah_custom.map(|n| human_size(n)).unwrap_or_default(),
+            niah_custom_text: cfg.niah_custom.map(human_size).unwrap_or_default(),
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
@@ -670,21 +670,17 @@ impl ConfigState {
                     self.rate_text = next;
                 }
             }
-            // NIAH (C1) ladders: digits, k/M (any case), comma, space.
-            Field::NiahContexts => {
-                if is_niah_size_char(c) {
-                    self.niah_contexts_text.push(c);
-                }
+            // NIAH (C1) ladders: digits, k/M (any case), comma, space. A
+            // rejected char fails the guard and falls through to the no-op
+            // arm below (identical to the `if`-body behavior).
+            Field::NiahContexts if is_niah_size_char(c) => {
+                self.niah_contexts_text.push(c);
             }
-            Field::NiahDepths => {
-                if is_niah_size_char(c) {
-                    self.niah_depths_text.push(c);
-                }
+            Field::NiahDepths if is_niah_size_char(c) => {
+                self.niah_depths_text.push(c);
             }
-            Field::NiahCustom => {
-                if is_niah_size_char(c) {
-                    self.niah_custom_text.push(c);
-                }
+            Field::NiahCustom if is_niah_size_char(c) => {
+                self.niah_custom_text.push(c);
             }
             // Mode / booleans don't take typed text.
             _ => {}
@@ -1500,7 +1496,7 @@ mod tests {
         let mut app = App::new();
         app.view = View::Config;
         app.config.edit_mode = ConfigMode::Editing;
-        app.config.cursor = 18; // RateKwh (the last field)
+        app.config.cursor = 18; // RateKwh (now the 19th field; NIAH follows)
         let text = render_text(&app, 120, 40);
         assert!(
             text.contains("Electricity rate"),
@@ -1598,5 +1594,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── NIAH (C1) matrix fields ─────────────────────────────────────────
+
+    #[test]
+    fn niah_fields_are_reachable_by_cursor() {
+        // The three NIAH fields are appended (indices 19/20/21); the
+        // existing absolute indices are untouched (RateKwh stays 18).
+        assert_eq!(Field::ALL[18], Field::RateKwh);
+        assert_eq!(Field::ALL[19], Field::NiahContexts);
+        assert_eq!(Field::ALL[20], Field::NiahDepths);
+        assert_eq!(Field::ALL[21], Field::NiahCustom);
+        let base = ConfigState::default();
+        assert_eq!(
+            ConfigState {
+                cursor: 19,
+                ..base.clone()
+            }
+            .current(),
+            Field::NiahContexts
+        );
+        assert_eq!(
+            ConfigState {
+                cursor: 20,
+                ..base.clone()
+            }
+            .current(),
+            Field::NiahDepths
+        );
+        assert_eq!(
+            ConfigState { cursor: 21, ..base }.current(),
+            Field::NiahCustom
+        );
+    }
+
+    #[test]
+    fn niah_from_config_to_config_round_trip() {
+        // A config with custom NIAH values seeds the buffers, and to_config
+        // parses them back to the same resolved values.
+        let cfg = Config {
+            niah_contexts: vec![8000, 256000, 1_000_000],
+            niah_depths: vec![0, 50, 100],
+            niah_custom: Some(256_000),
+            ..Config::default()
+        };
+        let s = ConfigState::from_config(&cfg);
+        // Buffers seeded: contexts/custom via human_size, depths plain.
+        assert_eq!(s.niah_contexts_text, "8k,256k,1M");
+        assert_eq!(s.niah_depths_text, "0,50,100");
+        assert_eq!(s.niah_custom_text, "256k");
+        // to_config parses them back exactly.
+        let cfg2 = s.to_config();
+        assert_eq!(cfg2.niah_contexts, vec![8000, 256000, 1_000_000]);
+        assert_eq!(cfg2.niah_depths, vec![0, 50, 100]);
+        assert_eq!(cfg2.niah_custom, Some(256_000));
+    }
+
+    #[test]
+    fn niah_to_config_parses_k_and_m_suffixes() {
+        let mut s = ConfigState {
+            niah_contexts_text: "8k".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(s.to_config().niah_contexts, vec![8000]);
+        s.niah_contexts_text = "256k".to_string();
+        assert_eq!(s.to_config().niah_contexts, vec![256000]);
+        s.niah_custom_text = "1M".to_string();
+        assert_eq!(s.to_config().niah_custom, Some(1_000_000));
+    }
+
+    #[test]
+    fn niah_to_config_falls_back_to_defaults_on_blank_or_invalid() {
+        let mut s = ConfigState::default();
+        // Blank contexts → the built-in default ladder.
+        s.niah_contexts_text.clear();
+        assert_eq!(s.to_config().niah_contexts, NIAH_SIZES.to_vec());
+        // Invalid contexts → the built-in default (no hard error).
+        s.niah_contexts_text = "abc".to_string();
+        assert_eq!(s.to_config().niah_contexts, NIAH_SIZES.to_vec());
+        // A 0 context is rejected → the built-in default.
+        s.niah_contexts_text = "0".to_string();
+        assert_eq!(s.to_config().niah_contexts, NIAH_SIZES.to_vec());
+        // Invalid depths → the built-in default.
+        s.niah_depths_text = "not a depth".to_string();
+        assert_eq!(s.to_config().niah_depths, NIAH_DEPTHS.to_vec());
+        // Blank / 0 / invalid custom → None (the full ladder runs).
+        s.niah_custom_text.clear();
+        assert_eq!(s.to_config().niah_custom, None);
+        s.niah_custom_text = "0".to_string();
+        assert_eq!(s.to_config().niah_custom, None);
+        s.niah_custom_text = "abc".to_string();
+        assert_eq!(s.to_config().niah_custom, None);
+    }
+
+    #[test]
+    fn niah_save_writes_parsed_values_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("crucible-niah-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.json");
+        let mut s = ConfigState {
+            config_path: path.clone(),
+            niah_contexts_text: "16k,64k,256k".to_string(),
+            niah_depths_text: "0,50,100".to_string(),
+            niah_custom_text: "1M".to_string(),
+            ..Default::default()
+        };
+        s.save().expect("save");
+        // The on-disk ConfigFile carries the *parsed* values (no longer the
+        // hard-coded None trap); the R3 budgets stay None (out of scope).
+        let file = crate::config::load_config_file(&path)
+            .unwrap()
+            .expect("the file was written");
+        assert_eq!(file.niah_contexts, Some(vec![16000, 64000, 256000]));
+        assert_eq!(file.niah_depths, Some(vec![0, 50, 100]));
+        assert_eq!(file.niah_custom, Some(1_000_000));
+        assert_eq!(file.niah_max_tokens, None, "R3 budget stays None");
+        assert_eq!(file.structured_max_tokens, None, "R3 budget stays None");
+        // Reload round-trips through ConfigFile::to_config.
+        let reloaded = file.to_config();
+        assert_eq!(reloaded.niah_contexts, vec![16000, 64000, 256000]);
+        assert_eq!(reloaded.niah_depths, vec![0, 50, 100]);
+        assert_eq!(reloaded.niah_custom, Some(1_000_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn niah_char_filter_accepts_size_chars_and_rejects_junk() {
+        let mut c = ConfigState {
+            cursor: 19, // NiahContexts
+            niah_contexts_text: String::new(),
+            ..Default::default()
+        };
+        // digits, k/M (any case), comma, and space are all accepted.
+        for ch in "8k 256M,16".chars() {
+            c.type_current(ch);
+        }
+        assert_eq!(c.niah_contexts_text, "8k 256M,16");
+        // Other letters and symbols are rejected.
+        c.type_current('x');
+        c.type_current('-');
+        c.type_current('.');
+        assert_eq!(c.niah_contexts_text, "8k 256M,16", "junk chars rejected");
+    }
+
+    #[test]
+    fn niah_field_typing_updates_the_buffer() {
+        let mut c = ConfigState {
+            cursor: 19, // NiahContexts
+            niah_contexts_text: String::new(),
+            ..Default::default()
+        };
+        for ch in "256k".chars() {
+            c.type_current(ch);
+        }
+        assert_eq!(c.niah_contexts_text, "256k");
+        assert_eq!(c.to_config().niah_contexts, vec![256000]);
+        // Backspace removes from the buffer (live edit).
+        c.backspace_current();
+        assert_eq!(c.niah_contexts_text, "256");
+    }
+
+    #[test]
+    fn niah_fields_render_in_the_form() {
+        let mut app = App::new();
+        app.view = View::Config;
+        app.config.edit_mode = ConfigMode::Editing;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("NIAH contexts"), "contexts label: {text}");
+        assert!(text.contains("NIAH depths"), "depths label: {text}");
+        assert!(text.contains("NIAH custom size"), "custom label: {text}");
+        // The default display shows the human_size-formatted ladder.
+        assert!(
+            text.contains("2k,4k,8k,16k,32k,64k,128k"),
+            "default contexts: {text}"
+        );
+        assert!(
+            text.contains("0,10,20,30,40,50,60,70,80,90,100"),
+            "default depths: {text}"
+        );
+        assert!(text.contains("off"), "default custom (off): {text}");
+    }
+
+    #[test]
+    fn niah_field_display_warns_on_invalid_entry() {
+        let th = Theme::default();
+        // Blank buffer → the built-in default, plain value style.
+        let c = ConfigState::default();
+        let (_, _, style) = field_display(Field::NiahContexts, &c, th, None);
+        assert_eq!(style, style::value(th));
+        // A valid (parseable) buffer → plain value style.
+        let c = ConfigState {
+            niah_contexts_text: "16k,64k".to_string(),
+            ..Default::default()
+        };
+        let (_, _, style) = field_display(Field::NiahContexts, &c, th, None);
+        assert_eq!(style, style::value(th));
+        // A non-blank buffer that fails to parse → the warn style.
+        let c = ConfigState {
+            niah_contexts_text: "abc".to_string(),
+            ..Default::default()
+        };
+        let (_, _, style) = field_display(Field::NiahContexts, &c, th, None);
+        assert_eq!(style, style::value_warn(th));
+        assert_ne!(style, style::value(th));
     }
 }
