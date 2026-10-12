@@ -37,10 +37,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::config::{
-    default_config_path, parse_ladder, Config, ConfigFile, EngineSelection, EngineSelectionFile,
-    Mode, DEFAULT_RATE_KWH,
+    default_config_path, parse_ladder, parse_niah_contexts, parse_niah_depths, parse_size, Config,
+    ConfigFile, EngineSelection, EngineSelectionFile, Mode, DEFAULT_RATE_KWH,
 };
 use crate::engines::concurrency::DEFAULT_LADDER;
+use crate::engines::{human_size, NIAH_DEPTHS, NIAH_SIZES};
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
 
@@ -66,11 +67,14 @@ pub enum Field {
     EngineFlatOut,
     Theme,
     RateKwh,
+    NiahContexts,
+    NiahDepths,
+    NiahCustom,
 }
 
 impl Field {
     /// Every field in cursor order.
-    pub const ALL: [Field; 19] = [
+    pub const ALL: [Field; 22] = [
         Field::Url,
         Field::Model,
         Field::Mode,
@@ -90,6 +94,9 @@ impl Field {
         Field::EngineFlatOut,
         Field::Theme,
         Field::RateKwh,
+        Field::NiahContexts,
+        Field::NiahDepths,
+        Field::NiahCustom,
     ];
 
     /// The form label for this field.
@@ -114,6 +121,9 @@ impl Field {
             Field::EngineFlatOut => "Engine F — Flat Out",
             Field::Theme => "Theme",
             Field::RateKwh => "Electricity rate",
+            Field::NiahContexts => "NIAH contexts",
+            Field::NiahDepths => "NIAH depths",
+            Field::NiahCustom => "NIAH custom size",
         }
     }
 
@@ -210,9 +220,27 @@ impl Field {
             ),
             Field::RateKwh => Some(
                 "Your electricity rate in $/kWh (e.g., 0.16).\n\
-                 Drives the $/1M-token cost in the GPU &\n\
-                 Power view. Blank/invalid falls back to $0.16.\n\
-                 Type digits and a decimal point.",
+                  Drives the $/1M-token cost in the GPU &\n\
+                  Power view. Blank/invalid falls back to $0.16.\n\
+                  Type digits and a decimal point.",
+            ),
+            Field::NiahContexts => Some(
+                "Context sizes for the NIAH (C1) matrix, comma-\n\
+                  separated, k/M suffixes (e.g. 16k,64k,128k,256k,1M).\n\
+                  Blank/invalid → built-in 2k→128k. Each row = one\n\
+                  haystack size; bigger probes RoPE/YaRN limits.",
+            ),
+            Field::NiahDepths => Some(
+                "Needle depths (% of the haystack), comma-separated,\n\
+                  0–100 (e.g. 0,25,50,75,100). Blank/invalid →\n\
+                  built-in 0…100 in 10% steps. Each column = one\n\
+                  needle position per size.",
+            ),
+            Field::NiahCustom => Some(
+                "Optional single size for a focused 'count test'\n\
+                  (e.g. 256k or 1000000). When set, it OVERRIDES\n\
+                  the contexts ladder and collapses the matrix to\n\
+                  one size row. Blank = run the full ladder.",
             ),
             // Engine fields use `Engine::description()` via `engine()`.
             Field::Hardware
@@ -287,6 +315,18 @@ pub struct ConfigState {
     /// (`"0.16"`) and parsed on save / run (blank or invalid input falls
     /// back to the built-in default).
     pub rate_text: String,
+    /// The NIAH (C1) context-size ladder as a text buffer (e.g.
+    /// `"2k,4k,8k,16k,32k,64k,128k"`). Parsed by `parse_niah_contexts` on
+    /// use; blank/invalid → `NIAH_SIZES`.
+    pub niah_contexts_text: String,
+    /// The NIAH (C1) needle-depth ladder as a text buffer (e.g.
+    /// `"0,10,20,…,100"`). Parsed by `parse_niah_depths` on use;
+    /// blank/invalid → `NIAH_DEPTHS`.
+    pub niah_depths_text: String,
+    /// The NIAH (C1) focused single-size "count test" as a text buffer
+    /// (e.g. `"256k"`). Parsed by `parse_size` on use; blank/invalid →
+    /// `None` (the full ladder runs).
+    pub niah_custom_text: String,
     /// The cursor's position in [`Field::ALL`].
     pub cursor: usize,
     /// Where `F2` writes the form.
@@ -340,6 +380,24 @@ impl ConfigState {
             engine_flatout: cfg.engines.flatout,
             theme: cfg.theme.clone(),
             rate_text: format!("{}", cfg.rate_per_kwh),
+            // The NIAH (C1) ladders, seeded from the resolved config so a
+            // file/CLI-set ladder is what the form shows. Contexts and the
+            // custom size are formatted through the engine's own
+            // `human_size` (`2k`/`128k`/`1M`, …); depths are plain
+            // percentages; a `None` custom size is the empty buffer.
+            niah_contexts_text: cfg
+                .niah_contexts
+                .iter()
+                .map(|n| human_size(*n))
+                .collect::<Vec<_>>()
+                .join(","),
+            niah_depths_text: cfg
+                .niah_depths
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            niah_custom_text: cfg.niah_custom.map(|n| human_size(n)).unwrap_or_default(),
             cursor: 0,
             config_path: default_config_path().unwrap_or_else(|| PathBuf::from("config.json")),
             saved: false,
@@ -586,6 +644,22 @@ impl ConfigState {
                     self.rate_text = next;
                 }
             }
+            // NIAH (C1) ladders: digits, k/M (any case), comma, space.
+            Field::NiahContexts => {
+                if is_niah_size_char(c) {
+                    self.niah_contexts_text.push(c);
+                }
+            }
+            Field::NiahDepths => {
+                if is_niah_size_char(c) {
+                    self.niah_depths_text.push(c);
+                }
+            }
+            Field::NiahCustom => {
+                if is_niah_size_char(c) {
+                    self.niah_custom_text.push(c);
+                }
+            }
             // Mode / booleans don't take typed text.
             _ => {}
         }
@@ -621,6 +695,15 @@ impl ConfigState {
             }
             Field::RateKwh => {
                 self.rate_text.pop();
+            }
+            Field::NiahContexts => {
+                self.niah_contexts_text.pop();
+            }
+            Field::NiahDepths => {
+                self.niah_depths_text.pop();
+            }
+            Field::NiahCustom => {
+                self.niah_custom_text.pop();
             }
             Field::Tokens => {
                 self.tokens /= 10;
@@ -849,7 +932,7 @@ fn render_form(area: Rect, c: &ConfigState, th: Theme, f: &mut Frame, gpu_label:
         lines.extend(crate::ui::views::info_lines(th, text));
     }
     // Pad to always 4 lines (reserved space).
-    let field_end = Field::ALL.len() + 1; // 16 fields + 1 blank
+    let field_end = Field::ALL.len() + 1; // all fields + 1 blank
     while lines.len() < field_end + 4 {
         lines.push(Line::raw(""));
     }
@@ -1027,6 +1110,65 @@ fn field_display(
                 },
             )
         }
+        // NIAH (C1) ladders: the raw buffer is shown (live edit feedback).
+        // A blank buffer shows the built-in default; a non-blank buffer that
+        // fails to parse is flagged (warn) until it is valid.
+        Field::NiahContexts => {
+            let text = c.niah_contexts_text.trim();
+            (
+                "NIAH contexts".to_string(),
+                if text.is_empty() {
+                    NIAH_SIZES
+                        .iter()
+                        .map(|n| human_size(*n))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    text.to_string()
+                },
+                if text.is_empty() || parse_niah_contexts(text).is_some() {
+                    style::value(th)
+                } else {
+                    style::value_warn(th)
+                },
+            )
+        }
+        Field::NiahDepths => {
+            let text = c.niah_depths_text.trim();
+            (
+                "NIAH depths".to_string(),
+                if text.is_empty() {
+                    NIAH_DEPTHS
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    text.to_string()
+                },
+                if text.is_empty() || parse_niah_depths(text).is_some() {
+                    style::value(th)
+                } else {
+                    style::value_warn(th)
+                },
+            )
+        }
+        Field::NiahCustom => {
+            let text = c.niah_custom_text.trim();
+            (
+                "NIAH custom size".to_string(),
+                if text.is_empty() {
+                    "off".to_string()
+                } else {
+                    text.to_string()
+                },
+                if text.is_empty() || parse_size(text).is_some() {
+                    style::value(th)
+                } else {
+                    style::value_warn(th)
+                },
+            )
+        }
     }
 }
 
@@ -1070,6 +1212,16 @@ fn parse_rate(s: &str) -> f64 {
     } else {
         DEFAULT_RATE_KWH
     }
+}
+
+/// `true` for a character the NIAH (C1) size / depth text buffers accept:
+/// ASCII digits, `k`/`M` (any case), a comma, or a space. A single shared
+/// superset filter is the safe, lenient choice (design decision §4.6): a
+/// `k`/`M` typed into the *depths* buffer simply fails `parse_niah_depths`
+/// and falls back to the built-in default ("a typo never silently shrinks
+/// the matrix"), rather than a hard error.
+fn is_niah_size_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, 'k' | 'K' | 'm' | 'M' | ',' | ' ')
 }
 
 /// The user's **live** `$/kWh` rate from the Config form (read at render
