@@ -477,6 +477,7 @@ impl ConfigState {
     /// defaults resolution. Returns the written path.
     pub fn save(&mut self) -> Result<PathBuf, String> {
         let ladder = parse_ladder(&self.ladder).filter(|l| !l.is_empty());
+        let (niah_contexts, niah_depths, niah_custom) = self.parsed_niah();
         let file = ConfigFile {
             url: Some(self.url.trim().to_string()),
             model: Some(self.model.trim().to_string()),
@@ -527,12 +528,16 @@ impl ConfigState {
             // and persisted so it survives into the next launch via the
             // normal CLI > env > file > default resolution.
             rate_per_kwh: Some(parse_rate(&self.rate_text)),
-            // The NIAH (C1) ladders are CLI/env concerns (Issue #5) — the
-            // form has no inputs for them, so they are persisted as absent
-            // (`null` → `None` on reload → the built-in defaults apply).
-            niah_contexts: None,
-            niah_depths: None,
-            niah_custom: None,
+            // The NIAH (C1) ladders are first-class form fields (Issue #5):
+            // `F2` persists the *parsed* values (blank/invalid → the built-in
+            // defaults, via the shared `parsed_niah` helper) so an edited
+            // ladder survives into the next launch through the normal
+            // CLI > env > file > default resolution. (Previously these were
+            // hard-coded `None`, so an `F2` wiped a file-set ladder back to
+            // the defaults — that trap is now resolved.)
+            niah_contexts: Some(niah_contexts),
+            niah_depths: Some(niah_depths),
+            niah_custom,
             // The C1/C3 generation budgets (R3) are CLI/env concerns — the
             // form has no inputs for them, so they are persisted as absent
             // (the built-in safety-net defaults apply on reload).
