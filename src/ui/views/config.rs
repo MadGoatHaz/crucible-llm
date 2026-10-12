@@ -406,6 +406,23 @@ impl ConfigState {
         }
     }
 
+    /// Parse the three NIAH (C1) text buffers into their resolved values,
+    /// with the lenient invalid/empty → built-in-default fallback (mirrors
+    /// the `ladder` / rate policy: a typo never shrinks the matrix, and a
+    /// blank / zero custom size means "run the full ladder"). Shared by
+    /// [`to_config`] (the run path) and [`save`] (the persist path) so the
+    /// two can never drift (design decision §4.5).
+    fn parsed_niah(&self) -> (Vec<u32>, Vec<u8>, Option<u32>) {
+        let niah_contexts = parse_niah_contexts(&self.niah_contexts_text)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| NIAH_SIZES.to_vec());
+        let niah_depths = parse_niah_depths(&self.niah_depths_text)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| NIAH_DEPTHS.to_vec());
+        let niah_custom = parse_size(&self.niah_custom_text).filter(|n| *n > 0);
+        (niah_contexts, niah_depths, niah_custom)
+    }
+
     /// Turn the form back into a [`Config`] (the run path: `F5` / `r`).
     pub fn to_config(&self) -> Config {
         let ladder = parse_ladder(&self.ladder)
@@ -446,6 +463,10 @@ impl ConfigState {
             .map(PathBuf::from);
         cfg.theme = self.theme.clone();
         cfg.rate_per_kwh = parse_rate(&self.rate_text);
+        let (niah_contexts, niah_depths, niah_custom) = self.parsed_niah();
+        cfg.niah_contexts = niah_contexts;
+        cfg.niah_depths = niah_depths;
+        cfg.niah_custom = niah_custom;
         cfg
     }
 
