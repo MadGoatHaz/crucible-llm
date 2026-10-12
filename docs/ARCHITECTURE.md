@@ -84,7 +84,7 @@ All engines use the OpenAI-compatible `/v1/chat/completions` endpoint with `stre
 }
 ```
 
-plus **conditional fields** the engines opt into: `chat_template_kwargs: {"enable_thinking": false}` (vLLM / SGLang / LM Studio), `think: false` (Ollama), and a trailing `/no_think` in the message (llama.cpp) — the per-backend chain-of-thought suppression used by C1/C2/C3; `response_format` (C3's `json_schema` object, or the flagged `json_object` hint fallback); and `ignore_eos` (Engine F's 60-second window). Backends that don't recognize a field drop it — graceful, per the OpenAI spec.
+plus **conditional fields** the engines opt into: `chat_template_kwargs: {"enable_thinking": false}` (vLLM / SGLang / LM Studio), `think: false` (Ollama), and a trailing `/no_think` in the message (llama.cpp) — the per-backend chain-of-thought suppression used by C1/C2/C3. In **C1 and C3** this suppression is a **best-effort speed optimization, not a correctness dependency**: backends that don't recognize a field drop it (graceful, per the OpenAI spec), and a *config-only* server (reasoning controlled at startup, e.g. `--reasoning off`) silently ignores the per-request fields — which is why the **generation budget (`max_tokens`), honored by every server, carries the correctness guarantee** (the hybrid design; see Engines C1/C3 below). C2 sends the same suppression (its challenges benefit from CoT, and it keeps its 512-token budget). Also opt-in: `response_format` (C3's `json_schema` object, or the flagged `json_object` hint fallback); and `ignore_eos` (Engine F's 60-second window).
 
 Requests are sent via `reqwest` (a connection-pooled HTTP client). For local endpoints (plain HTTP), this is HTTP/1.1 with chunked transfer encoding. For remote endpoints (TLS), this is HTTP/2. The server responds with Server-Sent Events (SSE) — one `data:` frame per token (or token group), terminated by `data: [DONE]`.
 
@@ -294,14 +294,17 @@ For each cell:
    - The needle sentence is inserted at the depth position: `IMPORTANT: the secret code is {value}. Remember the secret code exactly as written.`
    - The retrieval query is appended: `What is the secret code? Answer with the value only.`
 
-3. **Send the full document as a single streaming request** (`max_tokens: 64` — the answer is the value only, so a short budget keeps the matrix fast), with the model's chain-of-thought **suppressed** (per-backend: `chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp; a graceful no-op elsewhere)
+3. **Send the full document as a single streaming request** with a **per-cell generation budget** — default **2048 tokens** (`NIAH_MAX_GEN_TOKENS`; overridable via `--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config file). The needle answer is ~15 tokens, so where a server honors suppression the budget is a rarely-hit ceiling (the matrix stays fast); where it doesn't, the budget is headroom for the model's chain-of-thought *before* the answer. The request also carries the model's chain-of-thought **suppression** (per-backend: `chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp; a graceful no-op elsewhere) — a **best-effort speed optimization, not a correctness dependency** (a config-only server silently drops these per-request fields, per the OpenAI spec; `/no_think` is unreliable on newer Qwen — so correctness rests on the budget, which every server honors)
 
-4. **Check retrieval on the visible answer only**: does the *content* span (reasoning deltas deliberately excluded) contain the exact 33-character needle value? Strict substring match — no fuzzy matching. A one-character difference is a failure; a needle that appears only in the model's CoT is not a retrieval. This is what makes the engine correct on reasoning models (before the suppression, a reasoning model spent its entire 64-token budget on CoT and false-failed ~65 % of cells it could actually answer).
+4. **Check retrieval on the visible answer only**: does the *content* span (reasoning deltas deliberately excluded) contain the exact 33-character needle value? Strict substring match — no fuzzy matching. A one-character difference is a failure; a needle that appears only in the model's CoT is not a retrieval. This is what makes the engine correct on reasoning models: in v0.1.4 the 64-token budget meant a suppression-ignoring model spent it all on CoT and false-failed ~65 % of the cells it could actually answer; the hybrid design (a budget sized to carry CoT *and* answer, plus the `truncated_by_reasoning` outcome) removes that false-negative class while keeping the content-only check.
 
 5. **Record TTFT and prefill throughput** (`prompt_tokens / TTFT`) for the cell
 
-6. **Classify the cell** (after the full matrix is complete):
-    - **Failed (red)**: retrieval missed, or no TTFT recorded
+6. **Classify the cell** (after the full matrix is complete). The **retrieval outcome** is a three-way split:
+    - **Retrieved**: the content span contains the needle value
+    - **`truncated_by_reasoning`** (the TUI's `◌` marker): the stream **completed OK** but spent its entire budget on chain-of-thought (≥ 1 CoT frame, **zero** content frames) — an *inconclusive (budget)* over-thinker, **not** a retrieval failure. It is excluded from the pass-rate denominator and reported separately: terminal (`X retrieved, Y truncated-by-reasoning`), `--json` (top-level count, per-cell flag, per-cell `reasoning_tokens`), the `needle_evaluations.truncated_by_reasoning` DB column, and the TUI grid. (A genuine transport/HTTP failure is a *fail*, never `truncated_by_reasoning` — the frame rule is gated on the stream completing OK.)
+    - **Failed (red `✗`)**: content was committed but the needle is not in it, or no TTFT recorded
+    and the **prefill state** is a separate axis (the TUI's color):
     - **Nominal (green)**: retrieval succeeded, and TTFT is within 2× the linear expectation (anchored on the smallest context size at the same depth)
     - **Throttled (yellow)**: retrieval succeeded, but TTFT exceeds 2× the linear expectation — the server is struggling with the context length
     - **No-baseline flag**: an accurate *larger* cell whose smallest-size baseline failed (no TTFT to anchor against) is flagged `no_baseline` — distinct from a confirmed-healthy Nominal, so a missing baseline never masks real prefill degradation
@@ -335,6 +338,8 @@ A bank of **13 self-contained challenges** across three categories:
 
 All challenges run with the model's chain-of-thought **suppressed** (the same per-backend switch as C1), and the checkers judge the **committed answer span only** — the accumulated *content* deltas. A model that *thinks* the answer into its CoT is not credited, and a chatty "yes, but actually no" tail cannot flip the verdict.
 
+C2 is **deliberately left out of the hybrid budget design** (which covers C1/C3): its challenges (math / logic / code) genuinely *benefit* from chain-of-thought — 12/13 solve cleanly with thinking on — so it keeps its fixed **512-token** budget (`REASONING_MAX_GEN_TOKENS`), comfortably covering think *and* answer, with no `truncated_by_reasoning` bucket and no configurable budget flag.
+
 Each challenge has exactly one correct answer, validated by a **strict, deterministic checker**:
 
 - **Math**: solved when the expected value matches the *first* number in the answer span, or appears *whole* anywhere in it (tolerance: 1e-6). The old "last number wins" rule false-failed valid chatty answers.
@@ -363,7 +368,9 @@ Can you trust the model to follow format instructions? Critical for API integrat
 
 ### Methodology
 
-**4 runs total**: one free-form baseline + three constrained cases of escalating complexity.
+**4 runs total**: one free-form baseline + three constrained cases of escalating complexity. Every run carries a **per-run generation budget** — default **4096 tokens** (`STRUCTURED_MAX_GEN_TOKENS`; overridable via `--structured-max-tokens` / `CRUCIBLE_STRUCTURED_MAX_TOKENS` / the config file).
+
+**Hybrid reasoning (same design as C1).** The budget is the **correctness guarantee**: the JSON answer itself is small (the largest case, Complex, needs well under 200 tokens, and is further constrained by the strict schema), so 4096 is headroom for a reasoning model's chain-of-thought *before* the JSON on servers that ignore the best-effort `disable_thinking` suppression (a config-only server silently drops the per-request fields, per the OpenAI spec — `max_tokens`, in contrast, is honored by every server). Content-only accumulation is kept: the checker judges the visible span. A stream that exhausts the budget in CoT with zero content is the distinct `Truncated` verdict below — an honest *inconclusive (budget)*, never a false capability failure. The server-reported `reasoning_tokens` and the `truncated_by_reasoning` flag are carried per case in the `--json` `structured` section.
 
 Each constrained run sends a `response_format` directive in the request body: a real schema constraint — `response_format: { "type": "json_schema", "json_schema": {…} }` carrying the case's **strict** schema (`strict: true`, `additionalProperties: false` on every object) — which engages server-side **constrained decoding** (vLLM XGrammar, Outlines, GBNF) to restrict the token space to the schema. The shared request path encodes the object verbatim (Phase 1, CF-08). If a transport cannot encode the object, C3 falls back to the softer `response_format: { "type": "json_object" }` *hint* and flags it: `json_object` is **not** a grammar constraint — it biases the model toward emitting JSON, but several backends (llama.cpp, TGI) **drop the field entirely** and OpenAI/vLLM treat it as basic JSON mode, not schema enforcement. The result and summary line **flag which mode was used** (`json_schema` vs. `json_object hint`), so a ~0% "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
 
@@ -380,6 +387,7 @@ Each case is classified:
 - **Compliant**: valid JSON *and* schema-correct (every check passes — "valid JSON" and "schema-correct" are reported as separate rates, so a response that parses but violates the schema is not silently counted as compliant)
 - **Partial**: valid JSON, but one or more schema checks fail (e.g., wrong array length, missing field, bad type)
 - **Failed**: not valid JSON (cannot be evaluated further)
+- **Truncated** (`truncated_by_reasoning`): the stream completed OK but the budget was exhausted in chain-of-thought (all-CoT, zero content) — an *inconclusive (budget)* outcome reported separately from the compliance score (it counts in none of the three, and a truncated case is never penalized in the speed calculation)
 
 A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in code fences). Integer fields accept a finite float with a zero fraction (`36.0` is a valid integer answer — not false-failed).
 
@@ -395,6 +403,8 @@ A ` ```json ` fence is stripped before parsing (models commonly wrap JSON in cod
 | **2/3 compliant** | ⚠ Suitable for simple structures, unreliable for complex schemas. Add output validation. |
 | **1/3 compliant** | ⚠ Limited use — only trivial key-value extraction. |
 | **0/3 compliant** | ✗ Not suitable for structured output. The model produces free text regardless of instructions. Requires output parsing/fallback. |
+
+If **all** cases are `truncated_by_reasoning` (the model never commits visible content within the budget), the result is *inconclusive (budget)* — **not** a 0/3 capability verdict: raise `--structured-max-tokens` and re-run. The TUI renders an all-truncated result amber, not red.
 
 The **speed penalty** tells you the cost of the constraint in use (see the mode flag in the summary line): a +5% penalty is negligible; a +30% penalty is significant for high-throughput deployments. A ~0% penalty in `json_object`-hint mode means the backend ignored the directive, **not** that constrained decoding is free.
 

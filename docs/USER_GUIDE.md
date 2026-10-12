@@ -58,6 +58,8 @@ No GPU? Engine D is disabled automatically. No N/A panels.
 |---------|---------|
 | Target tokens | `10000` |
 | Concurrency ladder | `1, 2, 3, 4, 8, 12, 16, 24, 32` |
+| C1 (NIAH) per-cell budget | `2048` tokens (`--niah-max-tokens`) |
+| C3 (Structured) per-run budget | `4096` tokens (`--structured-max-tokens`) |
 | Engines | A (Speed), B (Concurrency), C1 (NIAH), C2 (Reasoning), C3 (Structured), F (Flat Out) |
 | Engine D (Energy) | **auto** — on when a GPU is detected (NVIDIA/AMD/Intel), off when not; explicit engine selection always wins. Must run on the GPU machine. |
 | Mode | `short` |
@@ -113,6 +115,7 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 
 ### Reading the NIAH View (View 3)
 - **Matrix**: Rows = context size (the configured ladder — default 2k→128k), shows pass rate
+- **Cell markers**: `●` retrieved (green = nominal prefill, yellow = throttled prefill) · `✗` retrieval failed (red) · `◌` truncated by reasoning (an over-thinker that spent its whole budget on CoT — *inconclusive*, not a failure) · `···` not run
 - **Colors**: Green ≥80%, Yellow 50-79%, Red <50%
 - **Verdict**: "Reliable up to ~Xk tokens"
 - **Labels**: sizes read `Nk` (or `1M`, `2M`, …) via the shared size formatter; without a `--tokenizer` each size carries the `(approx.)` qualifier (the haystack is a `chars/4` estimate)
@@ -252,6 +255,24 @@ The C1 matrix's context sizes and needle depths are **runtime-configurable** (de
 | `--niah-contexts <CSV>` | `--niah-contexts 16k,64k,256k` | Replace the context-size ladder (`0` is not allowed — a haystack must be a positive size) |
 | `--niah-depths <CSV>` | `--niah-depths 0,50,100` | Replace the needle-depth ladder (percentages 0–100) |
 | `--niah-custom <SIZE>` | `--niah-custom 256k` | Single-size "count test" at exactly that context, across the depth ladder — **takes precedence** over `--niah-contexts` |
+| `--niah-max-tokens <N>` | `--niah-max-tokens 4096` | C1's per-cell generation budget (the hybrid-reasoning safety net; default `2048`) |
+| `--structured-max-tokens <N>` | `--structured-max-tokens 8192` | C3's per-run generation budget (the hybrid-reasoning safety net; default `4096`) |
+| `--no-disable-thinking` | `--no-disable-thinking` | Force-test: stop requesting CoT suppression, so the `truncated_by_reasoning` safety net can be exercised live (pair with a tiny budget, e.g. `--niah-max-tokens 32`) |
+
+### Hybrid reasoning: the budget is the correctness guarantee
+
+C1 and C3 use a **hybrid** design for reasoning models (C2 is deliberately left alone — see below):
+
+- **The generation budget (`max_tokens`) is the correctness guarantee.** It is the one per-request knob that *every* OpenAI-compatible server honors. If the model thinks, the budget gives it room to finish its chain-of-thought *and* commit the answer.
+- **`disable_thinking` is a best-effort speed optimization, not a correctness dependency.** Crucible asks each backend to suppress CoT (`chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp). Where a server honors it, the model answers without CoT and the budget is a rarely-hit ceiling — the matrix stays fast. **Config-only** servers (reasoning control set at startup only) **silently drop** the per-request fields, per the OpenAI spec, and `/no_think` is unreliable on newer Qwen — so correctness can never depend on suppression. Where it is ignored, the budget is the safety net.
+- **Content-only scoring is kept:** C1 checks retrieval on the visible answer only, and C3 parses the visible span — a needle or answer that appears only in the CoT is never credited.
+- **`truncated_by_reasoning` — a distinct outcome, not a failure.** A stream that completes OK but spends its entire budget on chain-of-thought (all-CoT, zero content) is reported `truncated_by_reasoning` — an honest *inconclusive (budget)*: the model is an over-thinker, not a model without the capability. It is excluded from the pass-rate / compliance denominator and surfaces in:
+  - **Terminal** — `[C1] 3/11 retrieved, 2 truncated-by-reasoning (27.3%)` and `[C3] … 3/3 schema, 1 truncated_by_reasoning`
+  - **`--json`** — a top-level `truncated_by_reasoning` count, a per-cell / per-case flag, and the server-reported `reasoning_tokens` per cell / per case (`null` when the backend reports no usage block)
+  - **SQLite** — the `needle_evaluations.truncated_by_reasoning` column (C1) and the C3 headline in the session's `engine_results`
+  - **TUI** — a `◌` marker in the NIAH grid (View 3), distinct from the red `✗` of a genuine miss, and an amber "truncated by reasoning" note in the C3 detail on the Live view
+- **Layering:** both budgets resolve **CLI > env (`CRUCIBLE_NIAH_MAX_TOKENS` / `CRUCIBLE_STRUCTURED_MAX_TOKENS`) > config file (`niah_max_tokens` / `structured_max_tokens`) > default (2048 / 4096)**.
+- **C2 (Reasoning) is deliberately left alone** — its 13 challenges genuinely *benefit* from chain-of-thought (12/13 solve cleanly with thinking on), so it keeps its fixed 512-token budget, with no `truncated_by_reasoning` bucket.
 
 ```bash
 # A focused probe of one large window (e.g. a RoPE/YaRN-extended context):

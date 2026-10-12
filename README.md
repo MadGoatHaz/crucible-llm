@@ -7,7 +7,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-green?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](./LICENSE)
 [![Binary](https://img.shields.io/badge/binary-static%20%C2%B7%20zero--deps-green)](https://crates.io/)
-[![Tests](https://img.shields.io/badge/tests-919%20green-brightgreen)](#)
+[![Tests](https://img.shields.io/badge/tests-967%20green-brightgreen)](#)
 
 </div>
 
@@ -207,6 +207,8 @@ CLI flag  >  environment variable  >  config file  >  built-in default
   "matrix_contexts": [0, 8000, 32000],
   "hardware": true,
   "theme": "cyberpunk",
+  "niah_max_tokens": 2048,
+  "structured_max_tokens": 4096,
   "engines": {
     "speed": true, "concurrency": true, "niah": true,
     "reasoning": true, "structured": true, "flatout": true,
@@ -217,7 +219,7 @@ CLI flag  >  environment variable  >  config file  >  built-in default
 
 ### Environment Variables
 
-Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`, `CRUCIBLE_NIAH_CONTEXTS`, `CRUCIBLE_NIAH_DEPTHS`, `CRUCIBLE_NIAH_CUSTOM`, `CRUCIBLE_RATE_KWH`. (The last four have no CLI flag — the NIAH ladders and the $/kWh rate are layered from env / config file only.)
+Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`, `CRUCIBLE_NIAH_CONTEXTS`, `CRUCIBLE_NIAH_DEPTHS`, `CRUCIBLE_NIAH_CUSTOM`, `CRUCIBLE_NIAH_MAX_TOKENS`, `CRUCIBLE_STRUCTURED_MAX_TOKENS`, `CRUCIBLE_RATE_KWH`. (The NIAH ladders and the $/kWh rate have no CLI flag — they are layered from env / config file only. `--no-disable-thinking` is the reverse: a CLI-only force-test switch with no env / config-file layer.)
 
 ### CLI Reference
 
@@ -243,6 +245,9 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--niah-contexts <CSV>` | `2k,4k,8k,16k,32k,64k,128k` | Engine C1's context-size ladder (`k`/`M` suffixes; `0` not allowed), e.g. `16k,64k,256k,1M`. |
 | `--niah-depths <CSV>` | `0,10,…,100` (step 10) | Engine C1's needle-depth ladder (percentages 0–100), e.g. `0,50,100`. |
 | `--niah-custom <SIZE>` | — | Engine C1 single-size "count test" at exactly that context (e.g. `256k`, `1M`) across the depth ladder — probes a RoPE/YaRN-extended limit; takes precedence over `--niah-contexts`. |
+| `--niah-max-tokens <N>` | `2048` | Engine C1 per-cell generation budget (the hybrid-reasoning safety net, `max_tokens`): headroom for a verbose reasoner to finish its chain-of-thought *and* commit the ~15-token needle answer. A tiny value force-tests the `truncated_by_reasoning` outcome. |
+| `--structured-max-tokens <N>` | `4096` | Engine C3 per-run generation budget (the hybrid-reasoning safety net, `max_tokens`): headroom for a reasoning model's chain-of-thought *before* the JSON answer, which is itself small (≤ ~200 tokens on the largest case). |
+| `--no-disable-thinking` | off | Force-test switch (CLI-only): stops the client from requesting C1/C3 chain-of-thought suppression — a *best-effort speed optimization* that config-only servers silently drop. With suppression off and a tiny budget, an over-thinker exhausts it mid-CoT and is reported `truncated_by_reasoning`, never a capability fail. |
 | `--no-hardware` | off | Disable the hardware/energy telemetry poller. |
 | `--export <fmt>` | — | Export the run: `json`, `md`, or `csv`. |
 | `--export-path <PATH>` | `data_dir()/exports/…` | Destination file for `--export`. |
@@ -285,7 +290,9 @@ Hides a unique random fact in a synthetic document and asks the model to retriev
 - 🟢 **Green ≥ 80 %** · 🟡 **Yellow 50–79 %** · 🔴 **Red < 50 %** (per context size).
 - **Runtime-configurable ladders** — `--niah-contexts` (e.g. `16k,64k,256k,1M`) and `--niah-depths` (e.g. `0,50,100`) replace the default ladders (`k`/`M` suffixes; layered CLI > env > config file > default). The **`--niah-custom <size>`** "count test" collapses the matrix to a **single size** at exactly that context across the depth ladder — the way to probe a RoPE/YaRN-extended limit well beyond the 128k default top.
 - **Scales well beyond 128k** — the haystack generator is unbounded (a 1M-token document builds in a few hundred ms); the practical ceiling is the server's max context, and an over-limit size degrades to a labeled per-cell HTTP 400 (no crash, never a silent zero).
-- **Reasoning-model correct:** each cell suppresses the model's chain-of-thought (per-backend switch) and checks retrieval on the **visible answer only** (strict substring of the 128-bit needle). A model that *thinks* the needle into its CoT cannot false-pass, and a reasoning model whose answer was previously buried in a 64-token CoT budget no longer false-fails — retrieval on reasoning models went from ~35 % (false-fail) to ~100 %.
+- **Hybrid-reasoning design:** the generation **budget is the correctness guarantee** — `max_tokens` is the one per-request knob every OpenAI-compatible server honors. Chain-of-thought suppression (`disable_thinking`) is a **best-effort speed optimization, not a correctness dependency**: config-only servers silently drop per-request reasoning fields (per the OpenAI spec), and `/no_think` is unreliable on newer Qwen — so correctness can never depend on suppression. The default per-cell budget is **2048 tokens** (`--niah-max-tokens`), with headroom for a verbose reasoner to finish its chain-of-thought *and* commit the ~15-token answer (v0.1.4's 64-token budget is what false-failed reasoning models at ~35 %).
+- **Content-only scoring (kept):** retrieval is checked on the **visible answer only** (strict substring of the 128-bit needle, reasoning deltas excluded) — a model that *thinks* the needle into its CoT cannot false-pass.
+- **`truncated_by_reasoning` — a distinct "over-thinker" outcome:** a stream that completes OK but spends its entire budget on chain-of-thought (all-CoT, zero content) is reported `truncated_by_reasoning` — an honest *inconclusive (budget)*, **not** a capability failure, and it is excluded from the pass-rate denominator. It surfaces in the terminal (`3/11 retrieved, 2 truncated-by-reasoning, …`), in `--json` (a top-level count plus a per-cell flag), in SQLite (`needle_evaluations.truncated_by_reasoning`), and in the TUI NIAH grid as a distinct `◌` marker (not the red `✗` of a genuine miss).
 - **Token-honest sizes** — without a `--tokenizer` the haystack is a `chars/4` estimate and every size reads `Nk (approx.)` (headless log, TUI NIAH grid, TUI Long Context bar, and the `--json` `niah` section alike); with one, sizes are exact.
 - Tells you the **maximum reliable context window** for RAG / long-document QA ("reliable up to" = largest size with ≥ 80 % pass rate), plus how prefill speed degrades as context grows. NIAH results are included in `--json` output (an additive `niah` section: accuracy, `reliable_up_to`, per-size recall, per-cell detail).
 
@@ -294,11 +301,13 @@ Hides a unique random fact in a synthetic document and asks the model to retriev
 - **13 deterministic challenges** (5 math, 5 logic, 3 code), each validated by a **strict checker** — no LLM-as-judge, no fuzzy scoring.
 - **Reasoning-model correct:** thinking is suppressed (per-backend) and the checkers judge the **committed answer span** (content only) — a chatty "I think… yes, but actually no" no longer flips a verdict, and a chain-of-thought that merely *contains* the answer is not credited.
 - **% solved** is a reproducible, cross-model indicator of raw problem-solving ability, reported alongside average decode speed (the *content/answer-phase* rate).
+- **Deliberately left out of the hybrid budget design:** the 13 challenges genuinely *benefit* from chain-of-thought (12/13 solve cleanly with thinking on), so C2 keeps its fixed **512-token** budget — comfortably covering think *and* answer — with per-backend suppression and content-only judging, and no `truncated_by_reasoning` bucket.
 
 ### Structured (Engine C3)
 
 A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-length array) → **Complex** (nested schema) — plus a free-form baseline to quantify the **grammar speed penalty**.
 
+- **Hybrid-reasoning design (same as C1):** the per-run generation **budget is the correctness guarantee** (default **4096 tokens**, `--structured-max-tokens`). The JSON answer itself is small (the largest case needs well under 200 tokens, and is further constrained by the strict schema); the budget is headroom for a reasoning model's chain-of-thought *before* the JSON on servers that ignore the best-effort `disable_thinking` suppression. Content-only accumulation is kept — the checker judges the visible span. A stream that exhausts the budget in CoT with zero content is the distinct **`truncated_by_reasoning`** verdict (`Truncated`) — an honest *inconclusive (budget)*, reported separately from the compliance score (`3/3 schema, 1 truncated_by_reasoning`), never a capability failure.
 - **Real constrained decoding:** where the transport supports it, each constrained run sends `response_format: { "type": "json_schema", "json_schema": { name, schema, strict: true } }` (strict schemas, `additionalProperties: false` on every object) — engaging the server's constrained-decoding engine (vLLM XGrammar, Outlines, GBNF). Backends that cannot carry the object fall back to the softer `response_format: { "type": "json_object" }` **hint**, and the result **flags which mode was used** (`json_schema (constrained decoding)` vs `json_object hint`) — so a ~0 % "penalty" on a hint-dropping backend is never misread as "constrained decoding is free".
 - The **speed penalty** is reported only when the constraint was *effective* (the constrained run produced valid JSON); otherwise it reads "penalty N/A (constraint not effective)".
 - **Verdict:** `3/3` fully suitable for API/agent use · `2/3` simple-only · `1/3` trivial key-value only · `0/3` not suitable (needs parsing/fallback).
@@ -328,7 +337,7 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 | Run logs | `~/.local/share/crucible/logs/latest.log` (+ `run-<timestamp>-<session-id[:8]>.log` archives) |
 | Config file | `~/.config/crucible/config.json` |
 
-**Every run is traceable end-to-end.** Each run gets a session UUID that stamps the `benchmark_sessions` row, the run-log archive name, and the default export filename — the three join deterministically. The session row records **which engines ran** (`engines` column) and the **headline result of every non-stream engine** (`engine_results`: B's sweet spot, C2's score, C3's compliance/penalty, D's energy, F's throughput); Engine A persists per-run `stream_metrics` (including `reasoning_tokens`) and C1 persists per-cell `needle_evaluations`. So a stored run carries the complete picture — not just A + C1. Exports (JSON/MD/CSV) are equally complete: the energy object, the prefill/latency split, the dual per-stream denominators, NIAH reliability, and `reasoning_tokens` all make it out. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
+**Every run is traceable end-to-end.** Each run gets a session UUID that stamps the `benchmark_sessions` row, the run-log archive name, and the default export filename — the three join deterministically. The session row records **which engines ran** (`engines` column) and the **headline result of every non-stream engine** (`engine_results`: B's sweet spot, C2's score, C3's compliance/penalty, D's energy, F's throughput); Engine A persists per-run `stream_metrics` (including `reasoning_tokens`) and C1 persists per-cell `needle_evaluations` (including the `truncated_by_reasoning` flag). So a stored run carries the complete picture — not just A + C1. Exports (JSON/MD/CSV) are equally complete: the energy object, the prefill/latency split, the dual per-stream denominators, NIAH reliability, and `reasoning_tokens` all make it out. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
 
 ---
 

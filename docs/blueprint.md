@@ -147,7 +147,7 @@ A fast model is useless if speed comes at the expense of context retention or re
 #### 1. Needle-In-A-Haystack (NIAH) Context Retainer
 * Automatically generates synthetic long-context documents dynamically scaled to $2\text{k}, 4\text{k}, 8\text{k}, 16\text{k}, 32\text{k}, 64\text{k},$ or $128\text{k}$ tokens.
 * Inserts a unique, cryptographically random key-value fact ("needle" — a 128-bit value rendered `{16 hex}-{16 hex}`) at customizable depths ($0\%$ to $100\%$ in $10\%$ intervals): 7 sizes × 11 depths = 77 cells, run sequentially.
-* **Reasoning-model correct:** each cell suppresses the model's chain-of-thought (a per-backend switch — `chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp; graceful no-op elsewhere) and checks retrieval **on the visible answer only** (strict substring of the needle value). A model that merely *mentions* the value in its CoT cannot false-pass; a reasoning model whose answer used to be buried in a 64-token CoT budget no longer false-fails (retrieval on reasoning models went from ~35 % false-fail to ~100 %).
+* **Hybrid-reasoning design (the budget is the correctness guarantee):** each cell runs under a **configurable generation budget** (default **2048 tokens** — `--niah-max-tokens` / `CRUCIBLE_NIAH_MAX_TOKENS` / the config file) and checks retrieval **on the visible answer only** (strict substring of the needle value; reasoning deltas excluded). A model that merely *mentions* the value in its CoT cannot false-pass. The per-backend chain-of-thought suppression (`chat_template_kwargs.enable_thinking=false` for vLLM/SGLang/LM Studio, `think=false` for Ollama, a trailing `/no_think` for llama.cpp; graceful no-op elsewhere) is a **best-effort speed optimization, not a correctness dependency**: config-only servers silently drop the per-request reasoning fields (per the OpenAI spec) and `/no_think` is unreliable on newer Qwen — so `max_tokens`, which every server honors, carries correctness. A stream that completes OK but spends its entire budget on chain-of-thought (all-CoT, zero content) is the distinct **`truncated_by_reasoning`** outcome — an *inconclusive (budget)* over-thinker, **not** a capability failure — surfaced in the terminal, `--json` (count, per-cell flag, per-cell `reasoning_tokens`), the `needle_evaluations` DB column, and the TUI grid's `◌` marker. History: v0.1.4's 64-token budget with load-bearing suppression false-failed ~35 % of reasoning-model cells; the hybrid removed that false-negative class.
 * Measures two factors simultaneously:
   1. **Accuracy:** Does the model retrieve the needle cleanly? Per-size pass rates, color-coded green ≥ 80 % / yellow 50–79 % / red < 50 %, and a "reliable up to" threshold (largest size with ≥ 80 % pass rate).
   2. **Prefill Degradation:** Measures the decay curve of prefill processing speed (`prompt_tokens / TTFT` per cell) as context length scales up; a cell is *throttled* (yellow) when its TTFT exceeds 2× the linear expectation anchored on the smallest context size at the same depth.
@@ -155,11 +155,13 @@ A fast model is useless if speed comes at the expense of context retention or re
 #### 2. Deterministic Reasoning & Code Verification
 * Runs a standardized bank of **13 self-contained challenges** (5 math, 5 logic, 3 code), each with exactly one correct answer.
 * Validates responses against **strict, deterministic, pure-`std` checkers** (no regex or parser crates, no LLM-as-judge): math by numeric-value match, logic by whole-word yes/no verdict, code by structural markers and balanced-delimiter checks. The checkers judge the **committed answer span only** (content deltas; chain-of-thought is suppressed per-backend and excluded), so chatty answers cannot flip a verdict and CoT-only output is not credited. A deterministic pass/fail accuracy score is reported alongside the answer-phase decode speed.
+* **Deliberately left out of the hybrid budget design:** C2's challenges genuinely *benefit* from chain-of-thought (12/13 solve cleanly with thinking on), so it keeps its fixed **512-token** budget with no `truncated_by_reasoning` bucket — unlike C1/C3, where the budget carries the correctness guarantee.
 
 #### 3. Structured Output & JSON Grammar Compliance
 * One free-form baseline plus three escalating schema cases (flat object → fixed-length array → nested schema), scored field-by-field (valid JSON, schema shape, fields, types).
 * Where the transport supports it, each constrained run sends a **real** `response_format: { "type": "json_schema", "json_schema": { …, "strict": true } }` object — engaging the server's constrained-decoding engine (vLLM XGrammar, Outlines, GBNF) to restrict the token space to the schema. Backends that cannot carry the object fall back to the softer `json_object` *hint*, and the result **flags which mode was used** — a ~0 % "penalty" on a hint-dropping backend is reported as "no constraint was applied", never as "constrained decoding is free".
 * Quantifies the performance penalty of the constraint in use (free-form vs. constrained decode speed), reported only when the constraint was effective (the constrained run produced valid JSON).
+* **Hybrid reasoning (same design as C1):** a **per-run generation budget** (default **4096 tokens** — `--structured-max-tokens` / `CRUCIBLE_STRUCTURED_MAX_TOKENS` / the config file) is the correctness guarantee — headroom for a reasoning model's chain-of-thought *before* the (small, strict-schema-constrained) JSON on servers that ignore the best-effort `disable_thinking` suppression. Content-only accumulation keeps judging the visible span. A stream that exhausts the budget in CoT with zero content is the distinct **`truncated_by_reasoning`** verdict — *inconclusive (budget)*, reported separately from the compliance score, per case in `--json` (with the server-reported `reasoning_tokens`).
 
 ---
 
@@ -235,6 +237,7 @@ Bridges the gap between software performance and physical compute. **Linux-only 
   * Bright Green: Accurate retrieval + nominal prefill speed.
   * Yellow: Accurate retrieval with substantial prefill throttling.
   * Red: Needle retrieval failed (or no valid baseline at a smaller size — flagged distinctly).
+  * `◌` (info color): **`truncated_by_reasoning`** — the stream completed OK but spent its whole budget on chain-of-thought (all-CoT, zero content). An *inconclusive (budget)* over-thinker, distinct from red (a genuine retrieval failure).
 * Context sizes measured without a tokenizer are labeled `(approx.)` — never presented as exact.
 
 #### View 4: GPU & Power Monitor
@@ -315,6 +318,7 @@ CREATE TABLE needle_evaluations (
     context_length INTEGER,
     depth_percent REAL,
     retrieved_successfully BOOLEAN,
+    truncated_by_reasoning BOOLEAN,  -- hybrid reasoning: all-CoT / zero-content completion (inconclusive budget, not a failure)
     latency_ms REAL
 );
 ```
