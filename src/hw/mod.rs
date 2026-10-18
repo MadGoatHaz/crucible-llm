@@ -549,7 +549,13 @@ impl HwPoller {
     /// Arm a **new** benchmark run on the monitor: reset every accumulator
     /// and open the idle clock. The sequence executor calls this before the
     /// pre-load idle window.
+    ///
+    /// I6: the **run-scoped** energy accumulator resets here too — the
+    /// live "(this run)" gauge reads this counter, and a 2nd+ run in a
+    /// session must not be inflated by the 1st (before I6 the lifetime
+    /// cumulative survived `begin_run`).
     pub fn begin_run(&mut self) {
+        self.energy_joules = 0.0;
         self.load_energy_start = None;
         self.load_energy_end = None;
         self.monitor.begin_run();
@@ -682,11 +688,23 @@ impl HwPoller {
         &self.trace
     }
 
-    /// Live silicon efficiency for the UI gauge: cumulative joules ÷
+    /// Live silicon efficiency for the UI gauge: **run-scoped** joules ÷
     /// total tokens generated so far. `None` when no tokens yet (N/A —
     /// never a spurious `0.0`).
+    ///
+    /// I6: the numerator is the load-window slice when a window is open
+    /// (the same quantity the Engine D headline uses — the idle-window
+    /// raw draw before `start_load` is excluded), else the run cumulative
+    /// since [`Self::begin_run`] (which resets it). The old code used the
+    /// *lifetime* cumulative (since poller start), which `begin_run` never
+    /// reset — a 2nd+ run in a session showed an inflated "(this run)"
+    /// gauge.
     pub fn live_joules_per_token(&self, total_tokens: u64) -> Option<f64> {
-        (total_tokens > 0).then(|| self.energy_joules / total_tokens as f64)
+        (total_tokens > 0).then(|| {
+            self.load_window_joules()
+                .unwrap_or(self.energy_joules)
+                / total_tokens as f64
+        })
     }
 
     /// One 100 ms poll: read the GPU backend (if any) + CPU/RAM, advance
@@ -1229,6 +1247,54 @@ mod tests {
                 ..GpuSample::default()
             }
         }
+    }
+
+    /// I6: the live "(this run)" gauge is **run-scoped** — a 2nd run's
+    /// numerator is not inflated by the 1st: `begin_run` resets the
+    /// accumulator, and the gauge reads the load-window slice (the same
+    /// quantity Engine D uses) once a window is open.
+    #[test]
+    fn live_gauge_is_not_inflated_on_a_second_run() {
+        let mut p = HwPoller::new().with_capacity(1000);
+        let gpu = Some(GpuSample {
+            power_watts: Some(100.0),
+            ..Default::default()
+        });
+        // Run 1: a short load window at 100 W.
+        p.begin_run();
+        p.start_load();
+        for _ in 0..5 {
+            p.advance(&gpu);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        p.end_load();
+        let run1 = p.energy_joules;
+        assert!(run1 > 0.0, "run 1 integrated energy: {run1}");
+        let g1 = p.live_joules_per_token(1000).expect("tokens present");
+        assert!(
+            (g1 - run1 / 1000.0).abs() < 1e-9,
+            "gauge == run-1 energy / tokens: {g1}"
+        );
+
+        // Run 2: `begin_run` resets the run-scoped accumulator (the old
+        // bug: the lifetime cumulative carried run 1 forward)…
+        p.begin_run();
+        assert_eq!(p.energy_joules, 0.0, "the run-scoped accumulator is reset");
+        p.start_load();
+        for _ in 0..5 {
+            p.advance(&gpu);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        p.end_load();
+        let run2 = p.energy_joules;
+        assert!(
+            run2 > 0.0 && run2 < run1 * 1.5,
+            "run 2 is its own energy, not run1 + run2: {run2} (run1={run1})"
+        );
+        // …and the gauge reflects run 2 alone.
+        let g2 = p.live_joules_per_token(1000).expect("tokens present");
+        assert!((g2 - run2 / 1000.0).abs() < 1e-9, "gauge is run-scoped: {g2}");
+        assert!(g2 < g1 * 1.5, "the 2nd run's gauge is not inflated by the 1st");
     }
 
     /// F7: the idle-baseline accumulation lives in `advance` (shared by the
