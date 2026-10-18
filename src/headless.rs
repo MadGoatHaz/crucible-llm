@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::client::StreamEvent;
 use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::{joules_per_token, profile, EnergyResult};
-use crate::engines::sequence::sum_all_engines_tokens;
+use crate::engines::sequence::{speed_mean_tps, sum_all_engines_tokens};
 use crate::engines::speed::{
     all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
@@ -43,6 +43,7 @@ use crate::hw::{
     HW_POLL_INTERVAL_MS,
 };
 use crate::log::{Context, RunLogger};
+use crate::report::MatrixReport;
 use crate::storage::export::{self, ExportPayload, PacketSample};
 use crate::storage::{
     BenchmarkSession, ConcurrencySummary, Database, EnergySummary, EngineResults, FlatOutSummary,
@@ -115,6 +116,49 @@ pub fn headless_energy(hw: &Option<Arc<Mutex<HwPoller>>>, total_tokens: u64) -> 
     energy
 }
 
+/// The `--matrix-report` assembly: pure over the in-scope run variables
+/// (testable like [`headless_energy`] — the `println!` in
+/// [`run_headless`] is the only I/O in the flag's path).
+///
+/// The user fields (backend / quant / use case / notes) are left
+/// **empty** (the task spec): the block is a copy-pasteable starting
+/// point the user completes before submitting to
+/// <https://madgoathaz.github.io/llm-matrix/>.
+///
+/// - `gpu_name` / `gpu_count` — from the detected backend (the same
+///   sources the run's `--json` / DB persist; `None` / `0` on a
+///   driverless host — the honest RAM-only line).
+/// - `vram_total_mib` — **binary** MiB (the harvested trace's last
+///   sample, `vram_total_bytes ÷ 1024²`); `0` when the poller is off →
+///   the `vram` field is **blank** (the N/A rule), never a fabricated
+///   tier.
+/// - `ram_total_bytes` — a fresh `sysinfo` read (the caller).
+/// - `speed` — the real Engine A valid-mean `tg_speed`
+///   ([`speed_mean_tps`]); `0.0` when there are no valid runs → blank
+///   (never a silent `0`, never an estimate).
+#[must_use]
+pub fn headless_matrix_report(
+    cfg: &Config,
+    results: &[SpeedResult],
+    gpu_name: Option<&str>,
+    gpu_count: u32,
+    vram_total_mib: u64,
+    ram_total_bytes: u64,
+) -> MatrixReport {
+    MatrixReport::build(
+        gpu_name.unwrap_or(""),
+        gpu_count,
+        vram_total_mib,
+        ram_total_bytes,
+        &cfg.model,
+        speed_mean_tps(results),
+        "",
+        "",
+        "",
+        "",
+    )
+}
+
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
 /// and print the prototype's result box(es) / summary — or `--json` on
 /// stdout. Returns the process exit code (1 iff every run failed).
@@ -151,6 +195,10 @@ pub fn run_headless(
             return 1;
         }
     };
+    // `--matrix-report`: the (vendor-agnostic) GPU count, captured before
+    // `gpu` is moved into the poller below (the trait `poll_all`; NVML
+    // overrides per-device).
+    let gpu_count = gpu.as_ref().map(|g| g.poll_all().len() as u32).unwrap_or(0);
     // CF-40: the 100 ms hardware sampler runs for the whole headless run
     // **only when the hardware telemetry is enabled** (`--no-hardware` off,
     // or a selection that omits D). It runs on a **dedicated OS thread** —
@@ -638,7 +686,7 @@ pub fn run_headless(
             model_name: cfg.model.clone(),
             backend_type: None,
             quantization: None,
-            system_gpu: gpu_name,
+            system_gpu: gpu_name.clone(),
             total_duration_sec: Some(results.iter().map(|r| r.stream_time).sum()),
             // R2 (traceability): record which engines this run selected so
             // a stored session joins back to its run / log / export.
@@ -733,6 +781,35 @@ pub fn run_headless(
         // pure JSON.
         if let Some(v) = json_doc {
             println!("{v}");
+        }
+
+        // `--matrix-report`: print the `[COMMUNITY-SUBMISSION]` block on
+        // stdout (CI-pipeable via the non-TTY auto-fallback, main.rs — a
+        // pipe run is headless, so the block lands on the same stream).
+        // With `--json`, the JSON document prints *first*: the block's
+        // markers cannot appear inside the JSON, so a pipe consumer
+        // slices stdout on them. The user fields are left blank — the
+        // block is a copy-pasteable starting point.
+        if cfg.matrix_report {
+            // VRAM: the already-harvested trace's last sample
+            // (bytes → **binary** MiB) — empty when the poller is off
+            // (the honest blank, never a fabricated tier).
+            let vram_mib = hw_trace
+                .last()
+                .and_then(|s| s.vram_total_bytes)
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(0);
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let report = headless_matrix_report(
+                cfg,
+                &results,
+                gpu_name.as_deref(),
+                gpu_count,
+                vram_mib,
+                sys.total_memory(),
+            );
+            println!("{}", report.render());
         }
 
         // Prototype exit-code rule: all runs failed → exit 1.
@@ -1411,5 +1488,119 @@ mod tests {
         let desc3 = niah_size_desc(&cfg3);
         assert!(desc3.contains("32k"), "{desc3}");
         assert!(!desc3.contains("approx."), "{desc3}");
+    }
+
+    // ── `--matrix-report` assembly (the pure part of the flag) ──────────
+
+    /// A minimal Engine A result fixture (the report's speed-mean input).
+    fn speed_result(tg: f64, failed: bool, looping: bool) -> SpeedResult {
+        SpeedResult {
+            ttft: 0.2,
+            prompt_tokens: 100,
+            completion_tokens: if failed { 0 } else { 50 },
+            reasoning_tokens: None,
+            pp_speed: 1000.0,
+            tg_speed: tg,
+            mtp_efficiency: 1.0,
+            stream_time: 1.0,
+            total_chunks: 10,
+            content_chunks: 10,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "m".into(),
+            mode: "short".into(),
+            error: failed.then(|| "boom".to_string()),
+            looping,
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
+        }
+    }
+
+    #[test]
+    fn headless_matrix_report_assembles_the_block() {
+        let cfg = Config {
+            model: "test-model".to_string(),
+            ..Config::default()
+        };
+        // Valid mean of 45 + 55 = 50 (the failed + looping runs are
+        // excluded).
+        let results = vec![
+            speed_result(45.0, false, false),
+            speed_result(0.0, true, false),
+            speed_result(55.0, false, false),
+            speed_result(99.0, false, true),
+        ];
+        // 24576 MiB = 24 GiB (binary) → the `16-24` tier; 64 decimal GB
+        // RAM.
+        let r = headless_matrix_report(
+            &cfg,
+            &results,
+            Some("NVIDIA GeForce RTX 3080 Ti"),
+            1,
+            24576,
+            64 * 1_000_000_000,
+        );
+        assert_eq!(r.hardware, "1x NVIDIA GeForce RTX 3080 Ti 24GB + 64GB RAM");
+        assert_eq!(r.vram, "24GB — 16-24");
+        assert_eq!(r.model, "test-model");
+        assert_eq!(r.speed, "50 tok/s");
+        // The user fields are blank (the copy-pasteable starting point
+        // the user completes before submitting).
+        assert_eq!(r.backend, "");
+        assert_eq!(r.quant, "");
+        assert_eq!(r.use_case, "");
+        assert_eq!(r.notes, "");
+        // The exact block the `println!` emits (the parser contract:
+        // markers + 8 ordered lines + the 10-column value alignment).
+        let rendered = r.render();
+        assert!(rendered.ends_with('\n'), "trailing newline (file-friendly)");
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "[COMMUNITY-SUBMISSION]");
+        assert_eq!(
+            lines[1],
+            "hardware: 1x NVIDIA GeForce RTX 3080 Ti 24GB + 64GB RAM"
+        );
+        assert_eq!(lines[2], "vram:     24GB — 16-24");
+        assert_eq!(lines[3], "model:    test-model");
+        assert_eq!(lines[4], "backend:  ");
+        assert_eq!(lines[5], "quant:    ");
+        assert_eq!(lines[6], "speed:    50 tok/s");
+        assert_eq!(lines[7], "use_case: ");
+        assert_eq!(lines[8], "notes:    ");
+        assert_eq!(lines[9], "[/COMMUNITY-SUBMISSION]");
+    }
+
+    #[test]
+    fn headless_matrix_report_no_gpu_is_honest() {
+        let cfg = Config {
+            model: "test-model".to_string(),
+            ..Config::default()
+        };
+        // No GPU (name `None`, count 0), no VRAM telemetry, no runs.
+        let r = headless_matrix_report(&cfg, &[], None, 0, 0, 32 * 1_000_000_000);
+        assert_eq!(r.hardware, "32GB RAM", "RAM-only line, never a 1x …");
+        assert_eq!(r.vram, "", "no telemetry → blank (the N/A rule)");
+        assert_eq!(r.speed, "", "no runs → blank (never a silent 0)");
+        assert_eq!(r.model, "test-model");
+    }
+
+    #[test]
+    fn headless_matrix_report_speed_blank_when_no_valid_runs() {
+        let cfg = Config {
+            model: "m".to_string(),
+            ..Config::default()
+        };
+        // A failed run + a looping run: no *valid* runs → blank speed.
+        let results = vec![
+            speed_result(0.0, true, false),
+            speed_result(88.0, false, true),
+        ];
+        let r = headless_matrix_report(&cfg, &results, Some("G"), 1, 8192, 16 * 1_000_000_000);
+        assert_eq!(r.speed, "", "no valid runs → blank, never a silent 0");
+        // 8192 MiB = 8 GiB (binary) → the `≤16` tier.
+        assert_eq!(r.vram, "8GB — ≤16");
+        assert_eq!(r.hardware, "1x G 8GB + 16GB RAM");
     }
 }
