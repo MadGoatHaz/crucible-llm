@@ -2530,6 +2530,32 @@ mod tests {
     }
 
     #[test]
+    fn envelope_of_a_monotone_curve_is_the_peak_level() {
+        // The incident shape: a strictly rising aggregate curve (gains 79 /
+        // 55 / 21 % — all > 5 %, no plateau) has **no knee**, so the
+        // envelope is the peak-throughput level (the last / highest-
+        // concurrency level, 106 t/s @ 4).
+        let result = SweepResult::from_levels(
+            vec![
+                level(1, 31.6, 5.0),
+                level(2, 56.5, 6.0),
+                level(3, 87.3, 7.0),
+                level(4, 106.0, 8.0),
+            ],
+            None,
+        );
+        assert!(result.detect_knee().is_none(), "monotone curve has no knee");
+        let env = result.envelope().expect("envelope");
+        assert_eq!(env.sweet_spot, 4, "the peak (last) level");
+        assert!((env.aggregate_tps - 106.0).abs() < 1e-9);
+        // And the *practical* sweet spot is a different, lower value (1 —
+        // level 3 measures 87.3 / 3 = 29.1 t/s, missing the 29.4 bar by 0.3):
+        // the distinction the Flat Out fix turns on.
+        assert_eq!(result.usability().practical_sweet_spot, Some(1));
+        assert_ne!(env.sweet_spot, result.usability().practical_sweet_spot.unwrap());
+    }
+
+    #[test]
     fn relative_gain_and_spike_handle_zero_baselines() {
         assert_eq!(relative_gain(0.0, 100.0), f64::INFINITY);
         assert_eq!(relative_gain(0.0, 0.0), 0.0);

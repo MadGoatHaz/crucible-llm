@@ -1136,4 +1136,108 @@ mod tests {
         assert!(text.contains("100.0 t/s"), "per-stream at 1 user: {text}");
         assert!(text.contains("85.0 t/s"), "per-stream at 4 users: {text}");
     }
+
+    // ── the max-throughput relabel (the Flat Out definition fix) ────────
+
+    #[test]
+    fn matrix_flags_the_max_throughput_row_not_sweet() {
+        // The incident curve: practical sweet spot = 1, envelope (max-
+        // throughput) = 4. The matrix must flag the envelope row as
+        // "· MAX THROUGHPUT", not the old "· SWEET".
+        let app = crate::ui::app::App::new();
+        app.sweep.store(SweepResult::from_levels(
+            vec![
+                lvl(1, 31.6, 5.0),
+                lvl(2, 56.5, 6.0),
+                lvl(3, 87.3, 7.0),
+                lvl(4, 106.0, 8.0),
+            ],
+            None,
+        ));
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The envelope row (4) is flagged max-throughput.
+        assert!(
+            text.contains("· MAX THROUGHPUT"),
+            "matrix flags max throughput: {text}"
+        );
+        // The old "· SWEET" matrix flag is gone.
+        assert!(!text.contains("· SWEET"), "old SWEET matrix flag removed: {text}");
+        // No knee on a monotone curve → no KNEE flag.
+        assert!(!text.contains("· KNEE"), "no knee on a monotone curve: {text}");
+    }
+
+    #[test]
+    fn recommendation_panel_shows_both_practical_and_max_throughput() {
+        // The incident curve: practical = 1 (the hosting recommendation,
+        // kept) and max-throughput (envelope) = 4 (what Flat Out runs at).
+        // Both numbers sit on the same screen, each labelled as what it is.
+        let app = crate::ui::app::App::new();
+        app.sweep.store(SweepResult::from_levels(
+            vec![
+                lvl(1, 31.6, 5.0),
+                lvl(2, 56.5, 6.0),
+                lvl(3, 87.3, 7.0),
+                lvl(4, 106.0, 8.0),
+            ],
+            None,
+        ));
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The practical sweet spot (the hosting recommendation) is kept.
+        assert!(text.contains("Practical Sweet Spot"), "practical kept: {text}");
+        assert!(text.contains("1 concurrent users"), "practical = 1: {text}");
+        // The new max-throughput line (what Flat Out runs at) is distinct.
+        assert!(
+            text.contains("Flat Out runs at"),
+            "max-throughput line present: {text}"
+        );
+        assert!(
+            text.contains("4 streams (max throughput)"),
+            "max-throughput = 4: {text}"
+        );
+    }
+
+    #[test]
+    fn curve_legend_describes_the_max_throughput_point() {
+        // The curve legend now names the accent-coloured max-throughput
+        // point (distinct from the shared ◆ measured glyph and the ▲ knee).
+        let levels = vec![
+            lvl(1, 31.6, 5.0),
+            lvl(2, 56.5, 6.0),
+            lvl(3, 87.3, 7.0),
+            lvl(4, 106.0, 8.0),
+        ];
+        let env = SweepResult::from_levels(levels.clone(), None).envelope();
+        let lines = build_curve_lines(Theme::default(), &levels, 80, 12, &env);
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("max throughput"),
+            "legend names the max-throughput point: {text}"
+        );
+    }
 }

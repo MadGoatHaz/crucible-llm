@@ -166,6 +166,16 @@ impl StreamCountSource {
             Self::Default => "default",
         }
     }
+
+    /// The human-readable descriptor for the startup log line — names what
+    /// actually drove the count so the log matches the JSON label.
+    pub fn log_descriptor(self) -> &'static str {
+        match self {
+            Self::ConcurrencyMaxThroughput => "concurrency max-throughput level",
+            Self::ConcurrencySweetSpot => "practical sweet spot",
+            Self::Default => "default",
+        }
+    }
 }
 
 /// The `(stream count, source)` Flat Out should use given a completed
@@ -870,13 +880,7 @@ impl FlatOutEngine {
         } else {
             // The non-default sources name what actually drove the count so
             // the run log matches the JSON `stream_count_source` label.
-            let source_desc = match self.stream_count_source {
-                StreamCountSource::ConcurrencyMaxThroughput => {
-                    "concurrency max-throughput level"
-                }
-                StreamCountSource::ConcurrencySweetSpot => "practical sweet spot",
-                StreamCountSource::Default => unreachable!("handled above"),
-            };
+            let source_desc = self.stream_count_source.log_descriptor();
             if let Some(l) = &self.logger {
                 l.info(
                     Context::EngineF,
@@ -1270,6 +1274,7 @@ impl FlatOutEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::concurrency::SweepLevel;
     use crate::sse::{Chunk, ParsedFrame, Usage};
     use crate::timing::StreamTimestamps;
 
@@ -1350,7 +1355,138 @@ mod tests {
             StreamCountSource::ConcurrencySweetSpot.as_str(),
             "concurrency_sweet_spot"
         );
+        assert_eq!(
+            StreamCountSource::ConcurrencyMaxThroughput.as_str(),
+            "concurrency_max_throughput"
+        );
         assert_eq!(StreamCountSource::Default.as_str(), "default");
+    }
+
+    #[test]
+    fn stream_count_source_log_descriptors_name_the_actual_source() {
+        // The startup log line must reflect the real source: max-throughput
+        // (the envelope) vs practical (the hosting recommendation) vs default.
+        assert_eq!(
+            StreamCountSource::ConcurrencyMaxThroughput.log_descriptor(),
+            "concurrency max-throughput level"
+        );
+        assert_eq!(
+            StreamCountSource::ConcurrencySweetSpot.log_descriptor(),
+            "practical sweet spot"
+        );
+        assert_eq!(StreamCountSource::Default.log_descriptor(), "default");
+    }
+
+    /// A minimal sweep level (the Flat Out tests only read `concurrency`,
+    /// `aggregate_tps`, and `p90_tpot_ns`).
+    fn level(concurrency: usize, tps: f64, p90_ms: f64) -> SweepLevel {
+        SweepLevel {
+            concurrency,
+            context: 0,
+            aggregate_tps: tps,
+            per_stream_tps: tps / concurrency.max(1) as f64,
+            p50_tpot_ns: 0,
+            p90_tpot_ns: (p90_ms * 1e6) as u64,
+            p99_tpot_ns: 0,
+            ttft_p50_ns: 0,
+            ttft_p90_ns: 0,
+            total_tokens: 0,
+            completed_streams: concurrency,
+            failed_streams: 0,
+            timed_out_streams: 0,
+            timed_out_tokens: 0,
+            aborted: false,
+            wall_ns: 0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+            estimated: false,
+            streams: Vec::new(),
+        }
+    }
+
+    // ── flatout_streams_for: the shared TUI/headless seam ───────────────
+
+    #[test]
+    fn flatout_streams_for_uses_the_envelope_not_the_practical() {
+        // The incident shape: practical sweet spot = 1 (level 3 measures
+        // 87.3 / 3 = 29.1 t/s, missing the 29.4 bar by 0.3), envelope
+        // (max-throughput) = 4 (monotone, no knee). The helper must return
+        // the envelope (4), NOT the practical (1) — and tag it as
+        // max-throughput.
+        let r = SweepResult::from_levels(
+            vec![
+                level(1, 31.6, 5.0),
+                level(2, 56.5, 6.0),
+                level(3, 87.3, 7.0),
+                level(4, 106.0, 8.0),
+            ],
+            None,
+        );
+        assert_eq!(r.sweet_spot, 1, "the practical sweet spot is 1");
+        let (n, source) = flatout_streams_for(&r);
+        assert_eq!(n, 4, "the envelope (max-throughput), not the practical");
+        assert_ne!(n, r.sweet_spot, "consumed value is distinct from the practical");
+        assert_eq!(source, StreamCountSource::ConcurrencyMaxThroughput);
+    }
+
+    #[test]
+    fn flatout_streams_for_is_the_last_level_before_the_knee() {
+        // A knee-present curve (throughput plateaus 340→345, +1.5% ≤ 5 %,
+        // while p90 spikes 10→30 ms, 3× ≥ 2×) → the envelope is the last
+        // level before the knee (8), not the peak.
+        let r = SweepResult::from_levels(
+            vec![
+                level(1, 100.0, 5.0),
+                level(2, 190.0, 6.0),
+                level(4, 280.0, 7.0),
+                level(8, 340.0, 10.0),
+                level(16, 345.0, 30.0),
+            ],
+            None,
+        );
+        assert_eq!(r.envelope().expect("envelope").knee.map(|k| k.concurrency), Some(16));
+        let (n, source) = flatout_streams_for(&r);
+        assert_eq!(n, 8, "the last level before the knee");
+        assert_eq!(source, StreamCountSource::ConcurrencyMaxThroughput);
+    }
+
+    #[test]
+    fn flatout_streams_for_falls_back_to_the_practical_when_no_curve() {
+        // A sweep that ran but produced no usable levels: envelope() is
+        // None, so the helper falls back to the practical sweet spot
+        // (from_levels computes it as 1) — today's behavior, tagged as
+        // max-throughput source.
+        let r = SweepResult::from_levels(vec![], None);
+        assert!(r.envelope().is_none(), "no curve → no envelope");
+        let (n, source) = flatout_streams_for(&r);
+        assert_eq!(n, r.sweet_spot, "falls back to the practical sweet spot");
+        assert_eq!(n, 1);
+        assert_eq!(source, StreamCountSource::ConcurrencyMaxThroughput);
+    }
+
+    #[test]
+    fn to_dict_carries_the_max_throughput_source_label() {
+        let r = FlatOutResult {
+            stream_count: 4,
+            stream_count_source: StreamCountSource::ConcurrencyMaxThroughput,
+            total_tokens: 17_124,
+            duration_secs: 60.0,
+            aggregate_tps: 285.4,
+            per_stream_tps: 71.35,
+            tps_per_completed_stream: 71.35,
+            tps_per_requested_stream: 71.35,
+            failed_stream_ratio: 0.0,
+            config_error: None,
+            max_tokens_used: MAX_TOKENS,
+            ttft_avg_ms: 312.5,
+            itl_p50_ms: 28.3,
+            itl_p99_ms: 65.1,
+            tokens_estimated: false,
+            counting_method: "usage".into(),
+        };
+        let v = r.to_dict();
+        assert_eq!(v["stream_count"], 4);
+        assert_eq!(v["stream_count_source"], "concurrency_max_throughput");
     }
 
     #[test]
