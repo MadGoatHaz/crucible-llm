@@ -24,6 +24,7 @@ pub use reasoning::{
     REASONING_BANK, REASONING_MAX_GEN_TOKENS,
 };
 pub use structured::{
-    evaluate_case, is_json_compliant, CaseCheck, CaseVerdict, StructuredCase, StructuredCaseResult,
-    StructuredEngine, StructuredResult, STRUCTURED_CASES, STRUCTURED_MAX_GEN_TOKENS,
+    evaluate_case, is_json_compliant, CaseCheck, CaseVerdict, CountingMethod, StructuredCase,
+    StructuredCaseResult, StructuredEngine, StructuredResult, STRUCTURED_CASES,
+    STRUCTURED_MAX_GEN_TOKENS,
 };

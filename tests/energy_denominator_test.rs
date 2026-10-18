@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use crucible_llm::engines::hardware::profile;
 use crucible_llm::engines::{
-    FlatOutResult, NiahResult, ReasoningResult, ReasoningScore, SpeedResult, StreamCountSource,
-    StructuredResult, SweepLevel, SweepResult, NIAH_MAX_GEN_TOKENS,
+    CountingMethod, FlatOutResult, NiahResult, ReasoningResult, ReasoningScore, SpeedResult,
+    StreamCountSource, StructuredResult, SweepLevel, SweepResult, NIAH_MAX_GEN_TOKENS,
 };
 use crucible_llm::hw::HwSample;
 use crucible_llm::timing::MonotonicInstant;
@@ -119,6 +119,7 @@ fn structured_with_body_chars(chars: usize) -> StructuredResult {
         cases: Vec::new(),
         constrained_body: String::new(),
         free_body: "x".repeat(chars),
+        counting_method: CountingMethod::ServerUsage,
     }
 }
 

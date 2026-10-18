@@ -431,6 +431,47 @@ impl StructuredCaseResult {
     }
 }
 
+/// How a C3 run's completion token count was obtained (F5) — the
+/// **Authoritative Counting Rule** (`client/stream.rs`) made explicit per
+/// run, so a last-resort estimate is never presented as exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CountingMethod {
+    /// The server's `usage.completion_tokens` — the primary, exact source.
+    #[default]
+    ServerUsage,
+    /// A re-count of the *content-only* body with the model's exact
+    /// tokenizer (the fallback for a proxy that omits `usage`). Exact for
+    /// what it counts — with one nuance: the count covers the committed
+    /// content only (the CoT text is not in the judged body), while the
+    /// decode window spans *all* token frames, so a stream that emitted
+    /// CoT reads a content count over a blended window.
+    Tokenizer,
+    /// The observed SSE frame tally — the **last-resort estimate**,
+    /// exactly what the Authoritative Counting Rule exists to avoid: a
+    /// batched server (vLLM MTP / speculative decoding) carries several
+    /// tokens per frame, so the frame count understates the true output.
+    /// Flagged [`is_estimated`](Self::is_estimated) — never presented as
+    /// exact.
+    FrameFallback,
+}
+
+impl CountingMethod {
+    /// `true` when the count is an estimate (the last-resort frame tally).
+    pub fn is_estimated(self) -> bool {
+        matches!(self, CountingMethod::FrameFallback)
+    }
+
+    /// The short label for summaries / the `--json` section.
+    pub fn label(self) -> &'static str {
+        match self {
+            CountingMethod::ServerUsage => "server usage",
+            CountingMethod::Tokenizer => "tokenizer re-count",
+            CountingMethod::FrameFallback => "frame count (estimated)",
+        }
+    }
+}
+
 /// The full structured-output evaluation result.
 #[derive(Debug, Clone)]
 pub struct StructuredResult {
@@ -449,6 +490,13 @@ pub struct StructuredResult {
     pub constrained_body: String,
     /// The free-form case-1 output.
     pub free_body: String,
+    /// F5: how the speed pair's token counts were obtained — the more
+    /// estimated of the free-baseline and constrained case-0 runs (an
+    /// estimate is never hidden behind an exact number). `FrameFallback`
+    /// (a no-`usage`, no-tokenizer run) is the last-resort frame tally the
+    /// Authoritative Counting Rule avoids — flagged, never presented as
+    /// exact.
+    pub counting_method: CountingMethod,
 }
 
 impl StructuredResult {
@@ -676,11 +724,15 @@ impl StructuredResult {
         } else {
             "penalty N/A (constraint not effective)".to_string()
         };
-        let mut parts = vec![
-            penalty,
-            self.compliance_label(),
-            format!("{c}/{total} schema, {t} truncated_by_reasoning"),
-        ];
+        let mut parts = vec![penalty];
+        // F5: a last-resort frame-count run flags its speed numbers as
+        // estimated in the summary line (estimates are labeled, never
+        // presented as measured).
+        if self.counting_method.is_estimated() {
+            parts.push(self.counting_method.label().to_string());
+        }
+        parts.push(self.compliance_label());
+        parts.push(format!("{c}/{total} schema, {t} truncated_by_reasoning"));
         let stability = self.stability_label();
         if !stability.is_empty() {
             parts.push(stability);
@@ -736,6 +788,11 @@ impl StructuredResult {
             "stability_rate": self.stability_rate(),
             "free_tps": self.free_tps,
             "constrained_tps": self.constrained_tps,
+            // F5: how the speed pair's token counts were obtained — the
+            // frame fallback is the labeled estimate (never presented as
+            // exact). Additive — pre-existing consumers are unaffected.
+            "counting_method": self.counting_method.label(),
+            "tokens_estimated": self.counting_method.is_estimated(),
             "cases": cases,
             "summary": self.summary_line(),
             "verdict": self.verdict_line(),
@@ -750,6 +807,39 @@ impl StructuredResult {
 /// and summary consumers filter `ttft > 0.0`.
 fn run_ttft(ts: &StreamTimestamps) -> f64 {
     ts.ttft_nanos().map(|n| n as f64 / 1e9).unwrap_or(0.0)
+}
+
+/// F5: the run's completion token count **and how it was obtained** —
+/// the Authoritative Counting Rule (`client/stream.rs`) made explicit:
+///
+/// 1. **PRIMARY** — the server's `usage.completion_tokens` (exact).
+/// 2. **FALLBACK** (no `usage`) — a re-count of the *content-only* judged
+///    body with the model's exact tokenizer (exact for what it counts;
+///    the content-only-vs-all-frames decode-window nuance is documented on
+///    [`CountingMethod::Tokenizer`]).
+/// 3. **LAST RESORT** (no `usage` and no tokenizer) — the observed frame
+///    tally ([`CountingMethod::FrameFallback`]) — exactly what the rule
+///    exists to avoid (a batched server carries several tokens per frame),
+///    so it is flagged estimated, never presented as exact.
+fn count_completion(
+    usage: Option<crate::sse::Usage>,
+    body: &str,
+    frames: u64,
+    tokenizer: Option<&crate::prompt::Tokenizer>,
+) -> (u64, CountingMethod) {
+    match usage
+        .map(|u| u.completion_tokens)
+        .filter(|&n| n > 0)
+    {
+        Some(n) => (n, CountingMethod::ServerUsage),
+        None => match tokenizer
+            .and_then(|t| t.try_count(body))
+            .filter(|&n| n > 0)
+        {
+            Some(n) => (n as u64, CountingMethod::Tokenizer),
+            None => (frames.max(1), CountingMethod::FrameFallback),
+        },
+    }
 }
 
 /// One `run_once` result: the judged body, the §7 timing metrics, and the
@@ -771,6 +861,9 @@ struct RunOutput {
     /// The server-reported CoT tokens for this run (R3 calibration
     /// measurement). `None` when the backend reported no usage block.
     reasoning_tokens: Option<u64>,
+    /// F5: how this run's completion count was obtained (the
+    /// Authoritative Counting Rule made explicit).
+    counting_method: CountingMethod,
 }
 
 /// The live runner: a free-form baseline plus the three constrained cases.
@@ -1037,26 +1130,13 @@ impl StructuredEngine {
         let ts: StreamTimestamps = outcome.timestamps;
         let stream_time = ts.total_nanos().unwrap_or(0) as f64 / 1e9;
         let ttft = run_ttft(&ts);
-        // Authoritative count: the server's `usage.completion_tokens`
-        // first; re-tokenize the full output with the model's exact
-        // tokenizer when a proxy omits usage; the observed frame count as
-        // a last-resort estimate.
-        let completion = match outcome
-            .usage
-            .map(|u| u.completion_tokens)
-            .filter(|&n| n > 0)
-        {
-            Some(n) => n,
-            None => match self
-                .tokenizer
-                .as_deref()
-                .and_then(|t| t.try_count(&body))
-                .filter(|&n| n > 0)
-            {
-                Some(n) => n as u64,
-                None => outcome.frames.max(1),
-            },
-        };
+        // Authoritative count (F5: the method is recorded, not implicit):
+        // the server's `usage.completion_tokens` first; a re-count of the
+        // content-only body with the model's exact tokenizer when a proxy
+        // omits usage; the observed frame count as a last-resort *estimate*
+        // — the one the Authoritative Counting Rule exists to avoid.
+        let (completion, counting_method) =
+            count_completion(outcome.usage, &body, outcome.frames, self.tokenizer.as_deref());
         // Decode window: first → last content/reasoning token (prefill /
         // TTFT excluded) — the research's Timing Boundary Rule.
         let (t_first, t_last) = token_window(&events);
@@ -1071,6 +1151,7 @@ impl StructuredEngine {
             tps,
             truncated_by_reasoning,
             reasoning_tokens,
+            counting_method,
         }
     }
 
@@ -1111,6 +1192,7 @@ impl StructuredEngine {
             });
         }
         let free = self.run_once(0, false).await;
+        let free_counting = free.counting_method;
         let (free_body, free_ttft, free_tps) = (free.body, free.ttft, free.tps);
 
         // Constrained cases, each repeated N× (CF-51). Case 0's *first* repeat
@@ -1119,6 +1201,7 @@ impl StructuredEngine {
         let mut constrained_tps = 0.0;
         let mut constrained_ttft = 0.0;
         let mut constrained_body = String::new();
+        let mut constrained_counting = CountingMethod::ServerUsage;
         let mut case_evals: Vec<Vec<StructuredCaseResult>> =
             Vec::with_capacity(STRUCTURED_CASES.len());
         let mut run_no = 1usize;
@@ -1140,6 +1223,7 @@ impl StructuredEngine {
                     constrained_tps = out.tps;
                     constrained_ttft = out.ttft;
                     constrained_body = out.body.clone();
+                    constrained_counting = out.counting_method;
                 }
                 // R2: the distinct `truncated_by_reasoning` outcome (all-CoT,
                 // zero content on a completed stream) is marked on the case
@@ -1180,6 +1264,9 @@ impl StructuredEngine {
             cases,
             constrained_body,
             free_body,
+            // F5: the more estimated of the two speed-pair runs — an
+            // estimate is never hidden behind an exact number.
+            counting_method: constrained_counting.max(free_counting),
         };
         if let Some(l) = &self.logger {
             l.info(
@@ -1517,6 +1604,7 @@ fn strip_json_fence(body: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sse::Usage;
     use crate::timing::MonotonicInstant;
 
     // ── hybrid reasoning (R2): the budget is the correctness guarantee ──
@@ -1700,6 +1788,7 @@ mod tests {
             ],
             constrained_body: c1.to_string(),
             free_body: "prose".to_string(),
+            counting_method: CountingMethod::ServerUsage,
         }
     }
 
@@ -2192,6 +2281,7 @@ mod tests {
             ],
             constrained_body: String::new(),
             free_body: String::new(),
+            counting_method: CountingMethod::ServerUsage,
         };
         let v = r.verdict_line();
         assert!(
@@ -2390,6 +2480,91 @@ mod tests {
         assert_eq!(d["cases"][0]["reasoning_tokens"], 14);
         assert_eq!(d["cases"][1]["reasoning_tokens"], serde_json::Value::Null);
         assert_eq!(d["cases"][2]["reasoning_tokens"], serde_json::Value::Null);
+    }
+
+    // ── F5: the counting method is recorded, the frame fallback flagged ──
+
+    #[test]
+    fn f5_counting_method_follows_the_authoritative_rule() {
+        // PRIMARY: the server's `usage` block — exact, never estimated.
+        let (n, m) = count_completion(
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 100,
+            }),
+            "body",
+            7,
+            None,
+        );
+        assert_eq!((n, m), (100, CountingMethod::ServerUsage));
+        assert!(!m.is_estimated());
+
+        // A reported `0` completion is treated as absent (Engine A's
+        // filter) → it falls through the rule.
+        let (_, m) = count_completion(
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 0,
+            }),
+            "body",
+            7,
+            None,
+        );
+        assert_eq!(m, CountingMethod::FrameFallback);
+
+        // LAST RESORT: no `usage`, no tokenizer → the observed frame tally
+        // (with the `max(1)` floor) — exactly what the Authoritative
+        // Counting Rule exists to avoid, so it is flagged estimated.
+        let (n, m) = count_completion(None, "body", 7, None);
+        assert_eq!((n, m), (7, CountingMethod::FrameFallback));
+        assert!(m.is_estimated(), "the frame fallback is an estimate");
+        let (n, m) = count_completion(None, "body", 0, None);
+        assert_eq!((n, m), (1, CountingMethod::FrameFallback), "the max(1) floor");
+
+        // FALLBACK: no `usage`, an exact tokenizer → the re-count of the
+        // content-only body — exact for what it counts, not estimated.
+        let tok =
+            crate::prompt::Tokenizer::from_json(include_str!(
+                "../../../tests/fixtures/mini_tokenizer.json"
+            ))
+            .unwrap();
+        let (n, m) = count_completion(None, "some content body", 7, Some(&tok));
+        assert_eq!(m, CountingMethod::Tokenizer);
+        assert!(!m.is_estimated());
+        assert!(n > 0, "the re-count is non-zero");
+    }
+
+    #[test]
+    fn f5_the_result_marker_surfaces_the_estimated_count() {
+        // The default (usage-reporting) fixture is not estimated — the
+        // summary line and `--json` section carry no estimate marker.
+        let r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            "not json",
+            "also not json",
+        );
+        assert_eq!(r.counting_method, CountingMethod::ServerUsage);
+        assert!(!r.counting_method.is_estimated());
+        assert!(!r.summary_line().contains("estimated"));
+        assert_eq!(r.to_dict()["tokens_estimated"], false);
+
+        // A no-usage, no-tokenizer run: the frame fallback is flagged in
+        // the result, the `--json` section, and the headless summary line —
+        // an estimate is never presented as measured.
+        let mut r = result_with(
+            r#"{"name": "Ada", "age": 36}"#,
+            "not json",
+            "also not json",
+        );
+        r.counting_method = CountingMethod::FrameFallback;
+        assert!(r.counting_method.is_estimated());
+        assert_eq!(r.to_dict()["counting_method"], "frame count (estimated)");
+        assert_eq!(r.to_dict()["tokens_estimated"], true);
+        assert!(
+            r.summary_line().contains("frame count (estimated)"),
+            "the summary line labels the estimate: {}",
+            r.summary_line()
+        );
     }
 
     // ── F6: the no-frame TTFT is the N/A sentinel, not total time ────────

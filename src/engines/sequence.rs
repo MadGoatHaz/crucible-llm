@@ -2179,6 +2179,7 @@ mod tests {
             cases: vec![],
             constrained_body: String::new(),
             free_body: "x".repeat(chars),
+            counting_method: crate::engines::capability::CountingMethod::ServerUsage,
         }
     }
 

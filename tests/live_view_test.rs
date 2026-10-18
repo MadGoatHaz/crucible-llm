@@ -24,8 +24,8 @@
 use ratatui::buffer::Buffer;
 
 use crucible_llm::engines::{
-    evaluate_case, Engine, EngineProgress, ReasoningResult, ReasoningScore, SeqPhase, SeqState,
-    StructuredResult, SweepLevel, SweepResult,
+    evaluate_case, CountingMethod, Engine, EngineProgress, ReasoningResult, ReasoningScore,
+    SeqPhase, SeqState, StructuredResult, SweepLevel, SweepResult,
 };
 use crucible_llm::metrics::MetricsSnapshot;
 use crucible_llm::ui::app::App;
@@ -377,6 +377,7 @@ fn capability_scores_show_for_c_engines() {
         ],
         constrained_body: "{}".into(),
         free_body: "hi".into(),
+        counting_method: CountingMethod::ServerUsage,
     });
     // Engine C2 (Reasoning) running → the capability panel is visible.
     app.seq.store(seq_state(

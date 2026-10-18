@@ -465,7 +465,9 @@ impl FlatOutSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::capability::{evaluate_case, CaseCheck, StructuredCaseResult};
+    use crate::engines::capability::{
+        evaluate_case, CaseCheck, CountingMethod, StructuredCaseResult,
+    };
 
     /// A C3 result with one compliant case, one partial case, and one
     /// **truncated** case (the R2 `truncated_by_reasoning` bucket).
@@ -495,6 +497,7 @@ mod tests {
             ],
             constrained_body: String::new(),
             free_body: "prose".to_string(),
+            counting_method: CountingMethod::ServerUsage,
         }
     }
 

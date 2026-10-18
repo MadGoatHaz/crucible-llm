@@ -1950,6 +1950,7 @@ mod tests {
                 ],
                 constrained_body: "{}".into(),
                 free_body: "hi".into(),
+                counting_method: crate::engines::capability::CountingMethod::ServerUsage,
             });
         let m = crate::metrics::state::MetricsSnapshot::default();
         let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
@@ -2229,6 +2230,7 @@ mod tests {
             ],
             constrained_body: String::new(),
             free_body: "hi".into(),
+            counting_method: crate::engines::capability::CountingMethod::ServerUsage,
         });
         let m = crate::metrics::state::MetricsSnapshot::default();
         let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
@@ -2268,6 +2270,7 @@ mod tests {
                 ],
                 constrained_body: String::new(),
                 free_body: "hi".into(),
+                counting_method: crate::engines::capability::CountingMethod::ServerUsage,
             });
         let m = crate::metrics::state::MetricsSnapshot::default();
         let scores = build_capability_scores(&app, &m, &selected(&app), Theme::default());
@@ -2308,6 +2311,7 @@ mod tests {
                 ],
                 constrained_body: "{}".into(),
                 free_body: "hi".into(),
+                counting_method: crate::engines::capability::CountingMethod::ServerUsage,
             });
         let text = render_live_text(&app, 120, 60);
         assert!(
