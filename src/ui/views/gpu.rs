@@ -343,9 +343,11 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f:
         eff_row(
             th,
             "Total tokens",
-            saw_token
-                .then(|| fmt::format_tokens(mon.all_tokens()))
-                .unwrap_or(na.clone()),
+            if saw_token {
+                fmt::format_tokens(mon.all_tokens())
+            } else {
+                na.clone()
+            },
         ),
         Line::raw(""),
         eff_row(
