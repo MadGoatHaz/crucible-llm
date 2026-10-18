@@ -697,14 +697,18 @@ impl NiahResult {
     /// The plain-language interpretation of the matrix: how far the model
     /// reliably retrieves, and what that means for RAG / long-document use.
     /// Pure over the grid (unit-testable).
+    ///
+    /// F8: the size renders through the shared [`human_size`] formatter
+    /// (`2k` / `128k` / `1M` / `1.5M`) — the old `size / 1000` + `k` format
+    /// read a 1 000 000-token size as "~1000k".
     pub fn interpretation(&self) -> String {
         match self.reliable_up_to(80.0) {
             Some(size) => format!(
-                "Reliable retrieval up to ~{}k tokens. Beyond that, the model \
+                "Reliable retrieval up to ~{} tokens. Beyond that, the model \
                  loses track of embedded information. For RAG: limit context \
-                 windows to {}k or use a model with better long-context training.",
-                size / 1000,
-                size / 1000
+                 windows to {} or use a model with better long-context training.",
+                human_size(size),
+                human_size(size)
             ),
             None => "No context size met the 80% reliability bar — this model is \
                      not dependable for retrieval in any tested length. Avoid RAG / \
@@ -1753,6 +1757,36 @@ mod tests {
         let interp = r.interpretation();
         assert!(interp.contains("up to ~4k"), "{interp}");
         assert!(interp.contains("For RAG"), "{interp}");
+    }
+
+    // ── F8: the interpretation size label uses the shared human_size ────
+
+    #[test]
+    fn f8_interpretation_renders_a_million_size_as_1m() {
+        // A 1 000 000-token reliable size renders as "1M" — the old
+        // `size / 1000` + `k` format read it as "~1000k".
+        let mut r = NiahResult::new(vec![1_000_000], vec![0, 100]);
+        for c in &mut r.cells {
+            c.target_tokens = 1_000_000;
+            c.retrieved = true;
+            c.ttft_s = 0.5;
+            c.state = NiahCellState::Nominal;
+        }
+        let interp = r.interpretation();
+        assert!(interp.contains("up to ~1M tokens"), "{interp}");
+        assert!(interp.contains("windows to 1M"), "{interp}");
+        assert!(!interp.contains("1000k"), "a 1M size must not read 1000k: {interp}");
+
+        // A fractional million renders with a single decimal.
+        let mut r = NiahResult::new(vec![1_500_000], vec![0, 100]);
+        for c in &mut r.cells {
+            c.target_tokens = 1_500_000;
+            c.retrieved = true;
+            c.ttft_s = 0.5;
+            c.state = NiahCellState::Nominal;
+        }
+        let interp = r.interpretation();
+        assert!(interp.contains("up to ~1.5M tokens"), "{interp}");
     }
 
     // ── Option C: three-way classification (pass / truncated / fail) ─────
