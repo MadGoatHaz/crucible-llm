@@ -125,32 +125,56 @@ pub const MINIMAL_PROMPT: &str =
 
 /// Where the run's stream count came from (the JSON export's
 /// `stream_count_source` field).
+///
+/// Two distinct Engine B values are both real, and the label names which
+/// one drove the run:
+///
+/// * [`Self::ConcurrencyMaxThroughput`] — the **max-throughput** level
+///   (the sweep *envelope*: the last level before the saturation knee,
+///   else the peak-aggregate level). This is the count Flat Out runs at.
+/// * [`Self::ConcurrencySweetSpot`] — the **practical** sweet spot (the
+///   highest level where every stream still gets ≥ 29.4 t/s — the
+///   hosting recommendation). Retained for back-compat: it is what
+///   pre-envelope runs (and the JSON/DB records they produced) carry.
+/// * [`Self::Default`] — Engine B did not run, so there was no
+///   concurrency data to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamCountSource {
-    /// The practical sweet spot from Engine B's sweep (the recommended
-    /// production concurrency).
+    /// The **practical** sweet spot from Engine B's sweep — the highest
+    /// level where every stream still gets ≥ 29.4 t/s (the recommended
+    /// production hosting concurrency). Retained for back-compat: new runs
+    /// tag the max-throughput level via [`Self::ConcurrencyMaxThroughput`].
     ConcurrencySweetSpot,
+    /// Engine B's **max-throughput** level (the sweep envelope: the last
+    /// level before the saturation knee, else the peak-aggregate level) —
+    /// the real-world full-load count Flat Out runs at.
+    ConcurrencyMaxThroughput,
     /// The built-in default ([`DEFAULT_STREAM_COUNT`]) — Engine B did not
-    /// run, so there was no sweet spot to read.
+    /// run, so there was no concurrency data to read.
     Default,
 }
 
 impl StreamCountSource {
-    /// The JSON label (`"concurrency_sweet_spot"` / `"default"`).
+    /// The JSON label (`"concurrency_sweet_spot"` /
+    /// `"concurrency_max_throughput"` / `"default"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConcurrencySweetSpot => "concurrency_sweet_spot",
+            Self::ConcurrencyMaxThroughput => "concurrency_max_throughput",
             Self::Default => "default",
         }
     }
 }
 
-/// The complete Flat Out result: `n` concurrent streams (the sweet spot)
-/// running for one [`WINDOW_SECS`]-second window.
+/// The complete Flat Out result: `n` concurrent streams (the max-
+/// throughput level, or the default) running for one [`WINDOW_SECS`]-
+/// second window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatOutResult {
-    /// The number of concurrent streams (the sweet spot, or the default).
+    /// The number of concurrent streams (Engine B's max-throughput level,
+    /// the practical sweet spot, or the default — see
+    /// [`stream_count_source`](Self::stream_count_source)).
     pub stream_count: usize,
     /// Where the stream count came from.
     pub stream_count_source: StreamCountSource,
@@ -160,7 +184,7 @@ pub struct FlatOutResult {
     /// every stream ended on its own).
     pub duration_secs: f64,
     /// The headline number: `total_tokens / duration_secs` — the
-    /// server's real-world maximum throughput at full sweet-spot load.
+    /// server's real-world maximum throughput at full load.
     pub aggregate_tps: f64,
     /// **Back-compat alias of [`tps_per_requested_stream`](Self::tps_per_requested_stream)**
     /// — `aggregate_tps / stream_count`: what each *requested* user
@@ -700,7 +724,7 @@ impl FlatOutEngine {
     /// Build the engine from the resolved config (the stream count
     /// defaults to [`DEFAULT_STREAM_COUNT`] — use
     /// [`stream_count`](Self::stream_count) to drive it from Engine B's
-    /// sweet spot).
+    /// max-throughput level).
     pub fn new(cfg: &Config) -> Result<Self, FlatOutError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(cfg.timeout.max(1)))
@@ -826,11 +850,20 @@ impl FlatOutEngine {
                 );
             }
         } else {
+            // The non-default sources name what actually drove the count so
+            // the run log matches the JSON `stream_count_source` label.
+            let source_desc = match self.stream_count_source {
+                StreamCountSource::ConcurrencyMaxThroughput => {
+                    "concurrency max-throughput level"
+                }
+                StreamCountSource::ConcurrencySweetSpot => "practical sweet spot",
+                StreamCountSource::Default => unreachable!("handled above"),
+            };
             if let Some(l) = &self.logger {
                 l.info(
                     Context::EngineF,
                     format!(
-                        "Real-world max throughput: {n} streams (concurrency sweet spot) for {WINDOW_SECS:.0}s, max_tokens {max_tokens_used}"
+                        "Real-world max throughput: {n} streams ({source_desc}) for {WINDOW_SECS:.0}s, max_tokens {max_tokens_used}"
                     ),
                 );
             }
