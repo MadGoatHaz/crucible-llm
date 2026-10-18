@@ -51,11 +51,12 @@ pub struct NvmlBackend {
     /// poll is `&self`; a stuck anomalous reading must not spam the console
     /// every 100 ms). Parallel to the device indices.
     warned: Mutex<Vec<bool>>,
-    /// H1: per-device "TDP lookup degraded to the table" latches. The
-    /// power-management limit queries failed, so the TDP came from the
-    /// per-model table — a one-time WARN (a separate latch from `warned` so
-    /// the TDP-degradation notice never collides with the power-anomaly WARN).
-    tdp_degraded: Mutex<Vec<bool>>,
+    /// Per-device "power reading unvalidated" latches. The
+    /// power-management limit queries failed, so no TDP reference is
+    /// available — a one-time WARN that the reading stands, bounded only by
+    /// the global ceiling (a label of uncertainty, not a correction; a
+    /// separate latch from `warned` so the two notices never collide).
+    power_unvalidated: Mutex<Vec<bool>>,
 }
 
 impl NvmlBackend {
@@ -80,7 +81,7 @@ impl NvmlBackend {
             count,
             name,
             warned: Mutex::new(vec![false; count as usize]),
-            tdp_degraded: Mutex::new(vec![false; count as usize]),
+            power_unvalidated: Mutex::new(vec![false; count as usize]),
         }))
     }
 
@@ -112,8 +113,11 @@ impl GpuBackend for NvmlBackend {
         let mut out = Vec::with_capacity(self.count as usize);
         let mut guard = self.warned.lock().unwrap_or_else(|e| e.into_inner());
         guard.resize(self.count as usize, false);
-        let mut tdp_guard = self.tdp_degraded.lock().unwrap_or_else(|e| e.into_inner());
-        tdp_guard.resize(self.count as usize, false);
+        let mut unvalidated_guard = self
+            .power_unvalidated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unvalidated_guard.resize(self.count as usize, false);
         for i in 0..self.count {
             let Ok(device) = self.nvml.device_by_index(i) else {
                 continue; // per-device degradation: skip a lost device
@@ -124,8 +128,7 @@ impl GpuBackend for NvmlBackend {
                 .unwrap_or((0, 0));
             // Power: NVML reports *milliwatts* (mW / 1000 = W) — the units
             // are correct. The TDP drives the plausibility clamp: a reading
-            // above 1.5× the TDP (e.g. the 943 W on a single 200 W A4000) is
-            // flagged and capped at 1.5× the TDP.
+            // above 1.5× the TDP is flagged and capped at 1.5× the TDP.
             //
             // The TDP reference is the **default** power-management limit
             // (the card's factory TDP — not user-settable). We fall back to
@@ -135,30 +138,23 @@ impl GpuBackend for NvmlBackend {
             // clamp), and on some hosts the current-limit query fails
             // outright (returns `None`).
             //
-            // **H1:** on some hosts *both* limit queries fail (the A4000 in
-            // `work/scratch/latest.log`), leaving `tdp_w = None` and
-            // disabling the TDP-based clamp — so a phantom ~989 W reading
-            // passed the 1000 W global cap silently. When the queries fail
-            // we fall back to the **per-model TDP table** keyed on the
-            // marketing name, so the clamp still has a TDP to bound against.
-            // The degradation is WARNed once per device (`tdp_degraded`).
+            // **Generic, no per-card assumptions:** when *both* limit
+            // queries fail there is no TDP reference. The measured reading
+            // then **stands**, bounded only by the global
+            // `MAX_GPU_POWER_W` ceiling, and is flagged **unvalidated** by a
+            // one-time WARN (`power_unvalidated`) — a label of uncertainty,
+            // not a correction (a guessed card value would be).
             let name = device.name().unwrap_or_default();
-            let queried_tdp = device
+            let tdp_w = device
                 .power_management_limit_default()
                 .or_else(|_| device.power_management_limit())
                 .ok()
                 .map(|mw| mw as f64 / 1000.0);
-            let tdp_w = tdp_from_queries_or_model(queried_tdp, &name);
-            if queried_tdp.is_none() && !tdp_guard[i as usize] {
-                match tdp_w {
-                    Some(tdp) => eprintln!(
-                        "[WARN] [HW] GPU {i} ({name}): power-management limit queries failed — using the per-model TDP table ({tdp:.0} W) for the plausibility clamp"
-                    ),
-                    None => eprintln!(
-                        "[WARN] [HW] GPU {i} ({name}): power-management limit queries failed and no per-model TDP is known — only the {MAX_GPU_POWER_W:.0} W global ceiling applies"
-                    ),
-                }
-                tdp_guard[i as usize] = true;
+            if tdp_w.is_none() && !unvalidated_guard[i as usize] {
+                eprintln!(
+                    "[WARN] [HW] GPU {i} ({name}): power-management limit queries failed — no TDP reference available; the power reading is UNVALIDATED (only the {MAX_GPU_POWER_W:.0} W global ceiling applies)"
+                );
+                unvalidated_guard[i as usize] = true;
             }
             let power_watts = device.power_usage().ok().and_then(|mw| {
                 clamp_nvml_power(mw as f64 / 1000.0, tdp_w, i, &mut guard[i as usize])
@@ -207,84 +203,29 @@ impl GpuBackend for NvmlBackend {
     }
 }
 
-/// The per-model TDP table (watts) for common accelerator cards, keyed on a
-/// **case-insensitive substring** of the marketing name.
-///
-/// **H1:** NVML's `power_management_limit_default()` / `power_management_limit()`
-/// both fail on some hosts (the A4000 in `work/scratch/latest.log`), leaving
-/// `tdp_w = None` and disabling the TDP-based clamp — so a phantom ~989 W
-/// reading passed the 1000 W global cap silently. This table is the fallback:
-/// when the limit queries fail, the TDP is looked up from the card's name.
-/// The values are the cards' *factory* TDPs — conservative by design: a
-/// wrong-**high** TDP would let a phantom reading through, a wrong-**low**
-/// one just caps a real reading a little early.
-///
-/// Ordered so a more specific name matches before a substring of it (e.g.
-/// `l40s` before `l40` before `l4`; `rtx 4090` before `4090`), because
-/// [`tdp_for_model`] takes the *first* match.
-pub const TDP_TABLE: &[(&str, f64)] = &[
-    ("a4000", 200.0),
-    ("a5000", 230.0),
-    ("a6000", 300.0),
-    ("l40s", 350.0),
-    ("l40", 350.0),
-    ("l4", 72.0),
-    ("a100", 400.0),
-    ("h100", 700.0),
-    ("h200", 700.0),
-    ("rtx 4090", 450.0),
-    ("4090", 450.0),
-    ("rtx 4080", 250.0),
-    ("4080", 250.0),
-    ("3090", 350.0),
-    ("3080", 320.0),
-    ("t4", 70.0),
-    ("v100", 250.0),
-    ("p40", 250.0),
-];
-
-/// Resolve a per-model TDP (watts) from a marketing name (case-insensitive
-/// substring match against [`TDP_TABLE`]). `None` when no entry matches — the
-/// caller then has only the global ceiling (and a stronger WARN).
-#[must_use]
-pub fn tdp_for_model(name: &str) -> Option<f64> {
-    let n = name.to_ascii_lowercase();
-    TDP_TABLE
-        .iter()
-        .find(|(key, _)| n.contains(&key.to_ascii_lowercase()))
-        .map(|(_, tdp)| *tdp)
-}
-
-/// The TDP reference for the plausibility clamp: prefer the queried
-/// power-management limit, fall back to the per-model table (H1) when both
-/// limit queries failed (`queried` is `None`).
-#[must_use]
-pub fn tdp_from_queries_or_model(queried: Option<f64>, name: &str) -> Option<f64> {
-    queried.or_else(|| tdp_for_model(name))
-}
-
 /// Plausibility-clamp an NVML power reading (watts) against the card's
 /// TDP (watts) and the global ceiling.
 ///
 /// NVML's `power_usage()`, `power_management_limit_default()` **and**
 /// `power_management_limit()` all return *milliwatts*; the caller converts
-/// to watts before calling this. The TDP reference is the **default**
-/// power-management limit (the factory TDP, not user-settable), falling back
-/// to the current limit, and — **H1** — to the per-model [`TDP_TABLE`] when
-/// both limit queries failed.
+/// to watts before calling this. The TDP reference is the **queried**
+/// power-management limit — the **default** (the factory TDP, not
+/// user-settable), falling back to the current limit.
 ///
-/// **Per-model ceiling:** a reading above **1.5× the TDP** is a unit/scale
-/// bug or a phantom spike — the canonical case is the **989 W reported on a
-/// single 200 W A4000** (4.9× its TDP, physically impossible). It is flagged
-/// with a `[WARN]` (once per anomaly episode, via the `warned` latch) and
-/// **capped at 1.5× the TDP** (transient spikes are possible, 3× is not).
-/// The `> 1.5×TDP` trigger is deliberately stricter than the old `> 2×TDP`
-/// one: it stops a reading in `(1.5×TDP, 1000]` on a small card (e.g. 400 W
-/// on a 200 W A4000) from passing unflagged — a phantom that the looser
-/// trigger would have let through.
+/// **Generic, no per-card assumptions:**
 ///
-/// When no TDP is available at all (the limit queries failed *and* the model
-/// is not in the table) the global [`MAX_GPU_POWER_W`] ceiling stands in.
+/// * **With a queried TDP** (`Some`): a reading above **1.5× the TDP** is a
+///   unit/scale bug or a phantom spike. It is flagged with a `[WARN]` (once
+///   per anomaly episode, via the `warned` latch) and **capped at 1.5× the
+///   TDP** (transient spikes are possible, 3× is not). The `> 1.5×TDP`
+///   trigger is deliberately stricter than the old `> 2×TDP` one: it stops
+///   a reading in `(1.5×TDP, 1000]` on a small card from passing
+///   unflagged — a phantom that the looser trigger would have let through.
+/// * **Without a TDP** (`None` — both limit queries failed): there is no
+///   per-card value to clamp against. The measured reading **stands**,
+///   subject only to the global [`MAX_GPU_POWER_W`] last-resort ceiling,
+///   and is flagged **unvalidated** (a one-time WARN in `poll_all`) — a
+///   label of uncertainty, not a correction.
 #[must_use]
 fn clamp_nvml_power(
     power_w: f64,
@@ -295,8 +236,8 @@ fn clamp_nvml_power(
     if !power_w.is_finite() {
         return None;
     }
-    // Per-model ceiling (the 989 W-on-a-200 W A4000 guard). A reading above
-    // 1.5× the TDP is capped at 1.5× the TDP and flagged.
+    // TDP ceiling: a reading above 1.5× the queried TDP is capped at 1.5×
+    // the TDP and flagged (transient spikes are possible, 3× is not).
     if let Some(tdp) = tdp_w {
         if tdp > 0.0 {
             let ceiling = 1.5 * tdp;
@@ -333,14 +274,14 @@ mod tests {
     /// the mW → W conversion.
     #[test]
     fn nvml_power_unit_is_milliwatts() {
-        let mw = 300_000u32; // a 300 W A4000
+        let mw = 300_000u32; // 300 W in milliwatts
         assert!((mw as f64 / 1000.0 - 300.0).abs() < 1e-9);
         assert!((19_500_f64 / 1000.0 - 19.5).abs() < 1e-9);
     }
 
-    /// The 943 W-on-a-300 W A4000 bug: 943 > 2×300 = 600 → flagged and
-    /// capped at 1.5×300 = 450 W. A stuck reading does not re-warn (the
-    /// latch holds until the reading normalizes).
+    /// A 943 W reading on a 300 W-TDP card: 943 > 1.5×300 = 450 → flagged
+    /// and capped at 450 W. A stuck reading does not re-warn (the latch
+    /// holds until the reading normalizes).
     #[test]
     fn nvml_clamp_flags_and_caps_a_3x_tdp_reading() {
         let mut warned = false;
@@ -353,15 +294,14 @@ mod tests {
         assert_eq!(out2, Some(450.0));
     }
 
-    /// The A4000 phantom from `work/testing/latest.log` (Engine D "peak 974
-    /// W" on a single 200 W-TDP card): 974 > 2×200 = 400 → flagged and
-    /// capped at 1.5×200 = 300 W. This is the reading that, when the TDP
+    /// A 974 W phantom reading on a 200 W-TDP card: 974 > 1.5×200 = 300 →
+    /// flagged and capped at 300 W. This is the reading that, when the TDP
     /// reference was the *current* limit (which fails on some hosts →
-    /// `None`), slipped past the clamp through the 5 000 W global cap and
-    /// inflated the `$/1M` output cost ~10×. With the TDP now sourced from
-    /// the *default* limit, the clamp engages and caps it.
+    /// `None`), slipped past the clamp through the 1000 W global cap and
+    /// inflated the `$/1M` output cost ~10×. With the TDP sourced from the
+    /// *default* limit, the clamp engages and caps it.
     #[test]
-    fn nvml_clamp_caps_the_a4000_phantom_reading() {
+    fn nvml_clamp_caps_a_phantom_reading() {
         let mut warned = false;
         let out = clamp_nvml_power(974.0, Some(200.0), 0, &mut warned);
         assert_eq!(
@@ -403,68 +343,42 @@ mod tests {
         assert_eq!(clamp_nvml_power(f64::INFINITY, None, 0, &mut warned), None);
     }
 
-    // ── H1: the per-model TDP table fallback ────────────────────────────
+    // ── generic no-TDP behavior (no per-card assumptions) ───────────────
 
-    /// H1: the per-model TDP table resolves known cards by case-insensitive
-    /// name substring (the more-specific name matches before its substrings),
-    /// and returns `None` for an unknown name.
+    /// With **no** TDP reference (both limit queries failed), a reading
+    /// under the global ceiling is **not** card-clamped — it stands as
+    /// measured. The `poll_all` one-time WARN flags it unvalidated; the
+    /// clamp itself does not warn below the global cap.
     #[test]
-    fn tdp_for_model_resolves_known_names() {
-        assert_eq!(tdp_for_model("NVIDIA RTX A4000"), Some(200.0));
-        assert_eq!(tdp_for_model("nvidia a5000"), Some(230.0));
-        assert_eq!(tdp_for_model("NVIDIA A6000"), Some(300.0));
-        assert_eq!(tdp_for_model("NVIDIA L40S"), Some(350.0));
-        assert_eq!(tdp_for_model("NVIDIA L40"), Some(350.0));
-        // `l40` must not shadow `l4`: a plain L4 resolves to 72 W.
-        assert_eq!(tdp_for_model("NVIDIA L4"), Some(72.0));
-        assert_eq!(tdp_for_model("NVIDIA H100"), Some(700.0));
-        assert_eq!(tdp_for_model("NVIDIA A100"), Some(400.0));
-        assert_eq!(tdp_for_model("NVIDIA GeForce RTX 4090"), Some(450.0));
-        assert_eq!(tdp_for_model("Some Unknown GPU"), None);
-    }
-
-    /// H1: the fallback prefers the queried limit and falls back to the
-    /// table only when the query is `None`.
-    #[test]
-    fn tdp_from_queries_or_model_prefers_the_query() {
-        assert_eq!(
-            tdp_from_queries_or_model(Some(180.0), "NVIDIA RTX A4000"),
-            Some(180.0)
-        );
-        assert_eq!(
-            tdp_from_queries_or_model(None, "NVIDIA RTX A4000"),
-            Some(200.0)
-        );
-        assert_eq!(tdp_from_queries_or_model(None, "Unknown"), None);
-    }
-
-    /// H1 (the headline regression): a 989 W reading with **no** queried TDP
-    /// on an A4000 resolves its TDP from the table (200 W) and is capped at
-    /// 1.5×200 = 300 W — it can never pass unflagged. Before H1, `tdp_w` was
-    /// `None` and the reading passed the 1000 W global cap silently.
-    #[test]
-    fn a4000_phantom_with_no_queried_tdp_is_capped_by_the_table() {
+    fn a_reading_with_no_tdp_reference_is_not_card_clamped() {
         let mut warned = false;
-        // Both limit queries failed (`None`) → the table provides 200 W.
-        let tdp = tdp_from_queries_or_model(None, "NVIDIA RTX A4000");
-        assert_eq!(tdp, Some(200.0), "the table resolves the A4000 TDP");
-        let out = clamp_nvml_power(989.0, tdp, 0, &mut warned);
+        let out = clamp_nvml_power(989.0, None, 0, &mut warned);
         assert_eq!(
             out,
-            Some(300.0),
-            "989 W on a 200 W card is capped at 1.5× = 300 W"
+            Some(989.0),
+            "no per-card cap: the reading stands under the global ceiling"
         );
+        assert!(!warned, "the clamp does not warn below the global cap");
+    }
+
+    /// With **no** TDP reference, a reading above the global ceiling is
+    /// capped at `MAX_GPU_POWER_W` and flagged — the last-resort guard.
+    #[test]
+    fn a_reading_with_no_tdp_reference_above_the_global_cap_is_capped() {
+        let mut warned = false;
+        let out = clamp_nvml_power(1200.0, None, 0, &mut warned);
+        assert_eq!(out, Some(MAX_GPU_POWER_W), "capped at the global ceiling");
         assert!(warned, "the anomaly was flagged");
     }
 
-    /// H1: a reading in `(1.5×TDP, 1000]` on a known small card is capped by
-    /// the per-model ceiling — the case the old `> 2×TDP` trigger let through
-    /// (400 W on a 200 W card is under both 2×TDP=400… and the 1000 W cap, so
-    /// it must be caught by the stricter 1.5× rule).
+    /// A reading in `(1.5×TDP, 1000]` on a small card is capped by the
+    /// 1.5×TDP ceiling — the case the old `> 2×TDP` trigger let through
+    /// (400 W on a 200 W card is under both 2×TDP=400… and the 1000 W cap,
+    /// so it must be caught by the stricter 1.5× rule).
     #[test]
     fn a_reading_above_1_5x_tdp_is_capped_even_below_the_global_cap() {
         let mut warned = false;
-        // 400 W on a 200 W A4000: under the 1000 W global cap, over 1.5×200.
+        // 400 W on a 200 W-TDP card: under the 1000 W global cap, over 1.5×200.
         let out = clamp_nvml_power(400.0, Some(200.0), 0, &mut warned);
         assert_eq!(out, Some(300.0), "400 W on a 200 W card caps at 300 W");
         assert!(warned);
