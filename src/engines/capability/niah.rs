@@ -1258,6 +1258,15 @@ impl NiahSlot {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
+
+    /// Clear the slot back to its "not run" state (B1): store `None` and
+    /// clear the running flag. Called at the start of every sequence run so
+    /// a prior run's matrix never leaks into the next — the "None = not run"
+    /// invariant the Engine D denominator and `persist_results` rely on.
+    pub fn reset(&self) {
+        self.result.store(Arc::new(None));
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 impl Default for NiahSlot {

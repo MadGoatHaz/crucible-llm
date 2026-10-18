@@ -502,6 +502,24 @@ pub struct RunSlots {
     pub flatout: Arc<ResultSlot<FlatOutResult>>,
 }
 
+impl RunSlots {
+    /// Clear every result slot back to its "not run" state (B1 — no
+    /// cross-engine contamination). Called at the start of every sequence
+    /// run: each engine in the queue repopulates its own slot during the
+    /// run, and any engine *not* selected stays `None` — restoring the
+    /// "None = not run" invariant that the Engine D denominator
+    /// ([`Self`]'s [`BenchmarkSequence::all_engines_tokens`]) and
+    /// [`BenchmarkSequence::persist_results`] read.
+    pub fn reset_all(&self) {
+        self.speed.reset();
+        self.concurrency.reset();
+        self.niah.reset();
+        self.reasoning.reset();
+        self.structured.reset();
+        self.flatout.reset();
+    }
+}
+
 /// The sequential benchmark executor (one engine at a time).
 ///
 /// Built from the resolved [`Config`] (the engine selection comes from
@@ -665,6 +683,14 @@ impl BenchmarkSequence {
             self.slot.set_running(false);
             return;
         }
+        // B1: clear every result slot before the run starts. Each engine in
+        // the queue repopulates its own slot as it runs, and any engine *not*
+        // selected stays `None` — so a prior (larger) run's stale results can
+        // never leak into this one. This restores the "None = not run"
+        // invariant the Engine D denominator and `persist_results` rely on
+        // (without it, a D-only run after a full run read the previous run's
+        // tokens and wrote stale B/C2/C3/F summaries into the new session).
+        self.slots.reset_all();
         self.logger.info(
             Context::Sequence,
             format!(
@@ -853,20 +879,21 @@ impl BenchmarkSequence {
         self.persist_results();
     }
 
-    /// Persist the completed run to the default SQLite database: one
-    /// `benchmark_sessions` row plus `stream_metrics` rows (from Engine A
-    /// speed results) and `needle_evaluations` rows (from Engine C1 NIAH
-    /// results). A failure is logged but never propagated — the run is
-    /// already complete and the TUI is showing its final state.
-    fn persist_results(&self) {
-        // R2 (CF-14): fold the non-stream engine results (B/C2/C3/D/F) into
-        // the session's `engine_results` JSON column. A → `stream_metrics`
-        // and C1 → `needle_evaluations` (below); these are the engines that
-        // previously had *no* persistence at all.
-        //
-        // Engine D is continuous telemetry (no result slot), so its profile
-        // is recomputed here from the poller's trace (the same N/A rule as
-        // `run_hardware` / the headless path).
+    /// The `engine_results` JSON for this run (R2 / CF-14): the headline
+    /// summary of each non-stream engine that ran (`None` — and thus absent
+    /// from the JSON — for the ones that didn't).
+    ///
+    /// Engine D is continuous telemetry (no result slot), so its profile is
+    /// recomputed here from the poller's trace (the same N/A rule as
+    /// `run_hardware` / the headless path). The **B1 invariant** lives here:
+    /// every field is read from a result slot that [`Self::run`] cleared at
+    /// start, so only the engines that ran *this* session are present. After
+    /// a D-only run the B/C2/C3/F slots are `None` and only `d_energy` is
+    /// written — a prior run's stale summaries can no longer corrupt the new
+    /// session's `engine_results` column. Extracted from
+    /// [`Self::persist_results`] so that invariant is testable in isolation
+    /// (no DB I/O).
+    fn engine_results_json(&self) -> Option<String> {
         let d_energy: Option<EnergyResult> =
             self.hw.as_ref().and_then(|h| h.lock().ok()).and_then(|g| {
                 let trace = g.trace().to_vec();
@@ -887,7 +914,7 @@ impl BenchmarkSequence {
                 apply_load_window(&mut e, g.load_window_joules(), total_tokens);
                 Some(e)
             });
-        let engine_results = EngineResults {
+        EngineResults {
             b_concurrency: (*self.slots.concurrency.load())
                 .clone()
                 .as_ref()
@@ -906,7 +933,20 @@ impl BenchmarkSequence {
                 .as_ref()
                 .map(FlatOutSummary::from_flatout),
         }
-        .to_json();
+        .to_json()
+    }
+
+    /// Persist the completed run to the default SQLite database: one
+    /// `benchmark_sessions` row plus `stream_metrics` rows (from Engine A
+    /// speed results) and `needle_evaluations` rows (from Engine C1 NIAH
+    /// results). A failure is logged but never propagated — the run is
+    /// already complete and the TUI is showing its final state.
+    fn persist_results(&self) {
+        // R2 (CF-14): fold the non-stream engine results (B/C2/C3/D/F) into
+        // the session's `engine_results` JSON column. A → `stream_metrics`
+        // and C1 → `needle_evaluations` (below); these are the engines that
+        // previously had *no* persistence at all.
+        let engine_results = self.engine_results_json();
 
         // R2: the session id is the one shared with the run-log (stamped in
         // its header/archive name by `main`), so the stored row joins to it.
@@ -1517,6 +1557,7 @@ mod tests {
     use crate::config::EngineSelection;
     use crate::engines::capability::{NiahResult, ReasoningScore};
     use crate::engines::concurrency::SweepLevel;
+    use crate::hw::{GpuBackend, GpuSample};
 
     fn config_with(sel: EngineSelection) -> Config {
         Config {
@@ -2304,5 +2345,138 @@ mod tests {
         assert!(gate.is_paused());
         gate.set(false);
         assert!(!gate.is_paused());
+    }
+
+    // ── B1: the per-run "None = not run" slot invariant ─────────────────
+
+    /// A deterministic GPU backend with a real power reading, so a poller
+    /// built on it accumulates a non-empty, power-bearing trace (the
+    /// `d_energy`-present case for a D-only run).
+    #[derive(Debug)]
+    struct PowerGpuBackend {
+        watts: f64,
+    }
+
+    impl GpuBackend for PowerGpuBackend {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Mock GPU")
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                power_watts: Some(self.watts),
+                utilization_pct: Some(90),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    /// B1: `reset_all` (called at the start of every run) clears every
+    /// result slot and zeros the Engine D denominator — so a prior run's
+    /// stale tokens can no longer leak into the next.
+    #[test]
+    fn reset_all_clears_every_slot_and_zeroes_the_denominator() {
+        let s = seq(EngineSelection {
+            speed: true,
+            concurrency: true,
+            niah: true,
+            reasoning: true,
+            structured: true,
+            hardware: true,
+            flatout: true,
+        });
+        // Simulate a prior full run: populate every slot with stale results.
+        s.slots
+            .speed
+            .store(vec![speed_result(100.0, 0.2, 256, false)]);
+        s.slots.concurrency.store(sweep_with_total_tokens(1000));
+        s.slots.niah.store(niah_with_run_cells(1));
+        s.slots.reasoning.store(reasoning_with_response_chars(400));
+        s.slots.structured.store(structured_with_body_chars(800));
+        s.slots.flatout.store(flatout_with_total_tokens(5000));
+        // Sanity: before the reset the stale denominator is non-zero.
+        assert!(s.all_engines_tokens() > 0, "stale tokens are present pre-reset");
+
+        // The start-of-run reset clears every slot.
+        s.slots.reset_all();
+
+        for (name, present) in [
+            ("speed", s.slots.speed.load().as_ref().is_some()),
+            ("concurrency", s.slots.concurrency.load().as_ref().is_some()),
+            ("niah", s.slots.niah.load().as_ref().is_some()),
+            ("reasoning", s.slots.reasoning.load().as_ref().is_some()),
+            ("structured", s.slots.structured.load().as_ref().is_some()),
+            ("flatout", s.slots.flatout.load().as_ref().is_some()),
+        ] {
+            assert!(!present, "slot {name} is cleared after reset_all");
+        }
+        // The denominator is back to 0 (the N/A rule: no stale tokens).
+        assert_eq!(s.all_engines_tokens(), 0);
+    }
+
+    /// B1: after a D-only run (the worst case for stale-slot contamination),
+    /// the persisted `engine_results` contains **only** D — the B/C2/C3/F
+    /// summaries from a prior full run are `None` (absent from the JSON), not
+    /// the stale values the old code wrote into the new session.
+    #[tokio::test]
+    async fn d_only_run_engine_results_contains_only_d() {
+        let sel = EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        };
+        // A poller with a real (mock) power trace so D produces a result.
+        let poller = Arc::new(Mutex::new(HwPoller::with_backend(Some(Arc::new(
+            PowerGpuBackend { watts: 120.0 },
+        )))));
+        // Build up a non-empty, power-bearing trace.
+        {
+            let mut p = poller.lock().unwrap();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+        }
+        let s = BenchmarkSequence::new(
+            config_with(sel),
+            Arc::new(MetricsState::new()),
+            Some(poller),
+            Arc::new(SeqStateSlot::new()),
+            Arc::new(ProgressBus::new()),
+            RunSlots {
+                speed: Arc::new(ResultSlot::new()),
+                concurrency: Arc::new(ResultSlot::new()),
+                niah: Arc::new(NiahSlot::new()),
+                reasoning: Arc::new(ResultSlot::new()),
+                structured: Arc::new(ResultSlot::new()),
+                flatout: Arc::new(ResultSlot::new()),
+            },
+            None,
+            Arc::new(RunPause::new()),
+            crate::log::RunLogger::disabled(),
+            "test-session".to_string(),
+        );
+        // Simulate a prior full run: pre-populate the non-D slots with
+        // stale data, then the start-of-run reset (B1) clears them.
+        s.slots.concurrency.store(sweep_with_total_tokens(1000));
+        s.slots.reasoning.store(reasoning_with_response_chars(400));
+        s.slots.structured.store(structured_with_body_chars(800));
+        s.slots.flatout.store(flatout_with_total_tokens(5000));
+        s.slots.reset_all();
+
+        // The persisted `engine_results` for a D-only run contains only D.
+        let json =
+            s.engine_results_json().expect("a D-only run yields an engine_results object");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v.get("d_energy").is_some(), "D is present: {json}");
+        assert!(v.get("b_concurrency").is_none(), "stale B is absent: {json}");
+        assert!(v.get("c2_reasoning").is_none(), "stale C2 is absent: {json}");
+        assert!(v.get("c3_structured").is_none(), "stale C3 is absent: {json}");
+        assert!(v.get("f_flatout").is_none(), "stale F is absent: {json}");
     }
 }

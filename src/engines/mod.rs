@@ -140,6 +140,17 @@ impl<T> ResultSlot<T> {
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
+
+    /// Clear the slot back to its "not run" state (B1): store `None` and
+    /// clear the running flag. Called at the start of every sequence run so
+    /// a prior run's result never leaks into the next — the "None = not
+    /// run" invariant the Engine D denominator and `persist_results` rely
+    /// on. An engine in the current queue repopulates its own slot during
+    /// the run; one that is not selected stays `None`.
+    pub fn reset(&self) {
+        self.result.store(Arc::new(None));
+        self.running.store(false, Ordering::Relaxed);
+    }
 }
 
 impl<T> Default for ResultSlot<T> {
