@@ -704,6 +704,39 @@ Every completed run is persisted to the SQLite store (`~/.local/share/crucible/b
 
 **Measurement isolation:** all DB I/O happens on the key path (user-driven, rare) and the results are cached in the view's state, so the 60 Hz render loop never touches the database — it renders a pure `&App` read.
 
+## Matrix Report
+
+The **Matrix Report** is the `[COMMUNITY-SUBMISSION]` block Crucible generates after a run completes, formatted for the Level1Techs "Local LLM Matrix" (auto-parsed by https://madgoathaz.github.io/llm-matrix/ ). It has two output paths (TUI and headless) built on two pure, zero-dependency modules, so the block is byte-for-byte identical on every surface.
+
+### `src/report.rs` — the pure core
+
+A `std`-only module (no I/O, no TUI, no hardware probes) that owns the serialization and assembly. Both the TUI and headless paths call into it.
+
+- **`MatrixReport`** — the eight-field struct: `hardware`, `vram`, `model`, `backend`, `quant`, `speed`, `use_case`, `notes`. Pure data; `render()` is the only serialization.
+- **`render()`** — emits the **exact** block: two marker lines (`[COMMUNITY-SUBMISSION]` / `[/COMMUNITY-SUBMISSION]`) plus the eight `key: value` lines in a fixed order, each key `:`-padded so the value lands in a fixed column. **All eight lines are always emitted**, even when an optional value is blank (a key-based parser reads by key, so a blank value is safe; omitting a line is strictly riskier). This is the hard parser contract — any format drift breaks the auto-parser.
+- **`vram_tier()`** — buckets a **binary-MiB** VRAM total into the community's tier bands (`≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`). The **honesty rule**: a value in a gap (33–47, 65–95, 129–195 GiB) reports the raw size and is **never forced into a neighbouring tier**; `0` (no telemetry) → blank, never a fabricated tier.
+- **`build()`** — the single pure assembly function (GPU name/count, VRAM MiB, RAM bytes, model, speed, and the four user fields). The `hardware` string follows an **honest degradation ladder** (missing telemetry drops its own token: GPU+VRAM+RAM → `1x … 24GB + 128GB RAM`; no GPU → `128GB RAM`; etc.). `speed` is the real Engine A mean and is **blank when there are no valid runs** (never a silent `0`).
+
+### `src/clipboard.rs` — zero-dep OSC 52
+
+The copy path. No `base64` / `arboard` / `clipboard` crate — the project is zero-runtime-dependency, so:
+
+- **`b64_encode()`** — a hand-rolled RFC 4648 §4 standard base64 encoder (**encode-only** — the copy direction never decodes).
+- **`osc52()`** — builds the standard DEC/X3.100 part-52 sequence `\x1b]52;c;<base64>\x07`.
+- **`copy_to_clipboard()`** — writes the sequence to a **fresh** `std::io::stdout` (raw mode + the alternate screen do not block it). **N/A-never-fail:** any `io` error is returned (never panicked) so the caller logs "clipboard unsupported by terminal — use [S]ave". Legacy terminals (e.g. xterm) silently ignore OSC 52; save-to-file is the guaranteed path.
+
+### TUI: `Phase::Report`
+
+The post-run takeover (modeled on `Phase::Setup`):
+
+- **`src/ui/views/report.rs`** — `ReportState` (the assembled report + five editable buffers: `backend`, `quant`, `use_case`, `notes`, `save_path`, each with a char cursor), `ReportField` (the focus order), and `handle_key` (`Esc` close, `c`/`C` copy, `s`/`S` save, `Tab`/arrows cycle focus, printable chars incl. space type into the focused buffer). `render()` draws the top bar (brand + the auto-parser URL), the centered block (the focused field marked `▸`, the user fields highlighted "fill me in"), and the footer (`[C]opy [S]ave [Esc]lose → <save path>`).
+- **`src/ui/app.rs`** — the `m` key opens it, **gated on a completed run** (`SeqPhase::AllComplete`); before that it logs "complete a run first" and stays on the dashboard. `open_report()` assembles the auto fields (frozen at open) and pre-fills the save path (`data_dir()/exports/matrix-<unix-ts>.md`), **preserving the user's in-progress edits across close/re-open**. `build_matrix_report()` reads the hardware poller (GPU name/count, VRAM in binary MiB), a fresh `sysinfo` RAM read, and Engine A's `speed_mean_tps` (the valid-filtered mean). `ReportKeyResult::Copied`/`Saved` drive `copy_to_clipboard()` and the file write respectively; a copy failure is a logged warning, never a crash.
+- **Measurement isolation** holds: `ReportState` is mutated only in the key path; `render()` is a pure `&App` read; `build_matrix_report()` runs on the key path (the established `e`-export precedent), never the 60 Hz render/tick path.
+
+### Headless: `--matrix-report`
+
+The CLI flag (layered CLI > env `CRUCIBLE_MATRIX_REPORT` > config file > default `false`) **implies headless mode** (`main.rs` dispatch: `headless || json || matrix_report`). `headless_matrix_report()` is a pure helper over the in-scope run variables (the harvested `hw_trace`'s last sample for VRAM, the detected GPU name/count, a fresh `sysinfo` RAM read, and Engine A's `speed_mean_tps`); `run_headless` prints `report.render()` to stdout after the run. The user fields are left **blank** (a copy-pasteable starting point). With `--json`, the JSON document prints first — the block's markers can't appear inside it, so a pipe consumer slices stdout on the markers.
+
 ## Themes
 
 The TUI is skinned by a `Theme` enum with three complete palettes (`ui/theme.rs`). Every color a view draws comes from the active theme — no view hardcodes a `Color` — so switching re-colors the entire screen from a single source of truth.

@@ -80,7 +80,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; now includes the **NIAH (C1) matrix ladders** (contexts / depths / custom size, `k`/`M` suffixes) alongside the URL, model, mode, ladder, engines, theme, and $/kWh; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
-- **Pause/resume** (`Space`), one-key export (`e`), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
+- **Pause/resume** (`Space`), one-key export (`e`), the **Matrix Report** (`m`, after a run completes), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 
 More views in action:
 
@@ -117,6 +117,19 @@ For CI/CD, scripting, and regression gating:
 - **SQLite persistence** of every run for historical comparison and diffing.
 - **Engine selection honored** — headless runs exactly the engines you select (`--engine`, `CRUCIBLE_ENGINE`, or the config file): Engine A is *not* unconditional (a `--engine niah` run executes only C1), and Engine D is selectable like any other — gated on the *selection*, not the poller, so `--no-hardware --engine hardware` runs and reports a labeled `N/A` (plus the `energy` object in `--json`) instead of being silently skipped. An empty selection is an operator error (a clean no-op with a warning), not a silent full run.
 - **Exit codes** for pipeline integration: `0` = pass, `1` = benchmark failed, `2` = configuration error.
+
+### Matrix Report
+
+After a benchmark run completes, Crucible can generate a **Matrix Report** — a `[COMMUNITY-SUBMISSION]` block formatted for the Level1Techs "Local LLM Matrix" (auto-parsed by https://madgoathaz.github.io/llm-matrix/ ). Two ways to produce it:
+
+- **TUI:** press `m` after a run completes — the Report view shows the block with the user fields editable; `c` copies it to the clipboard (OSC 52), `s` saves it as a `.md` file, `Esc` closes.
+- **Headless / CLI:** `--matrix-report` prints the block to stdout (pipeable).
+
+**Auto-filled by Crucible:** `hardware` (e.g. `1x RTX 4090 24GB + 128GB RAM`), `vram` (bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a value in a gap reports the raw size, never a forced tier), `model`, and `speed` (Engine A answer-phase tokens/s).
+
+**User-filled** (Crucible can't detect these): `backend` (Ollama / llama.cpp / vLLM / …), `quant` (Q4_K_M / FP16 / …), `use_case`, `notes`.
+
+> **Honesty notes:** `speed` is the Engine A *answer-phase* rate — for a pure-reasoning ("CoT-only") model it can legitimately be **blank** (Crucible never fabricates a number); it is an optional field. Copy-to-clipboard uses the terminal's **OSC 52** sequence and works in OSC-52-capable terminals (Windows Terminal, iTerm2, kitty, …); on a terminal that doesn't support it, Crucible says so and **save-to-file is the guaranteed path**. VRAM is read in binary GiB.
 
 ---
 
@@ -219,7 +232,7 @@ CLI flag  >  environment variable  >  config file  >  built-in default
 
 ### Environment Variables
 
-Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`, `CRUCIBLE_NIAH_CONTEXTS`, `CRUCIBLE_NIAH_DEPTHS`, `CRUCIBLE_NIAH_CUSTOM`, `CRUCIBLE_NIAH_MAX_TOKENS`, `CRUCIBLE_STRUCTURED_MAX_TOKENS`, `CRUCIBLE_RATE_KWH`. (The $/kWh rate has no CLI flag — it is layered from env / config file only. `--no-disable-thinking` is the reverse: a CLI-only force-test switch with no env / config-file layer. The NIAH ladders are the exception among config-file fields: they are reachable from **all four** sources — CLI (`--niah-contexts` / `--niah-depths` / `--niah-custom`), env, config file, and the TUI (Config view / Setup) — layered CLI > env > config file > default.)
+Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODEL`, `CRUCIBLE_MODE`, `CRUCIBLE_TOKENS`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_API_KEY`, `CRUCIBLE_TIMEOUT`, `CRUCIBLE_NOCACHE`, `CRUCIBLE_TOKENIZER`, `CRUCIBLE_JSON`, `CRUCIBLE_VERBOSE`, `CRUCIBLE_NO_COLOR`, `CRUCIBLE_TUI`, `CRUCIBLE_HEADLESS`, `CRUCIBLE_MATRIX_REPORT`, `CRUCIBLE_CONFIG`, `CRUCIBLE_LADDER`, `CRUCIBLE_HARDWARE`, `CRUCIBLE_ENGINE`, `CRUCIBLE_LOG_DIR`, `CRUCIBLE_EXPORT`, `CRUCIBLE_EXPORT_PATH`, `CRUCIBLE_MATRIX_CONTEXT`, `CRUCIBLE_THEME`, `CRUCIBLE_NIAH_CONTEXTS`, `CRUCIBLE_NIAH_DEPTHS`, `CRUCIBLE_NIAH_CUSTOM`, `CRUCIBLE_NIAH_MAX_TOKENS`, `CRUCIBLE_STRUCTURED_MAX_TOKENS`, `CRUCIBLE_RATE_KWH`. (The $/kWh rate has no CLI flag — it is layered from env / config file only. `--no-disable-thinking` is the reverse: a CLI-only force-test switch with no env / config-file layer. The NIAH ladders are the exception among config-file fields: they are reachable from **all four** sources — CLI (`--niah-contexts` / `--niah-depths` / `--niah-custom`), env, config file, and the TUI (Config view / Setup) — layered CLI > env > config file > default.)
 
 ### CLI Reference
 
@@ -239,6 +252,7 @@ Every flag has a `CRUCIBLE_`-prefixed equivalent: `CRUCIBLE_URL`, `CRUCIBLE_MODE
 | `--tokenizer <PATH>` | — | HF `tokenizer.json` for exact token counts; without it, counts are `chars/4` estimates (flagged `estimated`). |
 | `--tui` | off | Force the interactive dashboard (default mode on a TTY). |
 | `--headless` | off | Run the classic headless benchmark instead of the TUI. |
+| `--matrix-report` | off | Print the `[COMMUNITY-SUBMISSION]` Matrix Report block to stdout after the run (auto-parsed by the Level1Techs Local LLM Matrix). Implies headless; the user fields are left blank. |
 | `--engine <NAME>` | A,B,C1,C2,C3,F (D auto) | Select which engines a run orchestrates (repeatable): `all` (every engine), `speed`/`a`, `concurrency`/`b`, `niah`/`needle`/`c1`, `reasoning`/`c2`, `structured`/`c3`, `hardware`/`energy`/`d`, `flatout`/`flat`/`f`. An explicit selection always wins over GPU auto-detection. |
 | `--ladder <CSV>` | `1,2,3,4,8,12,16,24,32` | Concurrency ladder for Engine B. |
 | `--matrix-context <CSV>` | `0,8k,32k` | Context sizes for Engine B's 2D concurrency × context matrix (`0` = the configured prompt). |

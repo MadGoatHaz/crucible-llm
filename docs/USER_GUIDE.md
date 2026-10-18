@@ -85,6 +85,7 @@ No GPU? Engine D is disabled automatically. No N/A panels.
 | Space | Pause / Resume benchmark |
 | c | Re-open the Setup flow |
 | e | Export results |
+| m | Matrix Report (opens after a run completes) |
 | q | Quit — opens a `[y/N]` confirmation (the **only** quit path) |
 | Ctrl+C | **Does not quit** — the terminal owns it for copy selection |
 
@@ -347,6 +348,68 @@ Press `e` during or after a run. There is no format menu — the export is writt
 
 ### Default Export Location
 `~/.local/share/crucible/exports/crucible-<session-id[:8]>.<ext>` — the run's session UUID (first 8 chars), so the export joins deterministically to the stored session and the session-stamped run-log archive. A TUI `e`-key export of the live snapshot uses `live-<unix-timestamp>.<ext>` instead.
+
+## Matrix Report
+
+After a benchmark run completes, you can generate a **Matrix Report** — a `[COMMUNITY-SUBMISSION]` block formatted for the Level1Techs "Local LLM Matrix" (auto-parsed by https://madgoathaz.github.io/llm-matrix/ ). It's the quick way to submit your hardware + model + speed to the community matrix.
+
+### From the TUI (press `m`)
+
+1. **Complete a run** first. Pressing `m` before a run finishes just logs "complete a run first" and stays on the dashboard.
+2. **Press `m`** — the full-screen **Matrix Report** view opens, showing the block. The auto fields (`hardware`, `vram`, `model`, `speed`) are already filled; the user fields (`backend`, `quant`, `use case`, `notes`) start empty.
+3. **Fill in the user fields** — focus starts on `backend`. Use `Tab` / `Shift+Tab` (or `→` / `←` / `↑` / `↓`) to move between `backend`, `quant`, `use case`, `notes`, and `save path`, and type to edit. Space is allowed (notes often need it).
+4. **Copy or save:**
+   - `c` — copy the block to your clipboard via the terminal's **OSC 52** sequence. This works in OSC-52-capable terminals (Windows Terminal, iTerm2, kitty, …). If your terminal doesn't support it, Crucible tells you — use save instead.
+   - `s` — **save** the block to a `.md` file (**the guaranteed path on every terminal**). The default path is `~/.local/share/crucible/exports/matrix-<timestamp>.md`; edit the `save path` field to change it.
+5. **`Esc`** — close and return to the dashboard. Your in-progress edits are kept if you re-open with `m`.
+
+### The block (and which fields are auto vs. manual)
+
+The report is exactly this shape — all eight lines are always present, in this order (the parser reads by key, so a blank value is fine):
+
+```
+[COMMUNITY-SUBMISSION]
+hardware: 1x RTX 4090 24GB + 128GB RAM
+vram:     24GB — 16-24
+model:    qwen3.8-27b
+backend:  vLLM
+quant:    Q4_K_M
+speed:    45 tok/s
+use_case: daily chat
+notes:    enable_thinking=false
+[/COMMUNITY-SUBMISSION]
+```
+
+| Field | Filled by | Notes |
+|-------|-----------|-------|
+| `hardware` | **auto** | e.g. `1x RTX 4090 24GB + 128GB RAM` (GPU + VRAM + host RAM; degrades honestly if telemetry is missing) |
+| `vram` | **auto** | Bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a value in a gap (e.g. `40GB`) reports the raw size, never a forced tier; read in **binary GiB** |
+| `model` | **auto** | The target model from your config |
+| `speed` | **auto** | Engine A answer-phase tokens/s — **blank** for a pure-reasoning (CoT-only) model (never a fabricated number) |
+| `backend` | **you** | Ollama / llama.cpp / vLLM / LM Studio / … |
+| `quant` | **you** | Q4_K_M / FP16 / … |
+| `use_case` | **you** | e.g. "daily chat" |
+| `notes` | **you** | launch flags, quirks |
+
+> **Honesty:** `speed` is the Engine A *answer-phase* rate. For a pure-CoT model that spends its whole budget thinking (no answer phase), it is legitimately **blank** — an optional field in the template, and Crucible never invents a number.
+
+### Headless / CLI (`--matrix-report`)
+
+For scripting, CI, or a quick pipeable block, add `--matrix-report` to a headless run — it prints the `[COMMUNITY-SUBMISSION]` block to stdout after the run:
+
+```bash
+# Engine A speed run + matrix report on stdout (pipeable)
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model \
+  --engine speed --matrix-report
+
+# Capture the block to a file
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model \
+  --engine speed --matrix-report > submission.md
+```
+
+`--matrix-report` implies headless mode. The auto fields are filled from the run + hardware telemetry; the user fields (`backend` / `quant` / `use_case` / `notes`) are left **blank** — the block is a copy-pasteable starting point you complete before submitting. With `--json`, the JSON document prints first (the block's markers can't appear inside it, so a pipe consumer slices stdout on the `[COMMUNITY-SUBMISSION]` markers).
+
+Then paste the block into your forum post.
 
 ## Understanding Your Results
 
