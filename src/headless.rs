@@ -782,6 +782,13 @@ pub fn headless_energy_line(energy: &EnergyResult) -> Option<String> {
                 "  Energy: N/A — no power telemetry (no valid power sensor on this host)"
                     .to_string()
             }
+            // I7: telemetry + tokens present, but the (idle-subtracted)
+            // draw never rose above the floor — the `0.0` N/A value,
+            // labeled (never a silent 0.0 J/token).
+            "no energy measured" => {
+                "  Energy: N/A — no energy measured above the idle floor (power telemetry present)"
+                    .to_string()
+            }
             // Power telemetry is present, but the run produced zero tokens
             // (a D-only / no-work run) — nothing to divide the energy by.
             _ => "  Energy: N/A — no tokens generated this run (power telemetry present)"
@@ -1097,6 +1104,28 @@ mod tests {
             line2.contains("N/A — no power telemetry"),
             "the no-telemetry cause: {line2}"
         );
+    }
+
+    /// I7: the zero-energy-above-the-floor case prints its own **labeled**
+    /// N/A line (telemetry present, draw never rose above the floor) —
+    /// never a silent gap, never a spurious 0.0.
+    #[test]
+    fn headless_energy_line_labels_no_energy_measured() {
+        let e = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: Some(0.0),
+            peak_power_w: Some(80.0),
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: Some(90.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("Mock".into()),
+            cpu_power_estimated: false,
+        };
+        let line = headless_energy_line(&e).expect("a line");
+        assert!(line.contains("N/A — no energy measured"), "{line}");
     }
 
     /// I4: `headless_energy` reads the estimate flag from the poller's

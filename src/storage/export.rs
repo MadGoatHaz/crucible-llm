@@ -313,8 +313,13 @@ impl ExportPayload {
         ));
 
         out.push_str("## Stream Metrics\n\n");
+        // I7c: the per-stream J/token column is labeled as the *per-stream*
+        // (Engine A, per-iteration window) concept — distinct from the
+        // run-level `Energy (Engine D)` section below (the same two
+        // concepts the JSON export carries as `metrics[].joules_per_token`
+        // vs `energy.joules_per_token`).
         out.push_str(
-            "| # | Concurrency | Prompt Tokens | Completion Tokens | Reasoning Tokens | TTFT (ms) | TPOT (ms) | MTP η | J/Token | Cache |\n",
+            "| # | Concurrency | Prompt Tokens | Completion Tokens | Reasoning Tokens | TTFT (ms) | TPOT (ms) | MTP η | J/Token (per stream) | Cache |\n",
         );
         out.push_str("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for (i, m) in self.metrics.iter().enumerate() {
@@ -331,6 +336,43 @@ impl ExportPayload {
                 md_cell(&opt_f3(m.joules_per_token)),
                 md_cell(&opt_bool(m.cache_hit)),
             ));
+        }
+
+        // I7b: the Engine D energy section — the JSON export carries the
+        // `energy` object; the markdown did not. The run-level J/token here
+        // is the whole-load-window, all-tokens figure (idle-subtracted) —
+        // labeled distinct from the per-stream column above.
+        if let Some(e) = &self.energy {
+            out.push_str("\n## Energy (Engine D)\n\n");
+            out.push_str("| Metric | Value |\n");
+            out.push_str("|---|---|\n");
+            out.push_str(&format!(
+                "| Energy (J) | {} |\n",
+                md_cell(&format!("{:.1}", e.joules))
+            ));
+            out.push_str(&format!(
+                "| J/token (run, all tokens) | {} |\n",
+                md_cell(&opt_f3(e.joules_per_token))
+            ));
+            out.push_str(&format!(
+                "| Avg power (W) | {} |\n",
+                md_cell(&opt_f3(e.avg_power_w))
+            ));
+            out.push_str(&format!(
+                "| Peak power (W) | {} |\n",
+                md_cell(&opt_f3(e.peak_power_w))
+            ));
+            out.push_str(&format!(
+                "| CPU power estimated | {} |\n",
+                md_cell(&if e.cpu_power_estimated {
+                    "yes"
+                } else {
+                    "no"
+                })
+            ));
+            if let Some(r) = &e.na_reason {
+                out.push_str(&format!("| N/A reason | {} |\n", md_cell(r)));
+            }
         }
 
         if !self.needles.is_empty() {
@@ -716,6 +758,41 @@ mod tests {
         assert!(md.contains("**Duration:** 12.34 s"));
         // No needle data → no needle section.
         assert!(!md.contains("## Needle Evaluations"));
+    }
+
+    /// I7b: the markdown export includes the **D energy section** (parity
+    /// with the JSON export's `energy` object) when the payload carries
+    /// energy — and omits it when it does not. I7c: the run-level J/token
+    /// is labeled distinct from the per-stream column.
+    #[test]
+    fn markdown_export_includes_the_d_energy_section() {
+        // No energy → no section.
+        let md = sample_payload().to_markdown();
+        assert!(!md.contains("## Energy (Engine D)"), "{md}");
+
+        // With energy → the section, the labeled run-level J/token, and
+        // the estimate flag.
+        let mut payload = sample_payload();
+        payload.energy = Some(crate::storage::models::EnergySummary {
+            joules: 178_522.0,
+            joules_per_token: Some(0.0998),
+            avg_power_w: Some(229.0),
+            peak_power_w: Some(521.0),
+            avg_utilization_pct: Some(91.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("RTX 3080 Ti".into()),
+            fragmentation_warning: None,
+            na_reason: None,
+            cpu_power_estimated: false,
+        });
+        let md = payload.to_markdown();
+        assert!(md.contains("## Energy (Engine D)"), "{md}");
+        assert!(md.contains("J/token (run, all tokens)"), "{md}");
+        // opt_f3 renders 0.0998 as "0.100".
+        assert!(md.contains("| 0.100 |"), "{md}");
+        assert!(md.contains("| CPU power estimated | no |"), "{md}");
+        // I7c: the per-stream column is labeled distinct from the run level.
+        assert!(md.contains("J/Token (per stream)"), "{md}");
     }
 
     #[test]

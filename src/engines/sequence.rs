@@ -1596,7 +1596,10 @@ pub fn apply_load_window(
 ) {
     if let Some(j) = load_joules {
         energy.joules = j;
-        energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
+        // I7: a `0.0` load-window energy is the N/A value (labeled by
+        // `na_reason` as "no energy measured") — never a spurious
+        // `0.0` J/token ("free inference").
+        energy.joules_per_token = (total_tokens > 0 && j > 0.0).then(|| j / total_tokens as f64);
         if let Some(d) = duration_sec.filter(|d| *d > 0.0) {
             energy.avg_power_w = Some(j / d);
         }

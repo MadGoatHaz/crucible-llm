@@ -98,12 +98,16 @@ impl EnergyResult {
     }
 
     /// The N/A reason for this result, when `joules_per_token` is `None`
-    /// (the N/A case) — distinguishing the **two root causes** so a consumer
-    /// never sees a silent gap (B3):
+    /// (the N/A case) — distinguishing the **root causes** so a consumer
+    /// never sees a silent gap (B3 / I7):
     ///
     /// * **`"no power telemetry"`** — [`Self::is_na`]: no sample in scope
     ///   carried a reading (a driverless host, or a sensor with no usable
     ///   reading, e.g. the RAPL quirk on a shared host).
+    /// * **`"no energy measured"`** — power telemetry *is* present and
+    ///   tokens were generated, but the (idle-subtracted) energy is `0.0`
+    ///   (the draw never rose above the idle floor) — I7: the `0.0` N/A
+    ///   value, labeled, never a silent `0.0` J/token.
     /// * **`"no tokens generated"`** — power telemetry *is* present, but the
     ///   run produced zero tokens (a D-only / no-work run), so there is
     ///   nothing to divide the energy by.
@@ -119,6 +123,8 @@ impl EnergyResult {
         }
         if self.is_na() {
             Some("no power telemetry")
+        } else if self.joules <= 0.0 {
+            Some("no energy measured")
         } else {
             Some("no tokens generated")
         }
@@ -304,7 +310,12 @@ pub fn profile(
 
     EnergyResult {
         joules,
-        joules_per_token: (has_power && total_tokens > 0).then(|| joules / total_tokens as f64),
+        // I7: a `0.0` energy (the draw never rose above the idle floor, or
+        // no interval resolved) is the N/A value — `joules_per_token` stays
+        // `None` (labeled by `na_reason`), never a spurious `0.0` J/token
+        // ("free inference").
+        joules_per_token:
+            (has_power && total_tokens > 0 && joules > 0.0).then(|| joules / total_tokens as f64),
         avg_power_w,
         peak_power_w,
         peak_vram_bytes,
@@ -639,9 +650,10 @@ mod tests {
         );
     }
 
-    /// F9: a floor at or above every sample yields zero load-attributable
-    /// energy — and `has_power` stays true (telemetry existed), so the N/A
-    /// machinery (not a silent 0.0 J/token) handles the result.
+    /// F9 / I7: a floor at or above every sample yields zero
+    /// load-attributable energy — `has_power` stays true (telemetry
+    /// existed), `joules_per_token` stays `None` (never a spurious
+    /// `0.0`), and `na_reason` names the cause ("no energy measured").
     #[test]
     fn floor_at_or_above_all_samples_yields_zero_energy() {
         let a = MonotonicInstant::now();
@@ -654,6 +666,17 @@ mod tests {
         let (joules, has_power) = integrate_joules(&samples, None, 100.0);
         assert!(has_power, "readings exist — this is not the no-telemetry N/A");
         assert_eq!(joules, 0.0, "nothing above the floor → zero load energy");
+        let p = profile(&samples, None, 100, 100.0);
+        assert_eq!(p.joules, 0.0);
+        assert_eq!(
+            p.joules_per_token, None,
+            "zero energy is the N/A value — never a spurious 0.0 J/token"
+        );
+        assert_eq!(
+            p.na_reason(),
+            Some("no energy measured"),
+            "the 0.0 N/A carries its labeled cause"
+        );
     }
 
     // ── B3: the N/A reason distinguishes its two root causes ─────────────
@@ -723,5 +746,27 @@ mod tests {
         let mut e = energy_with_power_no_tokens();
         e.joules_per_token = Some(0.4);
         assert_eq!(e.na_reason(), None, "a value is not N/A");
+    }
+
+    /// I7: telemetry + tokens present, but the (idle-subtracted) energy is
+    /// `0.0` → the third, distinct cause "no energy measured" (the draw
+    /// never rose above the idle floor) — the `0.0` N/A value is labeled,
+    /// never a silent `0.0` J/token.
+    #[test]
+    fn na_reason_no_energy_measured_when_the_floor_covers_the_draw() {
+        let e = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: Some(0.0),
+            peak_power_w: Some(80.0),
+            avg_utilization_pct: Some(90.0),
+            ..energy_no_power()
+        };
+        assert!(!e.is_na(), "telemetry is present → not the no-telemetry N/A");
+        assert_eq!(
+            e.na_reason(),
+            Some("no energy measured"),
+            "the distinct zero-energy cause"
+        );
     }
 }

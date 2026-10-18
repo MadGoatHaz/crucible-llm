@@ -598,6 +598,53 @@ mod tests {
         assert_eq!(s3.joules_per_token, Some(0.5));
     }
 
+    /// I7a: `EnergySummary.joules` is a non-`Option` `f64` — the `0.0` N/A
+    /// value must **always** carry `na_reason` (never a silent `0.0` in the
+    /// DB / export).
+    #[test]
+    fn energy_summary_zero_joules_always_carries_na_reason() {
+        // No telemetry: joules 0.0 + the no-telemetry reason.
+        let no_power = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: None,
+            peak_power_w: None,
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: None,
+            vendor: None,
+            model: None,
+            cpu_power_estimated: false,
+        };
+        let s = EnergySummary::from_energy(&no_power);
+        assert_eq!(s.joules, 0.0);
+        assert!(
+            s.na_reason.is_some(),
+            "the 0.0 N/A value carries a reason: {:?}",
+            s.na_reason
+        );
+
+        // Zero energy above the floor (telemetry + tokens present): the
+        // distinct "no energy measured" reason.
+        let no_energy = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: Some(0.0),
+            peak_power_w: Some(80.0),
+            avg_utilization_pct: Some(90.0),
+            ..no_power
+        };
+        let s2 = EnergySummary::from_energy(&no_energy);
+        assert_eq!(s2.joules, 0.0);
+        assert_eq!(
+            s2.na_reason.as_deref(),
+            Some("N/A — no energy measured"),
+            "the 0.0 N/A value is labeled: {:?}",
+            s2.na_reason
+        );
+    }
+
     /// I4: `from_energy` copies the `cpu_power_estimated` flag into the
     /// persisted summary (previously the flag existed only in the `--json`
     /// stdout object — the DB / export could not tell measured from
