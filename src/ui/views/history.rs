@@ -185,8 +185,11 @@ impl DiffReport {
                 false,
             ),
             diff_row("MTP rate", summary_a.mtp, summary_b.mtp, false),
+            // I9: the per-stream (Engine A) J/token — labeled as such, a
+            // distinct concept from the run-level Engine D figure (the
+            // mean over the session's stored stream_metrics rows).
             diff_row(
-                "J/token",
+                "J/token (A)",
                 summary_a.joules_per_token,
                 summary_b.joules_per_token,
                 true,
@@ -578,9 +581,14 @@ fn render_detail(area: Rect, h: &HistoryState, idx: usize, th: Theme, f: &mut Fr
                     Span::styled(format!("{mtp:.2} x"), style::highlight(th)),
                 ]));
             }
+            // I9: the per-stream (Engine A) J/token — the mean over this
+            // session's stored stream_metrics rows (headless rows carry a
+            // per-iteration windowed value; TUI rows stay consistently
+            // NULL → the line is hidden). Labeled `(A)` to distinguish it
+            // from the run-level Engine D figure.
             if let Some(jpt) = sum.joules_per_token {
                 lines.push(Line::from(vec![
-                    Span::styled("    J/token:     ", style::label(th)),
+                    Span::styled("    J/token (A): ", style::label(th)),
                     Span::styled(format!("{jpt:.3}"), style::value(th)),
                 ]));
             }
@@ -801,7 +809,7 @@ fn render_compare(
     }
 
     let info_note = Line::from(Span::styled(
-        "  ℹ Green = improvement, Red = regression, — = no change. TTFT & J/token improve when lower.",
+        "  ℹ Green = improvement, Red = regression, — = no change. TTFT & J/token (A) improve when lower.",
         style::info(th),
     ));
     let back_hint = Line::from(Span::styled("  [Esc] Back to list", style::footer(th)));
@@ -885,7 +893,7 @@ fn format_metric(label: &str, v: Option<f64>) -> String {
         "Gen t/s" => fmt::format_rate(v),
         "Prompt t/s" => fmt::format_rate(v),
         "MTP rate" => format!("{v:.2} x"),
-        "J/token" => format!("{v:.3} J/tok"),
+        "J/token (A)" => format!("{v:.3} J/tok"),
         _ => format!("{v:.3}"),
     }
 }
@@ -1037,8 +1045,8 @@ mod tests {
 
     #[test]
     fn missing_or_zero_baselines_yield_no_delta() {
-        assert_eq!(diff_row("J/token", None, Some(0.3), true).delta_pct, None);
-        assert_eq!(diff_row("J/token", Some(0.3), None, true).delta_pct, None);
+        assert_eq!(diff_row("J/token (A)", None, Some(0.3), true).delta_pct, None);
+        assert_eq!(diff_row("J/token (A)", Some(0.3), None, true).delta_pct, None);
         assert_eq!(
             diff_row("Gen t/s", Some(0.0), Some(5.0), false).delta_pct,
             None
@@ -1066,9 +1074,45 @@ mod tests {
         assert_eq!(report.rows[1].improved, Some(true));
         assert_eq!(report.rows[3].delta_pct, Some(25.0)); // 1.0 → 1.25 x
         assert_eq!(report.rows[3].improved, Some(true));
-        // J/token: no hardware telemetry on either side → not comparable.
+        // I9: the per-stream (Engine A) J/token row — labeled `(A)`,
+        // distinct from the run-level Engine D figure.
+        assert_eq!(report.rows[4].label, "J/token (A)");
+        // …no hardware telemetry on either side → not comparable.
         assert_eq!(report.rows[4].delta_pct, None);
         assert_eq!(report.rows[4].improved, None);
+    }
+
+    /// I9: a session whose stored stream rows carry a per-iteration
+    /// J/token (the headless path) shows it in the detail view under the
+    /// labeled per-stream name — and a TUI session (rows consistently
+    /// NULL) shows no line at all (never a fabricated value).
+    #[test]
+    fn detail_view_labels_the_per_stream_joules_per_token() {
+        // Headless-style: the rows carry a stamped per-iteration value.
+        let a = session("aaaa", "vllm-0.6");
+        let report = DiffReport::from_sessions(
+            &a,
+            &[metric("aaaa", Some(200.0), Some(20.0), Some(1.0), Some(0.25))],
+            &session("bbbb", "vllm-0.7"),
+            &[metric("bbbb", Some(160.0), Some(16.0), Some(1.25), Some(0.30))],
+        );
+        assert!((report.summary_a.joules_per_token.unwrap() - 0.25).abs() < 1e-9);
+        assert!((report.summary_b.joules_per_token.unwrap() - 0.30).abs() < 1e-9);
+        // The diff row formats the value (the `J/tok` unit suffix).
+        assert_eq!(
+            format_metric(report.rows[4].label, report.rows[4].a),
+            "0.250 J/tok"
+        );
+        // TUI-style: all rows NULL → the summary J/token is None (the
+        // detail view hides the line; the diff row is not comparable).
+        let report2 = DiffReport::from_sessions(
+            &session("cccc", "vllm-0.8"),
+            &[metric("cccc", Some(200.0), Some(20.0), Some(1.0), None)],
+            &session("dddd", "vllm-0.9"),
+            &[metric("dddd", Some(160.0), Some(16.0), Some(1.25), None)],
+        );
+        assert_eq!(report2.summary_a.joules_per_token, None);
+        assert_eq!(report2.rows[4].delta_pct, None);
     }
 
     // ---- formatting ----
