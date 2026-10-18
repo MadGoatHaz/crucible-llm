@@ -39,7 +39,10 @@
 //!   not keep counting on screen.
 //!
 //! **N/A rule** (blueprint §5D): with no power telemetry every derived
-//! metric is `None` (rendered `N/A`), never a spurious `0.0`.
+//! metric is `None` (rendered `N/A`), never a spurious `0.0`. It covers the
+//! View 4 Efficiency panel too: with no token observed *this* run,
+//! J/token / J/ktoken / Tokens/W / Total tokens render `N/A`, never a
+//! silent `0.000` (and never a stale non-zero total).
 
 use crate::timing::MonotonicInstant;
 
@@ -908,18 +911,27 @@ impl GpuPowerMonitor {
     }
 
     /// The **all-token** total for this run: input (prompt) + output
-    /// (completion), cumulative across every engine (I3). This is the same
-    /// denominator Engine D's headline J/token uses
-    /// (`sum_all_engines_tokens` in `engines/sequence.rs`), so the View 4
-    /// efficiency figure and the D result can never diverge by an unlabeled
-    /// output-only convention.
+    /// (completion), cumulative across every engine (I3).
+    ///
+    /// This is View 4's **live** token total: the monitor accumulates the
+    /// metrics pipeline's `OverallStats` cumulative on each poll
+    /// ([`Self::record`]) — a **parallel live accumulation**, not a call to
+    /// `sum_all_engines_tokens` (the Engine D denominator helper in
+    /// `engines/sequence.rs`). The two follow the *same convention* (all
+    /// engines, input + output), so the View 4 efficiency figure and the D
+    /// result can never diverge by an unlabeled output-only convention;
+    /// they can still diverge at run edges (a stale live counter), which is
+    /// why the Efficiency panel gates on whether any token was seen *this
+    /// run* (`first_token_at`) rather than trusting the raw number.
     #[must_use]
     pub fn all_tokens(&self) -> u64 {
         self.prompt_tokens + self.total_tokens
     }
 
-    /// Joules per **all** token (input + output) — the same denominator
-    /// Engine D uses (I3). `None` without power or without tokens (N/A
+    /// Joules per **all** token (input + output) — the same convention as
+    /// Engine D's denominator (all engines, input + output; I3), computed
+    /// over the monitor's parallel live token accumulation (see
+    /// [`Self::all_tokens`]). `None` without power or without tokens (N/A
     /// rule).
     pub fn joules_per_token(&self) -> Option<f64> {
         (self.has_power && self.all_tokens() > 0)

@@ -1252,12 +1252,14 @@ impl BenchmarkSequence {
     /// J/token by excluding the tokens of the most energy-hungry work.
     ///
     /// **Real counts** are used where the result type carries them: A
-    /// `completion_tokens`, B `levels[].total_tokens`, **C1 per-cell
-    /// `prompt_tokens` + `completion_tokens`** (H2 — the server-reported
-    /// usage; the `chars/4` doc estimate stands in for the prompt only when
-    /// no usage block arrived), F `total_tokens`. C2/C3 (and a C1 cell with
-    /// no usage block) contribute a clearly-labeled `chars/4` / gen-cap
-    /// estimate.
+    /// `completion_tokens`, B all concurrency-matrix legs'
+    /// `total_tokens` (the primary leg is inside the matrix — not counted
+    /// again) or the single-context ladder `levels[].total_tokens` (F4),
+    /// **C1 per-cell `prompt_tokens` + `completion_tokens`** (H2 — the
+    /// server-reported usage; the `chars/4` doc estimate stands in for the
+    /// prompt only when no usage block arrived), F `total_tokens`. C2/C3
+    /// (and a C1 cell with no usage block) contribute a clearly-labeled
+    /// `chars/4` / gen-cap estimate.
     ///
     /// Slots that have not run yet contribute `0`, so calling this at D's
     /// sampling point (before F) and at `persist_results` (after F) each stay
@@ -1518,9 +1520,12 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
 /// contributes `0`). **H2:** C1 (NIAH) contributes the real per-cell
 /// `prompt_tokens` + `completion_tokens`; the labeled `NIAH_MAX_GEN_TOKENS`
 /// gen-cap stands in only for a cell with no usage block. C2/C3 contribute
-/// the codebase's standard no-tokenizer `chars/4` estimate. The numerator
-/// (the power window the energy math integrates) spans the same engine set
-/// as this denominator — a number must mean what it says.
+/// the codebase's standard no-tokenizer `chars/4` estimate. **F4:** B
+/// contributes **all** its concurrency-matrix legs' tokens when the 2D
+/// matrix ran (the primary leg is inside the matrix — not added again),
+/// else the single-context ladder levels. The numerator (the power window
+/// the energy math integrates) spans the same engine set as this
+/// denominator — a number must mean what it says.
 #[must_use]
 pub fn sum_all_engines_tokens(
     speed: Option<&[SpeedResult]>,
@@ -1535,9 +1540,23 @@ pub fn sum_all_engines_tokens(
     if let Some(results) = speed {
         total += results.iter().map(|r| r.completion_tokens).sum::<u64>();
     }
-    // Engine B — real sweep total tokens.
+    // Engine B — the full load the numerator spans (F4): every context leg
+    // when the 2D matrix ran (the primary leg is *inside* the matrix — do
+    // not add `levels` again), else the single-context ladder levels.
     if let Some(result) = sweep {
-        total += result.levels.iter().map(|l| l.total_tokens).sum::<u64>();
+        match &result.matrix {
+            Some(m) => {
+                total += m
+                    .cells
+                    .iter()
+                    .flatten()
+                    .map(|c| c.total_tokens)
+                    .sum::<u64>();
+            }
+            None => {
+                total += result.levels.iter().map(|l| l.total_tokens).sum::<u64>();
+            }
+        }
     }
     // Engine C1 (NIAH) — real per-cell prompt + completion tokens (H2); the
     // labeled gen-cap stands in only for a cell with no usage block.
@@ -1611,7 +1630,7 @@ mod tests {
     use super::*;
     use crate::config::EngineSelection;
     use crate::engines::capability::{NiahResult, ReasoningScore};
-    use crate::engines::concurrency::SweepLevel;
+    use crate::engines::concurrency::{ConcurrencyMatrix, MatrixCell, SweepLevel};
     use crate::hw::{GpuBackend, GpuSample};
 
     fn config_with(sel: EngineSelection) -> Config {
@@ -2145,6 +2164,82 @@ mod tests {
             estimated: false,
         };
         SweepResult::from_levels(vec![level], None)
+    }
+
+    /// F4: one matrix cell with a known `total_tokens`.
+    fn matrix_cell(total_tokens: u64) -> MatrixCell {
+        MatrixCell {
+            context: 0,
+            concurrency: 1,
+            aggregate_tps: 100.0,
+            per_stream_tps: 100.0,
+            tps_per_completed_stream: 100.0,
+            tps_per_requested_stream: 100.0,
+            failed_stream_ratio: 0.0,
+            high_failure: false,
+            ttft_p50_ns: 10_000_000,
+            itl_p50_ns: 1_000_000,
+            itl_p99_ns: 3_000_000,
+            total_tokens,
+            estimated: false,
+            timed_out_tokens: 0,
+            wall_ns: 1_000_000_000,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+        }
+    }
+
+    /// F4: a multi-context (2D matrix) `SweepResult`: `levels` is only the
+    /// **primary** (ctx == 0) leg (CF-27); `matrix.cells` holds **every**
+    /// context leg (1000 + 2000 + 3000 tokens).
+    fn sweep_with_matrix() -> SweepResult {
+        let level = SweepLevel {
+            concurrency: 1,
+            aggregate_tps: 100.0,
+            p50_tpot_ns: 1_000_000,
+            p90_tpot_ns: 2_000_000,
+            p99_tpot_ns: 3_000_000,
+            ttft_p50_ns: 10_000_000,
+            ttft_p90_ns: 20_000_000,
+            total_tokens: 1000,
+            completed_streams: 1,
+            failed_streams: 0,
+            timed_out_streams: 0,
+            timed_out_tokens: 0,
+            aborted: false,
+            wall_ns: 1_000_000_000,
+            streams: Vec::new(),
+            context: 0,
+            per_stream_tps: 100.0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+            estimated: false,
+        };
+        SweepResult::from_levels(
+            vec![level],
+            Some(ConcurrencyMatrix {
+                contexts: vec![0, 8000, 32000],
+                concurrency: vec![1],
+                cells: vec![
+                    vec![matrix_cell(1000)],
+                    vec![matrix_cell(2000)],
+                    vec![matrix_cell(3000)],
+                ],
+            }),
+        )
+    }
+
+    /// F4: a multi-context B run contributes **every** matrix leg to the
+    /// denominator — larger than the primary leg alone (the old inflation is
+    /// gone) and **not** `levels` + matrix (the primary leg is inside the
+    /// matrix; 6000, not 7000).
+    #[test]
+    fn all_engines_tokens_multi_context_sweep_counts_every_matrix_leg() {
+        let sweep = sweep_with_matrix();
+        let total = sum_all_engines_tokens(None, Some(&sweep), None, None, None, None);
+        assert_eq!(total, 6000, "all legs: 1000 + 2000 + 3000");
+        assert!(total > 1000, "larger than the primary leg alone");
+        assert_ne!(total, 7000, "the primary leg is not double-counted");
     }
 
     fn niah_with_run_cells(run: usize) -> NiahResult {

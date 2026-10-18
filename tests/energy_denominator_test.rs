@@ -1,14 +1,16 @@
 //! CF-41(b) / P3 CF-03 — the Joules/token denominator spans **all** engines
 //! that produced tokens (A+B+C1+C2+C3+F), not just A+B.
 //!
-//! `BenchmarkSequence::all_engines_tokens` (sequence.rs:1213) is a *private*
-//! lib method, so this integration test **mirrors** its summing rule over the
-//! public result types and asserts the property the CF-03 fix establishes:
-//! the all-engine denominator is strictly larger than the old A+B-only one,
-//! and feeding it to the energy `profile` yields a *lower* (honest) J/token —
-//! the numerator (the power-trace integral) always includes the most
-//! energy-hungry capability cells, so the denominator must span the same
-//! engine set.
+//! `sum_all_engines_tokens` (sequence.rs) is the shared helper both the TUI
+//! and headless paths call, so this integration test **mirrors** its summing
+//! rule over the public result types and asserts the property the CF-03 fix
+//! establishes: the all-engine denominator is strictly larger than the old
+//! A+B-only one, and feeding it to the energy `profile` yields a *lower*
+//! (honest) J/token — the numerator (the power-trace integral) always
+//! includes the most energy-hungry capability cells, so the denominator
+//! must span the same engine set. **F4:** for Engine B that means *every*
+//! concurrency-matrix leg when the 2D matrix ran (the primary leg is inside
+//! the matrix — not counted again), else the single-context ladder levels.
 //!
 //! No live server, no network I/O: the result types are constructed with
 //! known token contributions and the pure `profile` math is exercised
@@ -18,8 +20,9 @@ use std::time::Duration;
 
 use crucible_llm::engines::hardware::profile;
 use crucible_llm::engines::{
-    CountingMethod, FlatOutResult, NiahResult, ReasoningResult, ReasoningScore, SpeedResult,
-    StreamCountSource, StructuredResult, SweepLevel, SweepResult, NIAH_MAX_GEN_TOKENS,
+    ConcurrencyMatrix, CountingMethod, FlatOutResult, MatrixCell, NiahResult, ReasoningResult,
+    ReasoningScore, SpeedResult, StreamCountSource, StructuredResult, SweepLevel, SweepResult,
+    NIAH_MAX_GEN_TOKENS,
 };
 use crucible_llm::hw::HwSample;
 use crucible_llm::timing::MonotonicInstant;
@@ -77,6 +80,70 @@ fn sweep_with_total_tokens(total_tokens: u64) -> SweepResult {
             estimated: false,
             streams: Vec::new(),
         }],
+        ..SweepResult::default()
+    }
+}
+
+/// F4: one concurrency-matrix cell with a known `total_tokens`.
+fn matrix_cell(total_tokens: u64) -> MatrixCell {
+    MatrixCell {
+        context: 0,
+        concurrency: 1,
+        aggregate_tps: 100.0,
+        per_stream_tps: 100.0,
+        tps_per_completed_stream: 100.0,
+        tps_per_requested_stream: 100.0,
+        failed_stream_ratio: 0.0,
+        high_failure: false,
+        ttft_p50_ns: 10_000_000,
+        itl_p50_ns: 1_000_000,
+        itl_p99_ns: 3_000_000,
+        total_tokens,
+        estimated: false,
+        timed_out_tokens: 0,
+        wall_ns: 1_000_000_000,
+        loop_excluded_streams: 0,
+        loop_excluded_tokens: 0,
+    }
+}
+
+/// F4: a multi-context (2D matrix) Engine B sweep: `levels` is only the
+/// **primary** (ctx == 0) leg; `matrix.cells` holds **every** context leg
+/// (1000 + 2000 + 3000 tokens).
+fn sweep_with_matrix() -> SweepResult {
+    let level = SweepLevel {
+        concurrency: 1,
+        context: 0,
+        aggregate_tps: 100.0,
+        per_stream_tps: 100.0,
+        p50_tpot_ns: 1_000_000,
+        p90_tpot_ns: 2_000_000,
+        p99_tpot_ns: 3_000_000,
+        ttft_p50_ns: 10_000_000,
+        ttft_p90_ns: 20_000_000,
+        total_tokens: 1000,
+        completed_streams: 1,
+        failed_streams: 0,
+        timed_out_streams: 0,
+        timed_out_tokens: 0,
+        aborted: false,
+        wall_ns: 1_000_000_000,
+        loop_excluded_streams: 0,
+        loop_excluded_tokens: 0,
+        estimated: false,
+        streams: Vec::new(),
+    };
+    SweepResult {
+        levels: vec![level],
+        matrix: Some(ConcurrencyMatrix {
+            contexts: vec![0, 8000, 32000],
+            concurrency: vec![1],
+            cells: vec![
+                vec![matrix_cell(1000)],
+                vec![matrix_cell(2000)],
+                vec![matrix_cell(3000)],
+            ],
+        }),
         ..SweepResult::default()
     }
 }
@@ -147,12 +214,12 @@ fn flatout_with_total_tokens(total_tokens: u64) -> FlatOutResult {
 
 // ── the mirrored all-engine denominator ───────────────────────────────────
 
-/// Mirror of `BenchmarkSequence::all_engines_tokens` (sequence.rs:1213):
-/// the J/token denominator spans every engine that produced tokens — real
-/// counts for A/B/F, the labeled `chars/4` / NIAH-cap estimates for C1/C2/C3
-/// (whose result types carry no output count). The production method is
-/// private, so this re-states the same summing rule over the public result
-/// types.
+/// Mirror of `sum_all_engines_tokens` (sequence.rs): the J/token
+/// denominator spans every engine that produced tokens — real counts for
+/// A/B/F, the labeled `chars/4` / NIAH-cap estimates for C1/C2/C3 (whose
+/// result types carry no output count). The production helper is what both
+/// the TUI and headless paths call, so this re-states the same summing rule
+/// over the public result types.
 fn all_engines_tokens(
     speed: &[SpeedResult],
     sweep: &SweepResult,
@@ -164,8 +231,22 @@ fn all_engines_tokens(
     let mut total = 0u64;
     // Engine A — real completion tokens.
     total += speed.iter().map(|r| r.completion_tokens).sum::<u64>();
-    // Engine B — real sweep total tokens.
-    total += sweep.levels.iter().map(|l| l.total_tokens).sum::<u64>();
+    // Engine B — the full load the numerator spans (F4): every context leg
+    // when the 2D matrix ran (the primary leg is *inside* the matrix — do
+    // not add `levels` again), else the single-context ladder levels.
+    match &sweep.matrix {
+        Some(m) => {
+            total += m
+                .cells
+                .iter()
+                .flatten()
+                .map(|c| c.total_tokens)
+                .sum::<u64>();
+        }
+        None => {
+            total += sweep.levels.iter().map(|l| l.total_tokens).sum::<u64>();
+        }
+    }
     // Engine C1 (NIAH) — estimate: run cells × the NIAH gen cap
     // (`NIAH_MAX_GEN_TOKENS` — 1024 after the Option C budget raise).
     let run_cells = niah.cells.iter().filter(|c| c.target_tokens > 0).count();
@@ -261,4 +342,39 @@ fn all_engine_joules_per_token_denominator_spans_every_engine() {
 
     // The N/A rule: zero tokens (no engine ran) → no spurious 0.0.
     assert_eq!(profile(&trace, None, 0, 0.0).joules_per_token, None);
+}
+
+/// F4: on a multi-context (2D matrix) Engine B sweep, the mirrored
+/// denominator spans **every** matrix leg (1000 + 2000 + 3000 = 6000) —
+/// larger than the primary leg alone (1000), and **not** 7000 (the primary
+/// leg, which `levels` is, is inside the matrix and must not be added
+/// again). The mirror also equals the production shared helper on the same
+/// input, so it stays a true mirror of the new rule.
+#[test]
+fn mirror_denominator_counts_every_matrix_leg_without_double_counting() {
+    let sweep = sweep_with_matrix();
+
+    let mirror = all_engines_tokens(
+        &[],
+        &sweep,
+        &NiahResult::new(vec![2000], vec![50, 60]),
+        &reasoning_with_response_chars(0),
+        &structured_with_body_chars(0),
+        &flatout_with_total_tokens(0),
+    );
+
+    assert_eq!(mirror, 6000, "all legs: 1000 + 2000 + 3000");
+    assert!(mirror > 1000, "larger than the primary leg alone");
+    assert_ne!(mirror, 7000, "the primary leg is not double-counted");
+
+    // The mirror must equal the production helper on the same input.
+    let production = crucible_llm::engines::sequence::sum_all_engines_tokens(
+        None,
+        Some(&sweep),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(mirror, production, "mirror == production shared helper");
 }
