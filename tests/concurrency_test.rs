@@ -407,8 +407,9 @@ fn view2_renders_sweep_curve_knee_and_envelope() {
     assert!(text.contains("20.0 ms"));
     // The knee row (c=4) is flagged in the matrix.
     assert!(text.contains("KNEE"));
-    // The sweet-spot row (c=2, the last healthy level) is flagged.
-    assert!(text.contains("SWEET"));
+    // The max-throughput row (c=2, the envelope — last level before the
+    // knee) is flagged.
+    assert!(text.contains("MAX THROUGHPUT"));
     // The recommendation panel (FIX 3): per-stream = 100 / 175 / 20 →
     // practical sweet spot 2, max usable 4, no unusable boundary, knee
     // 4 as reference.
@@ -455,9 +456,10 @@ fn view2_highlights_knee_on_the_full_ladder_curve() {
     assert_eq!(knee.concurrency, 16);
     assert_eq!(knee.sweet_spot, 8);
 
-    // The matrix flags the knee and sweet-spot rows.
+    // The matrix flags the knee (16) and max-throughput (8, the envelope —
+    // last level before the knee) rows.
     assert!(text.contains("KNEE"));
-    assert!(text.contains("SWEET"));
+    assert!(text.contains("MAX THROUGHPUT"));
     // The recommendation panel (FIX 3): per-stream = 100 / 95 / 70 /
     // 42.5 / 21.6 / 10.7 / 5.3 → practical 8, max usable 16, unusable
     // from 32, knee (reference) 16.
@@ -510,7 +512,7 @@ fn view2_curve_shows_placeholder_before_a_sweep() {
 }
 
 #[test]
-fn view2_curve_marks_sweet_spot_and_knee() {
+fn view2_curve_marks_max_throughput_and_knee() {
     let mut app = App::new();
     app.view = View::Concurrency;
     app.sweep.store(SweepResult::from_levels(
@@ -525,12 +527,13 @@ fn view2_curve_marks_sweet_spot_and_knee() {
     let text: String = buf.content().iter().map(|c| c.symbol()).collect();
 
     assert!(text.contains("Parallel Users"), "curve panel title");
-    // Sweet spot (2): a bright-cyan ◆ marker. Knee (4): a hot-pink ▲ marker.
+    // Max-throughput level (2, the envelope): a bright-cyan ◆ marker. Knee
+    // (4): a hot-pink ▲ marker.
     assert!(
         buf.content()
             .iter()
             .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.primary()),
-        "sweet spot is a bright-cyan ◆"
+        "max-throughput level is a bright-cyan ◆"
     );
     assert!(
         buf.content()
@@ -538,12 +541,12 @@ fn view2_curve_marks_sweet_spot_and_knee() {
             .any(|c| c.symbol() == "▲" && c.fg == Theme::Cyberpunk.accent()),
         "knee is a hot-pink ▲"
     );
-    // The level below the sweet spot (1): a mint ◆ marker.
+    // The level below the max-throughput level (1): a mint ◆ marker.
     assert!(
         buf.content()
             .iter()
             .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.success()),
-        "levels below the sweet spot are mint ◆"
+        "levels below the max-throughput level are mint ◆"
     );
     // Stems, the knee annotation, and the value labels on every point.
     assert!(text.contains('│'));
@@ -581,7 +584,7 @@ fn view2_curve_renders_the_full_ladder() {
         buf.content()
             .iter()
             .any(|c| c.symbol() == "◆" && c.fg == Theme::Cyberpunk.primary()),
-        "sweet spot (8) is a bright-cyan ◆"
+        "max-throughput level (8) is a bright-cyan ◆"
     );
     assert!(
         buf.content()

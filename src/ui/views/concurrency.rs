@@ -601,7 +601,8 @@ pub(crate) fn curve_notes(th: Theme, levels: &[SweepLevel]) -> Vec<Line<'static>
 
 /// Sweep matrix: one row per ladder step — real aggregate t/s + p90 TPOT
 /// once a sweep has run, `--` until then. The knee row is flagged red
-/// (`KNEE`) and the sweet-spot row green (`SWEET`).
+/// (`KNEE`) and the max-throughput row (the envelope) green
+/// (`MAX THROUGHPUT`).
 fn render_matrix(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Option<Envelope>) {
     let mut rows: Vec<Row> = vec![Row::new(vec![
         Cell::from("USERS"),

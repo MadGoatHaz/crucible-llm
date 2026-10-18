@@ -15,8 +15,8 @@
 //! * **GPU telemetry** (any vendor) — shown only when GPU data is
 //!   available;
 //! * **Concurrency curve** (Engine B) — aggregate t/s vs parallel users,
-//!   reusing View 2's block rendering, with the sweet spot (`◆`) and the
-//!   saturation knee (`▲`);
+//!   reusing View 2's block rendering, with the max-throughput level
+//!   (`◆`) and the saturation knee (`▲`);
 //! * **Capability scores** — horizontal bars for Reasoning (C2), NIAH (C1),
 //!   Structured (C3), Energy (D), and Flat Out (F);
 //! * **Event log** — a compact stream of the executor's real events.
@@ -717,11 +717,11 @@ fn fmt_stat(v: f64) -> String {
 // ── Concurrency curve (Engine B) ───────────────────────────────────────────
 
 /// The prominent concurrency panel: aggregate t/s vs parallel users —
-/// View 2's labelled curve (green below the sweet spot, yellow at it,
-/// red past the knee, `▲ KNEE @ n` annotated) plus the plain-language
-/// "what to do with this" note. While Engine B is mid-sweep (no result
-/// published yet) it shows an in-progress note; with no sweep at all it
-/// shows the run-a-sweep hint.
+/// View 2's labelled curve (green below the max-throughput level, accent
+/// at it, red past the knee, `▲ KNEE @ n` annotated) plus the
+/// plain-language "what to do with this" note. While Engine B is mid-sweep
+/// (no result published yet) it shows an in-progress note; with no sweep at
+/// all it shows the run-a-sweep hint.
 fn render_concurrency_curve(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let block = theme::block(
         theme::panel_title(th, "CONCURRENCY CURVE — t/s vs parallel users"),
@@ -1103,7 +1103,7 @@ fn build_capability_scores(
                 ),
                 detail_style: style::value_ok(th),
                 color: th.success(),
-                info: "Real-world max throughput at sweet-spot concurrency (60s).",
+                info: "Real-world max throughput at max-throughput concurrency (60s).",
                 warn: None,
             });
         }

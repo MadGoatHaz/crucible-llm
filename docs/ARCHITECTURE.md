@@ -266,7 +266,7 @@ The **practical sweet spot** is the headline recommendation. Aggregate throughpu
 - **If your sweet spot is 8**: your server comfortably serves 8 simultaneous users. A 9th user will notice degradation.
 - **Per-stream t/s drops** as you add users because the GPU's compute and memory bandwidth are shared across all active streams.
 - **TTFB increases at higher concurrency** because requests queue on the server's batch scheduler. This is normal and expected — it is the server working, not the server failing.
-- **The concurrency curve** (View 2) plots aggregate t/s vs. concurrency on a log₂ x-axis: measured levels are `◆` points colored by zone (theme success/green below the sweet spot, the theme primary — cyan in the default Cyberpunk theme — at it, red past the knee), and the saturation knee is an `▲` (red). The level table alongside highlights the sweet-spot row green (`SWEET`) and the knee row red (`KNEE`).
+- **The concurrency curve** (View 2) plots aggregate t/s vs. concurrency on a log₂ x-axis: measured levels are `◆` points colored by zone (theme success/green below the max-throughput level, the theme primary — cyan in the default Cyberpunk theme — at it, red past the knee), and the saturation knee is an `▲` (red). The **max-throughput level** (the sweep envelope — the last level before the knee, else the peak-aggregate level) is what Flat Out runs at; the level table highlights that row green (`MAX THROUGHPUT`) and the knee row red (`KNEE`). The *practical sweet spot* (the per-stream hosting recommendation) is a distinct number shown in the recommendation panel.
 
 ## Engine C1: NIAH (Needle In A Haystack)
 

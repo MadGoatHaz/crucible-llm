@@ -198,7 +198,7 @@ impl Engine {
                 "GPU power profiling (watts, J/token, $/1M\ntokens). MUST run on the GPU box — NVIDIA\n(NVML)/AMD/Intel, multi-GPU. Remote users: N/A"
             }
             Engine::FlatOut => {
-                "Real-world maximum throughput. Runs at your server's\nsweet-spot concurrency for 60 seconds. The number to\nquote when comparing setups."
+                "Real-world maximum throughput. Runs at your server's\nmax-throughput concurrency for 60 seconds. The number\nto quote when comparing setups."
             }
         }
     }

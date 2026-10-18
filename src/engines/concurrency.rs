@@ -20,8 +20,10 @@
 //! ([`SweepResult::detect_knee`] — the level where aggregate throughput
 //! plateaus while p90 TPOT spikes, i.e. the memory-bandwidth-bound →
 //! compute-bound transition) and the "Optimal Operational Envelope"
-//! ([`SweepResult::envelope`] — the recommended sweet spot), and is the
-//! data View 2 (Concurrency Matrix) renders with the knee highlighted.
+//! ([`SweepResult::envelope`] — the **max-throughput level**: the last
+//! level before the knee, else the peak-aggregate level; what Flat Out runs
+//! at), and is the data View 2 (Concurrency Matrix) renders with the knee
+//! highlighted.
 //!
 //! **Measurement isolation** (blueprint §4): all timing comes from the
 //! workers' `quanta` stamps — the sweep only *consumes* tagged events. The
@@ -289,21 +291,23 @@ pub struct ConcurrencyMatrix {
 
 /// The full sweep curve: one [`SweepLevel`] per ladder step, plus (when
 /// the sweep ran with the v0.1.1 multi-context matrix axis) the full
-/// `context × concurrency` grid, and the recommended **sweet spot**
-/// (the stream count Engine F / Flat Out uses for its real-world
-/// full-load run).
+/// `context × concurrency` grid, and the **practical sweet spot**
+/// ([`Self::sweet_spot`] — the per-stream hosting recommendation). Engine
+/// F / Flat Out runs at a *different* number — the **max-throughput
+/// level** ([`Self::envelope`]).
 #[derive(Debug, Clone, Default)]
 pub struct SweepResult {
     pub levels: Vec<SweepLevel>,
     /// The 2D matrix (v0.1.1) — `None` for a single-context sweep.
     pub matrix: Option<ConcurrencyMatrix>,
-    /// The recommended number of concurrent streams for a real-world
-    /// full-load run: the **practical sweet spot** (the highest level
-    /// where every stream still gets ≥ [`PRACTICAL_PER_STREAM_TPS`] —
-    /// 30 t/s ideal with a 2% margin, 29.4 t/s effective), falling back
-    /// to the **maximum usable** level (≥ [`USABLE_PER_STREAM_TPS`]),
-    /// then to a single stream. Computed by [`Self::from_levels`]; `0`
-    /// for an empty / default result.
+    /// The **practical sweet spot** (the per-stream hosting
+    /// recommendation): the highest level where every stream still gets ≥
+    /// [`PRACTICAL_PER_STREAM_TPS`] (30 t/s ideal with a 2% margin, 29.4
+    /// t/s effective), falling back to the **maximum usable** level (≥
+    /// [`USABLE_PER_STREAM_TPS`]), then to a single stream. Computed by
+    /// [`Self::from_levels`]; `0` for an empty / default result. This is
+    /// distinct from the max-throughput level ([`Self::envelope`]) that
+    /// Flat Out runs at.
     pub sweet_spot: usize,
 }
 
@@ -326,9 +330,9 @@ impl SweepResult {
         self.levels.is_empty()
     }
 
-    /// The level with the highest aggregate throughput — the fallback
-    /// sweet spot when [`Self::detect_knee`] finds no saturation
-    /// transition on the curve.
+    /// The level with the highest aggregate throughput — the fallback for
+    /// the **max-throughput level** ([`Self::envelope`]) when
+    /// [`Self::detect_knee`] finds no saturation transition on the curve.
     #[must_use]
     pub fn peak_throughput(&self) -> Option<&SweepLevel> {
         self.levels
@@ -375,9 +379,11 @@ impl SweepResult {
     }
 
     /// The "Optimal Operational Envelope" (blueprint §6 View 2): the
-    /// recommended sweet spot for hosting this model on the target
-    /// hardware — the level just before the detected knee, or the
-    /// peak-throughput level when the curve is healthy (no knee).
+    /// **max-throughput level** — the level just before the detected knee,
+    /// or the peak-throughput level when the curve is healthy (no knee).
+    /// This is the level Flat Out runs at. It is distinct from the
+    /// *practical* sweet spot ([`SweepResult::sweet_spot`]), which is the
+    /// per-stream hosting recommendation.
     #[must_use]
     pub fn envelope(&self) -> Option<Envelope> {
         let knee = self.detect_knee();
@@ -534,7 +540,7 @@ pub const FAILED_STREAM_RATIO_THRESHOLD: f64 = 0.20;
 pub struct KneePoint {
     /// The concurrency at the knee (the first saturated level).
     pub concurrency: usize,
-    /// The recommended sweet spot: the last level before the knee.
+    /// The max-throughput level: the last level before the knee.
     pub sweet_spot: usize,
     /// Aggregate throughput (t/s) at the knee.
     pub aggregate_tps: f64,
@@ -543,15 +549,16 @@ pub struct KneePoint {
 }
 
 /// The "Optimal Operational Envelope" (blueprint §6 View 2): the
-/// recommended sweet spot, with the detected knee (when the curve shows a
+/// **max-throughput level**, with the detected knee (when the curve shows a
 /// saturation transition) attached.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Envelope {
-    /// The recommended concurrency (the sweet spot).
+    /// The max-throughput level — the concurrency the curve marks and Flat
+    /// Out runs at (distinct from the practical sweet spot).
     pub sweet_spot: usize,
-    /// Aggregate throughput (t/s) at the sweet spot.
+    /// Aggregate throughput (t/s) at the max-throughput level.
     pub aggregate_tps: f64,
-    /// p90 TPOT (ns) at the sweet spot.
+    /// p90 TPOT (ns) at the max-throughput level.
     pub p90_tpot_ns: u64,
     /// The detected knee, if the curve showed a saturation transition.
     pub knee: Option<KneePoint>,
