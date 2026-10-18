@@ -4,6 +4,7 @@
 //! subsequent chunks fill them in. See `work/plans/PLAN.md` for the chunk map.
 
 pub mod client;
+pub mod clipboard;
 pub mod config;
 pub mod engines;
 pub mod headless;
