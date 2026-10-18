@@ -379,8 +379,14 @@ pub fn run_headless(
                     ));
                 }
                 let r = sweep.run().await;
-                flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
-                // FIX 3: the headless summary leads with the
+                // Flat Out runs at the max-throughput level (the sweep
+                // envelope); the practical sweet spot only as the fallback
+                // when no curve exists.
+                flatout_streams = Some((
+                    r.envelope().map(|e| e.sweet_spot).unwrap_or(r.sweet_spot),
+                    StreamCountSource::ConcurrencyMaxThroughput,
+                ));
+                // FIX 3: the headless [B] summary leads with the
                 // practical (per-stream usability) sweet spot, with
                 // the pure-throughput knee as reference.
                 if r.is_empty() {
@@ -542,14 +548,16 @@ pub fn run_headless(
         if extra.flatout {
             match FlatOutEngine::new(cfg) {
                 Ok(mut engine) => {
-                    // The stream count is Engine B's sweet spot when
-                    // the sweep ran (real-world full load), else the
-                    // built-in default.
+                    // The stream count is Engine B's max-throughput level
+                    // (the sweep envelope) when the sweep ran (real-world
+                    // full load), else the built-in default.
                     if let Some((n, source)) = flatout_streams {
                         engine = engine.stream_count(n, source);
                     }
                     if !cfg.json {
-                        term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
+                        term.dim(
+                            "  [F] flat out (max-throughput full load — real-world max t/s)…",
+                        );
                     }
                     let r = engine.logger(logger.clone()).run().await;
                     // The `--json` document carries the flat_out

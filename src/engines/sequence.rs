@@ -1299,11 +1299,12 @@ impl BenchmarkSequence {
     }
 
     /// Engine F — Flat Out: the real-world maximum throughput finale.
-    /// Runs at the **concurrency sweet spot** (Engine B's recommendation —
-    /// the highest level where every user still gets ≥ 29.4 t/s) for 60
-    /// seconds: the server's full-load number to quote. Without a sweep,
-    /// it falls back to [`DEFAULT_STREAM_COUNT`] streams. Returns the
-    /// one-line summary.
+    /// Runs at Engine B's **max-throughput level** (the sweep *envelope* —
+    /// the last level before the saturation knee, else the peak-aggregate
+    /// level) for 60 seconds: the server's full-load number to quote.
+    /// When a sweep exists but has no envelope (no usable curve) it falls
+    /// back to the practical sweet spot; with no sweep at all, to
+    /// [`DEFAULT_STREAM_COUNT`] streams. Returns the one-line summary.
     async fn run_flatout(&self) -> String {
         self.slots.flatout.set_running(true);
         let (stream_count, source) = self
@@ -1312,7 +1313,15 @@ impl BenchmarkSequence {
             .load()
             .as_ref()
             .as_ref()
-            .map(|r| (r.sweet_spot, StreamCountSource::ConcurrencySweetSpot))
+            .map(|r| {
+                // The max-throughput level (the envelope); the practical
+                // sweet spot only as the fallback when no curve exists.
+                let n = r
+                    .envelope()
+                    .map(|e| e.sweet_spot)
+                    .unwrap_or(r.sweet_spot);
+                (n, StreamCountSource::ConcurrencyMaxThroughput)
+            })
             .unwrap_or((DEFAULT_STREAM_COUNT, StreamCountSource::Default));
         let engine = match FlatOutEngine::new(&self.cfg) {
             Ok(e) => e,
