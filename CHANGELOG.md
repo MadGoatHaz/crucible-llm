@@ -2,9 +2,7 @@
 
 All notable changes to Crucible LLM.
 
-## [Unreleased]
-
-Post-v0.1.6 corrections (C1–C3; roll into the next release):
+## [0.1.7] - 2026-10-18
 
 ### Added
 - **Matrix Report** — after a benchmark run completes, Crucible generates a `[COMMUNITY-SUBMISSION]` block formatted for the Level1Techs "Local LLM Matrix" (auto-parsed by https://madgoathaz.github.io/llm-matrix/ ). Two ways to produce it: **TUI** — press `m` (gated on a completed run) to open the full-screen Report view, where the user fields are editable and `c` copies to the clipboard (OSC 52) / `s` saves a `.md` file / `Esc` closes; **headless** — `--matrix-report` (implies headless) prints the block to stdout (pipeable). **Auto-filled** by Crucible: `hardware` (e.g. `1x RTX 4090 24GB + 128GB RAM`), `vram` (bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a gap value reports the raw size, never a forced tier), `model`, and `speed` (Engine A answer-phase tokens/s — blank for a pure-CoT model, never fabricated). **User-filled** (Crucible can't detect these): `backend`, `quant`, `use_case`, `notes`. Copy-to-clipboard uses the terminal's **OSC 52** sequence (works in OSC-52-capable terminals; save-to-file is the universal path); both paths are zero-dependency (hand-rolled RFC 4648 base64 + `std::io`).
