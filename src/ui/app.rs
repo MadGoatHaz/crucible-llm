@@ -42,6 +42,7 @@ use ratatui::Frame;
 use crate::client::models::ModelInfo;
 use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::profile;
+use crate::engines::sequence::sum_all_engines_tokens;
 use crate::engines::{
     fragmentation_warning, queue_for, BenchmarkSequence, EngineProgress, NiahEngineConfig,
     NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState,
@@ -1478,20 +1479,32 @@ impl App {
     fn build_export_payload(&self) -> ExportPayload {
         let cfg = self.config.to_config();
 
-        // Engine D energy + the GPU name: recomputed from the poller's
-        // trace (the same N/A rule as the headless / sequence paths). A
-        // poisoned/absent poller degrades to `None` — never an export
-        // failure.
+        // Engine D energy + the GPU name: the **same** definition the TUI
+        // DB path (`BenchmarkSequence::persist_results` /
+        // `engine_results_json`) uses (I1) — the shared
+        // `sum_all_engines_tokens` denominator (all engines, not
+        // Engine-A-only) + the shared `apply_load_window` (full
+        // load-window numerator, idle-subtracted, `avg_power_w` on the
+        // same basis) — so the export's `d_energy` equals the DB's
+        // `d_energy` for the same run. A poisoned/absent poller degrades
+        // to `None` — never an export failure.
         let (energy, gpu_name) = {
             let poller = self.hw.as_ref().and_then(|h| h.lock().ok());
             match poller {
                 Some(g) => {
                     let trace = g.trace().to_vec();
                     let e = (!trace.is_empty()).then(|| {
-                        let total_tokens = (*self.speed_slot.load())
-                            .as_ref()
-                            .map(|rs| rs.iter().map(|r| r.completion_tokens).sum())
-                            .unwrap_or(0);
+                        // I1: the all-engine token denominator — the shared
+                        // helper the DB path uses (the old export divided by
+                        // Engine-A-only completion tokens).
+                        let total_tokens = sum_all_engines_tokens(
+                            (*self.speed_slot.load()).as_deref(),
+                            (*self.sweep.load()).as_ref(),
+                            (*self.niah.load()).as_ref(),
+                            (*self.reasoning_slot.load()).as_ref(),
+                            (*self.structured_slot.load()).as_ref(),
+                            (*self.flatout_slot.load()).as_ref(),
+                        );
                         // F9: the monitor's idle floor keeps `avg_power_w`
                         // on the same basis as the idle-subtracted joules.
                         let idle_w = g.monitor().idle_system_power_w();
@@ -1500,6 +1513,16 @@ impl App {
                             e.vendor = Some(b.vendor().to_string());
                             e.model = b.model().map(str::to_string);
                         }
+                        // I1: the shared load-window application — the
+                        // export's `d_energy` is the DB's `d_energy`.
+                        let duration = (g.monitor().duration_sec() > 0.0)
+                            .then(|| g.monitor().duration_sec());
+                        crate::engines::sequence::apply_load_window(
+                            &mut e,
+                            g.load_window_joules(),
+                            total_tokens,
+                            duration,
+                        );
                         e
                     });
                     (e, g.gpu_name().map(str::to_string))
@@ -1547,19 +1570,20 @@ impl App {
             engine_results: engine_results_json,
         };
 
-        // Engine A: the speed slot's per-iteration results → metric rows
-        // (each carries the run's silicon-efficiency reading when a
-        // poller produced one).
+        // Engine A: the speed slot's per-iteration results → metric rows.
+        // I1: `joules_per_token` stays **consistently NULL** on TUI rows —
+        // the TUI path has no per-iteration power windows (the speed
+        // engine drains its events internally), and stamping every row
+        // with the single run-level number (the old A-only behavior)
+        // fabricated a per-stream metric. The run-level D figure lives in
+        // `payload.energy` / `engine_results.d_energy`, which this export
+        // carries; the headless path (which *does* capture per-iteration
+        // windows) stamps its rows with the per-iteration value.
         let metrics: Vec<StreamMetricRow> = (*self.speed_slot.load())
             .as_ref()
             .map(|rs| {
                 rs.iter()
-                    .map(|r| {
-                        let mut row =
-                            StreamMetricRow::from_speed_result(r, &session.session_id, 1);
-                        row.joules_per_token = energy.as_ref().and_then(|e| e.joules_per_token);
-                        row
-                    })
+                    .map(|r| StreamMetricRow::from_speed_result(r, &session.session_id, 1))
                     .collect()
             })
             .unwrap_or_default();
@@ -2248,6 +2272,148 @@ mod tests {
             .as_ref()
             .expect("engine_results present");
         assert_eq!(er.c2_reasoning.as_ref().unwrap().solved, 9);
+    }
+
+    // ── I1: the TUI export's d_energy == the TUI DB's d_energy ──────────
+
+    /// A deterministic mock GPU (150 W) so the export's poller has a
+    /// power-bearing trace without any hardware.
+    #[derive(Debug)]
+    struct MockExportGpu {
+        watts: f64,
+    }
+
+    impl GpuBackend for MockExportGpu {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Mock GPU")
+        }
+        fn poll(&self) -> crate::hw::GpuSample {
+            crate::hw::GpuSample {
+                power_watts: Some(self.watts),
+                utilization_pct: Some(90),
+                ..Default::default()
+            }
+        }
+    }
+
+    /// I1: the TUI `e`-export's `d_energy` is computed with the **same**
+    /// definition as the TUI DB path (`persist_results` /
+    /// `engine_results_json`): the shared all-engine token denominator +
+    /// the shared `apply_load_window` (full load-window numerator). The
+    /// old export recomputed D from the bounded trace with an
+    /// Engine-A-only completion denominator — orders of magnitude apart on
+    /// a NIAH-heavy run. Stream rows stay consistently NULL (the TUI path
+    /// has no per-iteration windows; a single stamped number was
+    /// fabricated).
+    #[test]
+    fn tui_export_d_energy_matches_the_db_definition() {
+        let mut app = App::new();
+        app.config.url = "http://slot-target:9999/v1".to_string();
+        app.config.model = "slot-model".to_string();
+        app.config.engine_speed = true;
+        // Engine A: 100 completion tokens (50 prompt — not in A's
+        // contribution to the all-engine denominator).
+        app.speed_slot.store(vec![SpeedResult {
+            ttft: 0.25,
+            prompt_tokens: 50,
+            completion_tokens: 100,
+            reasoning_tokens: None,
+            pp_speed: 400.0,
+            tg_speed: 20.0,
+            mtp_efficiency: 1.0,
+            stream_time: 2.5,
+            total_chunks: 100,
+            content_chunks: 100,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "slot-model".into(),
+            mode: "short".into(),
+            error: None,
+            looping: false,
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
+        }]);
+        // Engine C2: 400 response chars → 100 tokens (the chars/4
+        // estimate) in the all-engine denominator.
+        app.reasoning_slot.store(ReasoningResult {
+            responses: vec!["x".repeat(400)],
+            ttfts: vec![0.1],
+            tg_speeds: vec![10.0],
+            score: crate::engines::ReasoningScore {
+                total: 13,
+                solved: 9,
+                by_category: [(4, 5), (3, 5), (2, 3)],
+            },
+        });
+        // The hardware poller: armed (begin_run → start_load), a few
+        // 150 W samples, closed (end_load) — a completed run's window.
+        let hw = Arc::new(Mutex::new(
+            HwPoller::with_backend(Some(Arc::new(MockExportGpu { watts: 150.0 })))
+                .with_capacity(1000),
+        ));
+        {
+            let mut p = hw.lock().unwrap();
+            p.begin_run();
+            p.start_load();
+            for _ in 0..5 {
+                p.poll();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            p.end_load();
+        }
+        app = app.with_hw(hw.clone());
+
+        let payload = app.build_export_payload();
+
+        // The export carries a d_energy (in both the convenience `energy`
+        // object and `engine_results.d_energy` — the same summary).
+        let energy = payload.energy.as_ref().expect("export energy present");
+        let db_energy = payload
+            .engine_results
+            .as_ref()
+            .and_then(|er| er.d_energy.clone())
+            .expect("engine_results.d_energy present");
+        assert_eq!(energy.joules, db_energy.joules, "export == DB joules");
+        assert_eq!(
+            energy.joules_per_token, db_energy.joules_per_token,
+            "export == DB J/token"
+        );
+
+        // The numerator is the poller's full load window…
+        let full_j = hw
+            .lock()
+            .unwrap()
+            .load_window_joules()
+            .expect("closed load window");
+        assert!(full_j > 0.0, "the window integrated real energy: {full_j}");
+        assert_eq!(energy.joules, full_j, "export joules == full load window");
+
+        // …and the denominator is the **all-engine** total (100 A + 100
+        // C2 = 200) — not the old Engine-A-only 100.
+        let expected_jpt = full_j / 200.0;
+        let a_only_jpt = full_j / 100.0;
+        let jpt = energy.joules_per_token.expect("power + tokens → a value");
+        assert!(
+            (jpt - expected_jpt).abs() < 1e-9,
+            "J/token divides by all tokens: {jpt} vs {expected_jpt}"
+        );
+        assert!(
+            (jpt - a_only_jpt).abs() > 1e-9,
+            "the A-only denominator is not the one used: {jpt} vs {a_only_jpt}"
+        );
+
+        // I1: the stream rows are consistently NULL — no single stamped
+        // number masquerading as a per-stream metric.
+        assert_eq!(payload.metrics.len(), 1);
+        assert_eq!(
+            payload.metrics[0].joules_per_token, None,
+            "TUI stream rows stay NULL (no per-iteration window exists)"
+        );
     }
 
     // ── status-bar server address (never a backend name) ────────────────
