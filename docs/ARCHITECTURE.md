@@ -145,6 +145,8 @@ Every completion-token count flows through one canonical function, `authoritativ
 
 **The raw SSE frame tally is never used as a token count.** Batched servers (vLLM's multi-token prediction / speculative decoding) pack ~2.4 tokens into a single `data:` frame, so counting frames understates true output by 30–40 %. Frame counts survive only as decode-rate evidence on the wire, never as the token numerator.
 
+The same rule governs the token-derived speed metrics of the capability engines: **C2**'s decode speed is `completion_tokens − reasoning_tokens` (the answer phase) when the server reports the usage detail, falling back to content frames only when it does not — flagged `estimated` — and the **live snapshot and the published result use the same count, so they agree**. **C3** records its counting method (server usage → re-tokenization → frame tally) and flags the raw-frame last resort as estimated. And a C2/C3 stream that receives **no token frame** reports TTFT as the `0.0` N/A sentinel (flagged `degraded`), matching Engine A — never the total stream time.
+
 For **prompt token counting** (sizing the input), an optional HuggingFace `tokenizer.json` gives exact counts; without it I estimate at `chars/4` (the common BPE heuristic) and flag the result `[ESTIMATED]`. This is sufficient for Engine A's short/long modes and for Engine C1's haystack sizing (which pads with a token-stable `" apple"` filler when a tokenizer is available).
 
 ### SSE Parsing
@@ -171,7 +173,11 @@ The metrics pipeline has a **freeze-on-completion** behavior. While a run is act
 - the 100 ms hardware poller **goes idle** (it checks the freeze latch each tick and skips the sample/merge work while frozen), so it stops perturbing the system;
 - the frozen state persists until the **next run starts**, which calls `MetricsState::unfreeze()` to re-arm the pipeline.
 
-This applies to every run shape — the full `A → B → C1 → C2 → C3 → D → F` sequence and a standalone `n`-key NIAH run. The freeze is a **read-side** concern (it only gates how often snapshots are refreshed); it never touches the `quanta` timing path, so the measurement-isolation invariant holds.
+This applies to every run shape — the full `A → B → C1 → C2 → C3 → D → F` sequence and a standalone `n`-key NIAH run (which now arms the power monitor — fresh idle baseline + load window — like the sequence path). The freeze is a **read-side** concern (it only gates how often snapshots are refreshed); it never touches the `quanta` timing path, so the measurement-isolation invariant holds.
+
+### Per-Run Result Slots (the "None = Not Run" Invariant)
+
+`BenchmarkSequence` keeps one result slot per non-stream engine (B, C1, C2, C3, D, F). At the **start of every run** the slots are reset (`reset_all()`): a slot is `None` — "not run" — until the *current* run fills it. This is what makes a subset run honest: a D-only run after a full run in the same TUI session inherits none of the previous run's tokens, so the all-tokens J/token denominator sums to zero and reports `N/A` (never a confidently-wrong stale figure), and the persisted `engine_results` contains only the engines that actually ran (no cross-run DB contamination). The D denominator and the persistence path both read these slots, so one reset keeps them in lockstep.
 
 ## Engine A: Speed
 
@@ -254,7 +260,7 @@ I calculate four thresholds from the sweep curve:
 
 | Threshold | Definition | Meaning |
 |-----------|-----------|---------|
-| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 30 (29.4 t/s effective, 2% margin) | Comfortable for chat, coding agents, RAG pipelines. **This is what I recommend — and the load Engine F runs at.** |
+| **Practical Sweet Spot** | Highest level where per-stream t/s ≥ 30 (29.4 t/s effective, 2% margin) | Comfortable for chat, coding agents, RAG pipelines. **This is what I recommend** (the *hosting* number) — Engine F runs at the distinct **max-throughput** level, not here. |
 | **Maximum Usable** | Highest level where per-stream t/s ≥ 15 | Minimal but functional. Noticeably slower, but workable. |
 | **Unusable From** | First level where per-stream t/s < 15 | Interactive use becomes impractical. |
 | **Throughput Knee** | First level where aggregate t/s gain ≤ 5% AND p90 TPOT grows ≥ 2× | Pure capacity limit: the GPU has transitioned from memory-bandwidth-bound to compute-bound. |
@@ -281,7 +287,7 @@ The matrix is **N context sizes × M depths** — **7 × 11 = 77 cells by defaul
 - **Sizes (default)**: 2k, 4k, 8k, 16k, 32k, 64k, 128k tokens
 - **Depths (default)**: 0%, 10%, 20%, 30%, 40%, 50%, 60%, 70%, 80%, 90%, 100%
 
-**The ladders are runtime-configurable** (GitHub Issue #5): `--niah-contexts` (e.g. `16k,64k,256k,1M`) and `--niah-depths` (e.g. `0,50,100`) replace the defaults — layered **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS`) > config file > default**, `k`/`M` suffixes (case-insensitive), `0` rejected on the size axis (a haystack must be a positive token count). `--niah-custom <size>` (env `CRUCIBLE_NIAH_CUSTOM`) takes precedence and collapses the matrix to a **single size row** at exactly that context across the depth ladder — the focused "count test" for probing a RoPE/YaRN-extended limit beyond the 128k default top. The document generator scales **unbounded** (a 1M-token haystack is a ~4–6 MB string that builds in a few hundred ms; the `target × 4` char math uses a `u64` intermediate, overflow-safe for any `u32` target) — the practical ceiling is the server's `max_model_len`, not the client. An over-limit size is not pre-clamped: each cell's request is sent and the server's HTTP 400 is recorded as a labeled per-cell error (the run completes, exit 0, `0/N retrieved` — never a silent zero).
+**The ladders are runtime-configurable** (GitHub Issue #5): `--niah-contexts` (e.g. `16k,64k,256k,1M`) and `--niah-depths` (e.g. `0,50,100`) replace the defaults — layered **CLI > env (`CRUCIBLE_NIAH_CONTEXTS` / `CRUCIBLE_NIAH_DEPTHS`) > config file > default**, `k`/`M` suffixes (case-insensitive), `0` rejected on the size axis (a haystack must be a positive token count). `--niah-custom <size>` (env `CRUCIBLE_NIAH_CUSTOM`) takes precedence and collapses the matrix to a **single size row** at exactly that context across the depth ladder — the focused "count test" for probing a RoPE/YaRN-extended limit beyond the 128k default top. The document generator scales **unbounded** (a 1M-token haystack is a ~4–6 MB string that builds in a few hundred ms; the `target × 4` char math uses a `u64` intermediate, overflow-safe for any `u32` target) — the practical ceiling is the server's `max_model_len`, not the client. An over-limit size is not pre-clamped: each cell's request is sent and the server's HTTP 400 is recorded as a labeled per-cell error (the run completes, exit 0, `0/N retrieved` — never a silent zero). The **View 3 grid renders from the result's actual `sizes` / `depths` axes** (the built-in ladders are used only for the pre-run empty state), so a custom-ladder run displays its real matrix; size labels go through the shared `human_size` formatter — `2k` … `128k`, `256k`, `1M` (a 1 000 000-token size reads `1M`, never `~1000k`).
 
 For each cell:
 
@@ -434,6 +440,14 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
    - **Peak VRAM** (bytes and ratio)
    - **Fragmentation warning** when VRAM occupancy ≥ 90%
 
+### The Single Source of Truth
+
+The energy figure is computed **once** and projected everywhere: the full-load-window, idle-subtracted, all-tokens `EnergyResult` above is the only source. The 100 ms **poller** (a dedicated thread) samples the backends and advances the **monitor** (`GpuPowerMonitor`); the monitor's bounded 6-minute trace is *graph-only* (View 4's charts), while its **full-load-window cumulative** joule counter is the number. Every surface projects that same result — TUI View 4 (System Power + Efficiency), the TUI Live gauge (run-scoped, reset on each `begin_run`), the TUI History view, the TUI `e`-export, the headless terminal line, `--json`, and the persisted DB `EnergySummary` — so they agree by construction, and two views of the same app can never show two different J/token values.
+
+**`cpu_power_estimated` propagation.** The flag is set from the CPU power backend (RAPL / Super I/O = measured; the fixed 40 W fallback = estimated — including a mid-run sample-level fallback, so *any* estimated sample sets it), carried on the `EnergyResult`, copied into the persisted/exported `EnergySummary`, and surfaced in the TUI: an estimated figure is never stored, exported, or displayed as measured.
+
+**Headless selection-gating.** In headless mode Engine D is gated on the **selection** (`--engine hardware`), not on the poller flag: `--no-hardware --engine hardware` runs the engine and reports a labeled `N/A` (with the `energy` object present in `--json`) instead of being silently skipped — symmetric with the TUI's labeled N/A.
+
 ### Hardware Support
 
 | Platform | Telemetry | Status |
@@ -448,6 +462,12 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
 ### The N/A Rule
 
 When no power telemetry is available (no GPU, no driver, feature off), all derived energy metrics are `None` — rendered `N/A`, **never `0.0`**. A `0.0` J/token would claim "free" inference, which is misleading. The `HwSample` struct uses `Option` for every field; a `None` field means "no reading," and the integration and profile functions propagate this correctly.
+
+`EnergyResult::na_reason()` distinguishes the **root cause** of an N/A, and every surface (the TUI summary, the headless line, the `--json`/DB `na_reason`) renders from that one method, so they never disagree on *why*:
+
+- **`no power telemetry`** — no sample in scope carried a usable reading (a driverless host, or a sensor with no usable reading).
+- **`no energy measured`** — telemetry is present and tokens were generated, but the idle-subtracted energy is `0.0` (the draw never rose above the idle floor).
+- **`no tokens generated`** — telemetry is present, but the run produced zero tokens (e.g. a D-only run), so there is nothing to divide the energy by.
 
 ### What the Numbers Mean
 
@@ -494,7 +514,7 @@ The single detected backend is shared by the TUI panel, Engine D, and the Config
 ### Integration
 
 - **Hardware poller (100 ms)** polls the detected backend and merges each `GpuSample` into the `MetricsState` snapshot via the same `load → clone → merge → update` path as CPU/RAM — measurement isolation is untouched.
-- **Engine D** integrates the power trace (trapezoidal `∫P(t)dt`) into J/token, peak/average power, and peak VRAM; its result now also carries **mean GPU utilization, GPU vendor, and GPU model**.
+- **Engine D** integrates the **full load window** (trapezoidal `∫P(t)dt`, idle-subtracted) into J/token, peak/average power, and peak VRAM; its result now also carries **mean GPU utilization, GPU vendor, and GPU model**.
 - **TUI Live view** renders a full GPU telemetry panel — power, utilization, temperature, core/memory clocks, VRAM, throttle reasons, live J/token — **only when a backend is live and publishing**. With no GPU the panel is hidden entirely: no N/A box, no panic.
 - **Engine D default**: auto-enabled when a GPU is detected, auto-disabled when not. An explicit user selection (`--engine`, `CRUCIBLE_ENGINE`, or the config file) always wins over the auto-detection.
 - **Config / Setup views** show the detected GPU on the Engine D row (e.g. `[✓] Energy — RTX 4090`, or `no GPU`).
@@ -515,7 +535,7 @@ A **manual** idle measurement is available from the GPU tab: pressing `[i]` star
 
 ### Energy Integration (Trapezoidal Rule)
 
-Total energy is computed as `∫P(t)dt` over the **100 ms power trace** (windowed to the active load) using the trapezoidal rule — the 1 Hz history drives the graphs, the 100 ms trace drives the numbers:
+Total energy is computed as `∫P(t)dt` over the **full active load window** using the trapezoidal rule on the monitor's **cumulative joule counter** — the bounded 100 ms trace (3600 samples / 6 min) and the 1 Hz history drive the *graphs*, the cumulative counter drives the *numbers*, so a run longer than 6 minutes is measured in full:
 
 ```
 Energy (J) = Σ (P(i) + P(i+1)) / 2 × Δt(i)
@@ -561,12 +581,12 @@ The View 4 per-GPU table renders one row per device, making multi-GPU servers (e
 | **Power Over Time** (middle-left) | 1 Hz aggregate power bar chart with auto-scaling y-axis, mean and peak markers |
 | **Efficiency** (middle-right) | J/token, J/ktoken, tokens/watt, $/1M tokens (blended), total tokens, avg/peak/idle/compute power |
 | **Per-GPU Table** (lower-middle) | One row per device: full name (24-char, truncated with `…`), power, utilization, run-average utilization, temperature, run-average temperature, peak temperature, VRAM, core/mem clock, throttle |
-| **Cost Analysis** | $/1M Input (prefill), $/1M Output (decode), $/1M Blended (token-weighted), total run cost, token totals with request count |
+| **Cost Analysis** | $/1M Input (prefill), $/1M Output (decode), $/1M Blended (token-weighted), total run cost, token totals with request count — a **throughput-based estimate**, labeled distinct from the System panel's measured `Energy (kWh)` (two estimators, need not match) |
 | **Utilization + Temperature** (bottom) | Two 1 Hz **auto-scaled line charts** side by side — the y-axis spans the data's real range (with padding) so a narrow band shows its variation, each with grid lines, an area fill, a dashed mean line, and a peak marker |
 
 ### N/A Rule
 
-With no GPU telemetry (driver-less host), View 4 renders a single "no GPU telemetry" placeholder — never a broken frame, never fake zeros. Every derived metric is `Option`-gated: no power → all efficiency metrics are `None` (rendered `N/A`).
+With no GPU telemetry (driver-less host), View 4 renders a single "no GPU telemetry" placeholder — never a broken frame, never fake zeros. Every derived metric is `Option`-gated: no power → all efficiency metrics are `None` (rendered `N/A`), and the energy line is gated the same way — a no-telemetry host renders `N/A`, never a silent `0.000 kWh`.
 
 ### CPU Power Monitoring
 
@@ -589,7 +609,7 @@ Real-world maximum throughput: the server's **total** tokens/sec when it is load
 
 ### Methodology
 
-1. **Read the stream count** from Engine B's stored sweep result via the shared **`flatout_streams_for`** helper (used by both the TUI `sequence` path and the headless path, so they always agree): it returns the **max-throughput level** — the sweep *envelope* (the last level before the saturation knee, else the peak aggregate), tagged `concurrency_max_throughput`. When Engine B did not run (no sweep curve), it falls back to a small default load (3 streams, tagged `default`). The **practical sweet spot** (the per-stream hosting recommendation) is a distinct number and is *not* what Flat Out consumes.
+1. **Read the stream count** from Engine B's stored sweep result via the shared **`flatout_streams_for`** helper (used by both the TUI `sequence` path and the headless path, so they always agree): it returns the **max-throughput level** — the sweep *envelope* (the last level before the saturation knee, else the peak aggregate), tagged `concurrency_max_throughput`. When the sweep **ran but produced no usable curve**, it falls back to a single stream, tagged **`sweep_fallback_single_stream`** — a 1-stream floor is *not* a measured max-throughput level, so it names its own source. When Engine B did not run at all, it falls back to the default load (3 streams, tagged `default`). The **practical sweet spot** (the per-stream hosting recommendation) is a distinct number and is *not* what Flat Out consumes.
 2. **Spawn all `n` streams together** via the shared `WorkerPool`, each sending the same minimal (~15-token) open-ended prompt so prefill is <100 ms — negligible against the 60-second window.
 3. **`max_tokens = 100,000`, clamped to the model's probed max context, + `ignore_eos`** — effectively unlimited, so the *only* stop condition is the **60-second window** (`WINDOW_SECS`). Before the run the engine probes `GET /v1/models` for the model's max context (`max_model_len` / `max_context` / `context_length` / …) and clamps `max_tokens` to `context − prompt tokens` (floored at 1); a uniform HTTP-400 / zero-token run then surfaces as a `config_error` ("requested tokens exceed model limit"), **never** a silent 0 t/s. `ignore_eos` keeps llama.cpp servers from ending a stream on the model's own end-token; other backends ignore the field (graceful degradation).
 4. **Abort at 60 s** — the supervisor task is dropped, every worker task and its socket closes, and the server stops generating.
@@ -601,7 +621,7 @@ Real-world maximum throughput: the server's **total** tokens/sec when it is load
 - **Per-stream t/s** — the same **dual denominators** as Engine B: `tps_per_completed_stream` (aggregate ÷ completed streams, capacity) and `tps_per_requested_stream` (aggregate ÷ requested streams, user-experience; `per_stream_tps` is the back-compat alias of the requested view) — ≈ 30 t/s confirms the load is at the sweet spot. `failed_stream_ratio` is flagged when > 20 %.
 - **TTFT avg / ITL p50 / p99** — pooled across all streams, the latency evidence behind the throughput.
 
-The JSON export records the result under `flat_out` with `stream_count`, `stream_count_source` (`concurrency_sweet_spot` / `default`), `total_tokens`, `duration_secs`, `aggregate_tps`, `tps_per_completed_stream`, `tps_per_requested_stream`, `failed_stream_ratio`, `tokens_estimated`, `counting_method`, `config_error`, `max_tokens_used`, and the latency percentiles.
+The JSON export records the result under `flat_out` with `stream_count`, `stream_count_source` (`concurrency_max_throughput` / `sweep_fallback_single_stream` / `default`; `concurrency_sweet_spot` is retained only for reading pre-0.1.6 results), `total_tokens`, `duration_secs`, `aggregate_tps`, `tps_per_completed_stream`, `tps_per_requested_stream`, `failed_stream_ratio`, `tokens_estimated`, `counting_method`, `config_error`, `max_tokens_used`, and the latency percentiles.
 
 ## Data Flow Diagram
 

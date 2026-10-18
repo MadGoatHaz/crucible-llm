@@ -116,7 +116,7 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 - **Graph**: Visual curve of throughput vs users; the max-throughput level is highlighted.
 
 ### Reading the NIAH View (View 3)
-- **Matrix**: Rows = context size (the configured ladder — default 2k→128k), shows pass rate
+- **Matrix**: Rows = context size, columns = needle depth — rendered from **this run's actual ladder** (the configured `--niah-contexts` / `--niah-depths` / `--niah-custom`; default 2k→128k × 11 depths), so a custom ladder displays exactly as configured. Each cell shows its retrieval outcome
 - **Cell markers**: `●` retrieved (green = nominal prefill, yellow = throttled prefill) · `✗` retrieval failed (red) · `◌` truncated by reasoning (an over-thinker that spent its whole budget on CoT — *inconclusive*, not a failure) · `···` not run
 - **Colors**: Green ≥80%, Yellow 50-79%, Red <50%
 - **Verdict**: "Reliable up to ~Xk tokens"
@@ -196,6 +196,7 @@ The GPU & Power tab shows your local inference cost in the industry-standard for
 - **$/1M Blended**: Token-weighted mean of input and output (always between the two)
 - **Your rate**: Set your electricity cost ($/kWh) in Config [6]. Default: $0.16.
 - **Model**: Throughput-based energy (total phase tokens × measured phase power ÷ measured phase throughput), with a power×duration fallback for single-request runs.
+- **Distinct from the measured-draw cost** — this $/1M figure is a *throughput-based estimate*; the System Power panel's `Energy (kWh) @ $/kWh` is the *measured* integral of the full load window. The two are different estimators and need not match (the view says so).
 
 ### Duration & Idle Baseline
 
@@ -226,12 +227,12 @@ Your $/1M token cost reflects TRUE system draw, not just the GPU.
 
 ### Energy: How It's Computed
 
-- **Full-run figures.** J/token, power (avg/peak), and cost are integrated over the **entire active load window** (from the first engine to the last), not a fixed display slice — so a long run is measured over its full duration.
-- **Real token denominator.** J/token = total energy ÷ the **real prompt + completion tokens** actually processed by every engine that ran (the NIAH C1 cells count their real prompt tokens, not a generation-cap estimate).
+- **One number, everywhere.** J/token, energy, and power (avg/peak) come from a single source of truth — the **entire active load window** (from the first engine to the last, not a fixed display slice), the **measured idle baseline subtracted** (load-attributable energy), divided by the **real prompt + completion tokens of every engine that ran** (the NIAH C1 cells count their real prompt tokens, not a generation-cap estimate) — and that same figure appears identically in the GPU & Power view (System Power + Efficiency), the Live gauge (run-scoped), the History view, the `e` export, the headless terminal line, `--json`, and the stored database.
 - **Clamped, validated power.** GPU power is plausibility-clamped (NVIDIA to ≤1.5× TDP; a **per-model TDP fallback** engages when the card's power-limit queries fail, logging a WARN; a 1000 W global ceiling is the last resort), so phantom readings can't silently inflate the numbers.
-- **Idle baseline subtracted.** The measured no-load floor is subtracted before integrating, so the figure is the load-attributable energy.
-- **N/A, never a silent 0.** With no power telemetry (no GPU / driver, non-Linux host) every derived metric is `N/A` — never `0.0` (which would claim "free" inference).
-- **`cpu_power_estimated` flag.** When the CPU side of the draw is the fixed 40 W estimate (no RAPL / Super I/O), the result is labeled as estimated in the TUI and exports.
+- **N/A is always honest, with a reason.** With no power telemetry (no GPU / driver, non-Linux host) every derived metric is `N/A — no power telemetry` — never `0.0` (which would claim "free" inference). If the draw never rose above the idle floor it reads `N/A — no energy measured`; a selected-but-tokenless run (e.g. D-only) reads `N/A — no tokens generated`. Every surface shows the same reason.
+- **`cpu_power_estimated` flag.** When the CPU side of the draw is the fixed 40 W estimate (no RAPL / Super I/O), the result is labeled as estimated in the TUI **and** carried in the persisted/exported result (JSON, database, Markdown) — an estimate is never presented as a measurement.
+- **Two "cost" figures, labeled distinct.** The System Power panel's `Energy (kWh) @ $/kWh` is the *measured-draw* cost of this run; the Cost Analysis `$/1M tokens` is a separate *throughput-based estimate*. The view notes that the two are distinct estimators and need not match.
+- **Markdown export** includes the Engine D energy section (energy, run-level J/token, avg/peak power, the estimate flag) alongside the JSON.
 
 ## Headless / CLI Mode
 
@@ -259,6 +260,17 @@ For scripting, CI/CD, or when you don't want a TUI. **Headless honors engine sel
 # Custom timeout
 ./crucible-llm --headless --url http://localhost:8000/v1 --model my-model --timeout 60
 ```
+
+### Running individual engines
+
+All seven engines can be selected and run **standalone**, and each reports only what it measured:
+
+- **How to select one** — TUI: toggle the engine rows in the **Config view (View 6)** (or the Setup flow) and launch with `F5`. CLI: `--engine <name>` (repeatable, or `--engine all`), `CRUCIBLE_ENGINE`, or the config file's `engines` object. An explicit selection always wins over GPU auto-detection.
+- **A subset run is a fresh run.** Every run starts from a clean result slate (`None` = "not run"), so a D-only run after a full run in the same TUI session inherits **no** stale tokens: its Energy line reads an honest `N/A` (not a leftover J/token from the earlier run), and the stored result's `engine_results` contains only the engines that ran.
+- **D (Energy) alone** — with power telemetry present but no tokens generated this run: `N/A — no tokens generated` (distinct from `N/A — no power telemetry` on a driverless host, and `N/A — no energy measured` when the draw never rose above the idle floor).
+- **F (Flat Out) alone** — with no prior sweep it falls back to a default **3-stream** load (logged, no crash); if a sweep ran but produced no usable curve, the fallback is tagged `sweep_fallback_single_stream` — never presented as a measured max-throughput level.
+- **`--no-hardware --engine hardware`** — headless Engine D is gated on the *selection*, not the poller: it runs, reports a labeled `N/A` ("no power telemetry"), **and** still carries the `energy` object in `--json` (previously it was silently skipped).
+- **Zero engines selected** — a clean no-op: a warning is logged and the exit code is 0 (it is not a silent full run).
 
 ### Configuring the NIAH (C1) matrix
 
@@ -357,7 +369,7 @@ Look at the Concurrency view's "Practical Sweet Spot." That's your answer.
 - Each additional user beyond that makes everyone slower
 
 ### What's the headline number?
-That's **Flat Out (Engine F)** — it loads your server at its **max-throughput concurrency level** (the sweep envelope: the last level before the saturation knee, else the peak aggregate) for a **60-second full-load test**. This is distinct from the Concurrency view's **Practical Sweet Spot**, which is the *hosting* recommendation (how many users to keep comfortable); Flat Out measures the server's *peak aggregate* throughput, so the two numbers answer different questions and are not contradictory. The aggregate t/s it reports is the single number to quote when comparing servers or configurations. If you didn't run Concurrency first, it falls back to a small default load (3 streams).
+That's **Flat Out (Engine F)** — it loads your server at its **max-throughput concurrency level** (the sweep envelope: the last level before the saturation knee, else the peak aggregate) for a **60-second full-load test**. This is distinct from the Concurrency view's **Practical Sweet Spot**, which is the *hosting* recommendation (how many users to keep comfortable); Flat Out measures the server's *peak aggregate* throughput, so the two numbers answer different questions and are not contradictory. The aggregate t/s it reports is the single number to quote when comparing servers or configurations. If you didn't run Concurrency first, it falls back to a small default load (3 streams, source `default`); if a sweep ran but produced no usable curve, the single-stream fallback is tagged `sweep_fallback_single_stream` — never a "max-throughput" number. The JSON `stream_count_source` field names the source.
 
 ### Can I trust this model?
 - **Reasoning ≥ 90%**: Yes, for most tasks
@@ -385,7 +397,8 @@ Yes. Crucible uses the **server-reported `usage.completion_tokens`** as the auth
 ### Energy shows N/A
 - You're not on the GPU machine (all GPU telemetry — NVML, sysfs, Level Zero — is local), OR
 - No supported GPU driver found (NVIDIA / AMD / Intel), OR
-- There is no GPU at all — in that case the GPU panel is simply hidden (by design, not an error) and Engine D stays off
+- There is no GPU at all — in that case the GPU panel is simply hidden (by design, not an error) and Engine D stays off, OR
+- Engine D was selected but nothing was measured — the label says why: `N/A — no power telemetry` (no usable sensor), `N/A — no energy measured` (the draw never rose above the idle floor), or `N/A — no tokens generated` (e.g. a D-only run)
 
 ### Setup appears every time
 - You don't have a saved config with a URL + model yet. Save one from the Config view (View 6 → `Enter` → `F2`), and the next run opens straight to the dashboard.
