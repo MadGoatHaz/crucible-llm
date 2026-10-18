@@ -28,6 +28,7 @@ use std::time::Duration;
 use crate::client::StreamEvent;
 use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::{joules_per_token, profile, EnergyResult};
+use crate::engines::sequence::sum_all_engines_tokens;
 use crate::engines::speed::{
     all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
@@ -320,17 +321,189 @@ pub fn run_headless(
                 print!("{summary}");
             }
         }
-        // Engine D (hardware/energy) — the silicon-efficiency profile over
-        // the whole run. Computed once and reused for: the (non-JSON)
-        // display, the `--json` energy object (DO-09/CF-21), and the
-        // `engine_results` column. DO-08: only when D is selected. A
+        // ── Result capture (R2: the B/C2/C3/F headline numbers) ──
+        // The additional engines publish their results here so the
+        // persistence block (after them) can fold them into the session's
+        // `engine_results` column (CF-14: they used to be lost — only A +
+        // C1 were persisted).
+        let mut sweep_result: Option<SweepResult> = None;
+        // C1 NIAH: captured so the persistence block can write the
+        // `needle_evaluations` rows (the headless path used to run C1 and
+        // drop the result — the TUI/sequence path persists it).
+        let mut niah_result: Option<NiahResult> = None;
+        let mut reasoning_result: Option<ReasoningResult> = None;
+        let mut structured_result: Option<StructuredResult> = None;
+        let mut flatout_result: Option<FlatOutResult> = None;
+        // Engine D (hardware/energy) — computed after B/C1/C2/C3 and *before*
+        // F (the TUI sequence order A→B→C1→C2→C3→D→F) so the headless and TUI
+        // J/token agree (H5). `None` until D runs (or when D is not
+        // selected). Reused for the (non-JSON) display, the `--json` energy
+        // object (DO-09/CF-21), and the `engine_results` column; a
         // driverless host yields the N/A rule (no spurious 0.0).
-        let energy_result: Option<EnergyResult> = if cfg.hardware {
-            let total_tokens: u64 = results.iter().map(|r| r.completion_tokens).sum();
-            Some(profile(&hw_trace, None, total_tokens))
-        } else {
-            None
-        };
+        let mut energy_result: Option<EnergyResult> = None;
+
+        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
+        // C3 / F) and report a one-line summary for each. Engine A (speed)
+        // is the run above; Engine D (hardware) is the continuous poller
+        // started earlier. A selection of only `speed` skips this block
+        // entirely.
+        let extra = cfg.engines;
+        if !cfg.json
+            && (extra.concurrency
+                || extra.niah
+                || extra.reasoning
+                || extra.structured
+                || extra.flatout)
+        {
+            term.dim(&format!(
+                "  running selected engines: {}",
+                extra.iter_labels().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        // Engine F (Flat Out) reads Engine B's sweet spot as its stream
+        // count (the real-world full-load number).
+        let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
+        // The non-F additional engines (B, C1, C2, C3) run first — H5: D runs
+        // after them and *before* F (the TUI sequence order A→B→C1→C2→C3→D→F),
+        // so the headless and TUI J/token share the same denominator.
+        if extra.concurrency {
+            if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
+                if !cfg.json {
+                    term.dim(&format!(
+                        "  [B] concurrency sweep [{}]…",
+                        cfg.ladder
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ));
+                }
+                let r = sweep.run().await;
+                flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
+                // FIX 3: the headless summary leads with the
+                // practical (per-stream usability) sweet spot, with
+                // the pure-throughput knee as reference.
+                if r.is_empty() {
+                    term.warning("  [B] sweep produced no usable levels");
+                } else {
+                    term.info(&format!("  [B] {}", summarize_sweep(&r)));
+                }
+                sweep_result = Some(r);
+            }
+        }
+        if extra.niah {
+            match NiahEngine::new(cfg) {
+                Ok(engine) => {
+                    if !cfg.json {
+                        // Issue #3 + Issue #4: render the *configured*
+                        // ladders with the shared size formatter (was a
+                        // hard-coded "7 sizes × 11 depths", and the
+                        // per-cell worker tags logged `128000k`). Now the
+                        // headline matches the TUI grid (`2k→128k`, `1M`,
+                        // …) and names the count-test mode — and carries
+                        // the `(approx.)` qualifier when no `--tokenizer`
+                        // is set (`niah_size_desc`).
+                        term.dim(&niah_size_desc(cfg));
+                    }
+                    let r = engine.logger(logger.clone()).run().await;
+                    // Issue #6: the `--json` document carries the NIAH
+                    // result (per-size recall, `reliable_up_to`, per-cell
+                    // detail with the `context_label` qualifier) so a
+                    // headless `--json` run is self-contained. Additive —
+                    // the Engine-A JSON shape is untouched.
+                    if let Some(v) = &mut json_doc {
+                        v["niah"] = r.to_dict();
+                    }
+                    term.info(&format!("  [C1] {}", r.accuracy_label()));
+                    niah_result = Some(r);
+                }
+                Err(e) => {
+                    term.warning(&format!("[C1] niah init failed: {e}"));
+                    logger.error(Context::EngineC1, format!("niah init failed: {e}"));
+                }
+            }
+        }
+        if extra.reasoning {
+            match ReasoningEngine::new(cfg) {
+                Ok(engine) => {
+                    if !cfg.json {
+                        term.dim("  [C2] reasoning bank (13 challenges)…");
+                    }
+                    let r = engine.logger(logger.clone()).run().await;
+                    term.info(&format!(
+                        "  [C2] {} · avg {:.1} t/s",
+                        r.score.label(),
+                        r.avg_tg_speed()
+                    ));
+                    reasoning_result = Some(r);
+                }
+                Err(e) => {
+                    term.warning(&format!("[C2] reasoning init failed: {e}"));
+                    logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
+                }
+            }
+        }
+        if extra.structured {
+            match StructuredEngine::new(cfg) {
+                Ok(engine) => {
+                    if !cfg.json {
+                        term.dim("  [C3] structured output (free-form vs constrained)…");
+                    }
+                    let r = engine.logger(logger.clone()).run().await;
+                    // R2: the `--json` document carries the C3
+                    // structured result (the score split incl. the
+                    // distinct `truncated_by_reasoning` count, the
+                    // per-case `truncated_by_reasoning` flags, the
+                    // CF-17 compliance label, the CF-36-gated penalty,
+                    // the constraint mode) so a headless `--json` run
+                    // is self-contained. Additive — the Engine-A JSON
+                    // shape is untouched (same pattern as the `niah` /
+                    // `flat_out` sections).
+                    if let Some(v) = &mut json_doc {
+                        v["structured"] = r.to_dict();
+                    }
+                    term.info(&format!("  [C3] {}", r.summary_line()));
+                    structured_result = Some(r);
+                }
+                Err(e) => {
+                    term.warning(&format!("[C3] structured init failed: {e}"));
+                    logger.error(Context::EngineC3, format!("structured init failed: {e}"));
+                }
+            }
+        }
+
+        // Engine D (hardware/energy) — after A+B+C1+C2+C3, before F (the TUI
+        // sequence order). **H5:** the shared `sum_all_engines_tokens` helper,
+        // so the headless and TUI denominators agree (F is not yet run → it
+        // contributes 0, consistent with CF-03). **H3:** the numerator is the
+        // load window (the whole run in the headless poll()-only path, which
+        // never opens a load window), not the bounded 6-min trace.
+        if cfg.hardware {
+            let total_tokens = sum_all_engines_tokens(
+                Some(results.as_slice()),
+                sweep_result.as_ref(),
+                niah_result.as_ref(),
+                reasoning_result.as_ref(),
+                structured_result.as_ref(),
+                None,
+            );
+            let (trace_d, load_joules) = hw
+                .as_ref()
+                .and_then(|h| h.lock().ok())
+                .map(|g| {
+                    (
+                        g.trace().to_vec(),
+                        g.load_window_joules().or(Some(g.energy_joules())),
+                    )
+                })
+                .unwrap_or_default();
+            let mut energy = profile(&trace_d, None, total_tokens);
+            if let Some(j) = load_joules {
+                energy.joules = j;
+                energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
+            }
+            energy_result = Some(energy);
+        }
         if let Some(energy) = &energy_result {
             if !cfg.json {
                 if let Some(jpt) = energy.joules_per_token {
@@ -365,167 +538,31 @@ pub fn run_headless(
             }
         }
 
-        // ── Result capture (R2: the B/C2/C3/F headline numbers) ──
-        // The additional engines publish their results here so the
-        // persistence block (after them) can fold them into the session's
-        // `engine_results` column (CF-14: they used to be lost — only A +
-        // C1 were persisted).
-        let mut sweep_result: Option<SweepResult> = None;
-        // C1 NIAH: captured so the persistence block can write the
-        // `needle_evaluations` rows (the headless path used to run C1 and
-        // drop the result — the TUI/sequence path persists it).
-        let mut niah_result: Option<NiahResult> = None;
-        let mut reasoning_result: Option<ReasoningResult> = None;
-        let mut structured_result: Option<StructuredResult> = None;
-        let mut flatout_result: Option<FlatOutResult> = None;
-
-        // Chunk 18: run any *additionally-selected* engines (B / C1 / C2 /
-        // C3 / F) and report a one-line summary for each. Engine A (speed)
-        // is the run above; Engine D (hardware) is the continuous poller
-        // started earlier. A selection of only `speed` skips this block
-        // entirely.
-        let extra = cfg.engines;
-        if extra.concurrency || extra.niah || extra.reasoning || extra.structured || extra.flatout {
-            if !cfg.json {
-                term.dim(&format!(
-                    "  running selected engines: {}",
-                    extra.iter_labels().collect::<Vec<_>>().join(", ")
-                ));
-            }
-            // Engine F (Flat Out) reads Engine B's sweet spot as its
-            // stream count (the real-world full-load number); captured
-            // here because the sweep result is scoped to the block.
-            let mut flatout_streams: Option<(usize, StreamCountSource)> = None;
-            if extra.concurrency {
-                if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
+        // F runs last, after D.
+        if extra.flatout {
+            match FlatOutEngine::new(cfg) {
+                Ok(mut engine) => {
+                    // The stream count is Engine B's sweet spot when
+                    // the sweep ran (real-world full load), else the
+                    // built-in default.
+                    if let Some((n, source)) = flatout_streams {
+                        engine = engine.stream_count(n, source);
+                    }
                     if !cfg.json {
-                        term.dim(&format!(
-                            "  [B] concurrency sweep [{}]…",
-                            cfg.ladder
-                                .iter()
-                                .map(|n| n.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
+                        term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
                     }
-                    let r = sweep.run().await;
-                    flatout_streams = Some((r.sweet_spot, StreamCountSource::ConcurrencySweetSpot));
-                    // FIX 3: the headless summary leads with the
-                    // practical (per-stream usability) sweet spot, with
-                    // the pure-throughput knee as reference.
-                    if r.is_empty() {
-                        term.warning("  [B] sweep produced no usable levels");
-                    } else {
-                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
+                    let r = engine.logger(logger.clone()).run().await;
+                    // The `--json` document carries the flat_out
+                    // result object.
+                    if let Some(v) = &mut json_doc {
+                        v["flat_out"] = r.to_dict();
                     }
-                    sweep_result = Some(r);
+                    term.info(&format!("  [F] {}", r.summary_line()));
+                    flatout_result = Some(r);
                 }
-            }
-            if extra.niah {
-                match NiahEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            // Issue #3 + Issue #4: render the *configured*
-                            // ladders with the shared size formatter (was a
-                            // hard-coded "7 sizes × 11 depths", and the
-                            // per-cell worker tags logged `128000k`). Now the
-                            // headline matches the TUI grid (`2k→128k`, `1M`,
-                            // …) and names the count-test mode — and carries
-                            // the `(approx.)` qualifier when no `--tokenizer`
-                            // is set (`niah_size_desc`).
-                            term.dim(&niah_size_desc(cfg));
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        // Issue #6: the `--json` document carries the NIAH
-                        // result (per-size recall, `reliable_up_to`, per-cell
-                        // detail with the `context_label` qualifier) so a
-                        // headless `--json` run is self-contained. Additive —
-                        // the Engine-A JSON shape is untouched.
-                        if let Some(v) = &mut json_doc {
-                            v["niah"] = r.to_dict();
-                        }
-                        term.info(&format!("  [C1] {}", r.accuracy_label()));
-                        niah_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C1] niah init failed: {e}"));
-                        logger.error(Context::EngineC1, format!("niah init failed: {e}"));
-                    }
-                }
-            }
-            if extra.reasoning {
-                match ReasoningEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C2] reasoning bank (13 challenges)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        term.info(&format!(
-                            "  [C2] {} · avg {:.1} t/s",
-                            r.score.label(),
-                            r.avg_tg_speed()
-                        ));
-                        reasoning_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C2] reasoning init failed: {e}"));
-                        logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
-                    }
-                }
-            }
-            if extra.structured {
-                match StructuredEngine::new(cfg) {
-                    Ok(engine) => {
-                        if !cfg.json {
-                            term.dim("  [C3] structured output (free-form vs constrained)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        // R2: the `--json` document carries the C3
-                        // structured result (the score split incl. the
-                        // distinct `truncated_by_reasoning` count, the
-                        // per-case `truncated_by_reasoning` flags, the
-                        // CF-17 compliance label, the CF-36-gated penalty,
-                        // the constraint mode) so a headless `--json` run
-                        // is self-contained. Additive — the Engine-A JSON
-                        // shape is untouched (same pattern as the `niah` /
-                        // `flat_out` sections).
-                        if let Some(v) = &mut json_doc {
-                            v["structured"] = r.to_dict();
-                        }
-                        term.info(&format!("  [C3] {}", r.summary_line()));
-                        structured_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[C3] structured init failed: {e}"));
-                        logger.error(Context::EngineC3, format!("structured init failed: {e}"));
-                    }
-                }
-            }
-            if extra.flatout {
-                match FlatOutEngine::new(cfg) {
-                    Ok(mut engine) => {
-                        // The stream count is Engine B's sweet spot when
-                        // the sweep ran (real-world full load), else the
-                        // built-in default.
-                        if let Some((n, source)) = flatout_streams {
-                            engine = engine.stream_count(n, source);
-                        }
-                        if !cfg.json {
-                            term.dim("  [F] flat out (sweet-spot full load — real-world max t/s)…");
-                        }
-                        let r = engine.logger(logger.clone()).run().await;
-                        // The `--json` document carries the flat_out
-                        // result object.
-                        if let Some(v) = &mut json_doc {
-                            v["flat_out"] = r.to_dict();
-                        }
-                        term.info(&format!("  [F] {}", r.summary_line()));
-                        flatout_result = Some(r);
-                    }
-                    Err(e) => {
-                        term.warning(&format!("[F] flat out init failed: {e}"));
-                        logger.error(Context::EngineF, format!("flat out init failed: {e}"));
-                    }
+                Err(e) => {
+                    term.warning(&format!("[F] flat out init failed: {e}"));
+                    logger.error(Context::EngineF, format!("flat out init failed: {e}"));
                 }
             }
         }

@@ -35,7 +35,7 @@ use arc_swap::ArcSwapOption;
 
 use crate::config::Config;
 use crate::engines::capability::{
-    NiahEngine, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
+    NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
     NIAH_MAX_GEN_TOKENS,
 };
 use crate::engines::concurrency::SweepResult;
@@ -1198,66 +1198,34 @@ impl BenchmarkSequence {
         }
     }
 
-    /// CF-03: the cumulative **output-token** count across every engine that
-    /// has produced tokens so far (A+B+C1+C2+C3+F), read from the result
-    /// slots. This is the honest J/token denominator: the power trace the
-    /// numerator integrates spans the whole run, so the denominator must span
-    /// the same engine set. The old code divided by **A+B only** (the
-    /// `_ => 0` branch dropped C1/C2/C3), inflating the headline J/token by
-    /// excluding the tokens of the most energy-hungry work (C1's 77
-    /// long-context prefill cells).
+    /// CF-03 / H5: the cumulative **input + output** token count across every
+    /// engine that has produced tokens so far (A+B+C1+C2+C3+F), read from the
+    /// result slots — the honest J/token denominator. Delegates to the
+    /// **shared** [`sum_all_engines_tokens`] helper so the TUI and the
+    /// headless path compute the *same* denominator (H5) — the old code
+    /// divided by A+B only (and, in headless, A only), inflating the headline
+    /// J/token by excluding the tokens of the most energy-hungry work.
     ///
-    /// **Real counts** are used where the result type carries them:
-    /// A `completion_tokens`, B `levels[].total_tokens`, F `total_tokens`.
-    /// C1/C2 (and C3's bodies) carry no output count in their result types
-    /// and are sibling-owned, so they contribute a clearly-labeled
-    /// **estimate**: C1 = run cells × the 64-token gen cap, C2 = `chars/4`
-    /// over the response text, C3 = `chars/4` over the free + constrained
-    /// bodies (the codebase's standard no-tokenizer estimate).
+    /// **Real counts** are used where the result type carries them: A
+    /// `completion_tokens`, B `levels[].total_tokens`, **C1 per-cell
+    /// `prompt_tokens` + `completion_tokens`** (H2 — the server-reported
+    /// usage; the `chars/4` doc estimate stands in for the prompt only when
+    /// no usage block arrived), F `total_tokens`. C2/C3 (and a C1 cell with
+    /// no usage block) contribute a clearly-labeled `chars/4` / gen-cap
+    /// estimate.
     ///
     /// Slots that have not run yet contribute `0`, so calling this at D's
     /// sampling point (before F) and at `persist_results` (after F) each stay
-    /// consistent with the power trace they pair with.
+    /// consistent with the power window they pair with.
     fn all_engines_tokens(&self) -> u64 {
-        let mut total = 0u64;
-        // Engine A — real completion tokens.
-        total += summary_tokens_speed(&self.slots.speed);
-        // Engine B — real sweep total tokens.
-        total += summary_tokens_sweep(&self.slots.concurrency);
-        // Engine C1 (NIAH) — the **real** per-cell prompt + completion tokens
-        // (H2). The old `run_cells × NIAH_MAX_GEN_TOKENS` estimate ignored the
-        // ~2.79 M real prompt tokens and over-counted the ~2.3k real output
-        // tokens ~68×. A cell with no usage block
-        // (`completion_tokens == None`) falls back to the labeled
-        // `NIAH_MAX_GEN_TOKENS` gen-cap for its output side only.
-        if let Some(niah) = (*self.slots.niah.load()).as_ref() {
-            for c in niah.cells.iter().filter(|c| c.target_tokens > 0) {
-                let completion = match c.completion_tokens {
-                    Some(n) => n,
-                    None => NIAH_MAX_GEN_TOKENS as u64, // labeled gen-cap fallback
-                };
-                total += c.prompt_tokens + completion;
-            }
-        }
-        // Engine C2 (Reasoning) — estimate: chars/4 over the response text.
-        if let Some(r) = (*self.slots.reasoning.load()).as_ref() {
-            let chars: usize = r.responses.iter().map(|s| s.chars().count()).sum();
-            total += (chars / 4) as u64;
-        }
-        // Engine C3 (Structured) — estimate: chars/4 over free + constrained.
-        if let Some(s) = (*self.slots.structured.load()).as_ref() {
-            let chars: usize = s.free_body.chars().count()
-                + s.cases
-                    .iter()
-                    .map(|c| c.output.chars().count())
-                    .sum::<usize>();
-            total += (chars / 4) as u64;
-        }
-        // Engine F (Flat Out) — real total tokens.
-        if let Some(f) = (*self.slots.flatout.load()).as_ref() {
-            total += f.total_tokens;
-        }
-        total
+        sum_all_engines_tokens(
+            (*self.slots.speed.load()).as_deref(), // Option<Vec<_>> → &[SpeedResult]
+            (*self.slots.concurrency.load()).as_ref(),
+            (*self.slots.niah.load()).as_ref(),
+            (*self.slots.reasoning.load()).as_ref(),
+            (*self.slots.structured.load()).as_ref(),
+            (*self.slots.flatout.load()).as_ref(),
+        )
     }
 
     /// Engine D — the continuous energy profiler: a short final sampling
@@ -1459,20 +1427,66 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
     }
 }
 
-/// Tokens generated by a stored Engine A run (the Energy denominator).
-fn summary_tokens_speed(slot: &ResultSlot<Vec<SpeedResult>>) -> u64 {
-    match slot.load().as_ref() {
-        Some(results) => results.iter().map(|r| r.completion_tokens).sum(),
-        None => 0,
+/// The cumulative **input + output** token count across every engine (the
+/// honest J/token denominator, CF-03) — a **shared** pure helper used by
+/// both the TUI ([`BenchmarkSequence::all_engines_tokens`]) and the headless
+/// path ([`crate::run_headless`]) so the two can never diverge (H5).
+///
+/// Each argument is `None` for an engine that has not run yet (it
+/// contributes `0`). **H2:** C1 (NIAH) contributes the real per-cell
+/// `prompt_tokens` + `completion_tokens`; the labeled `NIAH_MAX_GEN_TOKENS`
+/// gen-cap stands in only for a cell with no usage block. C2/C3 contribute
+/// the codebase's standard no-tokenizer `chars/4` estimate. The numerator
+/// (the power window the energy math integrates) spans the same engine set
+/// as this denominator — a number must mean what it says.
+#[must_use]
+pub fn sum_all_engines_tokens(
+    speed: Option<&[SpeedResult]>,
+    sweep: Option<&SweepResult>,
+    niah: Option<&NiahResult>,
+    reasoning: Option<&ReasoningResult>,
+    structured: Option<&StructuredResult>,
+    flatout: Option<&FlatOutResult>,
+) -> u64 {
+    let mut total = 0u64;
+    // Engine A — real completion tokens.
+    if let Some(results) = speed {
+        total += results.iter().map(|r| r.completion_tokens).sum::<u64>();
     }
-}
-
-/// Tokens generated by a stored Engine B sweep (the Energy denominator).
-fn summary_tokens_sweep(slot: &ResultSlot<SweepResult>) -> u64 {
-    match slot.load().as_ref() {
-        Some(result) => result.levels.iter().map(|l| l.total_tokens).sum(),
-        None => 0,
+    // Engine B — real sweep total tokens.
+    if let Some(result) = sweep {
+        total += result.levels.iter().map(|l| l.total_tokens).sum::<u64>();
     }
+    // Engine C1 (NIAH) — real per-cell prompt + completion tokens (H2); the
+    // labeled gen-cap stands in only for a cell with no usage block.
+    if let Some(r) = niah {
+        for c in r.cells.iter().filter(|c| c.target_tokens > 0) {
+            let completion = match c.completion_tokens {
+                Some(n) => n,
+                None => NIAH_MAX_GEN_TOKENS as u64, // labeled gen-cap fallback
+            };
+            total += c.prompt_tokens + completion;
+        }
+    }
+    // Engine C2 (Reasoning) — estimate: chars/4 over the response text.
+    if let Some(r) = reasoning {
+        let chars: usize = r.responses.iter().map(|s| s.chars().count()).sum();
+        total += (chars / 4) as u64;
+    }
+    // Engine C3 (Structured) — estimate: chars/4 over free + constrained.
+    if let Some(s) = structured {
+        let chars: usize = s.free_body.chars().count()
+            + s.cases
+                .iter()
+                .map(|c| c.output.chars().count())
+                .sum::<usize>();
+        total += (chars / 4) as u64;
+    }
+    // Engine F (Flat Out) — real total tokens.
+    if let Some(f) = flatout {
+        total += f.total_tokens;
+    }
+    total
 }
 
 /// H3: apply the load-window numerator to a trace-profiled [`EnergyResult`].
@@ -2157,6 +2171,59 @@ mod tests {
             all,
             8000 + NIAH_MAX_GEN_TOKENS as u64,
             "the labeled gen-cap fallback: {all}"
+        );
+    }
+
+    /// H5: the TUI's `all_engines_tokens` method and the shared
+    /// `sum_all_engines_tokens` helper (used by the headless path) compute the
+    /// **same** denominator for the same stored results — headless and TUI can
+    /// never diverge (the old headless path used an A-only denominator).
+    #[test]
+    fn all_engines_tokens_tui_and_shared_helper_agree() {
+        let s = seq(EngineSelection {
+            speed: true,
+            concurrency: true,
+            niah: true,
+            reasoning: true,
+            structured: true,
+            hardware: true,
+            flatout: true,
+        });
+        // Populate every slot with a known contribution.
+        s.slots
+            .speed
+            .store(vec![speed_result(100.0, 0.2, 256, false)]);
+        s.slots.concurrency.store(sweep_with_total_tokens(1000));
+        let mut niah = NiahResult::new(vec![8000], vec![0]);
+        niah.cells[0].target_tokens = 8000;
+        niah.cells[0].prompt_tokens = 8000;
+        niah.cells[0].completion_tokens = Some(15);
+        s.slots.niah.store(niah);
+        s.slots.reasoning.store(reasoning_with_response_chars(400));
+        s.slots.structured.store(structured_with_body_chars(800));
+        s.slots.flatout.store(flatout_with_total_tokens(5000));
+
+        // The TUI method (reads the slots) and the shared helper (the
+        // headless path) must agree on the same inputs.
+        let via_method = s.all_engines_tokens();
+        let via_helper = sum_all_engines_tokens(
+            (*s.slots.speed.load()).as_deref(),
+            (*s.slots.concurrency.load()).as_ref(),
+            (*s.slots.niah.load()).as_ref(),
+            (*s.slots.reasoning.load()).as_ref(),
+            (*s.slots.structured.load()).as_ref(),
+            (*s.slots.flatout.load()).as_ref(),
+        );
+        assert_eq!(
+            via_method, via_helper,
+            "TUI and headless denominators agree"
+        );
+        // 256 (A) + 1000 (B) + (8000+15) (C1) + (400/4) (C2) + (800/4) (C3)
+        // + 5000 (F) = 15015.
+        assert_eq!(
+            via_method,
+            256 + 1000 + 8015 + 100 + 200 + 5000,
+            "the full all-engine sum"
         );
     }
 
