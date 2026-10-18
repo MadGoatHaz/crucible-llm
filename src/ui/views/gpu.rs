@@ -305,12 +305,19 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f:
         f.render_widget(Paragraph::new("").block(block), area);
         return;
     }
-    let jpt = mon.joules_per_token();
-    let jkt = mon.joules_per_ktoken();
-    let tpw = mon.tokens_per_watt();
     // The blended $/1M rate from the phase-aware cost math (the same
     // number the COST ANALYSIS panel shows), at the live config rate.
     let cmt = mon.token_costs_at_rate(rate).map(|c| c.blended);
+    // C3: the N/A rule for a tokenless run — if no token was observed
+    // *this* run (since `begin_run`), the token-derived figures (J/token,
+    // J/ktoken, Tokens/W, Total tokens) are N/A, never a silent 0.000
+    // (and never a stale non-zero total from a previous run's live
+    // counter). The $/1M row already gates on the same signal
+    // (`token_costs_at_rate` requires `first_token_at`).
+    let saw_token = mon.first_token_at.is_some();
+    let jpt = saw_token.then(|| mon.joules_per_token()).flatten();
+    let jkt = saw_token.then(|| mon.joules_per_ktoken()).flatten();
+    let tpw = saw_token.then(|| mon.tokens_per_watt()).flatten();
     let na = "N/A".to_string();
     let lines = vec![
         eff_row(
@@ -331,8 +338,15 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f:
         ),
         // I3: the all-token total (input + output) — the same denominator
         // the J/token line and Engine D use, so the panel is internally
-        // consistent (J/token = Energy ÷ Total tokens).
-        eff_row(th, "Total tokens", fmt::format_tokens(mon.all_tokens())),
+        // consistent (J/token = Energy ÷ Total tokens). C3: N/A on a
+        // tokenless run (never a stale non-zero total).
+        eff_row(
+            th,
+            "Total tokens",
+            saw_token
+                .then(|| fmt::format_tokens(mon.all_tokens()))
+                .unwrap_or(na.clone()),
+        ),
         Line::raw(""),
         eff_row(
             th,
@@ -1262,6 +1276,44 @@ mod tests {
             !text.contains("Total tokens  : 20,000"),
             "output-only total is not shown: {text}"
         );
+    }
+
+    /// C3: a D-only (tokenless) run — the Efficiency panel's token-derived
+    /// rows render `N/A`, never a silent `0.000` (and never the stale
+    /// non-zero "Total tokens" a previous run's live counter leaves behind
+    /// — the exact corner case observed on a contended idle GPU).
+    #[test]
+    fn view4_efficiency_is_na_on_a_tokenless_run() {
+        let mut mon = GpuPowerMonitor::default().with_rate(0.16);
+        mon.begin_run(); // fresh run window (resets first_token_at → None)
+        mon.start_load();
+        // Telemetry present (the panel is live, not "no GPU"):
+        mon.has_power = true;
+        // A stale live counter from a previous run (the residual the bug
+        // showed):
+        mon.total_tokens = 15_375;
+        mon.prompt_tokens = 0;
+        // A tiny (idle-subtracted) energy so the *un-gated* math would
+        // print "J/token: 0.000" (1.0 J / 15,375 ≈ 0.000065).
+        mon.load_window_joules = Some(1.0);
+        let mut app = app_with_monitor(mon);
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 50);
+        assert!(text.contains("EFFICIENCY"), "efficiency panel: {text}");
+        // The token-derived rows are N/A — never a silent 0.000:
+        assert!(text.contains("J/token:      N/A"), "J/token N/A: {text}");
+        assert!(text.contains("J/ktoken:     N/A"), "J/ktoken N/A: {text}");
+        assert!(text.contains("Tokens/W:     N/A"), "Tokens/W N/A: {text}");
+        assert!(
+            text.contains("Total tokens: N/A"),
+            "Total tokens N/A: {text}"
+        );
+        assert!(
+            !text.contains("J/token:      0.000"),
+            "no silent 0.000 J/token: {text}"
+        );
+        // The stale live counter is not rendered anywhere:
+        assert!(!text.contains("15,375"), "stale total not rendered: {text}");
     }
 
     #[test]
