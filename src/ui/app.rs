@@ -48,7 +48,7 @@ use crate::engines::{
     SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
     VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
-use crate::hw::{GpuBackend, HwPoller, MANUAL_IDLE_WINDOW_SECS};
+use crate::hw::{arm_power_monitor, GpuBackend, HwPoller, IDLE_WINDOW_SECS, MANUAL_IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::storage::db::Database;
@@ -744,6 +744,14 @@ impl App {
                     url = config.url
                 ),
             );
+            // B5: arm the power monitor like the sequence path (begin_run →
+            // idle window → start_load) so View 4's load window / duration is
+            // fresh for the standalone run — it used to only *close* the
+            // window at the end without ever opening one, leaving the
+            // duration stale.
+            if let Some(p) = &hw {
+                arm_power_monitor(p, IDLE_WINDOW_SECS).await;
+            }
             let result = engine.run().await;
             slot.set_running(false);
             slot.store(result);

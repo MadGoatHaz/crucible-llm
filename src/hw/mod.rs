@@ -64,7 +64,8 @@ pub use intel::{detect_intel_backend, IntelSysfsBackend};
 #[cfg(target_os = "linux")]
 pub use intel_level_zero::IntelLevelZeroBackend;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::metrics::state::{MetricsSnapshot, MetricsState, StreamStatus};
 use crate::timing::MonotonicInstant;
@@ -296,6 +297,30 @@ pub fn hw_sample_from_gpu(t: MonotonicInstant, g: &GpuSample) -> HwSample {
         gpu_temp_c: g.temperature_c.map(|c| c.max(0) as u32),
         gpu_util_pct: g.utilization_pct.map(|u| u as u32),
         ..HwSample::default()
+    }
+}
+
+/// Arm a **new** benchmark run on the poller: [`HwPoller::begin_run`] (reset
+/// the monitor + open the idle clock) → sleep the idle window (the
+/// background poller accumulates the no-load baseline) →
+/// [`HwPoller::start_load`] (finalize the baseline, open the load window).
+///
+/// Shared by the TUI sequence (`BenchmarkSequence::prepare_power_monitor`)
+/// and the standalone NIAH runner (`App::start_niah`) so View 4's load
+/// window / duration is fresh for *any* run. **B5:** the standalone `n`
+/// NIAH used to only *close* the window (`end_load`) at the end without ever
+/// opening one, so View 4's load window / duration stayed stale; this
+/// restores the same arming the sequence path has always used.
+///
+/// `idle_secs` is the no-load baseline window ([`IDLE_WINDOW_SECS`] in
+/// production; `0` in tests to skip the sleep).
+pub async fn arm_power_monitor(poller: &Arc<Mutex<HwPoller>>, idle_secs: u64) {
+    if let Ok(mut p) = poller.lock() {
+        p.begin_run();
+    }
+    tokio::time::sleep(Duration::from_secs(idle_secs)).await;
+    if let Ok(mut p) = poller.lock() {
+        p.start_load();
     }
 }
 
@@ -1111,5 +1136,26 @@ mod tests {
         // begin_run resets the window (the N/A rule for a fresh run).
         p.begin_run();
         assert_eq!(p.load_window_joules(), None);
+    }
+
+    /// B5: arming a run (`begin_run` → idle window → `start_load`) opens a
+    /// *fresh* load window — so a standalone NIAH run (which used to only
+    /// *close* the window at the end without ever opening one) now resets
+    /// View 4's load window / duration. `idle_secs = 0` skips the sleep in
+    /// the test.
+    #[tokio::test]
+    async fn arm_power_monitor_opens_a_fresh_load_window() {
+        let poller = Arc::new(Mutex::new(HwPoller::with_backend(None)));
+        // A fresh poller has no load window open.
+        assert!(
+            poller.lock().unwrap().load_window_joules().is_none(),
+            "no load window before arming"
+        );
+        arm_power_monitor(&poller, 0).await;
+        // `begin_run` + `start_load` ran → the load window is now open.
+        assert!(
+            poller.lock().unwrap().load_window_joules().is_some(),
+            "arming opens a fresh load window"
+        );
     }
 }

@@ -1174,10 +1174,6 @@ impl BenchmarkSequence {
         let Some(poller) = &self.hw else {
             return;
         };
-        // Arm the monitor (a brief lock — never held across an await).
-        if let Ok(mut p) = poller.lock() {
-            p.begin_run();
-        }
         self.log_line(format!(
             "[GPU] measuring idle power baseline ({}s) before load…",
             IDLE_WINDOW_SECS
@@ -1189,13 +1185,9 @@ impl BenchmarkSequence {
                 IDLE_WINDOW_SECS
             ),
         );
-        // Sleep the idle window: the background poller accumulates the
-        // baseline while we wait.
-        tokio::time::sleep(Duration::from_secs(IDLE_WINDOW_SECS)).await;
-        // Open the load window (finalize the idle baseline; history begins).
-        if let Ok(mut p) = poller.lock() {
-            p.start_load();
-        }
+        // Arm the monitor: begin_run → idle window → start_load (the shared
+        // helper, also used by the standalone NIAH runner — B5).
+        crate::hw::arm_power_monitor(poller, IDLE_WINDOW_SECS).await;
     }
 
     /// Close the GPU & Power monitor's (View 4) **load window** when the run
