@@ -362,13 +362,10 @@ impl ExportPayload {
                 "| Peak power (W) | {} |\n",
                 md_cell(&opt_f3(e.peak_power_w))
             ));
+            let estimated = if e.cpu_power_estimated { "yes" } else { "no" };
             out.push_str(&format!(
                 "| CPU power estimated | {} |\n",
-                md_cell(&if e.cpu_power_estimated {
-                    "yes"
-                } else {
-                    "no"
-                })
+                md_cell(estimated)
             ));
             if let Some(r) = &e.na_reason {
                 out.push_str(&format!("| N/A reason | {} |\n", md_cell(r)));
