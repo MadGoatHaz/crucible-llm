@@ -370,12 +370,14 @@ pub struct EnergySummary {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fragmentation_warning: Option<String>,
-    /// The clear N/A reason when no power telemetry was available (the
-    /// module N/A rule — a driverless host or a sensor with no usable
-    /// reading, e.g. the RAPL quirk on a shared host). `Some("N/A — no
-    /// power telemetry")` so the persisted/exported energy object is an
-    /// *honest, labeled* N/A, never a silent gap and never a spurious
-    /// `0.0` J/token. `None` when the profile measured power.
+    /// The clear N/A reason when `joules_per_token` is `None` (the module
+    /// N/A rule) — **labeled**, never a silent gap and never a spurious
+    /// `0.0` J/token. B3 distinguishes the two root causes:
+    /// `Some("N/A — no power telemetry")` (a driverless host, or a sensor
+    /// with no usable reading, e.g. the RAPL quirk on a shared host) vs
+    /// `Some("N/A — no tokens generated")` (power telemetry present, but the
+    /// run produced zero tokens to divide by). `None` when a J/token value
+    /// was measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub na_reason: Option<String>,
 }
@@ -392,7 +394,10 @@ impl EnergySummary {
             vendor: e.vendor.clone(),
             model: e.model.clone(),
             fragmentation_warning: e.fragmentation_warning.clone(),
-            na_reason: e.is_na().then(|| "N/A — no power telemetry".to_string()),
+            // B3: the labeled N/A reason (distinguishing "no power
+            // telemetry" from "no tokens generated"), or `None` when a
+            // J/token value was measured.
+            na_reason: e.na_reason().map(|r| format!("N/A — {r}")),
         }
     }
 }
@@ -522,5 +527,57 @@ mod tests {
         assert_eq!(back.truncated, 1);
         assert_eq!(back.cases[2].verdict, CaseVerdict::Truncated);
         assert!(back.cases[2].truncated_by_reasoning);
+    }
+
+    /// B3: `EnergySummary::from_energy` sets the labeled `na_reason` for
+    /// **both** N/A root causes (and none when a value is measured) — so the
+    /// persisted / `--json` energy object is never a silent gap.
+    #[test]
+    fn energy_summary_na_reason_labels_both_causes() {
+        // No power telemetry (driverless host).
+        let no_power = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: None,
+            peak_power_w: None,
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: None,
+            vendor: None,
+            model: None,
+            cpu_power_estimated: false,
+        };
+        let s = EnergySummary::from_energy(&no_power);
+        assert_eq!(
+            s.na_reason.as_deref(),
+            Some("N/A — no power telemetry"),
+            "the original N/A cause"
+        );
+
+        // Power telemetry present, but zero tokens generated.
+        let no_tokens = EnergyResult {
+            joules: 100.0,
+            joules_per_token: None,
+            avg_power_w: Some(200.0),
+            peak_power_w: Some(300.0),
+            avg_utilization_pct: Some(90.0),
+            ..no_power
+        };
+        let s2 = EnergySummary::from_energy(&no_tokens);
+        assert_eq!(
+            s2.na_reason.as_deref(),
+            Some("N/A — no tokens generated"),
+            "the distinct zero-tokens cause, not a mislabel"
+        );
+
+        // A measured value → no reason at all.
+        let with_value = EnergyResult {
+            joules_per_token: Some(0.5),
+            ..no_tokens
+        };
+        let s3 = EnergySummary::from_energy(&with_value);
+        assert_eq!(s3.na_reason, None, "a value is not N/A");
+        assert_eq!(s3.joules_per_token, Some(0.5));
     }
 }

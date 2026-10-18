@@ -96,6 +96,33 @@ impl EnergyResult {
     pub fn is_na(&self) -> bool {
         self.avg_power_w.is_none() && self.peak_power_w.is_none()
     }
+
+    /// The N/A reason for this result, when `joules_per_token` is `None`
+    /// (the N/A case) — distinguishing the **two root causes** so a consumer
+    /// never sees a silent gap (B3):
+    ///
+    /// * **`"no power telemetry"`** — [`Self::is_na`]: no sample in scope
+    ///   carried a reading (a driverless host, or a sensor with no usable
+    ///   reading, e.g. the RAPL quirk on a shared host).
+    /// * **`"no tokens generated"`** — power telemetry *is* present, but the
+    ///   run produced zero tokens (a D-only / no-work run), so there is
+    ///   nothing to divide the energy by.
+    ///
+    /// `None` when a `joules_per_token` value exists (not N/A). All three
+    /// surfaces — the TUI summary, the headless line, and the `--json`/DB
+    /// `na_reason` — render from this one method so they can never disagree
+    /// on *why* a number is N/A.
+    #[must_use]
+    pub fn na_reason(&self) -> Option<&'static str> {
+        if self.joules_per_token.is_some() {
+            return None;
+        }
+        if self.is_na() {
+            Some("no power telemetry")
+        } else {
+            Some("no tokens generated")
+        }
+    }
 }
 
 /// True when `t` lies within the closed window `[start, end]`.
@@ -542,5 +569,74 @@ mod tests {
         let (joules, has_power) = integrate_joules(&samples, None);
         assert!(has_power, "a CPU-only sample carries power");
         assert!(joules > 0.0, "CPU-only energy is positive: {joules}");
+    }
+
+    // ── B3: the N/A reason distinguishes its two root causes ─────────────
+
+    /// A telemetry-bearing profile (power measured) with a `joules_per_token`
+    /// of `None` only because the run produced zero tokens — the B3
+    /// "no tokens generated" case, distinct from "no power telemetry".
+    fn energy_with_power_no_tokens() -> EnergyResult {
+        EnergyResult {
+            joules: 100.0,
+            joules_per_token: None, // 0 tokens → N/A, but power IS present
+            avg_power_w: Some(200.0),
+            peak_power_w: Some(300.0),
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: Some(90.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("Mock GPU".into()),
+            cpu_power_estimated: false,
+        }
+    }
+
+    /// A no-telemetry profile (driverless host): no sample carried a reading.
+    fn energy_no_power() -> EnergyResult {
+        EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: None,
+            peak_power_w: None,
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: None,
+            vendor: None,
+            model: None,
+            cpu_power_estimated: false,
+        }
+    }
+
+    /// B3: telemetry present but zero tokens → "no tokens generated" (NOT
+    /// "no power telemetry" — the old mislabel).
+    #[test]
+    fn na_reason_no_tokens_when_power_is_present() {
+        let e = energy_with_power_no_tokens();
+        assert!(!e.is_na(), "power is present → not the no-telemetry N/A");
+        assert_eq!(e.joules_per_token, None, "0 tokens → no J/token");
+        assert_eq!(
+            e.na_reason(),
+            Some("no tokens generated"),
+            "the reason names the real cause"
+        );
+    }
+
+    /// B3: no power telemetry at all → "no power telemetry" (the original
+    /// N/A case, unchanged).
+    #[test]
+    fn na_reason_no_power_telemetry_when_driverless() {
+        let e = energy_no_power();
+        assert!(e.is_na(), "no sample carried a reading → N/A");
+        assert_eq!(e.na_reason(), Some("no power telemetry"));
+    }
+
+    /// B3: a real J/token → not N/A at all (`na_reason` is `None`).
+    #[test]
+    fn na_reason_is_none_when_a_value_exists() {
+        let mut e = energy_with_power_no_tokens();
+        e.joules_per_token = Some(0.4);
+        assert_eq!(e.na_reason(), None, "a value is not N/A");
     }
 }

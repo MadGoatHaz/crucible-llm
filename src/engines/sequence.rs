@@ -1321,20 +1321,7 @@ impl BenchmarkSequence {
         // display trace — so a run longer than the trace capacity integrates
         // the whole window (CF-03). The trace still supplies the stats.
         apply_load_window(&mut energy, load_joules, total_tokens);
-        let summary = match energy.joules_per_token {
-            Some(jpt) => {
-                let peak = energy
-                    .peak_power_w
-                    .map(|w| format!(" · peak {w:.0} W"))
-                    .unwrap_or_default();
-                let util = energy
-                    .avg_utilization_pct
-                    .map(|u| format!(" · {u:.0}% util"))
-                    .unwrap_or_default();
-                format!("{jpt:.3} J/token{peak}{util}")
-            }
-            None => "N/A (no power telemetry)".to_string(),
-        };
+        let summary = hardware_summary(&energy);
         self.logger
             .info(Context::EngineD, format!("Engine D complete — {summary}"));
         summary
@@ -1383,6 +1370,32 @@ impl BenchmarkSequence {
 }
 
 // ── Summary helpers (pure) ────────────────────────────────────────────────
+
+/// Engine D's one-line summary: the J/token with peak/util, or a labeled N/A
+/// that names the **real** cause (B3). The two N/A root causes are distinct —
+/// "no power telemetry" (a driverless host) vs "no tokens generated"
+/// (telemetry present but the run produced nothing to divide by) — and both
+/// come from [`EnergyResult::na_reason`], so the TUI, headless, and
+/// `--json`/DB surfaces can never disagree.
+fn hardware_summary(energy: &EnergyResult) -> String {
+    match energy.joules_per_token {
+        Some(jpt) => {
+            let peak = energy
+                .peak_power_w
+                .map(|w| format!(" · peak {w:.0} W"))
+                .unwrap_or_default();
+            let util = energy
+                .avg_utilization_pct
+                .map(|u| format!(" · {u:.0}% util"))
+                .unwrap_or_default();
+            format!("{jpt:.3} J/token{peak}{util}")
+        }
+        None => {
+            let reason = energy.na_reason().unwrap_or("no power telemetry");
+            format!("N/A ({reason})")
+        }
+    }
+}
 
 /// `1,847` — thousands separators (the Flat Out progress label's token
 /// count).
@@ -2012,6 +2025,56 @@ mod tests {
         assert!(line.contains("practical sweet spot 2 users"), "{line}");
         assert!(line.contains("~175 t/s each"), "{line}");
         assert_eq!(summarize_sweep(&SweepResult::default()), "no usable levels");
+    }
+
+    /// An Engine D profile fixture (B3): the J/token + power fields the
+    /// summary renders, everything else default.
+    fn energy_fixture(
+        jpt: Option<f64>,
+        avg: Option<f64>,
+        peak: Option<f64>,
+        util: Option<f64>,
+    ) -> EnergyResult {
+        EnergyResult {
+            joules: 100.0,
+            joules_per_token: jpt,
+            avg_power_w: avg,
+            peak_power_w: peak,
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: util,
+            vendor: None,
+            model: None,
+            cpu_power_estimated: false,
+        }
+    }
+
+    /// B3: the Engine D summary labels the two N/A root causes distinctly —
+    /// "no tokens generated" (power present) is NOT the old
+    /// "no power telemetry" mislabel.
+    #[test]
+    fn hardware_summary_labels_the_two_na_causes() {
+        let with_value = energy_fixture(Some(0.5), Some(200.0), Some(300.0), Some(90.0));
+        let line = hardware_summary(&with_value);
+        assert!(line.starts_with("0.500 J/token"), "{line}");
+        assert!(line.contains("peak 300 W"), "{line}");
+        assert!(line.contains("90% util"), "{line}");
+
+        // Power present but zero tokens → "no tokens generated".
+        let no_tokens = energy_fixture(None, Some(200.0), Some(300.0), Some(90.0));
+        assert_eq!(
+            hardware_summary(&no_tokens),
+            "N/A (no tokens generated)",
+            "the real cause, not the old mislabel"
+        );
+
+        // No telemetry at all → "no power telemetry" (the original case).
+        let no_power = energy_fixture(None, None, None, None);
+        assert_eq!(
+            hardware_summary(&no_power),
+            "N/A (no power telemetry)"
+        );
     }
 
     // ── CF-03: the J/token denominator spans every engine, not just A+B ──

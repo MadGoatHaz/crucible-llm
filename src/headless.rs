@@ -541,14 +541,28 @@ pub fn run_headless(
                         "  Energy: {:.1} J ({:.3} J/token{peak})",
                         energy.joules, jpt
                     ));
-                } else if energy.is_na() {
-                    // No power telemetry (driverless host, or a sensor with
-                    // no usable reading — e.g. the RAPL quirk on a shared
-                    // host): report it **clearly**, not as a silent gap and
-                    // not as a spurious 0.0 J/token.
-                    term.dim(
-                        "  Energy: N/A — no power telemetry (no valid power sensor on this host)",
-                    );
+                } else if let Some(reason) = energy.na_reason() {
+                    // B3: the N/A case — labeled, never a silent gap and
+                    // never a spurious 0.0 J/token. Two distinct root
+                    // causes (the old code printed *nothing* for the
+                    // zero-tokens case and mislabeled it "no power
+                    // telemetry"):
+                    match reason {
+                        "no power telemetry" => {
+                            // No power telemetry (driverless host, or a
+                            // sensor with no usable reading — e.g. the RAPL
+                            // quirk on a shared host).
+                            term.dim(
+                                "  Energy: N/A — no power telemetry (no valid power sensor on this host)",
+                            );
+                        }
+                        // Power telemetry is present, but the run produced
+                        // zero tokens (a D-only / no-work run) — nothing to
+                        // divide the energy by.
+                        _ => term.dim(
+                            "  Energy: N/A — no tokens generated this run (power telemetry present)",
+                        ),
+                    }
                 }
                 if let Some(w) = &energy.fragmentation_warning {
                     term.warning(&format!("VRAM: {w}"));
