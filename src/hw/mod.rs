@@ -664,9 +664,12 @@ impl HwPoller {
     /// - **live window** (`end_load` not yet called): `current − start`
     ///   (energy from load start to now);
     /// - **closed window** (`end_load` called): `end − start` (frozen);
-    /// - **no load window** (`start_load` never called — e.g. the headless
-    ///   path, which drives the poller with [`Self::poll`] only): `None` —
-    ///   the caller falls back to the whole-run [`Self::energy_joules`].
+    /// - **no load window** (`start_load` never called): `None` — the
+    ///   caller falls back to the whole-run [`Self::energy_joules`]. (The
+    ///   headless path opens a window like the TUI does — F7:
+    ///   `arm_power_monitor` before the workload and `end_load` after — so
+    ///   in production this `None` case is a not-yet-armed poller, not a
+    ///   headless one.)
     #[must_use]
     pub fn load_window_joules(&self) -> Option<f64> {
         let start = self.load_energy_start?;
@@ -742,8 +745,7 @@ impl HwPoller {
         // cumulative integral is **load-attributable** — it removes both the
         // constant 40 W CPU estimate and any measured no-load floor, so the
         // energy is the work the run did, not the machine's idle draw.
-        // `0.0` before the idle window finalizes (and always in the headless
-        // poll()-only path, which never opens an idle window).
+        // `0.0` until the idle window finalizes (`start_load`).
         let idle = self.monitor.idle_system_power_w();
         let p_total = (Self::sample_total_watts(&sample) - idle).max(0.0);
         if p_total > 0.0 {
@@ -758,6 +760,19 @@ impl HwPoller {
                 .map(|prev| prev.t.delta_nanos(&sample.t) as f64 / 1e9)
                 .unwrap_or(0.0);
             self.energy_joules += (p_prev + p_total) / 2.0 * dt;
+        }
+
+        // F7: the idle-baseline accumulation lives here (not in `tick`) so
+        // the headless poll()-only path measures the *same* no-load floor as
+        // the TUI: before the idle window finalizes (and outside a manual
+        // "Measure Idle" window) every sample contributes to the idle
+        // samples `start_load` averages — the floor the integral then
+        // subtracts.
+        if !self.monitor.idle_finalized && !self.monitor.measure_idle {
+            self.monitor
+                .record_idle(sample.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0));
+            self.monitor
+                .record_cpu_idle(sample.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0));
         }
 
         self.trace.push(sample.clone());
@@ -841,10 +856,11 @@ impl HwPoller {
             }
         } else if self.monitor.idle_finalized {
             self.monitor.record(&agg, &per_gpu, &self.gpu_names, &phase);
-        } else {
-            self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
-            self.monitor.record_cpu_idle(cpu_w);
         }
+        // The not-finalized idle accumulation (the `else` branch the old
+        // code had here) now happens in `advance` — shared with the
+        // headless poll()-only path (F7), so both front-ends measure the
+        // same no-load floor.
 
         let merged = merge_hw(
             &snap,
@@ -1194,6 +1210,52 @@ mod tests {
         // …and a fresh run clears it again.
         p.begin_run();
         assert_eq!(p.monitor().load_window_joules(), None);
+    }
+
+    /// A GPU backend with a constant no-load draw (the F7 test fixture).
+    #[derive(Debug)]
+    struct IdleGpu;
+
+    impl GpuBackend for IdleGpu {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Idle GPU")
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                power_watts: Some(30.0),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    /// F7: the idle-baseline accumulation lives in `advance` (shared by the
+    /// TUI `tick` path and the headless `poll`-only path) — and `tick` does
+    /// not double-record it: two ticks before the window finalizes yield
+    /// exactly two idle samples, and `start_load` averages them into the
+    /// floor.
+    #[test]
+    fn tick_does_not_double_record_the_idle_baseline() {
+        let mut p = HwPoller::with_backend(Some(Arc::new(IdleGpu)));
+        p.begin_run();
+        let state = MetricsState::new();
+        p.tick(&state);
+        p.tick(&state);
+        assert_eq!(
+            p.monitor().idle_samples.len(),
+            2,
+            "one idle sample per tick (no double recording)"
+        );
+        assert!(!p.monitor().idle_finalized, "still in the idle window");
+        // Finalizing averages the accumulated samples into the floor.
+        p.start_load();
+        assert!(
+            (p.monitor().idle_system_power_w() - 30.0).abs() < 1e-9,
+            "the floor is the mean of the idle samples: {}",
+            p.monitor().idle_system_power_w()
+        );
     }
 
     /// B5: arming a run (`begin_run` → idle window → `start_load`) opens a

@@ -38,7 +38,10 @@ use crate::engines::{
     FlatOutResult, NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource,
     StructuredEngine, StructuredResult, SweepResult,
 };
-use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
+use crate::hw::{
+    arm_power_monitor, CpuPowerBackend, GpuBackend, HwPoller, IDLE_WINDOW_SECS,
+    HW_POLL_INTERVAL_MS,
+};
 use crate::log::{Context, RunLogger};
 use crate::storage::export::{self, ExportPayload, PacketSample};
 use crate::storage::{
@@ -185,6 +188,17 @@ pub fn run_headless(
             color: !cfg.no_color && std::io::stdout().is_terminal(),
             tty: std::io::stderr().is_terminal(),
         };
+
+        // F7: the headless path opens the **same idle window** as the TUI
+        // sequence (begin_run → IDLE_WINDOW_SECS no-load baseline →
+        // start_load), so the cumulative integral subtracts the measured
+        // no-load floor — headless and TUI define energy identically
+        // (before F7 the headless poll()-only path ran with a 0.0 floor,
+        // so headless J ≥ TUI J for the same workload). Skipped when the
+        // poller is off (the D N/A path is unaffected).
+        if let Some(h) = &hw {
+            arm_power_monitor(h, IDLE_WINDOW_SECS).await;
+        }
 
         // Engine A (speed) — gated on the selection (R1). `--engine niah`
         // runs *only* C1; a selection that omits `speed` skips Engine A
@@ -608,6 +622,15 @@ pub fn run_headless(
                     term.warning(&format!("[F] flat out init failed: {e}"));
                     logger.error(Context::EngineF, format!("flat out init failed: {e}"));
                 }
+            }
+        }
+
+        // F7: close the load window once the workload is done, so the
+        // frozen value (end − start) is the numerator every surface
+        // (terminal display, `--json`, DB, export) reads.
+        if let Some(h) = &hw {
+            if let Ok(mut p) = h.lock() {
+                p.end_load();
             }
         }
 
@@ -1070,6 +1093,90 @@ mod tests {
         assert!(
             v.get("joules_per_token").is_none(),
             "joules_per_token is absent (N/A), never a spurious 0.0: {v}"
+        );
+    }
+
+    /// A GPU backend whose draw is controlled per-phase (the F7 test
+    /// fixture: low no-load floor, high load draw).
+    #[derive(Debug)]
+    struct RampGpuBackend {
+        watts: std::sync::Arc<std::sync::Mutex<f64>>,
+    }
+
+    impl GpuBackend for RampGpuBackend {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Ramp GPU")
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                power_watts: Some(*self.watts.lock().unwrap()),
+                utilization_pct: Some(90),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    /// F7: the headless path measures and subtracts the **same** no-load
+    /// idle floor as the TUI — the arming (`begin_run` → idle window →
+    /// `start_load`) happens in `run_headless`, and the cumulative
+    /// integral subtracts the measured floor. A 250 W load on a 50 W
+    /// floor integrates ~200 W (load-attributable), not ~250 W.
+    #[test]
+    fn headless_energy_subtracts_the_measured_idle_floor() {
+        let watts = Arc::new(Mutex::new(50.0));
+        let hw = Some(Arc::new(Mutex::new(HwPoller::with_backend(Some(
+            Arc::new(RampGpuBackend {
+                watts: watts.clone(),
+            }),
+        )))));
+        // The idle window (what `run_headless` opens via arm_power_monitor):
+        // no-load draw at 50 W.
+        {
+            hw.as_ref().unwrap().lock().unwrap().begin_run();
+        }
+        for _ in 0..5 {
+            *watts.lock().unwrap() = 50.0;
+            hw.as_ref().unwrap().lock().unwrap().poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Open the load window (finalizes the 50 W floor).
+        hw.as_ref().unwrap().lock().unwrap().start_load();
+        // The workload: 250 W draw.
+        let load_start = MonotonicInstant::now();
+        *watts.lock().unwrap() = 250.0;
+        for _ in 0..5 {
+            hw.as_ref().unwrap().lock().unwrap().poll();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Close the window (what `run_headless` does after the workload).
+        hw.as_ref().unwrap().lock().unwrap().end_load();
+        let load_end = MonotonicInstant::now();
+        let span = load_start.delta_nanos(&load_end) as f64 / 1e9;
+
+        let energy = headless_energy(&hw, 1000);
+        // The floor was measured at ~50 W (not the old 0.0)…
+        let idle_floor = {
+            let guard = hw.as_ref().unwrap().lock().unwrap();
+            guard.monitor().idle_system_power_w()
+        };
+        assert!(
+            (idle_floor - 50.0).abs() < 5.0,
+            "the measured no-load floor is ~50 W: {idle_floor}"
+        );
+        // …and the numerator is load-attributable: ~200 W × span, NOT
+        // ~250 W × span (the pre-F7 raw basis).
+        assert!(
+            (energy.joules - 200.0 * span).abs() < 250.0 * span * 0.15,
+            "idle-subtracted energy ≈ 200 W × {span}s: {}",
+            energy.joules
+        );
+        assert!(
+            energy.joules < 250.0 * span * 0.9,
+            "the raw (unsubtracted) basis would be ~250 W × span: {}",
+            energy.joules
         );
     }
 
