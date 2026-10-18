@@ -380,6 +380,19 @@ pub struct EnergySummary {
     /// was measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub na_reason: Option<String>,
+    /// I4 / CF-53: `true` when the CPU component of the system draw is (or
+    /// included) the labeled fixed-estimate fallback — including a
+    /// measured backend that fell back mid-run (the sample-level latch in
+    /// `CpuPowerBackend::is_estimated`). The DB / export can now tell
+    /// measured from estimated (previously the flag existed only in the
+    /// `--json` stdout object, never persisted).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cpu_power_estimated: bool,
+}
+
+/// `skip_serializing_if` predicate for a `false`-is-absent bool field.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl EnergySummary {
@@ -398,6 +411,10 @@ impl EnergySummary {
             // telemetry" from "no tokens generated"), or `None` when a
             // J/token value was measured.
             na_reason: e.na_reason().map(|r| format!("N/A — {r}")),
+            // I4: the estimate flag is copied from the result (the
+            // production callers set it from `CpuPowerBackend::is_estimated`
+            // — including the mid-run sample-level fallback).
+            cpu_power_estimated: e.cpu_power_estimated,
         }
     }
 }
@@ -579,5 +596,47 @@ mod tests {
         let s3 = EnergySummary::from_energy(&with_value);
         assert_eq!(s3.na_reason, None, "a value is not N/A");
         assert_eq!(s3.joules_per_token, Some(0.5));
+    }
+
+    /// I4: `from_energy` copies the `cpu_power_estimated` flag into the
+    /// persisted summary (previously the flag existed only in the `--json`
+    /// stdout object — the DB / export could not tell measured from
+    /// estimated).
+    #[test]
+    fn energy_summary_carries_the_cpu_power_estimated_flag() {
+        let base = EnergyResult {
+            joules: 100.0,
+            joules_per_token: Some(0.5),
+            avg_power_w: Some(200.0),
+            peak_power_w: Some(300.0),
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: Some(90.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("Mock".into()),
+            cpu_power_estimated: false,
+        };
+        // Estimated (a mid-run RAPL fallback latched the estimate).
+        let est = EnergyResult {
+            cpu_power_estimated: true,
+            ..base.clone()
+        };
+        let s = EnergySummary::from_energy(&est);
+        assert!(s.cpu_power_estimated, "the flag is copied");
+        // Measured → the flag is false and omitted from the JSON.
+        let m = EnergySummary::from_energy(&base);
+        assert!(!m.cpu_power_estimated);
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("cpu_power_estimated"),
+            "false is omitted (not a noisy zero): {json}"
+        );
+        let json_est = serde_json::to_string(&s).unwrap();
+        assert!(json_est.contains("\"cpu_power_estimated\":true"), "{json_est}");
+        // A legacy stored document (no field) deserializes as `false`.
+        let legacy = r#"{"joules":100.0,"joules_per_token":0.5}"#;
+        let back: EnergySummary = serde_json::from_str(legacy).unwrap();
+        assert!(!back.cpu_power_estimated, "legacy rows are not estimated");
     }
 }

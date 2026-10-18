@@ -49,29 +49,22 @@ use crate::timing::MonotonicInstant;
 
 /// Build the `--json` `energy` object from an [`EnergyResult`].
 ///
-/// Starts from the serializable [`EnergySummary`] (the raw `EnergyResult` is
-/// not `Serialize` — it carries non-`Clone`-friendly trace internals) and
-/// carries the **P3-A estimated-power flag**: `cpu_power_estimated` is `true`
-/// when the CPU component of the system draw is the labeled fixed-estimate
-/// fallback (no RAPL / Super-I-O sensor on the host). A `--json` consumer
-/// (CI/CD regression gating) can then tell a purely measured power reading
-/// from one that includes the fabricated 40 W CPU estimate — the J/token and
-/// `$/1M` derived from it inherit that uncertainty.
+/// Serializes the [`EnergySummary`] (the raw `EnergyResult` is not
+/// `Serialize` — it carries non-`Clone`-friendly trace internals), which
+/// carries the **P3-A / I4 estimated-power flag**: `cpu_power_estimated` is
+/// `true` when the CPU component of the system draw is (or included) the
+/// labeled fixed-estimate fallback — no RAPL / Super-I-O sensor on the
+/// host, *or* a measured backend that fell back mid-run (the sample-level
+/// latch). A `--json` consumer (CI/CD regression gating) can tell a purely
+/// measured power reading from one that includes the fabricated 40 W CPU
+/// estimate — the J/token and `$/1M` derived from it inherit that
+/// uncertainty. The flag now lives on the summary itself (I4), so the
+/// `--json` object and the persisted DB summary can never disagree.
 ///
-/// Pure and testable (no I/O). `cpu_power_estimated` is captured by the
-/// caller *before* the `CpuPowerBackend` is moved into the poller (the
-/// `HwPoller` exposes no direct accessor for it).
+/// Pure and testable (no I/O).
 #[must_use]
-pub fn build_energy_json(energy: &EnergyResult, cpu_power_estimated: bool) -> serde_json::Value {
-    let mut v =
-        serde_json::to_value(EnergySummary::from_energy(energy)).unwrap_or(serde_json::Value::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert(
-            "cpu_power_estimated".to_string(),
-            serde_json::Value::Bool(cpu_power_estimated),
-        );
-    }
-    v
+pub fn build_energy_json(energy: &EnergyResult) -> serde_json::Value {
+    serde_json::to_value(EnergySummary::from_energy(energy)).unwrap_or(serde_json::Value::Null)
 }
 
 /// The Engine D energy result for the headless path: profile the poller's
@@ -87,7 +80,7 @@ pub fn build_energy_json(energy: &EnergyResult, cpu_power_estimated: bool) -> se
 /// symmetric with the TUI, which degrades to a labeled N/A without a poller.
 #[must_use]
 pub fn headless_energy(hw: &Option<Arc<Mutex<HwPoller>>>, total_tokens: u64) -> EnergyResult {
-    let (trace_d, load_joules, idle_w, duration) = hw
+    let (trace_d, load_joules, idle_w, duration, cpu_est) = hw
         .as_ref()
         .and_then(|h| h.lock().ok())
         .map(|g| {
@@ -100,10 +93,17 @@ pub fn headless_energy(hw: &Option<Arc<Mutex<HwPoller>>>, total_tokens: u64) -> 
                 // idle window).
                 g.monitor().idle_system_power_w(),
                 (g.monitor().duration_sec() > 0.0).then(|| g.monitor().duration_sec()),
+                // I4: read **after** the run — a measured backend that
+                // fell back to the estimate mid-run is labeled too.
+                g.cpu_power_estimated(),
             )
         })
         .unwrap_or_default();
     let mut energy = profile(&trace_d, None, total_tokens, idle_w);
+    // I4: the D result carries the estimate flag (the `with_cpu_power_
+    // estimated` builder is no longer dead — every production path sets
+    // the field before the result reaches `--json` / the DB).
+    energy.cpu_power_estimated = cpu_est;
     // H3/F9: the shared helper (the same one the TUI sequence's
     // `persist_results` and the TUI `e`-export use) applies the
     // load-window numerator and keeps `avg_power_w` consistent with the
@@ -136,13 +136,6 @@ pub fn run_headless(
         logger.warn(Context::Setup, "no engines selected — nothing to run");
         return 0;
     }
-
-    // P3-A / CF-53: capture the CPU-power "estimated" flag **before** the
-    // backend is moved into the poller below (the `HwPoller` exposes no
-    // direct accessor for it). It is carried into the `--json` energy
-    // object by [`build_energy_json`] so the output reflects when the power
-    // is the labeled fixed-estimate fallback rather than a measurement.
-    let cpu_power_estimated = cpu_power.as_ref().is_some_and(|c| c.is_estimated());
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -577,11 +570,13 @@ pub fn run_headless(
             }
             // DO-09/CF-21: the `--json` document carries the energy object
             // (the serializable summary, not the non-`Serialize` raw
-            // `EnergyResult`). P3-A/CF-53: [`build_energy_json`] also carries
-            // the `cpu_power_estimated` flag so the output reflects when the
-            // power is the labeled fixed-estimate fallback.
+            // `EnergyResult`). P3-A/CF-53/I4: the summary carries the
+            // `cpu_power_estimated` flag (set in [`headless_energy`] from
+            // the backend *after* the run, including a mid-run sample-level
+            // fallback) so the output reflects when the power is the
+            // labeled fixed-estimate fallback.
             if let Some(v) = &mut json_doc {
-                v["energy"] = build_energy_json(energy, cpu_power_estimated);
+                v["energy"] = build_energy_json(energy);
             }
         }
 
@@ -939,12 +934,14 @@ mod tests {
         ) -> i32 = run_headless;
     }
 
-    /// P3-A / CF-53: the `--json` energy object carries the
-    /// `cpu_power_estimated` flag, reflecting the input, alongside the
-    /// `EnergySummary` fields.
+    /// P3-A / CF-53 / I4: the `--json` energy object carries the
+    /// `cpu_power_estimated` flag (now from the `EnergyResult` itself —
+    /// the same field the persisted `EnergySummary` copies, so `--json`
+    /// and the DB can never disagree), alongside the `EnergySummary`
+    /// fields.
     #[test]
     fn energy_json_carries_the_estimated_flag() {
-        let e = EnergyResult {
+        let base = EnergyResult {
             joules: 100.0,
             joules_per_token: Some(0.5),
             avg_power_w: Some(200.0),
@@ -955,15 +952,15 @@ mod tests {
             avg_utilization_pct: Some(90.0),
             vendor: Some("NVIDIA".into()),
             model: Some("RTX A4000".into()),
-            // P3-A CF-53 soft-contract field (default `false` — the JSON
-            // flag under test comes from the `build_energy_json` parameter,
-            // which is what the production path captures from
-            // `CpuPowerBackend::is_estimated()`).
             cpu_power_estimated: false,
         };
 
         // Estimated CPU power → the flag is `true` in the JSON object.
-        let v = build_energy_json(&e, true);
+        let e_est = EnergyResult {
+            cpu_power_estimated: true,
+            ..base.clone()
+        };
+        let v = build_energy_json(&e_est);
         assert_eq!(v["cpu_power_estimated"], true);
         // The `EnergySummary` fields are present too (not clobbered).
         assert_eq!(v["joules"], 100.0);
@@ -972,10 +969,55 @@ mod tests {
         assert_eq!(v["vendor"], "NVIDIA");
         assert_eq!(v["model"], "RTX A4000");
 
-        // Measured CPU power → the flag is `false`.
-        let v2 = build_energy_json(&e, false);
-        assert_eq!(v2["cpu_power_estimated"], false);
+        // Measured CPU power → the flag is `false` (omitted from the JSON,
+        // the `false`-is-absent convention).
+        let v2 = build_energy_json(&base);
+        assert!(v2.get("cpu_power_estimated").is_none(), "{v2}");
         assert_eq!(v2["joules"], 100.0);
+    }
+
+    /// I4: `headless_energy` reads the estimate flag from the poller's
+    /// CPU backend **after** the run — a measured (RAPL) backend that
+    /// latched a sample-level estimate fallback mid-run is labeled, not
+    /// presented as fully-measured.
+    #[test]
+    fn headless_energy_labels_a_mid_run_estimate_fallback() {
+        use crate::hw::cpu_power::{CpuPowerBackend, CpuPowerMethod};
+        // A RAPL-accepted backend with a latched estimated sample (the
+        // mid-run fallback the I4 fix must surface).
+        let cpu = CpuPowerBackend::from_method_for_test(CpuPowerMethod::Rapl, true);
+        let hw = Some(Arc::new(Mutex::new(
+            HwPoller::with_backend(Some(Arc::new(PowerGpuBackend { watts: 150.0 })))
+                .with_cpu_power(Some(Box::new(cpu))),
+        )));
+        {
+            let mut p = hw.as_ref().unwrap().lock().unwrap();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+        }
+        let energy = headless_energy(&hw, 1000);
+        assert!(
+            energy.cpu_power_estimated,
+            "the mid-run fallback labels the result"
+        );
+        // …and the `--json` object carries it.
+        let v = build_energy_json(&energy);
+        assert_eq!(v["cpu_power_estimated"], true);
+        // A fully-measured backend stays unlabeled.
+        let cpu_measured = CpuPowerBackend::from_method_for_test(CpuPowerMethod::Rapl, false);
+        let hw2 = Some(Arc::new(Mutex::new(
+            HwPoller::with_backend(Some(Arc::new(PowerGpuBackend { watts: 150.0 })))
+                .with_cpu_power(Some(Box::new(cpu_measured))),
+        )));
+        {
+            let mut p = hw2.as_ref().unwrap().lock().unwrap();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+        }
+        let energy2 = headless_energy(&hw2, 1000);
+        assert!(!energy2.cpu_power_estimated, "measured stays unlabeled");
     }
 
     /// A deterministic GPU backend with a real power reading (B2 test
@@ -1015,7 +1057,7 @@ mod tests {
         assert_eq!(energy.joules_per_token, None, "never a spurious 0.0");
 
         // The `--json` energy object is present and carries the reason.
-        let v = build_energy_json(&energy, false);
+        let v = build_energy_json(&energy);
         assert!(v.get("joules").is_some(), "energy object present: {v}");
         assert!(
             v.get("na_reason")

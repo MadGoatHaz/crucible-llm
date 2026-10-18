@@ -114,6 +114,13 @@ pub struct CpuPowerBackend {
     /// The last valid reading, watts — a node that vanishes mid-run yields
     /// this (the never-panic / last-known-value rule).
     last_watts: f64,
+    /// I4: `true` once **any** sample in this run fell back to the fixed
+    /// estimate (a mid-run RAPL / Super-I-O anomaly clamped by
+    /// [`clamp_cpu_power`]). The accepted `method` alone under-reports: a
+    /// backend accepted as `Rapl` at init can lose the sensor mid-run, and
+    /// `is_estimated()` must reflect *any* estimated sample so the energy
+    /// result is labeled, never presented as fully-measured.
+    any_estimated_sample: bool,
 }
 
 impl std::fmt::Debug for CpuPowerBackend {
@@ -121,6 +128,7 @@ impl std::fmt::Debug for CpuPowerBackend {
         f.debug_struct("CpuPowerBackend")
             .field("method", &self.method)
             .field("last_watts", &self.last_watts)
+            .field("any_estimated_sample", &self.any_estimated_sample)
             .finish()
     }
 }
@@ -137,6 +145,7 @@ impl CpuPowerBackend {
                 method: CpuPowerMethod::Rapl,
                 source,
                 last_watts: ESTIMATED_CPU_W,
+                any_estimated_sample: false,
             }));
         }
         if let Some(source) = try_super_io() {
@@ -144,6 +153,7 @@ impl CpuPowerBackend {
                 method: CpuPowerMethod::SuperIo,
                 source,
                 last_watts: ESTIMATED_CPU_W,
+                any_estimated_sample: false,
             }));
         }
         // No real sensor (RAPL / Super-I-O): the clearly-labeled fixed
@@ -153,7 +163,23 @@ impl CpuPowerBackend {
             method: CpuPowerMethod::Estimated,
             source: Source::Estimated,
             last_watts: ESTIMATED_CPU_W,
+            any_estimated_sample: true,
         }))
+    }
+
+    /// I4: a test seam that builds a backend with a given accepted method
+    /// and sample-level estimate latch. The sensor source is the labeled
+    /// fixed estimate (which never reads a real node), so the cascade's
+    /// `/sys` probing is bypassed — the `any_estimated_sample` latch is the
+    /// thing under test (a mid-run RAPL / Super-I-O fallback).
+    #[doc(hidden)]
+    pub fn from_method_for_test(method: CpuPowerMethod, any_estimated_sample: bool) -> Self {
+        Self {
+            method,
+            source: Source::Estimated,
+            last_watts: ESTIMATED_CPU_W,
+            any_estimated_sample,
+        }
     }
 
     /// The accepted method (its `label()` is the startup-log / UI string).
@@ -168,17 +194,24 @@ impl CpuPowerBackend {
         self.method.label()
     }
 
-    /// `true` when the accepted method is the fixed estimate (the UI flags
-    /// non-measured CPU power).
+    /// `true` when the CPU component is (or **included**) the fixed
+    /// estimate (the UI flags non-measured CPU power).
+    ///
+    /// I4: this reflects **any** estimated sample, not just the accepted
+    /// method — a backend accepted as `Rapl` / `SuperIo` at init can lose
+    /// the sensor mid-run (a phantom reading, a vanished node past its
+    /// last-known value), and those clamped samples are the labeled 40 W
+    /// estimate. The energy result must be labeled accordingly.
     ///
     /// This is the source of the energy-summary `cpu_power_estimated` flag
-    /// (CF-53): the caller that builds the `--json` energy object
-    /// ([`crate::engines::hardware::EnergyResult`]) copies this into
-    /// [`EnergyResult::cpu_power_estimated`] so consumers know the CPU
-    /// component of the total draw is a constant, not a measurement.
+    /// (CF-53 / I4): the callers that build the `--json` energy object, the
+    /// persisted [`EnergySummary`], and the TUI panel
+    /// ([`crate::engines::hardware::EnergyResult`]) copy this so consumers
+    /// know the CPU component of the total draw is (partly) a constant, not
+    /// a measurement.
     #[must_use]
     pub fn is_estimated(&self) -> bool {
-        self.method.is_estimated()
+        self.method.is_estimated() || self.any_estimated_sample
     }
 
     /// One CPU power reading in watts (the 100 ms / 1 Hz hot path).
@@ -236,14 +269,29 @@ impl CpuPowerBackend {
         // The plausibility clamp (the phantom-69 kW / unit-bug guard). A
         // non-finite or out-of-range reading degrades to the estimate
         // rather than polluting the energy / cost math.
-        let watts = if raw.is_finite() && (0.0..=MAX_CPU_POWER_W).contains(&raw) {
-            raw
-        } else {
+        let (watts, clamped) = clamp_cpu_power(raw);
+        if clamped {
             warn_anomalous_cpu(self.method, raw);
-            ESTIMATED_CPU_W
-        };
+            // I4: latch that *this run* contained an estimated sample —
+            // `is_estimated()` must stay true for the rest of the run even
+            // if the sensor recovers (a recovered reading cannot un-happen
+            // the fabricated samples already in the integral).
+            self.any_estimated_sample = true;
+        }
         self.last_watts = watts;
         watts
+    }
+}
+
+/// The plausibility clamp (the phantom-69 kW / unit-bug guard), as a pure
+/// decision: `(watts, was_clamped_to_the_estimate)`. A non-finite or
+/// out-of-range reading degrades to the labeled [`ESTIMATED_CPU_W`]
+/// estimate rather than polluting the energy / cost math.
+fn clamp_cpu_power(raw: f64) -> (f64, bool) {
+    if raw.is_finite() && (0.0..=MAX_CPU_POWER_W).contains(&raw) {
+        (raw, false)
+    } else {
+        (ESTIMATED_CPU_W, true)
     }
 }
 
@@ -427,10 +475,54 @@ mod tests {
             method: CpuPowerMethod::Estimated,
             source: Source::Estimated,
             last_watts: ESTIMATED_CPU_W,
+            any_estimated_sample: true,
         };
         assert!(b.is_estimated());
         assert_eq!(b.poll(), ESTIMATED_CPU_W);
         assert_eq!(b.method_name(), "Estimated (40W)");
+    }
+
+    /// I4: the clamp is a pure (watts, was-clamped) decision — a sane
+    /// reading passes through, a phantom (69 kW) or non-finite reading
+    /// degrades to the labeled estimate.
+    #[test]
+    fn clamp_cpu_power_degrades_anomalies_to_the_estimate() {
+        assert_eq!(clamp_cpu_power(50.0), (50.0, false));
+        assert_eq!(clamp_cpu_power(225.0), (225.0, false));
+        assert_eq!(
+            clamp_cpu_power(69_000.0),
+            (ESTIMATED_CPU_W, true),
+            "the phantom-RAPL scale is clamped"
+        );
+        assert_eq!(clamp_cpu_power(-1.0), (ESTIMATED_CPU_W, true));
+        assert_eq!(clamp_cpu_power(f64::NAN), (ESTIMATED_CPU_W, true));
+    }
+
+    /// I4: a mid-run RAPL → estimate fallback flips `is_estimated()` —
+    /// the accepted method stays `Rapl`, but the run *contained* an
+    /// estimated sample, so the energy result must be labeled, not
+    /// presented as fully-measured.
+    #[test]
+    fn a_mid_run_estimate_fallback_flags_the_backend_as_estimated() {
+        // A RAPL-accepted backend whose sensor is gone mid-run (the node
+        // vanished → the last known value; force the clamp by making the
+        // last-known value itself anomalous is not needed — the latch is
+        // set by any clamped sample).
+        let mut b = CpuPowerBackend::from_method_for_test(CpuPowerMethod::Rapl, false);
+        assert!(!b.is_estimated(), "accepted as RAPL, no estimated sample yet");
+        // Simulate the clamp latching an estimated sample (a mid-run
+        // anomaly) — the exact branch `poll` takes on an out-of-range read.
+        let (_, clamped) = clamp_cpu_power(69_000.0);
+        assert!(clamped);
+        b.any_estimated_sample = clamped;
+        assert!(
+            b.is_estimated(),
+            "any estimated sample → the backend reports estimated"
+        );
+        // …and it stays latched: a later clean reading does not un-label
+        // the run.
+        b.last_watts = 45.0;
+        assert!(b.is_estimated(), "the latch is sticky for the run");
     }
 
     /// A RAPL reading above the per-method ceiling degrades to the estimate

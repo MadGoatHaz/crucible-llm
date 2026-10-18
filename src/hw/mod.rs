@@ -636,6 +636,16 @@ impl HwPoller {
         self.gpu_name.as_deref()
     }
 
+    /// I4: the CPU-power "estimated" flag, read from the backend **after**
+    /// the run — `true` when the CPU component is the labeled fixed
+    /// estimate, *including* a measured backend (RAPL / Super-I-O) that
+    /// fell back to the estimate mid-run (the sample-level latch in
+    /// [`CpuPowerBackend::is_estimated`]). This is the value the Engine D
+    /// result / persisted `EnergySummary` / `--json` energy object carry.
+    pub fn cpu_power_estimated(&self) -> bool {
+        self.cpu_power.as_ref().is_some_and(|c| c.is_estimated())
+    }
+
     /// Cumulative `∫P(t)dt` since poller start, joules.
     pub fn energy_joules(&self) -> f64 {
         self.energy_joules

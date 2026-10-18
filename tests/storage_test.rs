@@ -132,6 +132,7 @@ fn engine_results_column_round_trips() {
             model: Some("RTX 4090".to_string()),
             fragmentation_warning: None,
             na_reason: None,
+            cpu_power_estimated: false,
         }),
         f_flatout: Some(FlatOutSummary {
             stream_count: 16,

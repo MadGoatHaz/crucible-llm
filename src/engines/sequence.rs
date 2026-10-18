@@ -913,6 +913,10 @@ impl BenchmarkSequence {
                     e.vendor = Some(b.vendor().to_string());
                     e.model = b.model().map(str::to_string);
                 }
+                // I4: the persisted summary carries the estimate flag
+                // (including a mid-run sample-level RAPL → estimate
+                // fallback), so the DB can tell measured from estimated.
+                e.cpu_power_estimated = g.cpu_power_estimated();
                 // H3: the persisted numerator is the full load window, not
                 // the bounded display trace. F9: the window duration keeps
                 // `avg_power_w` consistent with the idle-subtracted joules.
@@ -1296,7 +1300,7 @@ impl BenchmarkSequence {
         // Harvest the poller's accumulated power trace plus the backend's
         // vendor + model (the 100 ms task filled the trace; we only read it
         // here, never on the timing path).
-        let (trace, vendor, model, load_joules, idle_w, duration) = match &self.hw {
+        let (trace, vendor, model, load_joules, idle_w, duration, cpu_est) = match &self.hw {
             Some(poller) => {
                 let g = poller.lock().ok();
                 match g {
@@ -1310,6 +1314,8 @@ impl BenchmarkSequence {
                         let idle_w = p.monitor().idle_system_power_w();
                         let duration = (p.monitor().duration_sec() > 0.0)
                             .then(|| p.monitor().duration_sec());
+                        // I4: the estimate flag (incl. a mid-run fallback).
+                        let cpu_est = p.cpu_power_estimated();
                         (
                             p.trace().to_vec(),
                             vendor,
@@ -1317,16 +1323,20 @@ impl BenchmarkSequence {
                             p.load_window_joules(),
                             idle_w,
                             duration,
+                            cpu_est,
                         )
                     }
-                    None => (Vec::new(), None, None, None, 0.0, None),
+                    None => (Vec::new(), None, None, None, 0.0, None, false),
                 }
             }
-            None => (Vec::new(), None, None, None, 0.0, None),
+            None => (Vec::new(), None, None, None, 0.0, None, false),
         };
         let mut energy = profile(&trace, None, total_tokens, idle_w);
         energy.vendor = vendor;
         energy.model = model;
+        // I4: the D result is labeled when the CPU component is (or
+        // included) the fixed estimate — no longer dead code.
+        energy.cpu_power_estimated = cpu_est;
         // H3: the numerator is the full load window (the cumulative counter
         // sliced to [load_started, load_ended]), not the bounded 6-min
         // display trace — so a run longer than the trace capacity integrates
@@ -2570,5 +2580,114 @@ mod tests {
         assert!(v.get("c2_reasoning").is_none(), "stale C2 is absent: {json}");
         assert!(v.get("c3_structured").is_none(), "stale C3 is absent: {json}");
         assert!(v.get("f_flatout").is_none(), "stale F is absent: {json}");
+    }
+
+    // ── I4: the persisted d_energy carries the CPU estimate flag ────────
+
+    /// I4: `engine_results_json` (the `persist_results` path) sets
+    /// `d_energy.cpu_power_estimated` from the poller's CPU backend —
+    /// including a measured (RAPL) backend that latched a sample-level
+    /// estimate fallback mid-run. Previously the flag was dead in
+    /// production: the DB / export could not tell measured from
+    /// estimated.
+    #[test]
+    fn persisted_d_energy_carries_the_cpu_estimate_flag() {
+        use crate::hw::cpu_power::{CpuPowerBackend, CpuPowerMethod};
+        let sel = EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        };
+        // A poller with a power-bearing trace and a RAPL-accepted CPU
+        // backend that latched an estimated sample mid-run.
+        let poller = Arc::new(Mutex::new(
+            HwPoller::with_backend(Some(Arc::new(PowerGpuBackend { watts: 120.0 })))
+                .with_cpu_power(Some(Box::new(CpuPowerBackend::from_method_for_test(
+                    CpuPowerMethod::Rapl,
+                    true,
+                )))),
+        ));
+        {
+            let mut p = poller.lock().unwrap();
+            p.begin_run();
+            p.start_load();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+            p.end_load();
+        }
+        let s = BenchmarkSequence::new(
+            config_with(sel),
+            Arc::new(MetricsState::new()),
+            Some(poller),
+            Arc::new(SeqStateSlot::new()),
+            Arc::new(ProgressBus::new()),
+            RunSlots {
+                speed: Arc::new(ResultSlot::new()),
+                concurrency: Arc::new(ResultSlot::new()),
+                niah: Arc::new(NiahSlot::new()),
+                reasoning: Arc::new(ResultSlot::new()),
+                structured: Arc::new(ResultSlot::new()),
+                flatout: Arc::new(ResultSlot::new()),
+            },
+            None,
+            Arc::new(RunPause::new()),
+            crate::log::RunLogger::disabled(),
+            "test-session".to_string(),
+        );
+        let json = s.engine_results_json().expect("a D-only run yields an object");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["d_energy"]["cpu_power_estimated"] == true,
+            "the mid-run fallback is labeled in the persisted summary: {json}"
+        );
+
+        // …and a fully-measured backend stays unlabeled (the flag is
+        // omitted, the `false`-is-absent convention).
+        let poller2 = Arc::new(Mutex::new(
+            HwPoller::with_backend(Some(Arc::new(PowerGpuBackend { watts: 120.0 })))
+                .with_cpu_power(Some(Box::new(CpuPowerBackend::from_method_for_test(
+                    CpuPowerMethod::Rapl,
+                    false,
+                )))),
+        ));
+        {
+            let mut p = poller2.lock().unwrap();
+            p.begin_run();
+            p.start_load();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+            p.end_load();
+        }
+        let s2 = BenchmarkSequence::new(
+            config_with(sel),
+            Arc::new(MetricsState::new()),
+            Some(poller2),
+            Arc::new(SeqStateSlot::new()),
+            Arc::new(ProgressBus::new()),
+            RunSlots {
+                speed: Arc::new(ResultSlot::new()),
+                concurrency: Arc::new(ResultSlot::new()),
+                niah: Arc::new(NiahSlot::new()),
+                reasoning: Arc::new(ResultSlot::new()),
+                structured: Arc::new(ResultSlot::new()),
+                flatout: Arc::new(ResultSlot::new()),
+            },
+            None,
+            Arc::new(RunPause::new()),
+            crate::log::RunLogger::disabled(),
+            "test-session".to_string(),
+        );
+        let json2 = s2.engine_results_json().expect("a D-only run yields an object");
+        let v2: serde_json::Value = serde_json::from_str(&json2).unwrap();
+        assert!(
+            v2["d_energy"].get("cpu_power_estimated").is_none(),
+            "measured CPU is not labeled estimated: {json2}"
+        );
     }
 }
