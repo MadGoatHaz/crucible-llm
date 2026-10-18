@@ -415,13 +415,33 @@ fn energy_summary_labels_the_na_case_clearly() {
     let s = EnergySummary::from_energy(&na);
     assert_eq!(s.na_reason.as_deref(), Some("N/A — no power telemetry"));
 
-    // A profile with power is not N/A (no reason label).
+    // A profile with power AND a measured J/token is not N/A (no reason label).
     let powered = EnergyResult {
         joules: 100.0,
+        joules_per_token: Some(0.5),
         avg_power_w: Some(200.0),
         peak_power_w: Some(300.0),
-        ..na
+        ..na.clone()
     };
     assert!(!powered.is_na());
     assert_eq!(EnergySummary::from_energy(&powered).na_reason, None);
+
+    // B3: power telemetry present but zero tokens generated → the distinct
+    // "no tokens generated" label (not the "no power telemetry" mislabel,
+    // and not a silent gap).
+    let powered_no_tokens = EnergyResult {
+        joules: 100.0,
+        joules_per_token: None,
+        avg_power_w: Some(200.0),
+        peak_power_w: Some(300.0),
+        ..na.clone()
+    };
+    assert!(
+        !powered_no_tokens.is_na(),
+        "power is present → not the no-telemetry N/A"
+    );
+    assert_eq!(
+        EnergySummary::from_energy(&powered_no_tokens).na_reason.as_deref(),
+        Some("N/A — no tokens generated")
+    );
 }
