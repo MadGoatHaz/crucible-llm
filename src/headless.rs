@@ -74,6 +74,37 @@ pub fn build_energy_json(energy: &EnergyResult, cpu_power_estimated: bool) -> se
     v
 }
 
+/// The Engine D energy result for the headless path: profile the poller's
+/// trace (or the empty trace when no poller is running) over the all-engine
+/// token denominator, then apply the load-window numerator (H3 — the whole
+/// run in the headless poll()-only path, which never opens a load window).
+///
+/// **B2:** extracted so the D *gate* (the selection, not the poller flag)
+/// and the no-poller N/A case are testable in isolation. When `hw` is
+/// `None` (the poller is off — `--no-hardware` / a stale config) the trace is
+/// empty and the result is the labeled N/A (the module N/A rule): a selected
+/// Engine D is never silently skipped, and never a spurious 0.0 J/token —
+/// symmetric with the TUI, which degrades to a labeled N/A without a poller.
+#[must_use]
+pub fn headless_energy(hw: &Option<Arc<Mutex<HwPoller>>>, total_tokens: u64) -> EnergyResult {
+    let (trace_d, load_joules) = hw
+        .as_ref()
+        .and_then(|h| h.lock().ok())
+        .map(|g| {
+            (
+                g.trace().to_vec(),
+                g.load_window_joules().or(Some(g.energy_joules())),
+            )
+        })
+        .unwrap_or_default();
+    let mut energy = profile(&trace_d, None, total_tokens);
+    if let Some(j) = load_joules {
+        energy.joules = j;
+        energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
+    }
+    energy
+}
+
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
 /// and print the prototype's result box(es) / summary — or `--json` on
 /// stdout. Returns the process exit code (1 iff every run failed).
@@ -476,12 +507,19 @@ pub fn run_headless(
         }
 
         // Engine D (hardware/energy) — after A+B+C1+C2+C3, before F (the TUI
-        // sequence order). **H5:** the shared `sum_all_engines_tokens` helper,
-        // so the headless and TUI denominators agree (F is not yet run → it
-        // contributes 0, consistent with CF-03). **H3:** the numerator is the
-        // load window (the whole run in the headless poll()-only path, which
-        // never opens a load window), not the bounded 6-min trace.
-        if cfg.hardware {
+        // sequence order). **B2:** gated on the *selection*
+        // (`extra.hardware`), not the poller flag (`cfg.hardware`) — every
+        // other engine is gated on its selection, and an explicit
+        // `--engine hardware` with the poller off (`--no-hardware` / a stale
+        // `config.json`) must not be *silently skipped*: it runs and reports
+        // a labeled N/A (symmetric with the TUI), satisfying the `--json`
+        // energy-object contract. **H5:** the shared `sum_all_engines_tokens`
+        // helper, so the headless and TUI denominators agree (F is not yet
+        // run → it contributes 0, consistent with CF-03). **H3:** the
+        // numerator is the load window (the whole run in the headless
+        // poll()-only path, which never opens a load window), not the bounded
+        // 6-min trace.
+        if extra.hardware {
             let total_tokens = sum_all_engines_tokens(
                 Some(results.as_slice()),
                 sweep_result.as_ref(),
@@ -490,22 +528,7 @@ pub fn run_headless(
                 structured_result.as_ref(),
                 None,
             );
-            let (trace_d, load_joules) = hw
-                .as_ref()
-                .and_then(|h| h.lock().ok())
-                .map(|g| {
-                    (
-                        g.trace().to_vec(),
-                        g.load_window_joules().or(Some(g.energy_joules())),
-                    )
-                })
-                .unwrap_or_default();
-            let mut energy = profile(&trace_d, None, total_tokens);
-            if let Some(j) = load_joules {
-                energy.joules = j;
-                energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
-            }
-            energy_result = Some(energy);
+            energy_result = Some(headless_energy(&hw, total_tokens));
         }
         if let Some(energy) = &energy_result {
             if !cfg.json {
@@ -853,6 +876,7 @@ impl Term {
 mod tests {
     use super::*;
     use crate::config::EngineSelection;
+    use crate::hw::GpuSample;
     use crate::sse::chunk::Chunk;
     use crate::sse::parser::ParsedFrame;
     use crate::timing::StreamTimestamps;
@@ -931,6 +955,84 @@ mod tests {
         let v2 = build_energy_json(&e, false);
         assert_eq!(v2["cpu_power_estimated"], false);
         assert_eq!(v2["joules"], 100.0);
+    }
+
+    /// A deterministic GPU backend with a real power reading (B2 test
+    /// fixture): a poller built on it accumulates a power-bearing trace.
+    #[derive(Debug)]
+    struct PowerGpuBackend {
+        watts: f64,
+    }
+
+    impl GpuBackend for PowerGpuBackend {
+        fn vendor(&self) -> &str {
+            "NVIDIA"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Mock GPU")
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                power_watts: Some(self.watts),
+                utilization_pct: Some(90),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    /// B2: a selected Engine D with **no poller** (`hw = None` —
+    /// `--no-hardware` / a stale `config.json`) is not silently skipped: it
+    /// yields the labeled N/A, and the `--json` energy object is present with
+    /// `na_reason` set and `joules_per_token` `null` (the module N/A rule,
+    /// symmetric with the TUI).
+    #[test]
+    fn headless_d_no_poller_is_a_labeled_na_in_json() {
+        let hw: Option<Arc<Mutex<HwPoller>>> = None;
+        // D-only: no other engine produced tokens.
+        let energy = headless_energy(&hw, 0);
+        assert!(energy.is_na(), "no poller → no power telemetry → N/A");
+        assert_eq!(energy.joules_per_token, None, "never a spurious 0.0");
+
+        // The `--json` energy object is present and carries the reason.
+        let v = build_energy_json(&energy, false);
+        assert!(v.get("joules").is_some(), "energy object present: {v}");
+        assert!(
+            v.get("na_reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.is_empty()),
+            "na_reason is a non-empty label: {v}"
+        );
+        // `joules_per_token` is `None` → omitted from the object (the N/A
+        // rule: never a spurious 0.0).
+        assert!(
+            v.get("joules_per_token").is_none(),
+            "joules_per_token is absent (N/A), never a spurious 0.0: {v}"
+        );
+    }
+
+    /// B2: the normal (poller-present) path is unchanged — a power-bearing
+    /// trace with tokens yields a real J/token (not N/A).
+    #[test]
+    fn headless_d_poller_present_yields_joules_per_token() {
+        let hw = Some(Arc::new(Mutex::new(HwPoller::with_backend(Some(
+            Arc::new(PowerGpuBackend { watts: 150.0 }),
+        )))));
+        // Build up a power-bearing trace (two samples, distinct timestamps).
+        {
+            let mut p = hw.as_ref().unwrap().lock().unwrap();
+            p.poll();
+            std::thread::sleep(Duration::from_millis(5));
+            p.poll();
+        }
+        let energy = headless_energy(&hw, 1000);
+        assert!(
+            !energy.is_na(),
+            "poller present → power telemetry → not N/A"
+        );
+        assert!(
+            energy.joules_per_token.is_some(),
+            "tokens + power → a real J/token"
+        );
     }
 
     /// CF-40 support: `run_window` extracts the (T0, Tn) lifecycle window
