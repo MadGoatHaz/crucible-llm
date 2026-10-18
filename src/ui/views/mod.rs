@@ -19,6 +19,7 @@ pub mod gpu;
 pub mod history;
 pub mod live;
 pub mod needle;
+pub mod report;
 pub mod setup;
 pub mod theme_picker;
 

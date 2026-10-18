@@ -30,6 +30,7 @@
 //! path (measurement-isolation invariant, blueprint §4).
 
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -44,14 +45,15 @@ use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::profile;
 use crate::engines::sequence::sum_all_engines_tokens;
 use crate::engines::{
-    fragmentation_warning, queue_for, BenchmarkSequence, EngineProgress, NiahEngineConfig,
-    NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots, SeqPhase, SeqState,
-    SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS, NIAH_SIZES,
-    VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
+    fragmentation_warning, queue_for, speed_mean_tps, BenchmarkSequence, EngineProgress,
+    NiahEngineConfig, NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots,
+    SeqPhase, SeqState, SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS,
+    NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
 use crate::hw::{arm_power_monitor, GpuBackend, HwPoller, IDLE_WINDOW_SECS, MANUAL_IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
+use crate::report::MatrixReport;
 use crate::storage::db::Database;
 use crate::storage::export::{self, ExportPayload};
 use crate::storage::models::{
@@ -62,6 +64,7 @@ use crate::ui::theme::{self, glyph, style, Theme};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::{HistoryMode, HistoryState};
+use crate::ui::views::report::{ReportKeyResult, ReportState};
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
 /// The six dashboard views (blueprint §6).
@@ -147,6 +150,9 @@ pub enum Phase {
     ThemePicker,
     /// The interactive setup flow (full-screen takeover).
     Setup,
+    /// The post-run Matrix Report takeover (full-screen): opens via `m`
+    /// after a completed run; `Esc` closes it.
+    Report,
     /// The six-view dashboard (Live / Concurrency / Needle / GPU / History
     /// / Config).
     #[default]
@@ -258,12 +264,18 @@ pub struct App {
     /// completes; a failed discovery leaves the previous list (if any)
     /// in place — the picker degrades to free text (N/A-never-fail).
     pub models: Arc<ResultSlot<Vec<ModelInfo>>>,
-    /// The TUI phase: the Setup takeover or the dashboard (the
-    /// entry point picks; `c` re-opens Setup from the dashboard).
+    /// The TUI phase: the Setup / Matrix Report takeovers or the
+    /// dashboard (the entry point picks; `c` re-opens Setup and `m`
+    /// re-opens the report from the dashboard).
     pub phase: Phase,
     /// The interactive setup flow state (the four-stage URL → model →
     /// config → launch sequence). Mutated only in the key/tick path.
     pub setup: SetupState,
+    /// The post-run Matrix Report takeover state (the `m` key after a
+    /// completed run): the assembled [`MatrixReport`] + the user-fill
+    /// field buffers. Mutated only in the key path (the report is
+    /// re-assembled on every open).
+    pub report: ReportState,
     /// The first-run theme picker state (full-screen takeover shown before
     /// Setup when no theme has ever been chosen).
     pub theme_picker: crate::ui::views::theme_picker::ThemePickerState,
@@ -368,6 +380,7 @@ impl App {
             // target was not fully pre-configured.
             phase: Phase::Dashboard,
             setup: SetupState::new(),
+            report: ReportState::default(),
             theme_picker: crate::ui::views::theme_picker::ThemePickerState::default(),
             target_explicit: false,
             discovery_error: Arc::new(ArcSwapOption::empty()),
@@ -563,6 +576,46 @@ impl App {
         self.setup.form_field = 0;
         self.setup.phase = crate::ui::views::setup::SetupPhase::Config;
         self.phase = Phase::Setup;
+    }
+
+    /// Open the **Matrix Report** takeover (the `m` key, gated on a
+    /// completed run): assemble the report from the run's result slots +
+    /// hardware telemetry (the auto fields freeze at open; the user
+    /// fields start empty), pre-fill the save path, and take over the
+    /// screen. Re-opening after `Esc` re-assembles the auto fields and
+    /// keeps the user's in-progress edits (the buffers are re-seeded
+    /// from the fresh report only for the auto fields — see
+    /// [`build_matrix_report`](Self::build_matrix_report)).
+    pub fn open_report(&mut self) {
+        let report = self.build_matrix_report();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let save_path = format!(
+            "{}/exports/matrix-{ts}.md",
+            crate::config::data_dir().display()
+        );
+        // Preserve the user's in-progress edits across close/re-open:
+        // the fresh assembly carries the auto fields; the four user
+        // buffers keep whatever the user has already typed.
+        let (backend, quant, use_case, notes) = (
+            self.report.backend.clone(),
+            self.report.quant.clone(),
+            self.report.use_case.clone(),
+            self.report.notes.clone(),
+        );
+        self.report = ReportState::new(report, save_path);
+        self.report.backend = backend;
+        self.report.backend_cursor = self.report.backend.chars().count();
+        self.report.quant = quant;
+        self.report.quant_cursor = self.report.quant.chars().count();
+        self.report.use_case = use_case;
+        self.report.use_case_cursor = self.report.use_case.chars().count();
+        self.report.notes = notes;
+        self.report.notes_cursor = self.report.notes.chars().count();
+        self.report.sync_report();
+        self.phase = Phase::Report;
     }
 
     /// Stage-4 `Enter`: leave the Setup takeover, land on the Live view,
@@ -1079,6 +1132,53 @@ impl App {
             };
         }
 
+        // Matrix Report phase (full-screen takeover, modeled on the Setup
+        // phase below): `c` copy (OSC 52), `s` save, `Esc` close. It
+        // returns before the `q`-quit arm, so `q` types into the focused
+        // field (exactly as in Setup) and can never open the quit overlay
+        // from the report.
+        if self.phase == Phase::Report {
+            return match self.report.handle_key(key) {
+                ReportKeyResult::Inert => KeyAction::Continue,
+                // N/A-never-fail: a terminal that drops the OSC 52
+                // sequence is a logged warning, never a crash (the save
+                // path is the guaranteed one).
+                ReportKeyResult::Copied => {
+                    let res = crate::clipboard::copy_to_clipboard(&self.report.report.render());
+                    self.push_log(
+                        Self::report_copy_message(&res),
+                        if res.is_ok() {
+                            style::value_ok(th)
+                        } else {
+                            style::value_warn(th)
+                        },
+                    );
+                    KeyAction::Continue
+                }
+                ReportKeyResult::Saved => {
+                    match Self::write_report_file(
+                        &self.report.report.render(),
+                        &self.report.save_path,
+                    ) {
+                        Ok(p) => self.push_log(
+                            format!("[report] saved → {}", p.display()),
+                            style::value_ok(th),
+                        ),
+                        Err(e) => self
+                            .push_log(format!("[report] save failed: {e}"), style::value_warn(th)),
+                    }
+                    KeyAction::Continue
+                }
+                ReportKeyResult::Closed => {
+                    // The run state is untouched (`seq` still reads
+                    // `AllComplete`), so `m` re-opens the report with the
+                    // same auto fields and the user's in-progress edits.
+                    self.phase = Phase::Dashboard;
+                    KeyAction::Continue
+                }
+            };
+        }
+
         // Setup phase (full-screen takeover): every other key routes to
         // the four-stage flow. `q` types into a field; `Esc` walks back
         // one stage (quitting only at stage 1).
@@ -1448,6 +1548,26 @@ impl App {
                 KeyAction::NewNeedle
             }
             KeyCode::Char('e') => KeyAction::Export,
+            // `m` — open the Matrix Report (the post-run
+            // `[COMMUNITY-SUBMISSION]` block). Gated on a **completed**
+            // run: the auto fields are assembled from the run's result
+            // slots + hardware telemetry, and opening with stale/empty
+            // data would fabricate a report (the `m` key is free on the
+            // dashboard — `q`/`c`/`e`/`n`/`r`/`i`/`+` are the only
+            // letter keys in use here).
+            KeyCode::Char('m') => {
+                let complete =
+                    self.seq.load().map(|s| s.phase == SeqPhase::AllComplete) == Some(true);
+                if complete {
+                    self.open_report();
+                } else {
+                    self.push_log(
+                        "[report] complete a run first (press [R] to start)".to_string(),
+                        style::value_warn(th),
+                    );
+                }
+                KeyAction::Continue
+            }
             // `i` — measure a fresh idle power baseline (the GPU tab's
             // manual idle test): the 100 ms poller sits the system no-load
             // for [`MANUAL_IDLE_WINDOW_SECS`] and records the mean as the
@@ -1625,6 +1745,109 @@ impl App {
         payload
     }
 
+    /// The Matrix Report auto fields, assembled from the run's result
+    /// slots + hardware telemetry (mirrors [`build_export_payload`]
+    /// (Self::build_export_payload); the headless path assembles the same
+    /// block from its in-scope run variables — design §1.4/§4.2).
+    ///
+    /// Sources (the honest-degradation rules, design §1.4/§1.5):
+    /// - **model** — the Configuration form (`config.to_config()`);
+    /// - **GPU name** — the poller's `gpu_display_name` form, then the
+    ///   shared backend, then `""` (no GPU);
+    /// - **GPU count** — vendor-agnostic (`GpuBackend::poll_all().len()`;
+    ///   NVML overrides per-device) — *not* the NVML-only `device_count`;
+    /// - **VRAM** — the lock-free aggregate [`GpuSample`]
+    ///   (`memory_total_mb`, **binary MiB**) — *not* the decimal
+    ///   `vram_total_gb` (a "24 GiB" card reads 25.77 in decimal GB and
+    ///   would cross its tier boundary);
+    /// - **RAM** — a fresh `sysinfo` read (the poller's copy is ≤100 ms
+    ///   stale);
+    /// - **speed** — Engine A's mean `tg_speed` over the valid runs
+    ///   ([`speed_mean_tps`]) — blank, never a silent 0, when there are
+    ///   no valid runs.
+    ///
+    /// The user fields (backend / quant / use case / notes) are passed
+    /// **empty** — the user fills them in the takeover.
+    fn build_matrix_report(&self) -> MatrixReport {
+        let cfg = self.config.to_config();
+        let (gpu_name, gpu_count, vram_mib, ram_bytes) = {
+            let poller = self.hw.as_ref().and_then(|h| h.lock().ok());
+            // Name: the poller first (the `gpu_display_name` form it
+            // captured at construction), then the shared backend.
+            let gpu_name = poller
+                .as_ref()
+                .and_then(|g| g.gpu_name().map(str::to_string))
+                .or_else(|| {
+                    self.gpu
+                        .as_ref()
+                        .map(|g| crate::hw::gpu_display_name(g.as_ref()))
+                })
+                .unwrap_or_default();
+            // Count: vendor-agnostic (the trait `poll_all`); a
+            // pollerless host falls back to the shared backend.
+            let gpu_count = match poller.as_ref().and_then(|g| g.backend()) {
+                Some(b) => b.poll_all().len() as u32,
+                None => self
+                    .gpu
+                    .as_ref()
+                    .map(|g| g.poll_all().len() as u32)
+                    .unwrap_or(0),
+            };
+            // VRAM: the lock-free aggregate sample (binary MiB) — the
+            // decimal `vram_total_gb` is deliberately *not* used (the
+            // 24-GiB-card-reads-25.77 trap, design §1.2).
+            let vram_mib = self
+                .metrics
+                .load()
+                .gpu
+                .as_ref()
+                .and_then(|g| g.memory_total_mb)
+                .unwrap_or(0);
+            // RAM: a fresh `sysinfo` read (the poller's copy is ≤100 ms
+            // stale; this is the key path, never the 60 Hz render path).
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            let ram_bytes = sys.total_memory();
+            (gpu_name, gpu_count, vram_mib, ram_bytes)
+        };
+        // Engine A's mean decode speed (the valid filter; 0.0 = no valid
+        // runs → the report's blank speed field).
+        let speed = speed_mean_tps((*self.speed_slot.load()).as_deref().unwrap_or(&[]));
+        // The user fields start empty (the user fills them in the
+        // takeover).
+        MatrixReport::build(
+            &gpu_name, gpu_count, vram_mib, ram_bytes, &cfg.model, speed, "", "", "", "",
+        )
+    }
+
+    /// The `c` key's log message for a clipboard write outcome (the
+    /// N/A-never-fail rule, design invariant 3 — a terminal that drops the
+    /// OSC 52 sequence is a logged warning, never a crash; save-to-file is
+    /// the guaranteed path). Pure over the outcome so the handler logic is
+    /// testable without a terminal.
+    #[must_use]
+    pub fn report_copy_message(res: &Result<(), String>) -> String {
+        match res {
+            Ok(()) => "[report] copied to clipboard (OSC 52)".to_string(),
+            Err(_) => "[report] clipboard unsupported by terminal — use [S]ave".to_string(),
+        }
+    }
+
+    /// The `s` key: write the Matrix Report block verbatim to `path`
+    /// (creating the parent directory) — the `storage/export.rs` `write`
+    /// pattern over a raw string (`export::write` is `ExportPayload`-typed,
+    /// so this is the small raw-string variant, not a change to it).
+    fn write_report_file(content: &str, path: &str) -> Result<std::path::PathBuf, String> {
+        let p = std::path::PathBuf::from(path);
+        if let Some(parent) = p.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+        }
+        std::fs::write(&p, content).map_err(|e| e.to_string())?;
+        Ok(p)
+    }
+
     /// The `e` key (blueprint §6 footer, Chunk 13): export the run's
     /// results (built from the result slots, URC-5) to
     /// `data_dir()/exports/` in the configured format and log the
@@ -1748,6 +1971,8 @@ impl App {
         }
         if self.phase == Phase::ThemePicker {
             views::theme_picker::render(f.area(), self, f);
+        } else if self.phase == Phase::Report {
+            views::report::render(f.area(), self, f);
         } else if self.phase == Phase::Setup {
             views::setup::render(f.area(), self, f);
         } else {
@@ -2027,7 +2252,8 @@ impl App {
     }
 
     /// The action keys: `[Space]Pause` / `[Space]Resume` while running,
-    /// `[R]Run` when idle, and `[q]Quit` always.
+    /// `[R]Run` when idle, `[M]Report` once a run has completed, and
+    /// `[q]Quit` always.
     fn footer_action_keys(&self) -> Vec<Span<'static>> {
         let th = self.active_theme;
         let running = self.seq.is_running() || self.niah.is_running();
@@ -2045,11 +2271,16 @@ impl App {
         let key_style = Style::default()
             .fg(th.secondary())
             .add_modifier(Modifier::BOLD);
-        vec![
-            Span::styled(primary.to_string(), key_style),
-            Span::raw(" "),
-            Span::styled("[q]Quit".to_string(), key_style),
-        ]
+        let mut spans = vec![Span::styled(primary.to_string(), key_style), Span::raw(" ")];
+        // The `m` key opens the Matrix Report once every selected engine
+        // has finished (the same gate the key itself uses).
+        let complete = self.seq.load().map(|s| s.phase == SeqPhase::AllComplete) == Some(true);
+        if complete {
+            spans.push(Span::styled("[M]Report".to_string(), key_style));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("[q]Quit".to_string(), key_style));
+        spans
     }
 }
 
@@ -3344,5 +3575,242 @@ mod tests {
             assert!(!text.contains("Terminal too narrow"), "{w}x{h}: {text}");
             assert!(text.contains("BENCHMARK SEQUENCE"), "dashboard: {text}");
         }
+    }
+
+    // ── Matrix Report (M3) ───────────────────────────────────────────────
+
+    use crate::hw::GpuSample;
+
+    /// A deterministic GPU backend (the Matrix Report assembly fixture):
+    /// a fixed marketing name + a fixed **binary-MiB** VRAM total.
+    #[derive(Debug)]
+    struct MockGpu {
+        vram_mib: u64,
+    }
+
+    impl GpuBackend for MockGpu {
+        fn vendor(&self) -> &str {
+            "Mock"
+        }
+        fn model(&self) -> Option<&str> {
+            Some("Mock GPU 24G")
+        }
+        fn poll(&self) -> GpuSample {
+            GpuSample {
+                memory_total_mb: Some(self.vram_mib),
+                ..GpuSample::default()
+            }
+        }
+    }
+
+    /// A minimal Engine A result fixture (the report's speed-mean input).
+    fn speed_fixture(tg: f64, failed: bool, looping: bool) -> SpeedResult {
+        SpeedResult {
+            ttft: 0.2,
+            prompt_tokens: 100,
+            completion_tokens: if failed { 0 } else { 50 },
+            reasoning_tokens: None,
+            pp_speed: 1000.0,
+            tg_speed: tg,
+            mtp_efficiency: 1.0,
+            stream_time: 1.0,
+            total_chunks: 10,
+            content_chunks: 10,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: "test-model".into(),
+            mode: "short".into(),
+            error: failed.then(|| "boom".to_string()),
+            looping,
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
+        }
+    }
+
+    #[test]
+    fn speed_mean_tps_is_over_the_valid_runs_only() {
+        // The canonical filter (`!is_failed() && !looping`): the failed
+        // and looping runs are excluded from the mean.
+        assert_eq!(
+            speed_mean_tps(&[
+                speed_fixture(90.0, false, false),
+                speed_fixture(0.0, true, false),
+                speed_fixture(30.0, false, true),
+            ]),
+            90.0
+        );
+        assert_eq!(
+            speed_mean_tps(&[
+                speed_fixture(40.0, false, false),
+                speed_fixture(60.0, false, false),
+            ]),
+            50.0
+        );
+        // No valid runs → 0.0 (the report renders a blank, never a
+        // silent 0).
+        assert_eq!(speed_mean_tps(&[]), 0.0);
+        assert_eq!(speed_mean_tps(&[speed_fixture(0.0, true, false)]), 0.0);
+    }
+
+    #[test]
+    fn build_matrix_report_assembles_the_auto_fields() {
+        let mut app = App::new();
+        app.config.model = "test-model".to_string();
+        let vram_mib = 24576; // 24 GiB (binary)
+        app.gpu = Some(Arc::new(MockGpu { vram_mib }) as Arc<dyn GpuBackend>);
+        app.hw = Some(Arc::new(Mutex::new(HwPoller::with_backend(Some(
+            Arc::new(MockGpu { vram_mib }) as Arc<dyn GpuBackend>,
+        )))));
+        // The lock-free aggregate sample (the VRAM source, binary MiB).
+        app.metrics.update(MetricsSnapshot {
+            gpu: Some(GpuSample {
+                memory_total_mb: Some(vram_mib),
+                ..GpuSample::default()
+            }),
+            ..MetricsSnapshot::default()
+        });
+        // Engine A: one valid run (90 t/s) + one failed + one looping
+        // (30) → the mean is the valid run alone.
+        app.speed_slot.store(vec![
+            speed_fixture(90.0, false, false),
+            speed_fixture(0.0, true, false),
+            speed_fixture(30.0, false, true),
+        ]);
+
+        let r = app.build_matrix_report();
+        assert_eq!(r.model, "test-model");
+        // VRAM via the **MiB→tier** path (binary): 24576 MiB = 24 GiB →
+        // `16-24`. (The decimal trap: the same bytes read 25.77 GB and
+        // would cross into `24-32`.)
+        assert_eq!(r.vram, "24GB — 16-24");
+        // The real Engine A mean — no tilde, no estimate.
+        assert_eq!(r.speed, "90 tok/s");
+        // Hardware: the display name + count + binary-GB VRAM + the
+        // (real) host-RAM tail.
+        assert!(
+            r.hardware.starts_with("1x Mock GPU 24G 24GB + "),
+            "hardware prefix: {}",
+            r.hardware
+        );
+        assert!(
+            r.hardware.ends_with("GB RAM"),
+            "hardware RAM tail: {}",
+            r.hardware
+        );
+        // The user fields start empty (the user fills them in the
+        // takeover).
+        assert_eq!(r.backend, "");
+        assert_eq!(r.quant, "");
+        assert_eq!(r.use_case, "");
+        assert_eq!(r.notes, "");
+    }
+
+    #[test]
+    fn build_matrix_report_degrades_honestly_without_a_gpu() {
+        let mut app = App::new();
+        app.config.model = "test-model".to_string();
+        app.speed_slot
+            .store(vec![speed_fixture(45.4, false, false)]);
+
+        let r = app.build_matrix_report();
+        // No GPU: the hardware is the host RAM only (never a fabricated
+        // `1x …`), the vram is blank (the N/A rule — never a tier), and
+        // the speed is the real mean.
+        assert!(
+            r.hardware.ends_with("GB RAM"),
+            "RAM-only hardware: {}",
+            r.hardware
+        );
+        assert!(!r.hardware.contains('x'), "{}", r.hardware);
+        assert_eq!(r.vram, "");
+        assert_eq!(r.speed, "45 tok/s");
+        assert_eq!(r.model, "test-model");
+    }
+
+    #[test]
+    fn report_copy_message_is_ok_and_na_never_fail() {
+        // The `c` key's handler decision, pure over the outcome (the
+        // N/A-never-fail rule — a broken sink is a warning, never a
+        // crash).
+        assert_eq!(
+            App::report_copy_message(&Ok(())),
+            "[report] copied to clipboard (OSC 52)"
+        );
+        assert_eq!(
+            App::report_copy_message(&Err("broken sink".to_string())),
+            "[report] clipboard unsupported by terminal — use [S]ave"
+        );
+    }
+
+    #[test]
+    fn report_copy_key_logs_success_and_stays_open() {
+        let mut app = App::new();
+        app.phase = Phase::Report;
+        app.report = ReportState::new(
+            MatrixReport {
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            "/tmp/exports/matrix-1.md".to_string(),
+        );
+        // In a piped `cargo test` the OSC 52 write to stdout succeeds
+        // (inert bytes on the pipe — the clipboard.rs smoke test
+        // establishes the convention) → the success log. The app never
+        // crashes and stays in the report.
+        app.handle_key(&key(KeyCode::Char('c')));
+        let log_text: Vec<String> = app.log.iter().map(line_text).collect();
+        assert!(
+            log_text
+                .iter()
+                .any(|l| l == "[report] copied to clipboard (OSC 52)"),
+            "the c key logs the copy: {log_text:?}"
+        );
+        assert!(app.running, "copy never quits the app");
+        assert_eq!(app.phase, Phase::Report, "stays in the report after copy");
+    }
+
+    #[test]
+    fn report_save_key_writes_the_block_to_the_save_path() {
+        let mut app = App::new();
+        app.phase = Phase::Report;
+        let path = std::env::temp_dir().join(format!("crucible-report-{}.md", std::process::id()));
+        app.report = ReportState::new(
+            MatrixReport {
+                hardware: "1x Mock GPU 24G 24GB + 64GB RAM".into(),
+                vram: "24GB — 16-24".into(),
+                model: "test-model".into(),
+                ..Default::default()
+            },
+            path.to_string_lossy().into_owned(),
+        );
+        // A typed user field must land in the written block (write-back).
+        app.report.backend = "vLLM".into();
+        app.report.sync_report();
+        app.handle_key(&key(KeyCode::Char('s')));
+
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("the s key wrote the file: {e}"));
+        assert!(content.contains("[COMMUNITY-SUBMISSION]"), "{content}");
+        assert!(content.contains("backend:  vLLM"), "{content}");
+        assert!(content.contains("[/COMMUNITY-SUBMISSION]"), "{content}");
+        let log_text: Vec<String> = app.log.iter().map(line_text).collect();
+        assert!(
+            log_text
+                .iter()
+                .any(|l| l.starts_with("[report] saved → ") && l.contains("crucible-report-")),
+            "the s key logs the path: {log_text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn report_esc_returns_to_the_dashboard() {
+        let mut app = App::new();
+        app.phase = Phase::Report;
+        app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(app.phase, Phase::Dashboard, "Esc closes the report");
+        assert!(app.running);
     }
 }

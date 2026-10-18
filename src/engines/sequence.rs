@@ -1476,6 +1476,32 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
     }
 }
 
+/// Engine A's mean decode speed over the **valid** runs — the shared
+/// definition the Matrix Report (`[COMMUNITY-SUBMISSION]` block,
+/// `crate::report`) uses on both the TUI and the headless path (design
+/// §1.5).
+///
+/// The valid filter is the canonical one (`speed.rs` `format_summary`):
+/// `!is_failed() && !looping` — a decode-loop-guard-flagged run's
+/// throughput is zeroed (not a measurement of the server), so it is
+/// excluded from the mean. `0.0` when there are no valid runs (the
+/// report renders that as a **blank** speed field — never a silent `0`
+/// and never an estimate; a single iteration's mean is that iteration,
+/// which is honest).
+#[must_use]
+pub fn speed_mean_tps(results: &[SpeedResult]) -> f64 {
+    let valid: Vec<f64> = results
+        .iter()
+        .filter(|r| !r.is_failed() && !r.looping)
+        .map(|r| r.tg_speed)
+        .collect();
+    if valid.is_empty() {
+        0.0
+    } else {
+        valid.iter().sum::<f64>() / valid.len() as f64
+    }
+}
+
 /// Engine B's one-line summary: the **practical sweet spot** (the
 /// highest concurrency where every user still gets ≥ 29.4 t/s — 30 t/s
 /// ideal with a 2% margin, what matters for real use), with the
