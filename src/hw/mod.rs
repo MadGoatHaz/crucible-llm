@@ -417,6 +417,14 @@ pub struct HwPoller {
     gpu_name: Option<String>,
     /// Cumulative `∫P(t)dt` since poller start, joules (trapezoidal rule).
     energy_joules: f64,
+    /// H3: the cumulative energy at the load-window boundaries.
+    /// [`Self::start_load`] captures `load_energy_start`; [`Self::end_load`]
+    /// captures `load_energy_end`. The Engine D numerator is
+    /// `load_energy_end − load_energy_start` (the *full* load window) — not
+    /// the bounded 6-min display trace — so a run longer than
+    /// [`HW_TRACE_CAPACITY`] integrates the whole window (CF-03).
+    load_energy_start: Option<f64>,
+    load_energy_end: Option<f64>,
     /// Bounded rolling trace of recent samples (the `P(t)` power trace).
     trace: Vec<HwSample>,
     /// Rolling trace capacity (oldest samples drop first).
@@ -472,6 +480,8 @@ impl HwPoller {
             sys,
             gpu_name,
             energy_joules: 0.0,
+            load_energy_start: None,
+            load_energy_end: None,
             trace: Vec::new(),
             capacity: HW_TRACE_CAPACITY,
             monitor: GpuPowerMonitor::default(),
@@ -510,6 +520,8 @@ impl HwPoller {
     /// and open the idle clock. The sequence executor calls this before the
     /// pre-load idle window.
     pub fn begin_run(&mut self) {
+        self.load_energy_start = None;
+        self.load_energy_end = None;
         self.monitor.begin_run();
     }
 
@@ -517,6 +529,10 @@ impl HwPoller {
     /// and start recording the 1 Hz power history). The sequence executor
     /// calls this once the idle window elapses and the benchmark load begins.
     pub fn start_load(&mut self) {
+        // H3: mark where the cumulative energy counter stood when the load
+        // window opened — the Engine D numerator's lower bound.
+        self.load_energy_start = Some(self.energy_joules);
+        self.load_energy_end = None;
         self.monitor.start_load();
     }
 
@@ -530,6 +546,9 @@ impl HwPoller {
     /// both freeze sites (the last engine's `Complete` and the `AllComplete`
     /// safety net), and it is a no-op before a load window has opened.
     pub fn end_load(&mut self) {
+        // H3: mark where the cumulative energy counter stood when the load
+        // window closed — the Engine D numerator's upper bound (frozen).
+        self.load_energy_end = Some(self.energy_joules);
         self.monitor.end_load();
     }
 
@@ -585,6 +604,29 @@ impl HwPoller {
     /// Cumulative `∫P(t)dt` since poller start, joules.
     pub fn energy_joules(&self) -> f64 {
         self.energy_joules
+    }
+
+    /// The load-window energy (joules): the cumulative `∫P dt` sliced to
+    /// `[load_started, load_ended]` (H3 / CF-03).
+    ///
+    /// The Engine D numerator uses this — **not** the bounded 6-min display
+    /// trace ([`HW_TRACE_CAPACITY`], which drops its oldest samples first) —
+    /// so a run longer than the trace capacity integrates the *full* load
+    /// window. The numerator then spans the same interval as the "all
+    /// engines" denominator (CF-03 pairing restored for arbitrary run
+    /// lengths).
+    ///
+    /// - **live window** (`end_load` not yet called): `current − start`
+    ///   (energy from load start to now);
+    /// - **closed window** (`end_load` called): `end − start` (frozen);
+    /// - **no load window** (`start_load` never called — e.g. the headless
+    ///   path, which drives the poller with [`Self::poll`] only): `None` —
+    ///   the caller falls back to the whole-run [`Self::energy_joules`].
+    #[must_use]
+    pub fn load_window_joules(&self) -> Option<f64> {
+        let start = self.load_energy_start?;
+        let end = self.load_energy_end.unwrap_or(self.energy_joules);
+        Some((end - start).max(0.0))
     }
 
     /// The rolling `P(t)` power trace (bounded, oldest first).
@@ -1005,5 +1047,54 @@ mod tests {
         }
         assert!(p.trace().len() <= 10);
         assert_eq!(p.trace().len(), 10);
+    }
+
+    /// H3: the load-window joules span the *full* run, not just the bounded
+    /// 6-min display trace. A run longer than the trace capacity integrates
+    /// the whole window via the cumulative counter; the bounded trace would
+    /// only cover the tail (the old Engine D numerator). The live window
+    /// tracks `current − start`; the closed window freezes at `end − start`.
+    #[test]
+    fn load_window_joules_spans_the_full_run_beyond_the_trace_capacity() {
+        let mut p = HwPoller::new().with_capacity(10); // a tiny ring
+        p.begin_run();
+        p.start_load(); // load_energy_start = the (zero) cumulative so far
+                        // Feed 30 samples at 200 W — well over the 10-sample capacity: the
+                        // cumulative counter grows for the whole run, the trace ring overflows.
+        let gpu = Some(GpuSample {
+            power_watts: Some(200.0),
+            ..Default::default()
+        });
+        for _ in 0..30 {
+            p.advance(&gpu);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let cumulative = p.energy_joules();
+        assert!(
+            cumulative > 0.0,
+            "the cumulative counter grew: {cumulative}"
+        );
+        // The live load window = current − start = the whole run.
+        assert_eq!(p.load_window_joules(), Some(cumulative));
+        // The bounded trace (10 samples ≈ 0.2 s) integrates far less than the
+        // full run (30 samples ≈ 0.6 s) — the H3 fix uses the cumulative.
+        let trace_only = crate::engines::hardware::integrate_joules(p.trace(), None).0;
+        assert!(
+            cumulative > trace_only,
+            "full run ({cumulative}) > bounded trace ({trace_only}) — H3"
+        );
+        // Close the window: the value freezes at `end − start`.
+        p.end_load();
+        let frozen = p.load_window_joules().expect("closed window");
+        assert_eq!(frozen, cumulative, "the closed window = start→end");
+        p.energy_joules += 500.0; // more energy after the window closed
+        assert_eq!(
+            p.load_window_joules(),
+            Some(frozen),
+            "post-end energy is excluded (frozen)"
+        );
+        // begin_run resets the window (the N/A rule for a fresh run).
+        p.begin_run();
+        assert_eq!(p.load_window_joules(), None);
     }
 }

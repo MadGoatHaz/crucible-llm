@@ -873,13 +873,16 @@ impl BenchmarkSequence {
                 }
                 // CF-03: the persisted (whole-run) J/token denominator spans
                 // every engine that ran — by persist time all slots (A..F) are
-                // filled, matching the full power trace the numerator uses.
+                // filled, matching the full load window the numerator uses.
                 let total_tokens = self.all_engines_tokens();
                 let mut e = profile(&trace, None, total_tokens);
                 if let Some(b) = g.backend() {
                     e.vendor = Some(b.vendor().to_string());
                     e.model = b.model().map(str::to_string);
                 }
+                // H3: the persisted numerator is the full load window, not the
+                // bounded display trace.
+                apply_load_window(&mut e, g.load_window_joules(), total_tokens);
                 Some(e)
             });
         let engine_results = EngineResults {
@@ -925,11 +928,7 @@ impl BenchmarkSequence {
         let mut metrics: Vec<StreamMetricRow> = Vec::new();
         if let Some(results) = (*self.slots.speed.load()).clone() {
             for r in &results {
-                let mut row = StreamMetricRow::from_speed_result(
-                    r,
-                    &session.session_id,
-                    1,
-                );
+                let mut row = StreamMetricRow::from_speed_result(r, &session.session_id, 1);
                 // CF-02 parity with the headless path: populate
                 // `reasoning_tokens` when the server reported the detail.
                 if let Some(t) = r.reasoning_tokens {
@@ -1278,7 +1277,7 @@ impl BenchmarkSequence {
         // Harvest the poller's accumulated power trace plus the backend's
         // vendor + model (the 100 ms task filled the trace; we only read it
         // here, never on the timing path).
-        let (trace, vendor, model) = match &self.hw {
+        let (trace, vendor, model, load_joules) = match &self.hw {
             Some(poller) => {
                 let g = poller.lock().ok();
                 match g {
@@ -1287,16 +1286,21 @@ impl BenchmarkSequence {
                             .backend()
                             .map(|b| (Some(b.vendor().to_string()), b.model().map(str::to_string)))
                             .unwrap_or((None, None));
-                        (p.trace().to_vec(), vendor, model)
+                        (p.trace().to_vec(), vendor, model, p.load_window_joules())
                     }
-                    None => (Vec::new(), None, None),
+                    None => (Vec::new(), None, None, None),
                 }
             }
-            None => (Vec::new(), None, None),
+            None => (Vec::new(), None, None, None),
         };
         let mut energy = profile(&trace, None, total_tokens);
         energy.vendor = vendor;
         energy.model = model;
+        // H3: the numerator is the full load window (the cumulative counter
+        // sliced to [load_started, load_ended]), not the bounded 6-min
+        // display trace — so a run longer than the trace capacity integrates
+        // the whole window (CF-03). The trace still supplies the stats.
+        apply_load_window(&mut energy, load_joules, total_tokens);
         let summary = match energy.joules_per_token {
             Some(jpt) => {
                 let peak = energy
@@ -1458,6 +1462,22 @@ fn summary_tokens_sweep(slot: &ResultSlot<SweepResult>) -> u64 {
     match slot.load().as_ref() {
         Some(result) => result.levels.iter().map(|l| l.total_tokens).sum(),
         None => 0,
+    }
+}
+
+/// H3: apply the load-window numerator to a trace-profiled [`EnergyResult`].
+///
+/// The `joules` (and the derived `joules_per_token`) come from the poller's
+/// cumulative `load_window_joules` (the *full* load window), not the bounded
+/// 6-min display trace — so a run longer than the trace capacity integrates
+/// the whole window and the numerator spans the same interval as the "all
+/// engines" denominator (CF-03). The other stats (peak / avg / utilization /
+/// VRAM) stay trace-based (the display ring). `None` (no load window — the
+/// N/A case) leaves the trace-profiled values untouched.
+fn apply_load_window(energy: &mut EnergyResult, load_joules: Option<f64>, total_tokens: u64) {
+    if let Some(j) = load_joules {
+        energy.joules = j;
+        energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
     }
 }
 
