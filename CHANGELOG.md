@@ -2,7 +2,7 @@
 
 All notable changes to Crucible LLM.
 
-## [Unreleased]
+## [0.1.6] - 2026-10-18
 
 ### Added
 - **NIAH (C1) matrix configurable in the TUI** — `niah_contexts` / `niah_depths` / `niah_custom` are now first-class editable fields in the Config view (View 6) and the Setup flow's stage-3 form, with `k`/`M` suffix support matching the CLI. The ladders display through the engine's shared `human_size` formatter, blank/invalid input falls back to the built-in defaults (lenient, not a hard error), and a single `parsed_niah()` helper keeps the run (`to_config`) and persist (`save`) paths in lockstep.
