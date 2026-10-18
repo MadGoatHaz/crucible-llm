@@ -370,12 +370,29 @@ fn view3_renders_color_coded_grid_from_published_result() {
     let buf = render_needle(&app, 120, 40);
     let text = buf_text(&buf);
 
-    // The grid title and the full size/depth axis labels.
+    // The grid title. F3: the grid renders the *published result's* own
+    // axes — this 2×2 custom-ladder result shows exactly its two size
+    // rows; the default const ladder no longer pads the grid with unrun
+    // 8k…128k rows (before F3 the matrix was 7×11 and every lookup on the
+    // non-2k/4k rows missed → `···`).
     assert!(text.contains("NEEDLE-IN-A-HAYSTACK MATRIX"));
-    for label in ["2k", "4k", "8k", "16k", "32k", "64k", "128k"] {
-        assert!(text.contains(label), "missing size row {label}");
-    }
+    assert!(text.contains("2k"), "missing the 2k size row");
+    assert!(text.contains("4k"), "missing the 4k size row");
     assert!(text.contains("100%"));
+    // Every cell of the published result ran → no unrun placeholders, and
+    // no default-ladder size rows (16k/32k/64k appear nowhere else in the
+    // view, so their absence proves the axes come from the result).
+    assert_eq!(
+        text.matches("···").count(),
+        0,
+        "a fully-run 2×2 grid has no unrun cells: {text}"
+    );
+    for label in ["16k", "32k", "64k"] {
+        assert!(
+            !text.contains(label),
+            "default-ladder row {label} must not pad a custom-ladder result"
+        );
+    }
 
     // The three color classes are present in the grid (cyberpunk:
     // nominal = mint, throttled = electric purple, failed = hot pink).

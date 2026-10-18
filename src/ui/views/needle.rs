@@ -22,9 +22,6 @@ use crate::engines::capability::{context_size_label, NiahCellState, NIAH_DEPTHS,
 use crate::ui::app::{fmt, App};
 use crate::ui::theme::{self, style, Theme};
 
-/// Needle depths, 0%…100% in 10% steps (the engine's `NIAH_DEPTHS`).
-const DEPTHS: [u8; 11] = NIAH_DEPTHS;
-
 /// Render the NIAH view into `area`.
 pub fn render(area: Rect, app: &App, f: &mut Frame) {
     let th = app.active_theme;
@@ -44,8 +41,23 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // the `n` key, never this path).
     let result = &*app.niah.load();
 
+    // F3: the grid's axes come from the *published result* — a
+    // custom-ladder run (`--niah-contexts` / `--niah-depths` /
+    // `--niah-custom`, the TUI config form) has its own sizes/depths, and
+    // rendering the default const ladders made every cell lookup miss
+    // (the whole matrix read `···`, the PASS % `--`). The consts render
+    // only the empty / pre-run state (no result published yet).
+    let sizes: &[u32] = result
+        .as_ref()
+        .map(|r| r.sizes.as_slice())
+        .unwrap_or(&NIAH_SIZES);
+    let depths: &[u8] = result
+        .as_ref()
+        .map(|r| r.depths.as_slice())
+        .unwrap_or(&NIAH_DEPTHS);
+
     let mut header: Vec<Cell> = vec![Cell::from("SIZE")];
-    for &d in &DEPTHS {
+    for &d in depths {
         header.push(Cell::from(format!("{d:>3}%")));
     }
     header.push(Cell::from("PASS %"));
@@ -55,7 +67,7 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // qualified label (`128k (approx.)` = 14 chars + margin); the depth
     // columns and the pass-rate column keep their percentages.
     let mut widths = vec![Constraint::Length(16)];
-    widths.extend(std::iter::repeat_n(Constraint::Percentage(6), DEPTHS.len()));
+    widths.extend(std::iter::repeat_n(Constraint::Percentage(6), depths.len()));
     widths.push(Constraint::Percentage(11));
 
     // Issue #4: the row labels come from the shared `context_size_label`
@@ -63,11 +75,11 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     // use) — with no `--tokenizer` the `chars/4` sizes read
     // `128k (approx.)`, with one they read plain `128k`.
     let approx = app.niah_approximate();
-    for (i, _) in NIAH_SIZES.iter().enumerate() {
-        let label = context_size_label(NIAH_SIZES[i], approx);
+    for &size in sizes {
+        let label = context_size_label(size, approx);
         let mut cells = vec![Cell::from(label).style(style::value(th))];
-        for &depth in &DEPTHS {
-            let (glyph, st) = match result.as_ref().and_then(|r| r.cell(NIAH_SIZES[i], depth)) {
+        for &depth in depths {
+            let (glyph, st) = match result.as_ref().and_then(|r| r.cell(size, depth)) {
                 // Option C: a truncated-by-reasoning cell (all-CoT /
                 // zero-content) renders as a distinct 4th marker — it is NOT a
                 // retrieval failure (red `✗`), it's an inconclusive (budget)
@@ -88,10 +100,7 @@ fn render_grid(area: Rect, app: &App, th: Theme, f: &mut Frame) {
         }
         // The per-size pass rate, color-coded by the ≥80 / 50–79 / <50 bar
         // (`--` until the row has been run).
-        let (pr_text, pr_style) = match result
-            .as_ref()
-            .and_then(|r| r.size_pass_rate(NIAH_SIZES[i]))
-        {
+        let (pr_text, pr_style) = match result.as_ref().and_then(|r| r.size_pass_rate(size)) {
             Some(p) => (
                 fmt::format_pct(p),
                 Style::default().fg(pass_rate_color(th, p)),
@@ -128,15 +137,41 @@ fn pass_rate_color(th: Theme, p: f64) -> Color {
 /// confirmation hint when idle.
 fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     let slot = &app.niah;
-    let requests = NIAH_SIZES.len() * NIAH_DEPTHS.len();
+    // F3: the request count comes from the *actual* ladder, not the
+    // default consts — a custom-ladder run (`--niah-contexts 16k,64k
+    // --niah-depths 0,50,100`) is 6 requests, not 77. The published
+    // result's axes when one exists; the configured run's axes (the
+    // `niah_custom` single size takes precedence over `niah_contexts`,
+    // mirroring `NiahEngineConfig::engine`) while a run is in flight or
+    // before the first run; the default consts only when nothing is
+    // configured and nothing has run.
+    let (requests, n_sizes, n_depths) = match &*slot.load() {
+        Some(r) if !slot.is_running() => {
+            (r.sizes.len() * r.depths.len(), r.sizes.len(), r.depths.len())
+        }
+        _ => match app.niah_config.as_ref() {
+            Some(cfg) => {
+                let sizes = match cfg.niah_custom {
+                    Some(_) => 1,
+                    None => cfg.niah_contexts.len(),
+                };
+                let depths = cfg.niah_depths.len();
+                (sizes * depths, sizes, depths)
+            }
+            None => (
+                NIAH_SIZES.len() * NIAH_DEPTHS.len(),
+                NIAH_SIZES.len(),
+                NIAH_DEPTHS.len(),
+            ),
+        },
+    };
     let status = if app.seq.is_running() {
         "Locked — NIAH runs as Engine C1 in the active benchmark sequence ([N] disabled)"
             .to_string()
     } else if slot.is_running() {
         format!(
             "Running NIAH matrix… {requests} requests ({} sizes × {} depths), one stream per cell · [Space] pauses",
-            NIAH_SIZES.len(),
-            NIAH_DEPTHS.len()
+            n_sizes, n_depths
         )
     } else if let Some(r) = &*slot.load() {
         format!(
@@ -148,8 +183,7 @@ fn render_legend(area: Rect, app: &App, th: Theme, f: &mut Frame) {
     } else {
         format!(
             "[N] runs a new NIAH test — {requests} requests ({} sizes × {} depths); [Y] confirms",
-            NIAH_SIZES.len(),
-            NIAH_DEPTHS.len()
+            n_sizes, n_depths
         )
     };
     // The dimmed `ℹ` note explaining what the matrix measures.
@@ -338,5 +372,90 @@ mod tests {
         assert!(buf_text(&buf).contains("truncated by reasoning"));
         // The panel's Accuracy line breaks out the truncated count (Option C).
         assert!(buf_text(&buf).contains("1 truncated-by-reasoning"));
+    }
+
+    // ── F3: the grid renders the result's actual axes ────────────────────
+
+    #[test]
+    fn grid_custom_ladder_renders_its_actual_axes() {
+        use crate::engines::capability::NiahResult;
+        let mut app = crate::ui::app::App::new();
+        app.view = crate::ui::app::View::Needle;
+
+        // A custom-ladder result (the old code rendered the default
+        // 7×11 const grid and every lookup missed → all `···` / `--`).
+        let mut r = NiahResult::new(vec![1000, 500000], vec![0, 100]);
+        r.cells[0].target_tokens = 1000;
+        r.cells[0].retrieved = true;
+        r.cells[0].ttft_s = 0.1;
+        r.cells[0].state = NiahCellState::Nominal;
+        r.cells[1].target_tokens = 1000;
+        r.cells[1].retrieved = true;
+        r.cells[1].ttft_s = 0.1;
+        r.cells[1].state = NiahCellState::Nominal;
+        r.cells[2].target_tokens = 500000;
+        r.cells[2].retrieved = false;
+        r.cells[2].ttft_s = 0.9;
+        r.cells[2].state = NiahCellState::Failed;
+        r.cells[3].target_tokens = 500000;
+        r.cells[3].retrieved = false;
+        r.cells[3].ttft_s = 0.9;
+        r.cells[3].state = NiahCellState::Failed;
+        app.niah.store(r);
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text = buf_text(terminal.backend().buffer());
+
+        // The grid renders the result's own 2 rows × 2 depth columns —
+        // its actual axes, not the default 7×11 const ladders.
+        assert!(text.contains("1k"), "the 1000-token row label: {text}");
+        assert!(text.contains("500k"), "the 500000-token row label: {text}");
+        assert!(text.contains("100.0%"), "the 1k row pass rate: {text}");
+        assert!(text.contains("0.0%"), "the 500k row pass rate: {text}");
+        // Every cell ran → no `···` placeholders anywhere in the view.
+        assert_eq!(
+            text.matches("···").count(),
+            0,
+            "a fully-run custom-ladder grid has no unrun cells: {text}"
+        );
+        // The run cells render their state glyphs (green nominal, red fail).
+        assert!(
+            buf_colors(terminal.backend().buffer())
+                .iter()
+                .any(|(s, c)| s == "●" && *c == Theme::Cyberpunk.success()),
+            "a retrieved cell renders the nominal glyph"
+        );
+        assert!(
+            buf_colors(terminal.backend().buffer())
+                .iter()
+                .any(|(s, c)| s == "✗" && *c == Theme::Cyberpunk.danger()),
+            "a failed cell renders the failure glyph"
+        );
+    }
+
+    #[test]
+    fn grid_empty_state_uses_the_default_ladders() {
+        // No result published yet (the empty / pre-run state): the grid
+        // renders the default const ladders — 7 sizes × 11 depths = 77
+        // unrun cells.
+        let mut app = crate::ui::app::App::new();
+        app.view = crate::ui::app::View::Needle;
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend terminal");
+        terminal
+            .draw(|f| render(f.area(), &app, f))
+            .expect("render frame");
+        let text = buf_text(terminal.backend().buffer());
+        assert_eq!(
+            text.matches("···").count(),
+            NIAH_SIZES.len() * NIAH_DEPTHS.len(),
+            "the empty grid shows the full default ladder: {text}"
+        );
+        assert!(text.contains("PASS %"), "{text}");
     }
 }

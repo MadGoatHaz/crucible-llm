@@ -83,9 +83,13 @@ fn without_tokenizer_the_niah_grid_and_long_context_bar_show_approx() {
     assert!(grid.contains("2k (approx.)"), "2k row qualified: {grid}");
     assert!(grid.contains("8k (approx.)"), "8k row qualified: {grid}");
     assert!(grid.contains("32k (approx.)"), "32k row qualified: {grid}");
+    // F3: the grid renders the result's own axes (2k/8k/32k) — a size the
+    // result does not have (128k) must not appear as a grid row (before F3
+    // the default const ladder padded the grid with 7 rows, so this passed
+    // only because of the bug).
     assert!(
-        grid.contains("128k (approx.)"),
-        "largest row qualified: {grid}"
+        !grid.contains("128k (approx.)"),
+        "the result has no 128k row — the default ladder must not pad the grid: {grid}"
     );
 
     // View 1 (the Live capability bar): the reliable-up-to threshold is
