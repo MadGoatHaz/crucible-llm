@@ -110,8 +110,10 @@ Crucible ships three complete color themes, and the whole TUI re-skins when you 
 
 ### Reading the Concurrency View (View 2)
 - **Table**: One row per concurrency level. Shows aggregate AND per-stream speed.
-- **Recommendation**: "Practical Sweet Spot" = where each user still gets ≥30 t/s (29.4 t/s effective with the 2% margin)
-- **Graph**: Visual curve of throughput vs users
+- **Two distinct numbers** — read each where it belongs:
+  - **Practical Sweet Spot** (the recommendation panel) — the most users you can **host** where *each* still gets ≥30 t/s (29.4 t/s effective with the 2% margin). This is the "how many users to serve comfortably" number.
+  - **Max Throughput** (marked on the curve) — the server's **peak aggregate** t/s level (the sweep envelope: the last level before the saturation knee, else the aggregate peak). This is a max-throughput number, not a hosting-comfort number.
+- **Graph**: Visual curve of throughput vs users; the max-throughput level is highlighted.
 
 ### Reading the NIAH View (View 3)
 - **Matrix**: Rows = context size (the configured ladder — default 2k→128k), shows pass rate
@@ -221,6 +223,15 @@ Crucible also monitors CPU power and includes it in total system energy:
 The system power line shows: `System: 2,920 W (GPU 2,847 + CPU 73)`
 
 Your $/1M token cost reflects TRUE system draw, not just the GPU.
+
+### Energy: How It's Computed
+
+- **Full-run figures.** J/token, power (avg/peak), and cost are integrated over the **entire active load window** (from the first engine to the last), not a fixed display slice — so a long run is measured over its full duration.
+- **Real token denominator.** J/token = total energy ÷ the **real prompt + completion tokens** actually processed by every engine that ran (the NIAH C1 cells count their real prompt tokens, not a generation-cap estimate).
+- **Clamped, validated power.** GPU power is plausibility-clamped (NVIDIA to ≤1.5× TDP; a **per-model TDP fallback** engages when the card's power-limit queries fail, logging a WARN; a 1000 W global ceiling is the last resort), so phantom readings can't silently inflate the numbers.
+- **Idle baseline subtracted.** The measured no-load floor is subtracted before integrating, so the figure is the load-attributable energy.
+- **N/A, never a silent 0.** With no power telemetry (no GPU / driver, non-Linux host) every derived metric is `N/A` — never `0.0` (which would claim "free" inference).
+- **`cpu_power_estimated` flag.** When the CPU side of the draw is the fixed 40 W estimate (no RAPL / Super I/O), the result is labeled as estimated in the TUI and exports.
 
 ## Headless / CLI Mode
 
@@ -346,7 +357,7 @@ Look at the Concurrency view's "Practical Sweet Spot." That's your answer.
 - Each additional user beyond that makes everyone slower
 
 ### What's the headline number?
-That's **Flat Out (Engine F)** — it uses your server's optimal user count (from the Concurrency sweet spot) for a **60-second full-load test**. The aggregate t/s it reports is the single number to quote when comparing servers or configurations. If you didn't run Concurrency first, it falls back to a small default load (3 streams).
+That's **Flat Out (Engine F)** — it loads your server at its **max-throughput concurrency level** (the sweep envelope: the last level before the saturation knee, else the peak aggregate) for a **60-second full-load test**. This is distinct from the Concurrency view's **Practical Sweet Spot**, which is the *hosting* recommendation (how many users to keep comfortable); Flat Out measures the server's *peak aggregate* throughput, so the two numbers answer different questions and are not contradictory. The aggregate t/s it reports is the single number to quote when comparing servers or configurations. If you didn't run Concurrency first, it falls back to a small default load (3 streams).
 
 ### Can I trust this model?
 - **Reasoning ≥ 90%**: Yes, for most tasks

@@ -50,7 +50,7 @@ Real-time throughput graph with auto-scaling y-axis, engine-transition markers, 
 | **C2 · Reasoning** | 13 deterministic math / logic / code challenges, strictly checked | How **smart** is the model? |
 | **C3 · Structured** | JSON compliance across 3 schema-complexity levels under real constrained decoding (`json_schema`, strict) where the backend supports it — with a clearly-flagged hint fallback — + grammar speed penalty | Can you **trust it** for API / agent tool-calling? |
 | **D · Energy** | GPU power + utilization monitoring. Auto-detects NVIDIA, AMD, or Intel. Measures watts, Joules/token, temperature, VRAM, clocks | What's the **power cost**? |
-| **F · Flat Out** | runs at the server's **sweet-spot concurrency** for 60 s — aggregate + per-stream t/s at real-world full load | What's the **headline number** to quote when comparing setups? |
+| **F · Flat Out** | runs at the server's **max-throughput concurrency** (the sweep envelope) for 60 s — aggregate + per-stream t/s at real-world full load | What's the **headline number** to quote when comparing setups? |
 
 By default a run executes **A, B, C1, C2, C3, F** — and **Engine D auto-enables when a GPU is detected** (it must run on the machine with the GPU; no GPU → off, no N/A panels). **All seven engines are individually selectable** — via `--engine <name>` (repeatable, or `--engine all`), the `CRUCIBLE_ENGINE` variable, the config file's `engines` object, and the TUI (Setup / View 6) — in headless *and* TUI runs: an explicit selection is always respected (A is not unconditional, D is not unselectable).
 
@@ -314,14 +314,14 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 
 ### Energy (Engine D)
 
-- GPU **power draw** (watts) sampled at 100 ms during inference; energy is the trapezoidal `∫P(t)dt` over the **100 ms hardware trace**, windowed to the active load (phase-aware: separate prefill vs. decode average power), not the coarse 1 Hz graph history.
-- **Joules/token** = `∫P(t)dt / total_tokens` — the denominator spans **every engine that ran** (not just A+B) — the silicon-efficiency metric for comparing quantizations and hardware.
+- GPU **power draw** (watts) sampled at 100 ms during inference; energy is the trapezoidal `∫P(t)dt` integrated over the **full active load window** (first engine to last, not a fixed display slice), with the measured idle baseline subtracted so the integral is the load-attributable draw (phase-aware: separate prefill vs. decode average power), not the coarse 1 Hz graph history. Power is **plausibility-clamped** (NVIDIA to ≤1.5× TDP — with a per-model TDP fallback + WARN when the card's power-limit queries fail — and a 1000 W global ceiling as last resort), so phantom readings can't silently inflate the figures.
+- **Joules/token** = `∫P(t)dt / total_tokens` — the denominator is the **real prompt + completion tokens** actually processed by **every engine that ran** (the NIAH C1 cells count their real prompt tokens, not a generation-cap estimate; a `chars/4` estimate is used only as a labeled fallback when a server reports no usage). The `cpu_power_estimated` flag is surfaced in the TUI whenever the CPU side of the draw is the fixed 40 W estimate (no RAPL / Super I/O). The silicon-efficiency metric for comparing quantizations and hardware.
 - **Requires a local GPU with driver support** — Crucible auto-detects **NVIDIA (NVML, on by default), AMD (sysfs/hwmon), or Intel (Level Zero, with a sysfs fallback)** at startup and activates the matching backend. On a remote or driverless host it degrades gracefully to **N/A** (never a failure, never a spurious `0.0`).
 - **Effectively Linux-only, by design** — every GPU power backend reads Linux interfaces (NVML, sysfs/hwmon, Level Zero), so the energy feature is a Linux feature: on a non-Linux host it degrades to N/A (with the CPU-side estimate labeled) while the rest of the suite runs unchanged.
 
 ### Flat Out (Engine F)
 
-- **Real-world maximum throughput** — the server loaded at its **concurrency sweet spot** (Engine B's recommendation) for a full **60 seconds** (`max_tokens` clamped to the model's probed max context, `ignore_eos` on).
+- **Real-world maximum throughput** — the server loaded at its **max-throughput concurrency** (Engine B's sweep *envelope*: the last level before the saturation knee, else the peak aggregate — a max-throughput number, distinct from the *practical sweet spot* hosting recommendation) for a full **60 seconds** (`max_tokens` clamped to the model's probed max context, `ignore_eos` on).
 - **Aggregate t/s** is the headline number: `total_tokens / 60 s`. **Per-stream t/s** uses the same **dual denominators** as Engine B — `tps_per_completed_stream` (capacity) and `tps_per_requested_stream` (user-experience) — plus a `failed_stream_ratio` flag.
 - **Honest counting:** when the 60 s abort prevents a terminal `usage` frame, the token count falls back to re-tokenization and is **flagged** (`tokens_estimated`, `≈ … (est.)`); a uniform HTTP-400 / zero-token run surfaces as a `config_error`, never a silent 0 t/s.
 - Without a prior sweep it falls back to a small default load (3 streams). This is the "one number" to quote when comparing setups.

@@ -421,14 +421,14 @@ Power consumption and energy efficiency of inference. "What does it cost, in jou
    - **Cross-platform CPU/RAM** (`sysinfo`): global CPU usage %, RAM used/total. Available on every host.
    - Each sample is appended to a bounded rolling trace (3600 samples = 6 minutes of power history).
 
-2. **During the benchmark run**, energy is integrated from the **100 ms `HwSample` trace** using the **trapezoidal rule**, windowed to the active load (`[load_start, load_end]`):
+2. **During the benchmark run**, energy is integrated over the **full active load window** (`[load_start, load_end]`) from the poller's **cumulative joule counter** (advanced by the trapezoidal rule each 100 ms tick) — not the bounded 6-minute display trace, so a long run is measured over its entire duration:
     ```
-    Energy = Σ (P(i) + P(i+1)) / 2 × Δt(i)
+    Energy = Σ (P(i) + P(i+1)) / 2 × Δt(i)        (over the full load window)
     ```
-    where `P(i)` is the instantaneous power in watts and `Δt(i)` is the time between samples. A missing power reading (e.g., `power_usage()` fails on some vGPU hosts) contributes nothing — the integral simply spans from the last known reading to the next. The 1 Hz aggregate history is **graph-only** (View 4's charts) — too coarse to measure a sub-second TTFT. Phase-aware **prefill vs. decode average power** also samples the 100 ms trace, so even a sub-second prefill yields a *real* phase power (the overall-average fallback survives only for a TTFT under ~100 ms).
+    where `P(i)` is the **load-attributable** system power — the measured total draw (GPU + CPU) **minus the frozen idle baseline** (clamped non-negative) — and `Δt(i)` is the time between samples. The integral spans the same window as the "all engines" denominator (CF-03 pairing restored for arbitrary run lengths). A missing power reading (e.g., `power_usage()` fails on some vGPU hosts) contributes nothing — the integral simply spans from the last known reading to the next. The 1 Hz aggregate history is **graph-only** (View 4's charts) — too coarse to measure a sub-second TTFT. Phase-aware **prefill vs. decode average power** also samples the 100 ms trace, so even a sub-second prefill yields a *real* phase power (the overall-average fallback survives only for a TTFT under ~100 ms).
 
 3. **At run completion**, the energy profile is computed:
-    - **Joules/Token** = total energy ÷ total tokens generated **by every engine that ran** (A+B+C1+C2+C3+F — real counts where the result type carries them, labeled `chars/4` estimates for the capability engines) — the honest denominator, not an A+B-only subset that inflates the figure
+    - **Joules/Token** = total energy ÷ the **real prompt + completion tokens** actually processed **by every engine that ran** (A+B+C1+C2+C3+F) — the NIAH (C1) cells count their real per-cell prompt tokens (not the old `cells × gen-cap` estimate), and C2/C3 (plus any C1 cell whose server reported no usage) fall back to a clearly-labeled `chars/4` / gen-cap estimate — the honest denominator, not an A+B-only subset that inflates the figure
    - **Peak power** (watts)
    - **Average power** (watts) = total energy ÷ span of power-bearing samples
    - **Peak VRAM** (bytes and ratio)
@@ -579,17 +579,17 @@ Total system power = Σ(GPU power) + CPU power. Feeds the energy integral and $/
 
 ### Power Plausibility
 
-All GPU backends apply a clamp: readings >1000W are treated as errors (no single GPU draws more). NVIDIA additionally flags readings >2× TDP and caps them at 1.5× TDP, where the TDP reference is the card's *default* power-management limit (`nvmlDeviceGetPowerManagementDefaultLimit` — the factory TDP, not user-settable), falling back to the current limit (`nvmlDeviceGetPowerManagementLimit`) if the default query is unsupported. Anomalous readings are logged once (warn-once latch) and capped.
+All GPU backends apply a clamp: readings >1000W are treated as errors (no single GPU draws more). NVIDIA additionally caps any reading above 1.5× TDP at 1.5× TDP, where the TDP reference is the card's *default* power-management limit (`nvmlDeviceGetPowerManagementDefaultLimit` — the factory TDP, not user-settable), falling back to the current limit (`nvmlDeviceGetPowerManagementLimit`) if the default query is unsupported. **When both NVML limit queries fail** (a class of host where the TDP was previously `None` and a phantom reading like ~989 W on a 200 W A4000 passed the 1000 W global cap silently), the clamp falls back to a **per-model TDP table** keyed on the card's marketing name (e.g. A4000 → 200 W, A5000 → 230, A6000 → 300, L4 → 72, L40 → 350, A100 → 400, H100 → 700, 4090 → 450), so a known card's phantom reading can never pass unflagged; this degradation is **WARNed once per device** (and a stronger note when even the table has no entry, leaving only the 1000 W global ceiling). Anomalous readings are logged once (warn-once latch) and capped.
 
 ## Engine F: Flat Out
 
 ### What It Measures
 
-Real-world maximum throughput: the server's **total** tokens/sec when it is loaded at its **concurrency sweet spot** — the user count Engine B recommends. This is the "one number" to quote when comparing servers or configurations, because it measures the deployment at the load you would actually run it.
+Real-world maximum throughput: the server's **total** tokens/sec when it is loaded at its **max-throughput concurrency level** — the sweep *envelope* (the last level before the saturation knee, else the peak aggregate). This is the "one number" to quote when comparing servers or configurations, because it measures the deployment at its peak aggregate load. It is deliberately distinct from Engine B's **practical sweet spot** (the *hosting* recommendation — the most users where each still gets ≥ ~29.4 t/s): Flat Out is the max-throughput finale, not the hosting-comfort number, so the two are kept separate everywhere they are reported.
 
 ### Methodology
 
-1. **Read the stream count** from Engine B's stored sweep result: the practical sweet spot (the highest level where every user still gets ≥ 29.4 t/s — 30 ideal with a 2% margin). When Engine B did not run, fall back to a small default load (3 streams, tagged `default`).
+1. **Read the stream count** from Engine B's stored sweep result via the shared **`flatout_streams_for`** helper (used by both the TUI `sequence` path and the headless path, so they always agree): it returns the **max-throughput level** — the sweep *envelope* (the last level before the saturation knee, else the peak aggregate), tagged `concurrency_max_throughput`. When Engine B did not run (no sweep curve), it falls back to a small default load (3 streams, tagged `default`). The **practical sweet spot** (the per-stream hosting recommendation) is a distinct number and is *not* what Flat Out consumes.
 2. **Spawn all `n` streams together** via the shared `WorkerPool`, each sending the same minimal (~15-token) open-ended prompt so prefill is <100 ms — negligible against the 60-second window.
 3. **`max_tokens = 100,000`, clamped to the model's probed max context, + `ignore_eos`** — effectively unlimited, so the *only* stop condition is the **60-second window** (`WINDOW_SECS`). Before the run the engine probes `GET /v1/models` for the model's max context (`max_model_len` / `max_context` / `context_length` / …) and clamps `max_tokens` to `context − prompt tokens` (floored at 1); a uniform HTTP-400 / zero-token run then surfaces as a `config_error` ("requested tokens exceed model limit"), **never** a silent 0 t/s. `ignore_eos` keeps llama.cpp servers from ending a stream on the model's own end-token; other backends ignore the field (graceful degradation).
 4. **Abort at 60 s** — the supervisor task is dropped, every worker task and its socket closes, and the server stops generating.
@@ -736,7 +736,7 @@ The act of measuring must not perturb the system. This is enforced architectural
 
 I report **per-user experience**, not just aggregate numbers.
 
-- Engine B's headline recommendation is the **practical sweet spot** (the highest level where per-stream t/s ≥ 30 — 29.4 effective with the 2% margin), not the peak aggregate throughput. 64 users at 2.6 t/s each is not "fast."
+- Engine B's headline recommendation is the **practical sweet spot** (the highest level where per-stream t/s ≥ 30 — 29.4 effective with the 2% margin), not the peak aggregate throughput. 64 users at 2.6 t/s each is not "fast." The **max-throughput level** (the sweep envelope) is a distinct number — it is what Flat Out (Engine F) runs at, never conflated with the practical sweet spot.
 - ITL percentiles (p50, p90, p99, p99.9) show the *distribution*, not just the mean. A p99 of 500ms means 1% of tokens take a half-second — the user perceives stutter even if the average is 30ms.
 - NIAH reports pass rates per context size, not just an overall percentage. The degradation curve is the actionable data.
 - Structured output reports per-case checks (valid JSON, schema, fields, types) — not just a boolean. You see *exactly what failed*.
