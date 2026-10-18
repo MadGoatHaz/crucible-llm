@@ -40,7 +40,9 @@ use crate::engines::capability::{
 };
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::StreamCountSource;
-use crate::engines::flatout::{FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT, WINDOW_SECS};
+use crate::engines::flatout::{
+    flatout_streams_for, FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT, WINDOW_SECS,
+};
 use crate::engines::hardware::{profile, EnergyResult};
 use crate::engines::speed::{SpeedEngine, SpeedResult};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
@@ -1307,21 +1309,16 @@ impl BenchmarkSequence {
     /// [`DEFAULT_STREAM_COUNT`] streams. Returns the one-line summary.
     async fn run_flatout(&self) -> String {
         self.slots.flatout.set_running(true);
+        // The shared helper guarantees the TUI and headless paths consume
+        // the same max-throughput level (the envelope); the practical
+        // sweet spot is only the fallback when no curve exists.
         let (stream_count, source) = self
             .slots
             .concurrency
             .load()
             .as_ref()
             .as_ref()
-            .map(|r| {
-                // The max-throughput level (the envelope); the practical
-                // sweet spot only as the fallback when no curve exists.
-                let n = r
-                    .envelope()
-                    .map(|e| e.sweet_spot)
-                    .unwrap_or(r.sweet_spot);
-                (n, StreamCountSource::ConcurrencyMaxThroughput)
-            })
+            .map(flatout_streams_for)
             .unwrap_or((DEFAULT_STREAM_COUNT, StreamCountSource::Default));
         let engine = match FlatOutEngine::new(&self.cfg) {
             Ok(e) => e,

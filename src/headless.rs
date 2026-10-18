@@ -34,9 +34,9 @@ use crate::engines::speed::{
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, context_size_label, summarize_sweep, FlatOutEngine, FlatOutResult, NiahEngine,
-    NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource, StructuredEngine,
-    StructuredResult, SweepResult,
+    build_sweep, context_size_label, flatout_streams_for, summarize_sweep, FlatOutEngine,
+    FlatOutResult, NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource,
+    StructuredEngine, StructuredResult, SweepResult,
 };
 use crate::hw::{CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS};
 use crate::log::{Context, RunLogger};
@@ -379,13 +379,10 @@ pub fn run_headless(
                     ));
                 }
                 let r = sweep.run().await;
-                // Flat Out runs at the max-throughput level (the sweep
-                // envelope); the practical sweet spot only as the fallback
-                // when no curve exists.
-                flatout_streams = Some((
-                    r.envelope().map(|e| e.sweet_spot).unwrap_or(r.sweet_spot),
-                    StreamCountSource::ConcurrencyMaxThroughput,
-                ));
+                // The shared helper (also used by the TUI sequence path)
+                // guarantees headless and TUI consume the same max-
+                // throughput level (the envelope).
+                flatout_streams = Some(flatout_streams_for(&r));
                 // FIX 3: the headless [B] summary leads with the
                 // practical (per-stream usability) sweet spot, with
                 // the pure-throughput knee as reference.

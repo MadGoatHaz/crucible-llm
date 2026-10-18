@@ -62,6 +62,7 @@ use thiserror::Error;
 use crate::client::pool::{PoolEvent, WorkerPool};
 use crate::client::{authoritative_tokens, StreamError, StreamEvent};
 use crate::config::Config;
+use crate::engines::concurrency::SweepResult;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::log::{Context, RunLogger};
 use crate::metrics::histogram::LatencyHistogram;
@@ -165,6 +166,23 @@ impl StreamCountSource {
             Self::Default => "default",
         }
     }
+}
+
+/// The `(stream count, source)` Flat Out should use given a completed
+/// Engine B sweep: the **max-throughput level** (the sweep *envelope* —
+/// the last level before the saturation knee, else the peak-aggregate
+/// level), falling back to the practical sweet spot only when no curve
+/// exists ([`SweepResult::envelope`] is `None` for an empty sweep).
+///
+/// A single shared pure helper so the TUI (`sequence.rs`) and headless
+/// (`headless.rs`) paths can never diverge on which level — or which
+/// source label — Flat Out consumes.
+#[must_use]
+pub fn flatout_streams_for(r: &SweepResult) -> (usize, StreamCountSource) {
+    (
+        r.envelope().map(|e| e.sweet_spot).unwrap_or(r.sweet_spot),
+        StreamCountSource::ConcurrencyMaxThroughput,
+    )
 }
 
 /// The complete Flat Out result: `n` concurrent streams (the max-

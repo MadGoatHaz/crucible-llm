@@ -71,8 +71,8 @@ pub use concurrency::{
     USABLE_PER_STREAM_TPS,
 };
 pub use flatout::{
-    FlatOutEngine, FlatOutResult, StreamCountSource, DEFAULT_STREAM_COUNT, MAX_TOKENS,
-    MINIMAL_PROMPT, WINDOW_SECS,
+    flatout_streams_for, FlatOutEngine, FlatOutResult, StreamCountSource, DEFAULT_STREAM_COUNT,
+    MAX_TOKENS, MINIMAL_PROMPT, WINDOW_SECS,
 };
 pub use hardware::{
     fragmentation_warning, integrate_joules, joules_per_token, profile, EnergyResult,
