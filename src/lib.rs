@@ -11,6 +11,7 @@ pub mod hw;
 pub mod log;
 pub mod metrics;
 pub mod prompt;
+pub mod report;
 pub mod sse;
 pub mod storage;
 pub mod timing;
