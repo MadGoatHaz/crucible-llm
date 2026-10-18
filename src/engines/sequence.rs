@@ -1224,10 +1224,20 @@ impl BenchmarkSequence {
         total += summary_tokens_speed(&self.slots.speed);
         // Engine B — real sweep total tokens.
         total += summary_tokens_sweep(&self.slots.concurrency);
-        // Engine C1 (NIAH) — estimate: run cells × the 64-token gen cap.
+        // Engine C1 (NIAH) — the **real** per-cell prompt + completion tokens
+        // (H2). The old `run_cells × NIAH_MAX_GEN_TOKENS` estimate ignored the
+        // ~2.79 M real prompt tokens and over-counted the ~2.3k real output
+        // tokens ~68×. A cell with no usage block
+        // (`completion_tokens == None`) falls back to the labeled
+        // `NIAH_MAX_GEN_TOKENS` gen-cap for its output side only.
         if let Some(niah) = (*self.slots.niah.load()).as_ref() {
-            let run_cells = niah.cells.iter().filter(|c| c.target_tokens > 0).count();
-            total += (run_cells as u64) * NIAH_MAX_GEN_TOKENS as u64;
+            for c in niah.cells.iter().filter(|c| c.target_tokens > 0) {
+                let completion = match c.completion_tokens {
+                    Some(n) => n,
+                    None => NIAH_MAX_GEN_TOKENS as u64, // labeled gen-cap fallback
+                };
+                total += c.prompt_tokens + completion;
+            }
         }
         // Engine C2 (Reasoning) — estimate: chars/4 over the response text.
         if let Some(r) = (*self.slots.reasoning.load()).as_ref() {
@@ -2081,6 +2091,73 @@ mod tests {
             flatout: false,
         });
         assert_eq!(s.all_engines_tokens(), 0);
+    }
+
+    /// H2: a NIAH result with known per-cell prompt + completion tokens
+    /// yields the *real* sum in the C1 denominator, not the old
+    /// `run_cells × gen-cap` product (which over-counted the ~2.3k real
+    /// output tokens ~68× and dropped the ~2.79 M real prompt tokens).
+    #[test]
+    fn all_engines_tokens_uses_real_niah_prompt_and_completion() {
+        let s = seq(EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: true,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        });
+        // Two run cells with real usage: (prompt 8000, completion 15) and
+        // (prompt 32000, completion 20) → the real C1 sum is 40035, not the
+        // old 2 × 2048 = 4096.
+        let mut r = NiahResult::new(vec![8000, 32000], vec![0]);
+        r.cells[0].target_tokens = 8000;
+        r.cells[0].prompt_tokens = 8000;
+        r.cells[0].completion_tokens = Some(15);
+        r.cells[1].target_tokens = 32000;
+        r.cells[1].prompt_tokens = 32000;
+        r.cells[1].completion_tokens = Some(20);
+        s.slots.niah.store(r);
+        let all = s.all_engines_tokens();
+        assert_eq!(
+            all,
+            8000 + 15 + 32000 + 20,
+            "the real prompt+completion sum: {all}"
+        );
+        assert_ne!(
+            all,
+            2 * NIAH_MAX_GEN_TOKENS as u64,
+            "not the old gen-cap product"
+        );
+    }
+
+    /// H2: a NIAH cell with no usage block (`completion_tokens == None`)
+    /// falls back to the labeled `NIAH_MAX_GEN_TOKENS` gen-cap for its output
+    /// side (defensive — the server reported neither a usage block).
+    #[test]
+    fn all_engines_tokens_falls_back_to_the_gen_cap_when_usage_is_absent() {
+        let s = seq(EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: true,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        });
+        // One run cell with a known prompt but no completion (no usage block).
+        let mut r = NiahResult::new(vec![8000], vec![0]);
+        r.cells[0].target_tokens = 8000;
+        r.cells[0].prompt_tokens = 8000;
+        r.cells[0].completion_tokens = None;
+        s.slots.niah.store(r);
+        let all = s.all_engines_tokens();
+        assert_eq!(
+            all,
+            8000 + NIAH_MAX_GEN_TOKENS as u64,
+            "the labeled gen-cap fallback: {all}"
+        );
     }
 
     // ── the sequence run itself (no network: empty engines no-op) ───────

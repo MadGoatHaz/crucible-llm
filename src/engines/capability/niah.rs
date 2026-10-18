@@ -456,6 +456,20 @@ pub struct NiahCell {
     /// zero CoT (thinking suppression worked). Set by
     /// [`NiahEngine::run_cell`] from [`StreamOutcome::usage_details`].
     pub reasoning_tokens: Option<u64>,
+    /// The **prompt** (input) tokens for this cell (H2): the server-reported
+    /// `usage.prompt_tokens`, falling back to the document's `token_count`
+    /// (the `chars/4` estimate when no `--tokenizer`). Always a real value —
+    /// the C1 J/token denominator's *input* side. Set by
+    /// [`NiahEngine::run_cell`].
+    pub prompt_tokens: u64,
+    /// The **completion** (output) tokens for this cell (H2): the
+    /// server-reported `usage.completion_tokens`, or `None` when the backend
+    /// reported no usage block (the honest "not reported" case — mirrors
+    /// [`reasoning_tokens`](Self::reasoning_tokens)). The C1 denominator's
+    /// *output* side; `None` falls back to the labeled
+    /// [`NIAH_MAX_GEN_TOKENS`] gen-cap estimate. Set by
+    /// [`NiahEngine::run_cell`].
+    pub completion_tokens: Option<u64>,
     /// Time-to-first-token, seconds (`T3 − T1`; `0.0` on stream failure).
     pub ttft_s: f64,
     /// Prefill throughput, tokens/s (prompt tokens ÷ TTFT).
@@ -486,6 +500,8 @@ impl NiahCell {
             retrieved: false,
             truncated_by_reasoning: false,
             reasoning_tokens: None,
+            prompt_tokens: 0,
+            completion_tokens: None,
             ttft_s: 0.0,
             prefill_tps: 0.0,
             state: NiahCellState::Failed,
@@ -802,6 +818,13 @@ impl NiahResult {
                     // the calibration measurement of a model's reasoning
                     // usage.
                     "reasoning_tokens": c.reasoning_tokens,
+                    // H2: the real per-cell prompt + completion token counts
+                    // (the C1 J/token denominator). `prompt_tokens` is always
+                    // present (usage, or the doc `chars/4` fallback);
+                    // `completion_tokens` is `null` when the backend reported
+                    // no usage block — additive, back-compatible.
+                    "prompt_tokens": c.prompt_tokens,
+                    "completion_tokens": c.completion_tokens,
                     "ttft_s": c.ttft_s,
                     "prefill_tps": c.prefill_tps,
                     "state": state_name(c.state),
@@ -1161,6 +1184,10 @@ impl NiahEngine {
             .usage
             .map(|u| u.prompt_tokens)
             .unwrap_or(doc.token_count as u64);
+        // H2: the server-reported completion (output) tokens for the cell —
+        // `None` when the backend reported no usage block (the honest
+        // "not reported" case). The C1 J/token denominator's output side.
+        let completion_tokens = outcome.usage.map(|u| u.completion_tokens);
         let prefill_tps = if ttft > 0.0 {
             prompt_tokens as f64 / ttft
         } else {
@@ -1172,6 +1199,8 @@ impl NiahEngine {
             retrieved,
             truncated_by_reasoning,
             reasoning_tokens,
+            prompt_tokens,
+            completion_tokens,
             ttft_s: ttft,
             prefill_tps,
             // Assigned by `compute_states` once the whole matrix is in.
@@ -1462,6 +1491,11 @@ mod tests {
             retrieved,
             truncated_by_reasoning: false,
             reasoning_tokens: None,
+            // H2: the test fixture reports no usage block (the honest
+            // "not reported" case) — the real-sum path is covered by the
+            // dedicated all_engines_tokens test.
+            prompt_tokens: size as u64,
+            completion_tokens: None,
             ttft_s: ttft,
             prefill_tps: if ttft > 0.0 { size as f64 / ttft } else { 0.0 },
             state: NiahCellState::Failed,
