@@ -327,11 +327,21 @@ pub struct GpuPowerMonitor {
 
     // ---- 1 Hz power history (the power-over-time graph only) ----
     pub history: Vec<PowerSample>,
-    /// The 100 ms `HwSample` power trace — the **source** for the energy /
-    /// cost integration and the prefill / decode phase-power measurements
+    /// The 100 ms `HwSample` power trace — the **source** for the prefill /
+    /// decode phase-power measurements and the energy integral's fallback
     /// (CF-19 / CF-37: re-based off the 1 Hz history, which now serves only
     /// the graph). Bounded to [`HW_TRACE_CAPACITY`].
     pub trace: Vec<HwSample>,
+    /// The **full load-window** energy (joules, idle-subtracted) published
+    /// by the poller: the cumulative `∫P(t)dt` sliced to
+    /// `[load_started, load_ended]` (F1/I2). `None` until the poller opens
+    /// a load window. When `Some`, [`Self::energy_joules`] returns this
+    /// instead of integrating the bounded trace — the trace drops its
+    /// oldest samples first, so any run longer than [`HW_TRACE_CAPACITY`]
+    /// (6 min) would otherwise under-report the headline energy. This is
+    /// the same quantity Engine D's headline uses (`load_window_joules` in
+    /// `engines/sequence.rs`), so View 4 and Engine D can never diverge.
+    pub load_window_joules: Option<f64>,
     /// When the load (post-idle) window began; `None` while idle / before a
     /// run. The history and `duration` are measured from here.
     pub load_started: Option<MonotonicInstant>,
@@ -401,6 +411,7 @@ impl Default for GpuPowerMonitor {
             last_token_at: None,
             history: Vec::new(),
             trace: Vec::new(),
+            load_window_joules: None,
             load_started: None,
             load_ended: None,
             run_started: None,
@@ -457,6 +468,9 @@ impl GpuPowerMonitor {
         self.last_token_at = None;
         self.history.clear();
         self.trace.clear();
+        // F1/I2: a fresh run has no load window yet — the previous run's
+        // published full-window value must not leak into this one.
+        self.load_window_joules = None;
         self.idle_samples.clear();
         self.cpu_idle_samples.clear();
         self.idle_finalized = false;
@@ -776,6 +790,18 @@ impl GpuPowerMonitor {
 
     // ── derived metrics (pure; the panel reads these) ─────────────────────
 
+    /// The **full load-window** energy (joules) published by the poller
+    /// (F1/I2) — the cumulative `∫P(t)dt` sliced to
+    /// `[load_started, load_ended]`, idle-subtracted. `None` until the
+    /// poller opens a load window (the headless poll()-only path, or before
+    /// `begin_run` / `start_load`). This is the same quantity Engine D's
+    /// headline uses, so the panel and the D result agree for runs of any
+    /// length — including those longer than the bounded 6-min trace.
+    #[must_use]
+    pub fn load_window_joules(&self) -> Option<f64> {
+        self.load_window_joules
+    }
+
     /// The load-window duration in seconds. While the run is live this
     /// grows with the clock; once [`Self::end_load`] has closed the window
     /// it is **frozen** at the final value (`0.0` before load / no clock).
@@ -789,7 +815,11 @@ impl GpuPowerMonitor {
 
     /// Total energy `∫P(t)dt` over the **test window**, joules.
     ///
-    /// Integrated from the **100 ms `HwSample` trace** (CF-37 — not the 1 Hz
+    /// **F1/I2:** when the poller has published the **full load-window**
+    /// cumulative ([`Self::load_window_joules`]), that value is returned —
+    /// it spans the whole window for runs of any length. Otherwise (a
+    /// manually built monitor, or before a load window opens) the energy is
+    /// integrated from the **100 ms `HwSample` trace** (CF-37 — not the 1 Hz
     /// history, which now serves only the power-over-time graph), so a short
     /// / sub-second run resolves at 10× the cadence.
     ///
@@ -801,6 +831,15 @@ impl GpuPowerMonitor {
     /// excluded — the energy, and the avg-power / cost / J-token figures
     /// derived from it, are final the moment the window closes.
     pub fn energy_joules(&self) -> f64 {
+        // F1/I2: prefer the poller's **full load-window** cumulative when it
+        // has published one — the bounded trace drops its oldest samples
+        // first, so any run longer than the trace capacity (6 min) would
+        // otherwise under-report the headline energy here while Engine D
+        // (the full window) reports the true total. Both are
+        // idle-subtracted the same way, so the figures agree.
+        if let Some(j) = self.load_window_joules {
+            return j;
+        }
         // H4: subtract the total system idle floor so the integral is
         // load-attributable (a measured host removes its measured floor; an
         // estimated host removes the estimate's idle contribution).
@@ -2202,5 +2241,64 @@ mod tests {
         m.begin_run();
         assert_eq!(m.cpu_power_w, 0.0);
         assert_eq!(m.cpu_power_peak_w, 0.0);
+    }
+
+    // ── F1/I2: the full load window is the headline energy source ───────
+
+    /// F1/I2: once the poller publishes the **full load-window** cumulative,
+    /// `energy_joules` returns it — not the bounded trace integral, which
+    /// drops its oldest samples first and under-reports any run longer than
+    /// the 6-min trace capacity. The derived kWh / avg-power / J-token
+    /// figures all follow the full window.
+    #[test]
+    fn energy_joules_prefers_the_full_load_window_over_the_bounded_trace() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(50.0);
+        m.start_load();
+        m.has_power = true;
+        // A small bounded trace (a few 100 ms samples at 100 W) — the kind
+        // of ring a >6-min run would have shrunk to its tail.
+        let a = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        m.trace = vec![a, b];
+        let trace_only = m.energy_joules();
+        assert!(trace_only > 0.0 && trace_only < 100.0, "small trace: {trace_only}");
+        // The poller publishes the full window (e.g. a 13-min run): the
+        // headline energy is the full window, not the trace tail.
+        m.load_window_joules = Some(180_000.0); // 180 kJ over the whole run
+        assert_eq!(m.energy_joules(), 180_000.0);
+        assert_eq!(m.load_window_joules(), Some(180_000.0));
+        // kWh follows the full window.
+        assert!((m.energy_kwh() - 180_000.0 / 3_600_000.0).abs() < 1e-12);
+        // …and so does the J/token figure (tokens present): the full-window
+        // joules divided by the token count.
+        m.prompt_tokens = 1_000_000;
+        m.total_tokens = 100_000;
+        let jpt = m.joules_per_token().expect("power + tokens");
+        assert!(
+            (jpt - 180_000.0 / 100_000.0).abs() < 1e-9,
+            "J/token divides the full window: {jpt}"
+        );
+    }
+
+    /// F1/I2: a fresh run clears the published window — the previous run's
+    /// full-window value never leaks into the next run's panel.
+    #[test]
+    fn begin_run_clears_the_published_load_window() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        m.load_window_joules = Some(50_000.0);
+        assert_eq!(m.energy_joules(), 50_000.0);
+        m.begin_run();
+        assert_eq!(m.load_window_joules, None, "fresh run: no window yet");
+        // Without a published window the integral falls back to the trace.
+        let a = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        m.trace = vec![a, b];
+        assert!(m.energy_joules() < 100.0, "trace fallback: {}", m.energy_joules());
     }
 }

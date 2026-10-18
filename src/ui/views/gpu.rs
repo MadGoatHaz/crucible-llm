@@ -197,9 +197,17 @@ fn render_system_power(
         ]),
         idle_line,
         {
+            // F1/I2: the N/A gate — a GPU present *without* power telemetry
+            // renders `N/A`, never a silent `0.000 kWh` (the module's own
+            // N/A rule, `monitor.rs` header).
+            let energy_text = if mon.has_power {
+                format!("{kwh:.3} kWh")
+            } else {
+                "N/A".to_string()
+            };
             let mut energy_spans = vec![
                 Span::styled("  Energy: ", style::label(th)),
-                Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
+                Span::styled(energy_text, style::value(th)),
                 Span::styled(format!("   @ ${:.2}/kWh", rate), style::info(th)),
                 Span::styled("   Duration: ", style::footer(th)),
                 Span::styled(fmt::format_duration(dur), style::value(th)),
@@ -1223,6 +1231,37 @@ mod tests {
     }
 
     // ── cost analysis ($/1M tokens) ──────────────────────────────────────
+
+    /// F1/I2: a GPU present *without* power telemetry renders the Energy
+    /// line as `N/A` — never a silent `0.000 kWh` (the module's N/A rule).
+    #[test]
+    fn view4_energy_line_is_na_without_power_telemetry() {
+        // A fresh monitor: no power reading has ever arrived.
+        let mut app = app_with_monitor(GpuPowerMonitor::default().with_rate(0.16));
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("Energy: N/A"), "N/A energy gate: {text}");
+        assert!(
+            !text.contains("0.000 kWh"),
+            "no silent 0.000 kWh without telemetry: {text}"
+        );
+    }
+
+    /// F1/I2: the Energy line reads the **full load-window** cumulative the
+    /// poller published — not the bounded 6-min trace tail. A tiny trace
+    /// with a large published window renders the window's kWh.
+    #[test]
+    fn view4_energy_uses_the_full_load_window() {
+        let mut mon = sample_monitor();
+        // Shrink the trace to what a >6-min run's bounded ring would hold
+        // (a few samples) and publish the full window: exactly 1.000 kWh.
+        mon.trace = mon.trace.split_off(mon.trace.len() - 2);
+        mon.load_window_joules = Some(3_600_000.0);
+        let mut app = app_with_monitor(mon);
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("1.000 kWh"), "full-window kWh: {text}");
+    }
 
     #[test]
     fn view4_cost_analysis_shows_input_output_and_blended() {

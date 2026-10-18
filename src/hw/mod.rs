@@ -564,6 +564,9 @@ impl HwPoller {
         self.load_energy_start = Some(self.energy_joules);
         self.load_energy_end = None;
         self.monitor.start_load();
+        // F1/I2: publish the (now zero) full-window cumulative to the
+        // monitor so View 4's energy reads the same quantity Engine D uses.
+        self.monitor.load_window_joules = self.load_window_joules();
     }
 
     /// The GPU & Power monitor (View 4) state.
@@ -580,6 +583,8 @@ impl HwPoller {
         // window closed — the Engine D numerator's upper bound (frozen).
         self.load_energy_end = Some(self.energy_joules);
         self.monitor.end_load();
+        // F1/I2: freeze the published full-window value on the monitor.
+        self.monitor.load_window_joules = self.load_window_joules();
     }
 
     /// Publish the current [`GpuPowerMonitor`] state into the metrics
@@ -749,6 +754,12 @@ impl HwPoller {
         if self.trace.len() > self.capacity {
             self.trace.drain(0..self.trace.len() - self.capacity);
         }
+        // F1/I2: keep the monitor's published full-window cumulative fresh
+        // on *every* advance (the live value tracks `current − start` until
+        // the window closes). This covers both the TUI `tick` path and the
+        // headless `poll`-only path, so View 4's headline energy is always
+        // the same full-window quantity Engine D uses.
+        self.monitor.load_window_joules = self.load_window_joules();
         sample
     }
 
@@ -1136,6 +1147,43 @@ mod tests {
         // begin_run resets the window (the N/A rule for a fresh run).
         p.begin_run();
         assert_eq!(p.load_window_joules(), None);
+    }
+
+    /// F1/I2: the poller publishes its **full load-window** cumulative to
+    /// the monitor on every tick / window transition, so View 4's energy
+    /// (`monitor.energy_joules`) reads the *same* quantity Engine D's
+    /// headline uses — the two can never diverge, even on a run longer
+    /// than the bounded 6-min trace.
+    #[test]
+    fn poller_publishes_the_full_window_to_the_monitor() {
+        let mut p = HwPoller::new().with_capacity(10); // a tiny ring
+        p.begin_run();
+        // Before the window opens the monitor carries no published value.
+        assert_eq!(p.monitor().load_window_joules(), None);
+        p.start_load();
+        // The window opens at zero; a few ticks publish the running total.
+        let gpu = Some(GpuSample {
+            power_watts: Some(200.0),
+            ..Default::default()
+        });
+        for _ in 0..12 {
+            p.advance(&gpu);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The trace ring holds only the last 10 samples, but the published
+        // full window spans all 12 — and the monitor's headline energy is
+        // exactly that full window (== the Engine D numerator).
+        let full = p.load_window_joules().expect("open window");
+        assert_eq!(p.monitor().load_window_joules(), Some(full));
+        assert_eq!(p.monitor().energy_joules(), full, "View 4 == Engine D numerator");
+        // Close the window: the published value freezes.
+        p.end_load();
+        let frozen = p.load_window_joules().expect("closed window");
+        assert_eq!(p.monitor().load_window_joules(), Some(frozen));
+        assert_eq!(p.monitor().energy_joules(), frozen, "frozen full window");
+        // …and a fresh run clears it again.
+        p.begin_run();
+        assert_eq!(p.monitor().load_window_joules(), None);
     }
 
     /// B5: arming a run (`begin_run` → idle window → `start_load`) opens a
