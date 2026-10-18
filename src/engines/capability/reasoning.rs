@@ -515,10 +515,7 @@ impl ReasoningEngine {
         // §7 timing deltas (the worker owns the quanta stamps).
         let ts: StreamTimestamps = outcome.timestamps;
         let stream_time = ts.total_nanos().unwrap_or(0) as f64 / 1e9;
-        let ttft = match ts.ttft_nanos() {
-            Some(n) => n as f64 / 1e9,
-            None => stream_time,
-        };
+        let ttft = challenge_ttft(&ts);
         // CF-49 / F2: the decode speed is the **content (answer) phase**
         // rate — the committed answer's token count over the content window
         // (first → last content frame), NOT the blended think+write rate.
@@ -867,6 +864,15 @@ fn content_phase(
         }
     }
     (first, last, count)
+}
+
+/// F6 (CF-25): one challenge's TTFT in seconds — `T3 − T1`, or the
+/// **`0.0` N/A sentinel** when no token frame ever arrived (a usage-only
+/// stream, a failure). Engine A's convention: the total stream time is
+/// NOT a TTFT (the old fallback mislabeled total latency as first-token
+/// time), and summary consumers filter `ttft > 0.0`.
+fn challenge_ttft(ts: &StreamTimestamps) -> f64 {
+    ts.ttft_nanos().map(|n| n as f64 / 1e9).unwrap_or(0.0)
 }
 
 /// F2: the **answer-phase token count** for one C2 challenge, with an
@@ -1516,5 +1522,57 @@ mod tests {
             (speed - 3.0 / window).abs() < 1e-9,
             "the frame tally over the content window: {speed}"
         );
+    }
+
+    // ── F6: the no-frame TTFT is the N/A sentinel, not total time ────────
+
+    #[test]
+    fn f6_no_frame_stream_ttft_is_the_na_sentinel() {
+        // A stream that never delivered a token frame (a usage-only /
+        // failed stream): TTFT is the `0.0` N/A sentinel — NOT the total
+        // stream time (the CF-25 anti-pattern Engine A explicitly fixed).
+        let t0 = MonotonicInstant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t0),
+            t2: None,
+            t3: None,
+            t_end: Some(MonotonicInstant::now()),
+        };
+        assert!(
+            ts.total_nanos().unwrap() > 0,
+            "the stream did take real total time"
+        );
+        assert_eq!(
+            challenge_ttft(&ts),
+            0.0,
+            "no token frame → the 0.0 N/A sentinel, not the total"
+        );
+        // A summary that filters `ttft > 0.0` (Engine A's convention)
+        // excludes it.
+        let ttfts = [challenge_ttft(&ts), 0.3];
+        let filtered: Vec<f64> = ttfts.iter().copied().filter(|t| *t > 0.0).collect();
+        assert_eq!(filtered, vec![0.3], "the N/A sentinel is filtered out");
+    }
+
+    #[test]
+    fn f6_token_frame_stream_ttft_is_t3_minus_t1() {
+        // The measured case is unchanged: a stream with token frames
+        // reports `T3 − T1`.
+        let t0 = MonotonicInstant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let t3 = MonotonicInstant::now();
+        let ts = StreamTimestamps {
+            t0: Some(t0),
+            t1: Some(t0),
+            t2: Some(t0),
+            t3: Some(t3),
+            t_end: Some(MonotonicInstant::now()),
+        };
+        let expected = t0.delta_nanos(&t3) as f64 / 1e9;
+        let got = challenge_ttft(&ts);
+        assert!((got - expected).abs() < 1e-9, "{got} vs {expected}");
+        assert!(got > 0.0);
     }
 }
