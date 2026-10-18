@@ -156,6 +156,10 @@ fn render_system_power(
     let peak = mon.peak_power_w;
     let kwh = mon.energy_kwh();
     let dur = mon.duration_sec();
+    // H4: flag the CPU component as an *estimate* (not a measurement) when
+    // the CPU power backend is the labeled fixed-estimate fallback — the
+    // estimate is surfaced, not hidden (previously `--json` only).
+    let cpu_est = if mon.cpu_power_estimated { " ~" } else { "" };
     // The idle-baseline line: the measured floor, or a live "measuring
     // idle…" status while the manual [i] window is running (it re-records
     // the no-load baseline after a run).
@@ -183,21 +187,30 @@ fn render_system_power(
             Span::styled(format_w(mon.system_power_w()), style::value(th)),
             Span::styled(
                 format!(
-                    "  (GPU {} + CPU {})",
+                    "  (GPU {} + CPU {}{})",
                     format_w(mon.total_power_w),
-                    format_w(mon.cpu_power_w)
+                    format_w(mon.cpu_power_w),
+                    cpu_est
                 ),
                 style::footer(th),
             ),
         ]),
         idle_line,
-        Line::from(vec![
-            Span::styled("  Energy: ", style::label(th)),
-            Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
-            Span::styled(format!("   @ ${:.2}/kWh", rate), style::info(th)),
-            Span::styled("   Duration: ", style::footer(th)),
-            Span::styled(fmt::format_duration(dur), style::value(th)),
-        ]),
+        {
+            let mut energy_spans = vec![
+                Span::styled("  Energy: ", style::label(th)),
+                Span::styled(format!("{kwh:.3} kWh"), style::value(th)),
+                Span::styled(format!("   @ ${:.2}/kWh", rate), style::info(th)),
+                Span::styled("   Duration: ", style::footer(th)),
+                Span::styled(fmt::format_duration(dur), style::value(th)),
+            ];
+            // H4: flag the energy figure as estimate-inclusive when the CPU
+            // power is the labeled fixed-estimate fallback.
+            if mon.cpu_power_estimated {
+                energy_spans.push(Span::styled(" (CPU ~)", style::footer(th)));
+            }
+            Line::from(energy_spans)
+        },
         Line::from(vec![
             Span::styled("  Avg: ", style::label(th)),
             Span::styled(
@@ -1182,6 +1195,31 @@ mod tests {
         assert!(text.contains("AvgT"), "avg temp column: {text}");
         assert!(text.contains("MaxT"), "max temp column: {text}");
         assert!(text.contains("72°C"), "peak temp value: {text}");
+    }
+
+    /// H4: the `cpu_power_estimated` flag is surfaced in the TUI System line
+    /// (the `~` marker on the CPU component) — not just in `--json`. A
+    /// measured (RAPL / Super-I-O) CPU carries no marker.
+    #[test]
+    fn view4_system_line_flags_estimated_cpu_power() {
+        // Estimated CPU power → the marker is shown.
+        let mut mon = sample_monitor();
+        mon.cpu_power_estimated = true;
+        let mut app = app_with_monitor(mon);
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 40);
+        assert!(text.contains("~"), "the estimate marker is shown: {text}");
+
+        // Measured CPU power → no estimate marker.
+        let mut mon2 = sample_monitor();
+        mon2.cpu_power_estimated = false;
+        let mut app2 = app_with_monitor(mon2);
+        app2.view = crate::ui::app::View::Gpu;
+        let text2 = render_text(&app2, 120, 40);
+        assert!(
+            !text2.contains("~"),
+            "no estimate marker for a measured CPU: {text2}"
+        );
     }
 
     // ── cost analysis ($/1M tokens) ──────────────────────────────────────

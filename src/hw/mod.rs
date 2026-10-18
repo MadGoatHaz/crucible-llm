@@ -506,6 +506,11 @@ impl HwPoller {
     #[must_use]
     pub fn with_cpu_power(mut self, cpu_power: Option<Box<CpuPowerBackend>>) -> Self {
         self.cpu_power = cpu_power;
+        // H4: surface the CPU "estimated" flag on the monitor so the View 4
+        // panel can label it (the `--json` path captures it from the backend
+        // directly).
+        self.monitor.cpu_power_estimated =
+            self.cpu_power.as_ref().is_some_and(|c| c.is_estimated());
         self
     }
 
@@ -692,12 +697,20 @@ impl HwPoller {
         // system draw* (GPU + CPU). A sample with neither contributes
         // nothing (N/A rule) — the integral spans from the last known
         // reading to the next.
-        let p_total = Self::sample_total_watts(&sample);
+        //
+        // H4: subtract the total system idle floor (GPU + CPU) so the
+        // cumulative integral is **load-attributable** — it removes both the
+        // constant 40 W CPU estimate and any measured no-load floor, so the
+        // energy is the work the run did, not the machine's idle draw.
+        // `0.0` before the idle window finalizes (and always in the headless
+        // poll()-only path, which never opens an idle window).
+        let idle = self.monitor.idle_system_power_w();
+        let p_total = (Self::sample_total_watts(&sample) - idle).max(0.0);
         if p_total > 0.0 {
             let p_prev = self
                 .trace
                 .last()
-                .map(Self::sample_total_watts)
+                .map(|s| (Self::sample_total_watts(s) - idle).max(0.0))
                 .unwrap_or(p_total);
             let dt = self
                 .trace
@@ -774,6 +787,7 @@ impl HwPoller {
             // the window elapses. This runs independently of the run's own
             // idle/load state, so it works after a completed run too.
             self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
+            self.monitor.record_cpu_idle(cpu_w);
             if let Some(start) = self.monitor.idle_measure_started {
                 if start.elapsed() >= std::time::Duration::from_secs(MANUAL_IDLE_WINDOW_SECS) {
                     self.monitor.finalize_idle_measurement();
@@ -783,6 +797,7 @@ impl HwPoller {
             self.monitor.record(&agg, &per_gpu, &self.gpu_names, &phase);
         } else {
             self.monitor.record_idle(agg.power_watts.unwrap_or(0.0));
+            self.monitor.record_cpu_idle(cpu_w);
         }
 
         let merged = merge_hw(

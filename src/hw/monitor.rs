@@ -279,6 +279,12 @@ pub struct GpuPowerMonitor {
     /// Idle baseline power (mean of the pre-load [`IDLE_WINDOW_SECS`]
     /// window), watts. `0.0` until measured.
     pub idle_power_w: f64,
+    /// The **CPU** component of the idle baseline (mean of the pre-load
+    /// [`IDLE_WINDOW_SECS`] window), watts (H4). The *total system* idle
+    /// floor is [`idle_power_w`](Self::idle_power_w) (GPU) + this (CPU); the
+    /// energy integral subtracts [`idle_system_power_w`](Self::idle_system_power_w)
+    /// so the result is load-attributable.
+    pub idle_cpu_power_w: f64,
     /// Peak temperature (max across devices) this run, °C.
     pub max_temp_c: f64,
     /// Mean utilization (over the 1 Hz history), %.
@@ -338,8 +344,12 @@ pub struct GpuPowerMonitor {
     pub run_started: Option<MonotonicInstant>,
 
     // ---- idle-measurement scratch (writer side) ----
-    /// Aggregate power samples collected during the pre-load idle window.
+    /// Aggregate (GPU) power samples collected during the pre-load idle
+    /// window.
     pub idle_samples: Vec<f64>,
+    /// CPU power samples collected during the pre-load idle window (H4) —
+    /// the CPU component of the total system idle floor.
+    pub cpu_idle_samples: Vec<f64>,
     /// `true` once the idle baseline has been finalized.
     pub idle_finalized: bool,
     /// `true` while a *manual* "Measure Idle" window is running (the GPU
@@ -356,6 +366,13 @@ pub struct GpuPowerMonitor {
     // ---- config ----
     /// The electricity rate for cost estimation, $/kWh.
     pub rate_per_kwh: f64,
+    /// `true` when the CPU component of the system draw is the labeled
+    /// fixed-estimate fallback (no RAPL / Super-I-O sensor on the host) —
+    /// surfaced in the View 4 panel (H4) so the estimate is *shown*, not
+    /// hidden. Set from [`CpuPowerBackend::is_estimated`](
+    /// crate::hw::cpu_power::CpuPowerBackend::is_estimated) at poller
+    /// construction.
+    pub cpu_power_estimated: bool,
 }
 
 impl Default for GpuPowerMonitor {
@@ -369,6 +386,7 @@ impl Default for GpuPowerMonitor {
             total_power_w: 0.0,
             peak_power_w: 0.0,
             idle_power_w: 0.0,
+            idle_cpu_power_w: 0.0,
             max_temp_c: 0.0,
             avg_util_pct: 0.0,
             throttle_events: 0,
@@ -387,12 +405,14 @@ impl Default for GpuPowerMonitor {
             load_ended: None,
             run_started: None,
             idle_samples: Vec::new(),
+            cpu_idle_samples: Vec::new(),
             idle_finalized: false,
             measure_idle: false,
             idle_measure_started: None,
             util_sample_counts: Vec::new(),
             temp_sample_counts: Vec::new(),
             rate_per_kwh: 0.16,
+            cpu_power_estimated: false,
         }
     }
 }
@@ -422,6 +442,7 @@ impl GpuPowerMonitor {
         self.total_power_w = 0.0;
         self.peak_power_w = 0.0;
         self.idle_power_w = 0.0;
+        self.idle_cpu_power_w = 0.0;
         self.max_temp_c = 0.0;
         self.avg_util_pct = 0.0;
         self.throttle_events = 0;
@@ -437,6 +458,7 @@ impl GpuPowerMonitor {
         self.history.clear();
         self.trace.clear();
         self.idle_samples.clear();
+        self.cpu_idle_samples.clear();
         self.idle_finalized = false;
         self.measure_idle = false;
         self.idle_measure_started = None;
@@ -469,6 +491,19 @@ impl GpuPowerMonitor {
         self.total_power_w = power_w;
     }
 
+    /// Record one poll's **CPU** draw (watts) during the idle window (H4):
+    /// accumulate it for the CPU component of the total system idle floor.
+    /// No-op once the idle window is finalized (mirrors
+    /// [`Self::record_idle`]).
+    pub fn record_cpu_idle(&mut self, cpu_w: f64) {
+        if self.idle_finalized && !self.measure_idle {
+            return;
+        }
+        if cpu_w > 0.0 && self.cpu_idle_samples.len() < 1024 {
+            self.cpu_idle_samples.push(cpu_w);
+        }
+    }
+
     /// Arm a **manual** idle-baseline measurement (the GPU tab's `[i]`
     /// "Measure Idle" action): clear the idle samples and start a fresh
     /// [`MANUAL_IDLE_WINDOW_SECS`] no-load window. Unlike [`Self::begin_run`]
@@ -479,6 +514,7 @@ impl GpuPowerMonitor {
     pub fn begin_idle_measurement(&mut self) {
         self.measure_idle = true;
         self.idle_samples.clear();
+        self.cpu_idle_samples.clear();
         self.idle_measure_started = Some(MonotonicInstant::now());
     }
 
@@ -489,6 +525,10 @@ impl GpuPowerMonitor {
         if !self.idle_samples.is_empty() {
             self.idle_power_w =
                 self.idle_samples.iter().sum::<f64>() / self.idle_samples.len() as f64;
+        }
+        if !self.cpu_idle_samples.is_empty() {
+            self.idle_cpu_power_w =
+                self.cpu_idle_samples.iter().sum::<f64>() / self.cpu_idle_samples.len() as f64;
         }
         self.measure_idle = false;
         self.idle_measure_started = None;
@@ -501,6 +541,7 @@ impl GpuPowerMonitor {
         self.measure_idle = false;
         self.idle_measure_started = None;
         self.idle_samples.clear();
+        self.cpu_idle_samples.clear();
     }
 
     /// `true` while a manual idle measurement is in progress (the GPU tab
@@ -518,6 +559,13 @@ impl GpuPowerMonitor {
                 0.0
             } else {
                 self.idle_samples.iter().sum::<f64>() / self.idle_samples.len() as f64
+            };
+            // H4: the CPU component of the idle floor (the estimate's idle
+            // contribution, or a measured host's no-load CPU floor).
+            self.idle_cpu_power_w = if self.cpu_idle_samples.is_empty() {
+                0.0
+            } else {
+                self.cpu_idle_samples.iter().sum::<f64>() / self.cpu_idle_samples.len() as f64
             };
             self.idle_finalized = true;
         }
@@ -753,14 +801,18 @@ impl GpuPowerMonitor {
     /// excluded — the energy, and the avg-power / cost / J-token figures
     /// derived from it, are final the moment the window closes.
     pub fn energy_joules(&self) -> f64 {
+        // H4: subtract the total system idle floor so the integral is
+        // load-attributable (a measured host removes its measured floor; an
+        // estimated host removes the estimate's idle contribution).
+        let idle = self.idle_system_power_w();
         match (self.load_started, self.load_ended) {
             // Closed window: integrate only `[load_started, load_ended]` —
             // a completed run's energy is final the moment the window closes
             // (post-completion samples are excluded).
-            (Some(start), Some(end)) => integrate_trace(&self.trace, Some((start, end))),
+            (Some(start), Some(end)) => integrate_trace(&self.trace, Some((start, end)), idle),
             // No closed window (live run, or no load window yet): the whole
             // trace is in scope.
-            _ => integrate_trace(&self.trace, None),
+            _ => integrate_trace(&self.trace, None, idle),
         }
     }
 
@@ -790,6 +842,19 @@ impl GpuPowerMonitor {
     /// cost math are built from (GPU alone underreports the real draw).
     pub fn system_power_w(&self) -> f64 {
         self.total_power_w + self.cpu_power_w
+    }
+
+    /// The *total system* idle floor (GPU + CPU), watts (H4):
+    /// [`idle_power_w`](Self::idle_power_w) (the GPU baseline) plus
+    /// [`idle_cpu_power_w`](Self::idle_cpu_power_w) (the CPU baseline — the
+    /// estimate's idle contribution on an estimated host, or the measured
+    /// no-load floor on a RAPL / Super-I-O host). The energy integral
+    /// subtracts this from the total system draw so the result is
+    /// **load-attributable** — it removes both the constant 40 W estimate
+    /// *and* any measured no-load floor, so a number means the work it did.
+    #[must_use]
+    pub fn idle_system_power_w(&self) -> f64 {
+        self.idle_power_w + self.idle_cpu_power_w
     }
 
     /// Mean power over the test window: `energy / duration` (time-weighted).
@@ -995,10 +1060,17 @@ fn trace_system_watts(s: &HwSample) -> f64 {
 /// sample), so no interval ever bridges across an edge or a gap. An empty
 /// trace, or a window with no power-bearing samples, integrates to `0.0`
 /// (the N/A rule).
+///
+/// `idle_w` (H4) is the total system idle floor (GPU + CPU) subtracted from
+/// every sample before integrating, so the result is **load-attributable**
+/// energy (a measured host removes its measured floor; an estimated host
+/// removes the estimate's idle contribution). Clamped non-negative; `0.0`
+/// leaves the integral unchanged (the pre-H4 / no-idle case).
 #[must_use]
 fn integrate_trace(
     trace: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
+    idle_w: f64,
 ) -> f64 {
     let mut joules = 0.0f64;
     let mut prev: Option<&HwSample> = None;
@@ -1007,14 +1079,16 @@ fn integrate_trace(
             Some((start, end)) => s.t.delta_nanos(&start) == 0 && end.delta_nanos(&s.t) == 0,
             None => true,
         };
-        let p_w = trace_system_watts(s);
+        // H4: subtract the idle floor, clamped non-negative.
+        let p_w = (trace_system_watts(s) - idle_w).max(0.0);
         if !in_window || p_w <= 0.0 {
             prev = None;
             continue;
         }
         if let Some(p) = prev {
             let dt = p.t.delta_nanos(&s.t) as f64 / 1e9;
-            joules += (trace_system_watts(p) + p_w) / 2.0 * dt;
+            let p_prev = (trace_system_watts(p) - idle_w).max(0.0);
+            joules += (p_prev + p_w) / 2.0 * dt;
         }
         prev = Some(s);
     }
@@ -2015,8 +2089,8 @@ mod tests {
             "windowed energy is the two 100 W in-window samples (~5 J): {windowed}"
         );
         // …whereas the full (unwindowed) trace, which includes the 999 W
-        // edges, is much larger.
-        let full = integrate_trace(&m.trace, None);
+        // edges, is much larger (no idle baseline in this test → `idle_w=0`).
+        let full = integrate_trace(&m.trace, None, 0.0);
         assert!(
             windowed < full,
             "windowed ({windowed}) < full-trace ({full}) — the 999 W edges are excluded"
@@ -2081,6 +2155,41 @@ mod tests {
         assert!(
             with_cpu > gpu_only,
             "system energy ({with_cpu}) > GPU-only ({gpu_only})"
+        );
+    }
+
+    /// H4: the energy integral is **load-attributable** — a 50 W total-system
+    /// idle floor (30 W GPU + 20 W CPU) is subtracted from the 100 W
+    /// load-avg draw, so the run integrates ~50 W·t (load − idle), not
+    /// ~100 W·t. This removes the constant 40 W estimate (an estimated host)
+    /// *and* any measured no-load floor.
+    #[test]
+    fn energy_joules_subtracts_the_idle_baseline() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.record_idle(30.0); // GPU idle
+        m.record_cpu_idle(20.0); // CPU idle
+        m.start_load();
+        assert!(
+            (m.idle_system_power_w() - 50.0).abs() < 1e-9,
+            "the total idle floor is 30 + 20 = 50 W"
+        );
+        // Load: 80 W GPU + 20 W CPU = 100 W system. After the 50 W idle
+        // subtraction, each sample contributes 50 W (load-attributable).
+        let a = trace_sample(m.load_started.unwrap(), 80.0, 20.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = trace_sample(MonotonicInstant::now(), 80.0, 20.0);
+        m.trace = vec![a, b];
+        let load_attributable = m.energy_joules();
+        let no_subtract = integrate_trace(&m.trace, None, 0.0);
+        assert!(
+            load_attributable < no_subtract,
+            "load-attributable ({load_attributable}) < raw ({no_subtract})"
+        );
+        // ≈ half the raw (50 W vs 100 W per sample), within a loose tolerance.
+        assert!(
+            (load_attributable - no_subtract / 2.0).abs() < no_subtract * 0.2,
+            "load-attributable ≈ half the raw: {load_attributable} vs {no_subtract}"
         );
     }
 
