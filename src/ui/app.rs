@@ -1492,7 +1492,10 @@ impl App {
                             .as_ref()
                             .map(|rs| rs.iter().map(|r| r.completion_tokens).sum())
                             .unwrap_or(0);
-                        let mut e = profile(&trace, None, total_tokens);
+                        // F9: the monitor's idle floor keeps `avg_power_w`
+                        // on the same basis as the idle-subtracted joules.
+                        let idle_w = g.monitor().idle_system_power_w();
+                        let mut e = profile(&trace, None, total_tokens, idle_w);
                         if let Some(b) = g.backend() {
                             e.vendor = Some(b.vendor().to_string());
                             e.model = b.model().map(str::to_string);

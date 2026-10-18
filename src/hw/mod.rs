@@ -1129,7 +1129,7 @@ mod tests {
         assert_eq!(p.load_window_joules(), Some(cumulative));
         // The bounded trace (10 samples ≈ 0.2 s) integrates far less than the
         // full run (30 samples ≈ 0.6 s) — the H3 fix uses the cumulative.
-        let trace_only = crate::engines::hardware::integrate_joules(p.trace(), None).0;
+        let trace_only = crate::engines::hardware::integrate_joules(p.trace(), None, 0.0).0;
         assert!(
             cumulative > trace_only,
             "full run ({cumulative}) > bounded trace ({trace_only}) — H3"

@@ -87,21 +87,28 @@ pub fn build_energy_json(energy: &EnergyResult, cpu_power_estimated: bool) -> se
 /// symmetric with the TUI, which degrades to a labeled N/A without a poller.
 #[must_use]
 pub fn headless_energy(hw: &Option<Arc<Mutex<HwPoller>>>, total_tokens: u64) -> EnergyResult {
-    let (trace_d, load_joules) = hw
+    let (trace_d, load_joules, idle_w, duration) = hw
         .as_ref()
         .and_then(|h| h.lock().ok())
         .map(|g| {
             (
                 g.trace().to_vec(),
                 g.load_window_joules().or(Some(g.energy_joules())),
+                // F9: the monitor's idle floor — the trace profile and the
+                // load-window numerator are on the same load-attributable
+                // basis (0.0 in the poll()-only path until F7 opens the
+                // idle window).
+                g.monitor().idle_system_power_w(),
+                (g.monitor().duration_sec() > 0.0).then(|| g.monitor().duration_sec()),
             )
         })
         .unwrap_or_default();
-    let mut energy = profile(&trace_d, None, total_tokens);
-    if let Some(j) = load_joules {
-        energy.joules = j;
-        energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
-    }
+    let mut energy = profile(&trace_d, None, total_tokens, idle_w);
+    // H3/F9: the shared helper (the same one the TUI sequence's
+    // `persist_results` and the TUI `e`-export use) applies the
+    // load-window numerator and keeps `avg_power_w` consistent with the
+    // idle-subtracted `joules` — one definition across every surface.
+    crate::engines::sequence::apply_load_window(&mut energy, load_joules, total_tokens, duration);
     energy
 }
 

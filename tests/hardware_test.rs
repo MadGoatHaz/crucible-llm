@@ -52,7 +52,7 @@ fn constant_power_integrates_exactly() {
     let last = samples.last().unwrap().t;
     let span_s = first.delta_nanos(&last) as f64 / 1e9;
 
-    let (joules, has_power) = integrate_joules(&samples, None);
+    let (joules, has_power) = integrate_joules(&samples, None, 0.0);
     assert!(has_power);
     assert!(
         (joules - 100.0 * span_s).abs() < 1e-9,
@@ -73,11 +73,11 @@ fn window_slicing_integrates_only_the_active_window() {
         sample(c, Some(1_000), None),
     ];
     // Whole trace: 1 W across (a → c).
-    let (full, _) = integrate_joules(&samples, None);
+    let (full, _) = integrate_joules(&samples, None, 0.0);
     let full_span = a.delta_nanos(&c) as f64 / 1e9;
     assert!((full - full_span).abs() < 1e-9, "full={full}");
     // The [b, c] window (the active token output window): only (b → c).
-    let (win, has) = integrate_joules(&samples, Some((b, c)));
+    let (win, has) = integrate_joules(&samples, Some((b, c)), 0.0);
     assert!(has);
     let win_span = b.delta_nanos(&c) as f64 / 1e9;
     assert!((win - win_span).abs() < 1e-9, "win={win}");
@@ -112,12 +112,12 @@ fn missing_power_is_na_not_zero() {
         sample(a, None, Some((10_000, 100_000))),
         sample(b, None, Some((20_000, 100_000))),
     ];
-    let (joules, has_power) = integrate_joules(&samples, None);
+    let (joules, has_power) = integrate_joules(&samples, None, 0.0);
     assert!(!has_power);
     assert_eq!(joules, 0.0);
     assert_eq!(joules_per_token(&samples, None, 100), None);
 
-    let p = profile(&samples, None, 100);
+    let p = profile(&samples, None, 100, 0.0);
     assert_eq!(p.joules_per_token, None);
     assert_eq!(p.peak_power_w, None);
     assert_eq!(p.avg_power_w, None);
@@ -148,7 +148,7 @@ fn fragmentation_warning_fires_at_the_threshold() {
         sample(a, Some(50_000), Some((80 * gb, 100 * gb))),
         sample(b, Some(50_000), Some((92 * gb, 100 * gb))),
     ];
-    let p = profile(&samples, None, 10);
+    let p = profile(&samples, None, 10, 0.0);
     assert!(p.fragmentation_warning.is_some());
     assert!(p.fragmentation_warning.unwrap().contains("92%"));
 }

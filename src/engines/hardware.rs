@@ -142,6 +142,13 @@ fn within(t: &MonotonicInstant, start: &MonotonicInstant, end: &MonotonicInstant
 /// i.e. linear interpolation across gaps (the standard treatment for
 /// missing sensor samples).
 ///
+/// `idle_w` (F9 / H4) is the total system idle floor (watts) subtracted
+/// from every sample before integrating (clamped non-negative), so the
+/// result is **load-attributable** energy — the same subtraction the
+/// poller's cumulative integral and the View 4 monitor apply. `0.0`
+/// leaves the integral unchanged (the pre-F9 / no-idle-baseline case,
+/// e.g. a standalone `profile_backend` run with no measured floor).
+///
 /// Returns `(joules, has_power)`: `has_power` is `false` when no sample
 /// in scope carried a reading, in which case `joules` is `0.0` and
 /// callers **must** report any derived metric as N/A (module N/A rule).
@@ -149,6 +156,7 @@ fn within(t: &MonotonicInstant, start: &MonotonicInstant, end: &MonotonicInstant
 pub fn integrate_joules(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
+    idle_w: f64,
 ) -> (f64, bool) {
     let mut joules = 0.0f64;
     let mut has_power = false;
@@ -162,17 +170,27 @@ pub fn integrate_joules(
         if !in_window {
             continue;
         }
-        // Total *system* draw (GPU + CPU), watts. A sample with neither
-        // contributes nothing (the N/A rule) — the trapezoid spans the gap.
-        let p_w = s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
+        // Total *system* draw (GPU + CPU), watts, minus the idle floor
+        // (clamped non-negative). A sample with no reading at all is
+        // skipped — the trapezoid spans from the last known reading to the
+        // next (linear interpolation across gaps, the standard treatment
+        // for missing sensor samples). A reading *at or below* the floor
+        // contributes 0 W to the integral (mirroring the poller's
+        // cumulative integral, which carries the post-subtraction value
+        // forward and only adds an interval when the current sample is
+        // above the floor).
+        let raw = s.power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0)
             + s.cpu_power_mw.map(|m| m as f64 / 1000.0).unwrap_or(0.0);
-        if p_w <= 0.0 {
+        if raw <= 0.0 {
             continue;
         }
         has_power = true;
-        if let Some((t_prev, p_prev)) = prev {
-            let dt_s = t_prev.delta_nanos(&s.t) as f64 / 1e9;
-            joules += (p_prev + p_w) / 2.0 * dt_s;
+        let p_w = (raw - idle_w).max(0.0);
+        if p_w > 0.0 {
+            if let Some((t_prev, p_prev)) = prev {
+                let dt_s = t_prev.delta_nanos(&s.t) as f64 / 1e9;
+                joules += (p_prev + p_w) / 2.0 * dt_s;
+            }
         }
         prev = Some((&s.t, p_w));
     }
@@ -184,13 +202,19 @@ pub fn integrate_joules(
 ///
 /// `None` when no power telemetry is available or `tokens` is zero
 /// (N/A rule — never a spurious `0.0`).
+///
+/// This is the **per-stream** (Engine A, per-iteration window) concept —
+/// it integrates the raw trace with no idle floor (`idle_w = 0.0`), distinct
+/// from the run-level `energy.joules_per_token` D headline (idle-subtracted
+/// full load window ÷ all-engine tokens). The JSON export labels the two
+/// (I7c) so a consumer never conflates them.
 #[must_use]
 pub fn joules_per_token(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
     tokens: u64,
 ) -> Option<f64> {
-    let (joules, has_power) = integrate_joules(samples, window);
+    let (joules, has_power) = integrate_joules(samples, window, 0.0);
     if has_power && tokens > 0 {
         Some(joules / tokens as f64)
     } else {
@@ -200,13 +224,20 @@ pub fn joules_per_token(
 
 /// Full Engine D profile for a window: energy, power stats, peak VRAM,
 /// and the fragmentation warning.
+///
+/// `idle_w` (F9 / H4) is the total system idle floor (watts) subtracted
+/// from the energy integral **and** the mean power, so `joules` and
+/// `avg_power_w` are on the *same* (load-attributable) basis —
+/// `joules ≈ avg_power_w × duration` holds. `0.0` for a profile with no
+/// measured idle baseline (the standalone `profile_backend` path).
 #[must_use]
 pub fn profile(
     samples: &[HwSample],
     window: Option<(MonotonicInstant, MonotonicInstant)>,
     total_tokens: u64,
+    idle_w: f64,
 ) -> EnergyResult {
-    let (joules, has_power) = integrate_joules(samples, window);
+    let (joules, has_power) = integrate_joules(samples, window, idle_w);
 
     // In-scope samples (window applied once for the stats).
     let in_scope: Vec<&HwSample> = samples
@@ -319,7 +350,9 @@ pub fn profile_backend(
         }
         std::thread::sleep(interval);
     }
-    let mut r = profile(&samples, None, tokens);
+    // `idle_w = 0.0`: a standalone backend profile has no measured idle
+    // baseline (the TUI / headless paths pass the monitor's floor).
+    let mut r = profile(&samples, None, tokens, 0.0);
     r.vendor = vendor;
     r.model = model;
     r
@@ -364,7 +397,7 @@ mod tests {
             hw_sample(t0, Some(100_000), None, None),
             hw_sample(t1, Some(100_000), None, None),
         ];
-        let (joules, has_power) = integrate_joules(&samples, None);
+        let (joules, has_power) = integrate_joules(&samples, None, 0.0);
         assert!(has_power);
         let span = t0.delta_nanos(&t1) as f64 / 1e9;
         assert!(
@@ -388,16 +421,16 @@ mod tests {
         ];
         // Full trace: the trapezoid spans the gap a → c:
         // (1 W + 1 W)/2 × ~0.4 s ≈ 0.4 J.
-        let (full, has_full) = integrate_joules(&samples, None);
+        let (full, has_full) = integrate_joules(&samples, None, 0.0);
         assert!(has_full);
         assert!((0.3..0.5).contains(&full), "full={full}");
         // Window [b, c]: b has no power, c is a single point → 0 J but
         // `has_power` stays true (a reading exists in scope).
-        let (win, has) = integrate_joules(&samples, Some((b, c)));
+        let (win, has) = integrate_joules(&samples, Some((b, c)), 0.0);
         assert!(has);
         assert_eq!(win, 0.0);
         // A window that contains only the power-less sample → N/A.
-        let (empty, has_empty) = integrate_joules(&samples, Some((b, b)));
+        let (empty, has_empty) = integrate_joules(&samples, Some((b, b)), 0.0);
         assert!(!has_empty);
         assert_eq!(empty, 0.0);
     }
@@ -406,11 +439,11 @@ mod tests {
     fn missing_power_samples_yield_na_not_zero_claim() {
         let a = MonotonicInstant::now();
         let samples = vec![hw_sample(a, None, Some(10), Some(20))];
-        let (joules, has_power) = integrate_joules(&samples, None);
+        let (joules, has_power) = integrate_joules(&samples, None, 0.0);
         assert!(!has_power);
         assert_eq!(joules, 0.0);
         assert_eq!(joules_per_token(&samples, None, 100), None);
-        assert_eq!(profile(&samples, None, 100).joules_per_token, None);
+        assert_eq!(profile(&samples, None, 100, 0.0).joules_per_token, None);
     }
 
     #[test]
@@ -422,7 +455,7 @@ mod tests {
             hw_sample(b, Some(50_000), None, None),
         ];
         assert_eq!(joules_per_token(&samples, None, 0), None);
-        assert_eq!(profile(&samples, None, 0).joules_per_token, None);
+        assert_eq!(profile(&samples, None, 0, 0.0).joules_per_token, None);
     }
 
     /// CF-53: the CPU "estimated" flag defaults to `false` on a profile (the
@@ -438,7 +471,7 @@ mod tests {
             hw_sample(b, Some(50_000), None, None),
         ];
         // `profile` defaults the flag to `false`.
-        let r = profile(&samples, None, 100);
+        let r = profile(&samples, None, 100, 0.0);
         assert!(!r.cpu_power_estimated, "profile defaults the flag to false");
         // The builder sets it (what the caller does from `is_estimated`).
         let r_est = r.with_cpu_power_estimated(true);
@@ -453,7 +486,7 @@ mod tests {
             hw_sample(a, Some(200_000), Some(90 * 1000), Some(100 * 1000)),
             hw_sample(b, Some(400_000), Some(95 * 1000), Some(100 * 1000)),
         ];
-        let p = profile(&samples, None, 100);
+        let p = profile(&samples, None, 100, 0.0);
         assert_eq!(p.peak_power_w, Some(400.0));
         assert!(p.avg_power_w.is_some());
         assert_eq!(p.peak_vram_bytes, Some(95_000));
@@ -566,9 +599,61 @@ mod tests {
                 ..HwSample::default()
             },
         ];
-        let (joules, has_power) = integrate_joules(&samples, None);
+        let (joules, has_power) = integrate_joules(&samples, None, 0.0);
         assert!(has_power, "a CPU-only sample carries power");
         assert!(joules > 0.0, "CPU-only energy is positive: {joules}");
+    }
+
+    /// F9: `avg_power_w` is on the **same idle-subtracted basis** as
+    /// `joules` — `joules ≈ avg_power_w × span` holds. Before F9 the mean
+    /// power was computed from the raw (non-idle-subtracted) samples while
+    /// `joules` (once `apply_load_window` overwrites it) was idle-subtracted,
+    /// so the two disagreed.
+    #[test]
+    fn avg_power_w_is_on_the_idle_subtracted_basis() {
+        // 100 W total system draw with a 50 W idle floor → 50 W
+        // load-attributable.
+        let a = MonotonicInstant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let b = MonotonicInstant::now();
+        let samples = vec![
+            hw_sample(a, Some(100_000), None, None),
+            hw_sample(b, Some(100_000), None, None),
+        ];
+        let p = profile(&samples, None, 100, 50.0);
+        let span = a.delta_nanos(&b) as f64 / 1e9;
+        // The energy is the 50 W above-floor draw over the span.
+        assert!(
+            (p.joules - 50.0 * span).abs() < 50.0 * span * 0.01,
+            "idle-subtracted joules: {}",
+            p.joules
+        );
+        // The mean power is the same 50 W — not the raw 100 W.
+        let avg = p.avg_power_w.expect("avg power present");
+        assert!((avg - 50.0).abs() < 1.0, "avg is the load draw: {avg}");
+        // The identity F9 guarantees: joules ≈ avg × span.
+        assert!(
+            (p.joules - avg * span).abs() <= p.joules.max(1.0) * 1e-6 + 1e-9,
+            "joules ({} ) ≈ avg ({avg}) × span ({span})",
+            p.joules
+        );
+    }
+
+    /// F9: a floor at or above every sample yields zero load-attributable
+    /// energy — and `has_power` stays true (telemetry existed), so the N/A
+    /// machinery (not a silent 0.0 J/token) handles the result.
+    #[test]
+    fn floor_at_or_above_all_samples_yields_zero_energy() {
+        let a = MonotonicInstant::now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let b = MonotonicInstant::now();
+        let samples = vec![
+            hw_sample(a, Some(80_000), None, None),
+            hw_sample(b, Some(90_000), None, None),
+        ];
+        let (joules, has_power) = integrate_joules(&samples, None, 100.0);
+        assert!(has_power, "readings exist — this is not the no-telemetry N/A");
+        assert_eq!(joules, 0.0, "nothing above the floor → zero load energy");
     }
 
     // ── B3: the N/A reason distinguishes its two root causes ─────────────

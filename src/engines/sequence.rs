@@ -904,14 +904,21 @@ impl BenchmarkSequence {
                 // every engine that ran — by persist time all slots (A..F) are
                 // filled, matching the full load window the numerator uses.
                 let total_tokens = self.all_engines_tokens();
-                let mut e = profile(&trace, None, total_tokens);
+                // F9: the trace profile uses the monitor's idle floor so
+                // `avg_power_w` is on the same (load-attributable) basis as
+                // the idle-subtracted joules.
+                let idle_w = g.monitor().idle_system_power_w();
+                let mut e = profile(&trace, None, total_tokens, idle_w);
                 if let Some(b) = g.backend() {
                     e.vendor = Some(b.vendor().to_string());
                     e.model = b.model().map(str::to_string);
                 }
-                // H3: the persisted numerator is the full load window, not the
-                // bounded display trace.
-                apply_load_window(&mut e, g.load_window_joules(), total_tokens);
+                // H3: the persisted numerator is the full load window, not
+                // the bounded display trace. F9: the window duration keeps
+                // `avg_power_w` consistent with the idle-subtracted joules.
+                let duration =
+                    (g.monitor().duration_sec() > 0.0).then(|| g.monitor().duration_sec());
+                apply_load_window(&mut e, g.load_window_joules(), total_tokens, duration);
                 Some(e)
             });
         EngineResults {
@@ -1289,7 +1296,7 @@ impl BenchmarkSequence {
         // Harvest the poller's accumulated power trace plus the backend's
         // vendor + model (the 100 ms task filled the trace; we only read it
         // here, never on the timing path).
-        let (trace, vendor, model, load_joules) = match &self.hw {
+        let (trace, vendor, model, load_joules, idle_w, duration) = match &self.hw {
             Some(poller) => {
                 let g = poller.lock().ok();
                 match g {
@@ -1298,21 +1305,35 @@ impl BenchmarkSequence {
                             .backend()
                             .map(|b| (Some(b.vendor().to_string()), b.model().map(str::to_string)))
                             .unwrap_or((None, None));
-                        (p.trace().to_vec(), vendor, model, p.load_window_joules())
+                        // F9: the monitor's idle floor + load-window duration
+                        // keep the profile on the load-attributable basis.
+                        let idle_w = p.monitor().idle_system_power_w();
+                        let duration = (p.monitor().duration_sec() > 0.0)
+                            .then(|| p.monitor().duration_sec());
+                        (
+                            p.trace().to_vec(),
+                            vendor,
+                            model,
+                            p.load_window_joules(),
+                            idle_w,
+                            duration,
+                        )
                     }
-                    None => (Vec::new(), None, None, None),
+                    None => (Vec::new(), None, None, None, 0.0, None),
                 }
             }
-            None => (Vec::new(), None, None, None),
+            None => (Vec::new(), None, None, None, 0.0, None),
         };
-        let mut energy = profile(&trace, None, total_tokens);
+        let mut energy = profile(&trace, None, total_tokens, idle_w);
         energy.vendor = vendor;
         energy.model = model;
         // H3: the numerator is the full load window (the cumulative counter
         // sliced to [load_started, load_ended]), not the bounded 6-min
         // display trace — so a run longer than the trace capacity integrates
         // the whole window (CF-03). The trace still supplies the stats.
-        apply_load_window(&mut energy, load_joules, total_tokens);
+        // F9: the window duration keeps `avg_power_w` on the same
+        // idle-subtracted basis as `joules`.
+        apply_load_window(&mut energy, load_joules, total_tokens, duration);
         let summary = hardware_summary(&energy);
         self.logger
             .info(Context::EngineD, format!("Engine D complete — {summary}"));
@@ -1546,13 +1567,29 @@ pub fn sum_all_engines_tokens(
 /// cumulative `load_window_joules` (the *full* load window), not the bounded
 /// 6-min display trace — so a run longer than the trace capacity integrates
 /// the whole window and the numerator spans the same interval as the "all
-/// engines" denominator (CF-03). The other stats (peak / avg / utilization /
-/// VRAM) stay trace-based (the display ring). `None` (no load window — the
-/// N/A case) leaves the trace-profiled values untouched.
-fn apply_load_window(energy: &mut EnergyResult, load_joules: Option<f64>, total_tokens: u64) {
+/// engines" denominator (CF-03). **F9:** when `duration_sec` (the load
+/// window's span) is known, `avg_power_w` is recomputed on the *same*
+/// idle-subtracted basis (`joules / duration`) — before F9 the mean power
+/// came from the raw (non-idle-subtracted) trace while `joules` was
+/// idle-subtracted, so `joules ≠ avg_power_w × duration`. The other stats
+/// (peak / utilization / VRAM) stay trace-based (the display ring). `None`
+/// (no load window — the N/A case) leaves the trace-profiled values
+/// untouched.
+///
+/// Shared by the TUI sequence (Engine D run + `persist_results`), the TUI
+/// `e`-export, and the headless path — one definition, no divergence.
+pub fn apply_load_window(
+    energy: &mut EnergyResult,
+    load_joules: Option<f64>,
+    total_tokens: u64,
+    duration_sec: Option<f64>,
+) {
     if let Some(j) = load_joules {
         energy.joules = j;
         energy.joules_per_token = (total_tokens > 0).then(|| j / total_tokens as f64);
+        if let Some(d) = duration_sec.filter(|d| *d > 0.0) {
+            energy.avg_power_w = Some(j / d);
+        }
     }
 }
 

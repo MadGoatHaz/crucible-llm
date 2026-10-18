@@ -246,10 +246,10 @@ fn all_engine_joules_per_token_denominator_spans_every_engine() {
     // the A+B-only one — the C1/C2/C3/F tokens the numerator already paid
     // for are now in the denominator too.
     let trace = power_trace();
-    let jpt_all = profile(&trace, None, all)
+    let jpt_all = profile(&trace, None, all, 0.0)
         .joules_per_token
         .expect("power + tokens");
-    let jpt_ab = profile(&trace, None, a_b_only)
+    let jpt_ab = profile(&trace, None, a_b_only, 0.0)
         .joules_per_token
         .expect("power + tokens");
     assert!(
@@ -258,5 +258,5 @@ fn all_engine_joules_per_token_denominator_spans_every_engine() {
     );
 
     // The N/A rule: zero tokens (no engine ran) → no spurious 0.0.
-    assert_eq!(profile(&trace, None, 0).joules_per_token, None);
+    assert_eq!(profile(&trace, None, 0, 0.0).joules_per_token, None);
 }
