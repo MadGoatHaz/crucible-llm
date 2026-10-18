@@ -1931,6 +1931,7 @@ mod tests {
                     solved: 12,
                     by_category: [(5, 5), (4, 4), (3, 4)],
                 },
+                estimated: false,
             });
         app.structured_slot
             .store(crate::engines::capability::StructuredResult {

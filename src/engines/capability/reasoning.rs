@@ -51,7 +51,7 @@ use crate::config::Config;
 use crate::engines::sequence::{EngineProgress, ProgressBus, RunPause};
 use crate::engines::speed::{EngineError, SpeedEngine};
 use crate::metrics::state::MetricsState;
-use crate::sse::Chunk;
+use crate::sse::{Chunk, Usage, UsageDetails};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
 
 /// Bounded worker→engine channel capacity (same as Engine A).
@@ -298,13 +298,24 @@ pub struct ReasoningResult {
     /// One committed content span per bank entry (index-aligned; the
     /// chain-of-thought is excluded from the judged text — CF-16).
     pub responses: Vec<String>,
-    /// Per-challenge TTFT, seconds (`T3 − T1`).
+    /// Per-challenge TTFT, seconds (`T3 − T1`; the `0.0` N/A sentinel —
+    /// CF-25 — when no token frame arrived).
     pub ttfts: Vec<f64>,
     /// Per-challenge **content-phase** decode speed, tokens/s (CF-49: the
-    /// committed answer's token frames over the content window, not the
-    /// blended think+write rate).
+    /// committed answer over the content window, not the blended
+    /// think+write rate). **F2:** the numerator is the authoritative
+    /// answer-phase count — `usage.completion_tokens − reasoning_tokens`
+    /// when the server reports a `usage` block (consistent with Engine A's
+    /// CF-26 split); the observed **content frame** tally only when no
+    /// `usage` arrives (flagged by [`estimated`](Self::estimated)) — the
+    /// frame count understates batched servers (vLLM MTP / speculative
+    /// decoding) and is never presented as exact.
     pub tg_speeds: Vec<f64>,
     pub score: ReasoningScore,
+    /// **F2:** `true` when any challenge's decode-speed count fell back to
+    /// the content frame tally (the server reported no `usage` block) — an
+    /// *estimated* number (batched frames undercount), never a measured one.
+    pub estimated: bool,
 }
 
 impl ReasoningResult {
@@ -411,8 +422,10 @@ impl ReasoningEngine {
 
     /// Run one challenge: spawn a worker, drain its channel, and return
     /// the committed content span (the chain-of-thought is excluded —
-    /// CF-16) plus the §7 timing deltas.
-    async fn run_challenge(&self, challenge: &Challenge) -> (String, f64, f64) {
+    /// CF-16) plus the §7 timing deltas and the F2 `estimated` flag
+    /// (`true` when the decode-speed count fell back to the content frame
+    /// tally because the server reported no `usage` block).
+    async fn run_challenge(&self, challenge: &Challenge) -> (String, f64, f64, bool) {
         let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
         let mut worker = StreamWorker::new(
             self.client.clone(),
@@ -506,30 +519,19 @@ impl ReasoningEngine {
             Some(n) => n as f64 / 1e9,
             None => stream_time,
         };
-        // CF-49: the decode speed is the **content (answer) phase** rate —
-        // the committed content token frames over the content window
+        // CF-49 / F2: the decode speed is the **content (answer) phase**
+        // rate — the committed answer's token count over the content window
         // (first → last content frame), NOT the blended think+write rate.
         // The request suppresses the chain-of-thought (CF-16), so in the
         // common case the content phase is the whole generation; when a
         // model emits CoT despite suppression, the thinking phase is
-        // excluded from both the count and the window. (The server's
-        // `usage.completion_tokens` includes reasoning tokens, so it is not
-        // a clean content count; the observed content frame count is.)
-        let (c_first, c_last, content_frames) = content_phase(&events);
-        let tg_speed = if content_frames == 0 {
-            // No committed answer phase (pure CoT / failure / empty
-            // content): no meaningful content decode rate.
-            0.0
-        } else {
-            let content_time = match (c_first, c_last) {
-                (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
-                // A single content frame (no span) → attribute the full
-                // post-TTFT generation time to it.
-                _ => (stream_time - ttft).max(0.001),
-            };
-            content_frames as f64 / content_time
-        };
-        (response, ttft, tg_speed)
+        // excluded from both the count and the window. The count is the
+        // authoritative `completion − reasoning` when the server reports a
+        // `usage` block (Engine A's CF-26 split); the content frame tally
+        // — flagged `estimated` — only when it does not.
+        let (tg_speed, estimated) =
+            answer_phase_speed(&events, stream_time, ttft, outcome.usage, outcome.usage_details);
+        (response, ttft, tg_speed, estimated)
     }
 
     /// Run the whole bank (sequential — one stream at a time, so each
@@ -551,6 +553,7 @@ impl ReasoningEngine {
         let mut responses = Vec::with_capacity(REASONING_BANK.len());
         let mut ttfts = Vec::with_capacity(REASONING_BANK.len());
         let mut tg_speeds = Vec::with_capacity(REASONING_BANK.len());
+        let mut estimated = false;
         for (i, challenge) in REASONING_BANK.iter().enumerate() {
             // The `Space`-key pause: hold before the next challenge's
             // request goes out (an in-flight challenge always completes).
@@ -563,16 +566,18 @@ impl ReasoningEngine {
                     total: REASONING_BANK.len(),
                 });
             }
-            let (response, ttft, tg_speed) = self.run_challenge(challenge).await;
+            let (response, ttft, tg_speed, est) = self.run_challenge(challenge).await;
             responses.push(response);
             ttfts.push(ttft);
             tg_speeds.push(tg_speed);
+            estimated |= est;
         }
         let result = ReasoningResult {
             score: score_responses(&responses),
             responses,
             ttfts,
             tg_speeds,
+            estimated,
         };
         if let Some(l) = &self.logger {
             l.info(
@@ -864,11 +869,82 @@ fn content_phase(
     (first, last, count)
 }
 
+/// F2: the **answer-phase token count** for one C2 challenge, with an
+/// `estimated` flag.
+///
+/// The **Authoritative Counting Rule** (the C2 face — the same rule the
+/// live snapshot and Engine A apply, `client/stream.rs`):
+///
+/// 1. **PRIMARY** — the server's `usage` block: `completion_tokens −
+///    reasoning_tokens` (the CF-02 detail; `0` when the backend does not
+///    report it). `completion_tokens` *includes* the chain-of-thought
+///    tokens, so the subtraction is what makes this a *content*
+///    (answer-phase) count — consistent with Engine A's CF-26 split.
+/// 2. **FALLBACK** (no `usage` — a non-compliant proxy, an aborted stream)
+///    — the observed **content frame** tally, flagged `estimated`: a
+///    batched server (vLLM MTP / speculative decoding) carries several
+///    tokens per frame, so the frame count understates the true answer
+///    length (~2.4× on a vLLM-MTP server) and is never presented as
+///    exact.
+///
+/// `estimated` is `true` only when the fallback produced a non-zero count
+/// (an empty stream has no number to estimate).
+fn content_count(
+    usage: Option<Usage>,
+    usage_details: Option<UsageDetails>,
+    content_frames: u64,
+) -> (u64, bool) {
+    match usage
+        .map(|u| u.completion_tokens)
+        .filter(|&n| n > 0)
+    {
+        Some(completion) => {
+            let reasoning = usage_details.map(|d| d.reasoning_tokens).unwrap_or(0);
+            (completion.saturating_sub(reasoning), false)
+        }
+        None => (content_frames, content_frames > 0),
+    }
+}
+
+/// F2: the published C2 **answer-phase decode speed** for one finished
+/// challenge — content tokens over the content window (CF-49), where the
+/// count is the authoritative [`content_count`]:
+///
+/// * `usage` reported → `completion − reasoning` (the same count the live
+///   snapshot publishes via `SpeedEngine::single_stream_snapshot`, so the
+///   Live Monitor and the published result agree — on a usage-reporting
+///   server with thinking suppressed, the common C2 case, both read
+///   `completion / (T_last_content − T_first_content)`);
+/// * no `usage` → the content frame tally, flagged `estimated`.
+///
+/// `(0.0, false)` when there is no committed answer (pure CoT / failure /
+/// empty content) — no meaningful content decode rate.
+fn answer_phase_speed(
+    events: &[StreamEvent],
+    stream_time: f64,
+    ttft: f64,
+    usage: Option<Usage>,
+    usage_details: Option<UsageDetails>,
+) -> (f64, bool) {
+    let (c_first, c_last, content_frames) = content_phase(events);
+    let (content_tokens, estimated) = content_count(usage, usage_details, content_frames);
+    if content_tokens == 0 {
+        return (0.0, false);
+    }
+    let content_time = match (c_first, c_last) {
+        (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+        // A single content frame (no span) → attribute the full
+        // post-TTFT generation time to it.
+        _ => (stream_time - ttft).max(0.001),
+    };
+    (content_tokens as f64 / content_time, estimated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::{StreamError, StreamEvent};
-    use crate::sse::{Chunk, ParsedFrame};
+    use crate::sse::ParsedFrame;
     use crate::timing::{MonotonicInstant, StreamTimestamps};
 
     #[test]
@@ -1278,5 +1354,167 @@ mod tests {
         // the error surface stays identical across engines.
         let e = StreamError::Connection("refused".into());
         assert!(e.is_retriable());
+    }
+
+    // ── F2: the decode speed is the authoritative token count ────────────
+
+    /// A content-only stream (3 frames, the first two sharing one instant,
+    /// the third a short sleep later → a real, non-clamped content window)
+    /// plus a terminal `Complete` carrying the optional `usage` block.
+    fn f2_events(usage: Option<Usage>) -> Vec<StreamEvent> {
+        let first = MonotonicInstant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let last = MonotonicInstant::now();
+        let frame = |at: MonotonicInstant, text: &str| StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk: Chunk::Content(text.into()),
+                t_nanos: 0,
+                done: false,
+            },
+            at,
+            timestamps: StreamTimestamps::default(),
+        };
+        let mut events = vec![frame(first, "a"), frame(first, "b"), frame(last, "c")];
+        events.push(StreamEvent::Complete {
+            timestamps: StreamTimestamps::default(),
+            usage,
+            premature: false,
+            malformed_frames: 0,
+            looping: false,
+            loop_excluded_tokens: 0,
+        });
+        events
+    }
+
+    #[test]
+    fn f2_content_count_is_authoritative_not_the_frame_tally() {
+        // A batched server (vLLM MTP / speculative decoding): 3 content
+        // frames carry 100 completion tokens, 20 of them chain-of-thought —
+        // the answer phase is 80 tokens, not 3 frames.
+        let (n, est) = content_count(
+            Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 100,
+            }),
+            Some(UsageDetails {
+                reasoning_tokens: 20,
+                cached_tokens: 0,
+            }),
+            3,
+        );
+        assert_eq!((n, est), (80, false), "completion − reasoning, not estimated");
+
+        // A `usage` block without the CF-02 detail field: the whole
+        // completion count is the answer (thinking suppressed / a backend
+        // that does not report the detail).
+        let (n, est) = content_count(
+            Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 100,
+            }),
+            None,
+            3,
+        );
+        assert_eq!((n, est), (100, false));
+
+        // A reported `0` completion is treated as absent (Engine A's
+        // filter) → the frame tally, flagged estimated.
+        let (n, est) = content_count(
+            Some(Usage {
+                prompt_tokens: 42,
+                completion_tokens: 0,
+            }),
+            None,
+            3,
+        );
+        assert_eq!((n, est), (3, true));
+
+        // No `usage` at all → the frame tally, flagged estimated; a stream
+        // with no content frames has no number to estimate.
+        assert_eq!(content_count(None, None, 3), (3, true));
+        assert_eq!(content_count(None, None, 0), (0, false));
+    }
+
+    #[test]
+    fn f2_published_speed_uses_the_authoritative_count() {
+        let usage = Usage {
+            prompt_tokens: 42,
+            completion_tokens: 100,
+        };
+        let events = f2_events(Some(usage));
+        let (speed, estimated) = answer_phase_speed(
+            &events,
+            0.0,
+            0.0,
+            Some(usage),
+            Some(UsageDetails {
+                reasoning_tokens: 20,
+                cached_tokens: 0,
+            }),
+        );
+        assert!(!estimated, "a usage-reported count is not an estimate");
+        // 80 answer tokens over the content window — never the 3-frame
+        // tally (which would read 3 / window, ~27× lower here).
+        let (c_first, c_last, _) = content_phase(&events);
+        let window = c_first.unwrap().delta_nanos(&c_last.unwrap()) as f64 / 1e9;
+        assert!(
+            (speed - 80.0 / window).abs() < 1e-9,
+            "80 authoritative tokens over the content window: {speed}"
+        );
+    }
+
+    #[test]
+    fn f2_live_snapshot_and_published_speed_agree_on_a_usage_server() {
+        // The common C2 case: a usage-reporting server with thinking
+        // suppressed (`reasoning_tokens == 0`, no CoT frames on the wire).
+        // The live panel (`single_stream_snapshot`) and the published
+        // result must read the same number — before F2 the published
+        // result was the raw frame tally and the two disagreed.
+        let usage = Usage {
+            prompt_tokens: 42,
+            completion_tokens: 100,
+        };
+        let events = f2_events(Some(usage));
+        let (published, estimated) = answer_phase_speed(
+            &events,
+            0.0,
+            0.0,
+            Some(usage),
+            Some(UsageDetails {
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+            }),
+        );
+        assert!(!estimated);
+        let live = SpeedEngine::single_stream_snapshot(
+            "http://test",
+            "test-model",
+            "Reasoning",
+            &events,
+            REASONING_MAX_GEN_TOKENS,
+            None,
+        );
+        assert!(
+            (live.decode_throughput - published).abs() < 1e-9,
+            "live {:.4} vs published {:.4} t/s must agree",
+            live.decode_throughput,
+            published
+        );
+    }
+
+    #[test]
+    fn f2_no_usage_falls_back_to_content_frames_flagged_estimated() {
+        // A non-compliant proxy: no `usage` block → the count is the
+        // observed content frame tally, flagged estimated (never exact).
+        let events = f2_events(None);
+        let (speed, estimated) = answer_phase_speed(&events, 0.0, 0.0, None, None);
+        assert!(estimated, "the frame fallback must be flagged estimated");
+        let (c_first, c_last, content_frames) = content_phase(&events);
+        let window = c_first.unwrap().delta_nanos(&c_last.unwrap()) as f64 / 1e9;
+        assert_eq!(content_frames, 3);
+        assert!(
+            (speed - 3.0 / window).abs() < 1e-9,
+            "the frame tally over the content window: {speed}"
+        );
     }
 }

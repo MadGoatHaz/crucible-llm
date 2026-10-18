@@ -362,6 +362,7 @@ fn capability_scores_show_for_c_engines() {
             solved: 12,
             by_category: [(5, 5), (4, 4), (3, 4)],
         },
+        estimated: false,
     });
     app.structured_slot.store(StructuredResult {
         free_tps: 100.0,
@@ -417,6 +418,7 @@ fn capability_scores_hidden_during_engine_a() {
             solved: 12,
             by_category: [(5, 5), (4, 4), (3, 4)],
         },
+        estimated: false,
     });
     // Engine A running → capabilities hidden even though data exists.
     app.seq.store(seq_state(
@@ -450,6 +452,7 @@ fn all_complete_shows_the_full_summary() {
             solved: 12,
             by_category: [(5, 5), (4, 4), (3, 4)],
         },
+        estimated: false,
     });
     let mut state = seq_state(SeqPhase::AllComplete, Engine::Hardware, None, Vec::new());
     state.summary = "6 of 6 engines complete".to_string();

@@ -2165,6 +2165,7 @@ mod tests {
                 solved: 1,
                 by_category: [(1, 1), (0, 0), (0, 0)],
             },
+            estimated: false,
         }
     }
 

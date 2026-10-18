@@ -103,6 +103,7 @@ fn reasoning_with_response_chars(chars: usize) -> ReasoningResult {
             solved: 1,
             by_category: [(1, 1), (0, 0), (0, 0)],
         },
+        estimated: false,
     }
 }
 

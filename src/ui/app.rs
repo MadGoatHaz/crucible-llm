@@ -2241,6 +2241,7 @@ mod tests {
                 solved: 9,
                 by_category: [(4, 5), (3, 5), (2, 3)],
             },
+            estimated: false,
         });
 
         let payload = app.build_export_payload();
@@ -2349,6 +2350,7 @@ mod tests {
                 solved: 9,
                 by_category: [(4, 5), (3, 5), (2, 3)],
             },
+            estimated: false,
         });
         // The hardware poller: armed (begin_run → start_load), a few
         // 150 W samples, closed (end_load) — a completed run's window.
