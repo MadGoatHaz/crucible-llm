@@ -127,8 +127,8 @@ pub const MINIMAL_PROMPT: &str =
 /// Where the run's stream count came from (the JSON export's
 /// `stream_count_source` field).
 ///
-/// Two distinct Engine B values are both real, and the label names which
-/// one drove the run:
+/// The distinct sources are all real, and the label names which one drove
+/// the run:
 ///
 /// * [`Self::ConcurrencyMaxThroughput`] — the **max-throughput** level
 ///   (the sweep *envelope*: the last level before the saturation knee,
@@ -137,6 +137,10 @@ pub const MINIMAL_PROMPT: &str =
 ///   highest level where every stream still gets ≥ 29.4 t/s — the
 ///   hosting recommendation). Retained for back-compat: it is what
 ///   pre-envelope runs (and the JSON/DB records they produced) carry.
+/// * [`Self::SweepFallbackSingleStream`] — the sweep **ran** but produced
+///   no usable curve (the envelope is `None`), so Flat Out falls back to a
+///   single stream. B4: a 1-stream floor is *not* a measured max-throughput
+///   level, so it gets its own tag — the log + JSON name the actual source.
 /// * [`Self::Default`] — Engine B did not run, so there was no
 ///   concurrency data to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +155,11 @@ pub enum StreamCountSource {
     /// level before the saturation knee, else the peak-aggregate level) —
     /// the real-world full-load count Flat Out runs at.
     ConcurrencyMaxThroughput,
+    /// The sweep ran but produced no usable curve (the envelope is `None`),
+    /// so Flat Out falls back to a single stream (B4). Distinct from
+    /// [`Self::ConcurrencyMaxThroughput`] — a 1-stream floor is not a
+    /// measured max-throughput level.
+    SweepFallbackSingleStream,
     /// The built-in default ([`DEFAULT_STREAM_COUNT`]) — Engine B did not
     /// run, so there was no concurrency data to read.
     Default,
@@ -158,11 +167,13 @@ pub enum StreamCountSource {
 
 impl StreamCountSource {
     /// The JSON label (`"concurrency_sweet_spot"` /
-    /// `"concurrency_max_throughput"` / `"default"`).
+    /// `"concurrency_max_throughput"` / `"sweep_fallback_single_stream"` /
+    /// `"default"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ConcurrencySweetSpot => "concurrency_sweet_spot",
             Self::ConcurrencyMaxThroughput => "concurrency_max_throughput",
+            Self::SweepFallbackSingleStream => "sweep_fallback_single_stream",
             Self::Default => "default",
         }
     }
@@ -173,6 +184,7 @@ impl StreamCountSource {
         match self {
             Self::ConcurrencyMaxThroughput => "concurrency max-throughput level",
             Self::ConcurrencySweetSpot => "practical sweet spot",
+            Self::SweepFallbackSingleStream => "empty sweep — single-stream fallback",
             Self::Default => "default",
         }
     }
@@ -182,17 +194,21 @@ impl StreamCountSource {
 /// Engine B sweep: the **max-throughput level** (the sweep *envelope* —
 /// the last level before the saturation knee, else the peak-aggregate
 /// level), falling back to the practical sweet spot only when no curve
-/// exists ([`SweepResult::envelope`] is `None` for an empty sweep).
+/// exists ([`SweepResult::envelope`] is `None` for a sweep that ran but
+/// produced no usable levels).
 ///
 /// A single shared pure helper so the TUI (`sequence.rs`) and headless
 /// (`headless.rs`) paths can never diverge on which level — or which
-/// source label — Flat Out consumes.
+/// source label — Flat Out consumes. **B4:** the no-curve fallback is
+/// tagged [`StreamCountSource::SweepFallbackSingleStream`] (a 1-stream
+/// floor is *not* a measured max-throughput level), so the log + JSON name
+/// the actual source.
 #[must_use]
 pub fn flatout_streams_for(r: &SweepResult) -> (usize, StreamCountSource) {
-    (
-        r.envelope().map(|e| e.sweet_spot).unwrap_or(r.sweet_spot),
-        StreamCountSource::ConcurrencyMaxThroughput,
-    )
+    match r.envelope() {
+        Some(e) => (e.sweet_spot, StreamCountSource::ConcurrencyMaxThroughput),
+        None => (r.sweet_spot, StreamCountSource::SweepFallbackSingleStream),
+    }
 }
 
 /// The complete Flat Out result: `n` concurrent streams (the max-
@@ -1359,13 +1375,18 @@ mod tests {
             StreamCountSource::ConcurrencyMaxThroughput.as_str(),
             "concurrency_max_throughput"
         );
+        assert_eq!(
+            StreamCountSource::SweepFallbackSingleStream.as_str(),
+            "sweep_fallback_single_stream"
+        );
         assert_eq!(StreamCountSource::Default.as_str(), "default");
     }
 
     #[test]
     fn stream_count_source_log_descriptors_name_the_actual_source() {
         // The startup log line must reflect the real source: max-throughput
-        // (the envelope) vs practical (the hosting recommendation) vs default.
+        // (the envelope) vs practical (the hosting recommendation) vs the
+        // empty-sweep fallback vs default.
         assert_eq!(
             StreamCountSource::ConcurrencyMaxThroughput.log_descriptor(),
             "concurrency max-throughput level"
@@ -1373,6 +1394,10 @@ mod tests {
         assert_eq!(
             StreamCountSource::ConcurrencySweetSpot.log_descriptor(),
             "practical sweet spot"
+        );
+        assert_eq!(
+            StreamCountSource::SweepFallbackSingleStream.log_descriptor(),
+            "empty sweep — single-stream fallback"
         );
         assert_eq!(StreamCountSource::Default.log_descriptor(), "default");
     }
@@ -1454,14 +1479,19 @@ mod tests {
     fn flatout_streams_for_falls_back_to_the_practical_when_no_curve() {
         // A sweep that ran but produced no usable levels: envelope() is
         // None, so the helper falls back to the practical sweet spot
-        // (from_levels computes it as 1) — today's behavior, tagged as
-        // max-throughput source.
+        // (from_levels computes it as 1) — B4: tagged with the distinct
+        // `SweepFallbackSingleStream` source (a 1-stream floor is *not* a
+        // measured max-throughput level).
         let r = SweepResult::from_levels(vec![], None);
         assert!(r.envelope().is_none(), "no curve → no envelope");
         let (n, source) = flatout_streams_for(&r);
         assert_eq!(n, r.sweet_spot, "falls back to the practical sweet spot");
         assert_eq!(n, 1);
-        assert_eq!(source, StreamCountSource::ConcurrencyMaxThroughput);
+        assert_eq!(
+            source,
+            StreamCountSource::SweepFallbackSingleStream,
+            "the empty-sweep fallback is named, not mislabeled max-throughput"
+        );
     }
 
     #[test]
