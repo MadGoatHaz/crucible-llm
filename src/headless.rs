@@ -546,37 +546,12 @@ pub fn run_headless(
         }
         if let Some(energy) = &energy_result {
             if !cfg.json {
-                if let Some(jpt) = energy.joules_per_token {
-                    let peak = energy
-                        .peak_power_w
-                        .map(|w| format!(" · peak {w:.0} W"))
-                        .unwrap_or_default();
-                    term.dim(&format!(
-                        "  Energy: {:.1} J ({:.3} J/token{peak})",
-                        energy.joules, jpt
-                    ));
-                } else if let Some(reason) = energy.na_reason() {
-                    // B3: the N/A case — labeled, never a silent gap and
-                    // never a spurious 0.0 J/token. Two distinct root
-                    // causes (the old code printed *nothing* for the
-                    // zero-tokens case and mislabeled it "no power
-                    // telemetry"):
-                    match reason {
-                        "no power telemetry" => {
-                            // No power telemetry (driverless host, or a
-                            // sensor with no usable reading — e.g. the RAPL
-                            // quirk on a shared host).
-                            term.dim(
-                                "  Energy: N/A — no power telemetry (no valid power sensor on this host)",
-                            );
-                        }
-                        // Power telemetry is present, but the run produced
-                        // zero tokens (a D-only / no-work run) — nothing to
-                        // divide the energy by.
-                        _ => term.dim(
-                            "  Energy: N/A — no tokens generated this run (power telemetry present)",
-                        ),
-                    }
+                // I5: the energy line is a pure function of the result —
+                // the measured figure with its estimate label, or the
+                // labeled N/A line (B3: never a silent gap, never a
+                // spurious 0.0 J/token).
+                if let Some(line) = headless_energy_line(energy) {
+                    term.dim(&line);
                 }
                 if let Some(w) = &energy.fragmentation_warning {
                     term.warning(&format!("VRAM: {w}"));
@@ -769,6 +744,51 @@ pub fn run_headless(
         }
         0
     })
+}
+
+/// I5: the headless terminal energy line — a pure function of the
+/// [`EnergyResult`] (unit-testable, no TTY):
+///
+/// * the **measured** figure (`J` + `J/token` + peak), with the
+///   **estimate label** `(CPU ~)` appended when the CPU component of the
+///   system draw is the labeled fixed-estimate fallback (I4: including a
+///   measured backend that fell back to the estimate mid-run) — the
+///   TUI's `~` / `(CPU ~)` marker, now on the terminal line too;
+/// * a **labeled N/A** line for each root cause (B3: "no power telemetry"
+///   vs "no tokens generated") — never a silent gap, never a spurious
+///   `0.0 J/token`.
+///
+/// `None` only when there is nothing to say (no energy result at all).
+#[must_use]
+pub fn headless_energy_line(energy: &EnergyResult) -> Option<String> {
+    let line = if let Some(jpt) = energy.joules_per_token {
+        let peak = energy
+            .peak_power_w
+            .map(|w| format!(" · peak {w:.0} W"))
+            .unwrap_or_default();
+        // I5: the estimate label (the energy includes the labeled CPU
+        // estimate, so the number is flagged, not hidden).
+        let estimated = if energy.cpu_power_estimated { " (CPU ~)" } else { "" };
+        format!(
+            "  Energy: {:.1} J ({:.3} J/token{peak}){estimated}",
+            energy.joules, jpt
+        )
+    } else {
+        let reason = energy.na_reason().unwrap_or("no power telemetry");
+        match reason {
+            "no power telemetry" => {
+                // No power telemetry (driverless host, or a sensor with no
+                // usable reading — e.g. the RAPL quirk on a shared host).
+                "  Energy: N/A — no power telemetry (no valid power sensor on this host)"
+                    .to_string()
+            }
+            // Power telemetry is present, but the run produced zero tokens
+            // (a D-only / no-work run) — nothing to divide the energy by.
+            _ => "  Energy: N/A — no tokens generated this run (power telemetry present)"
+                .to_string(),
+        }
+    };
+    Some(line)
 }
 
 /// Chunk 17: the (T0, Tn) lifecycle window of one iteration, extracted
@@ -997,6 +1017,86 @@ mod tests {
         let v2 = build_energy_json(&base);
         assert!(v2.get("cpu_power_estimated").is_none(), "{v2}");
         assert_eq!(v2["joules"], 100.0);
+    }
+
+    /// I5: the terminal energy line carries the **estimate label** when the
+    /// CPU component is the labeled fixed-estimate fallback — and no label
+    /// for a fully-measured run (the TUI's `(CPU ~)` marker, on the
+    /// terminal line).
+    #[test]
+    fn headless_energy_line_labels_the_estimated_cpu_component() {
+        let base = EnergyResult {
+            joules: 12_345.6,
+            joules_per_token: Some(0.098),
+            avg_power_w: Some(229.0),
+            peak_power_w: Some(521.0),
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: Some(91.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("RTX 3080 Ti".into()),
+            cpu_power_estimated: false,
+        };
+        // Measured CPU power → no estimate marker.
+        let line = headless_energy_line(&base).expect("a line");
+        assert!(line.contains("12345.6 J"), "{line}");
+        assert!(line.contains("0.098 J/token"), "{line}");
+        assert!(line.contains("peak 521 W"), "{line}");
+        assert!(!line.contains("~"), "no estimate marker: {line}");
+
+        // Estimated CPU power → the marker is present.
+        let est = EnergyResult {
+            cpu_power_estimated: true,
+            ..base
+        };
+        let line_est = headless_energy_line(&est).expect("a line");
+        assert!(line_est.contains("(CPU ~)"), "the estimate label: {line_est}");
+    }
+
+    /// I5: the power-present / 0-token case prints a **labeled** N/A line
+    /// (B3's root cause) — never a silent gap, never a spurious 0.0.
+    #[test]
+    fn headless_energy_line_is_labeled_na_for_zero_tokens() {
+        // Power present, zero tokens (a D-only / no-work run).
+        let no_tokens = EnergyResult {
+            joules: 321.0,
+            joules_per_token: None, // 0 tokens → N/A, power IS present
+            avg_power_w: Some(120.0),
+            peak_power_w: Some(200.0),
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: Some(90.0),
+            vendor: Some("NVIDIA".into()),
+            model: Some("Mock".into()),
+            cpu_power_estimated: false,
+        };
+        let line = headless_energy_line(&no_tokens).expect("a line");
+        assert!(
+            line.contains("N/A — no tokens generated"),
+            "the real cause is named: {line}"
+        );
+
+        // No power telemetry at all (driverless host).
+        let no_power = EnergyResult {
+            joules: 0.0,
+            joules_per_token: None,
+            avg_power_w: None,
+            peak_power_w: None,
+            peak_vram_bytes: None,
+            peak_vram_ratio: None,
+            fragmentation_warning: None,
+            avg_utilization_pct: None,
+            vendor: None,
+            model: None,
+            cpu_power_estimated: false,
+        };
+        let line2 = headless_energy_line(&no_power).expect("a line");
+        assert!(
+            line2.contains("N/A — no power telemetry"),
+            "the no-telemetry cause: {line2}"
+        );
     }
 
     /// I4: `headless_energy` reads the estimate flag from the poller's
