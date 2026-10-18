@@ -4,10 +4,13 @@
 //!
 //! Once a [`Sweep`] (plan Chunk 10) has run, the matrix renders the real
 //! per-level curve — aggregate tokens/sec and client-perceived p90 TPOT
-//! pooled across every concurrent stream of the level — and highlights the
+//! pooled across every concurrent stream of the level — and highlights two
+//! distinct things: the **max-throughput level** (the sweep *envelope*,
+//! [`SweepResult::envelope`] — the last level before the saturation knee,
+//! else the peak-aggregate level; the level Flat Out runs at), and the
 //! **saturation knee** (plan Chunk 11, [`SweepResult::detect_knee`]): the
 //! level where aggregate throughput plateaus while p90 TPOT spikes (the
-//! memory-bandwidth-bound → compute-bound transition).
+//! memory-bandwidth-bound → compute-bound transition) — *reference only*.
 //!
 //! The bottom panel is the **Concurrency Recommendation** (the practical
 //! sweet spot, FIX 3): the knee is *reference only* — the recommendation
@@ -17,8 +20,9 @@
 //!
 //! The top panel renders the sweep as a block-based throughput-vs-
 //! concurrency curve: one vertical bar per ladder level (x on a
-//! `log2(concurrency)` scale, y ∝ aggregate t/s), with the knee capped
-//! by a red `▲` and the rest marked `●`.
+//! `log2(concurrency)` scale, y ∝ aggregate t/s), with the **max-
+//! throughput level** (the envelope) marked in the accent colour and the
+//! saturation knee capped by a red `▲`.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -61,10 +65,10 @@ pub fn render(area: Rect, app: &App, f: &mut Frame) {
 
 /// Top panel: aggregate throughput vs concurrent users — one point per
 /// sweep level (x on a `log2(concurrency)` scale, y ∝ aggregate t/s),
-/// with each point labelled by its measured t/s, the **sweet spot**
-/// (yellow) and the **saturation knee** (red `▲`) marked, the
-/// diminishing-returns zone past the knee drawn dim/red, and a
-/// plain-language "what to do with this" note underneath.
+/// with each point labelled by its measured t/s, the **max-throughput
+/// level** (the envelope, in the accent colour) and the **saturation knee**
+/// (red `▲`) marked, the diminishing-returns zone past the knee drawn
+/// dim/red, and a plain-language "what to do with this" note underneath.
 fn render_curve(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Option<Envelope>) {
     // The primary title is uppercase + accent; the descriptive subtitle keeps
     // its natural casing (the "… vs Parallel Users" phrasing).
@@ -131,8 +135,8 @@ struct CurvePoint {
 ///   is a power-of-two series), y ∝ aggregate t/s against the curve max;
 /// * a vertical `│` stem from each point down to the baseline;
 /// * the measured t/s **labelled on every point**;
-/// * zone colors: **green** below the sweet spot, **yellow** at the sweet
-///   spot, **red** past the knee; the knee itself is an `▲` with a
+/// * zone colors: **green** below the max-throughput level, **accent** at
+///   it, **red** past the knee; the knee itself is an `▲` with a
 ///   `KNEE @ n` annotation;
 /// * a dimmed red `─` connector through the diminishing-returns zone;
 /// * an x-axis (`├──┬──`) with the concurrency values and a
@@ -175,16 +179,19 @@ pub(crate) fn build_curve_lines(
         .fold(0.0_f64, f64::max)
         .max(1.0);
     let cmax = sorted.last().map(|l| l.concurrency).unwrap_or(1);
-    let sweet = envelope.as_ref().map(|e| e.sweet_spot);
+    // The max-throughput level (the envelope) — the point the curve marks
+    // in the accent colour.
+    let max_throughput = envelope.as_ref().map(|e| e.sweet_spot);
     let knee = envelope
         .as_ref()
         .and_then(|e| e.knee)
         .map(|k| k.concurrency);
 
-    // The zone color: green below the sweet spot, yellow at it, red past
-    // it (the diminishing-returns zone). No envelope (defensive) → green.
+    // The zone color: green below the max-throughput level, accent at it,
+    // red past the knee (the diminishing-returns zone). No envelope
+    // (defensive) → green.
     let zone_color = |c: usize| -> Color {
-        match (sweet, knee) {
+        match (max_throughput, knee) {
             (Some(s), Some(k)) => {
                 if c > k {
                     th.danger()
@@ -379,8 +386,12 @@ pub(crate) fn build_curve_lines(
         write_text(&mut grid, r, Y_AXIS_W, "concurrent users", th.dim(), w);
     }
     if let Some(r) = legend_row {
-        let legend: [(&str, Color); 3] = [
+        // The max-throughput level is distinguished by its accent colour
+        // (`th.primary()`), not a distinct glyph (every measured point is
+        // ◆; the knee is ▲).
+        let legend: [(&str, Color); 4] = [
             ("◆ measured", th.success()),
+            ("◆ max throughput", th.primary()),
             ("▲ knee", th.accent()),
             ("── diminishing returns", th.secondary()),
         ];
@@ -515,6 +526,21 @@ fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
             style::value_warn(th),
         ))),
     }
+    // The max-throughput level (the sweep envelope) — what Flat Out runs
+    // at. Shown right below the practical sweet spot so the two numbers
+    // sit on the same screen, each labelled as what it is (they are
+    // distinct and not a contradiction).
+    if let Some(e) = result.envelope() {
+        ls.push(Line::from(vec![
+            Span::styled("  Flat Out runs at:     ", style::label(th)),
+            Span::styled(
+                format!("{} streams (max throughput)", e.sweet_spot),
+                Style::default()
+                    .fg(th.primary())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     // Maximum usable.
     match us.max_usable {
         Some(n) => ls.push(Line::from(vec![
@@ -562,7 +588,7 @@ fn recommendation_lines(th: Theme, result: &SweepResult) -> Vec<Line<'static>> {
 pub(crate) fn curve_notes(th: Theme, levels: &[SweepLevel]) -> Vec<Line<'static>> {
     let result = SweepResult::from_levels(levels.to_vec(), None);
     let mut ls: Vec<Line> = vec![Line::from(Span::styled(
-        "ℹ Sweet spot = most users where EACH still gets ≥30 t/s (comfortable).",
+        "ℹ Practical sweet spot = most users where EACH still gets ≥30 t/s (comfortable).",
         style::info(th),
     ))];
     ls.extend(recommendation_lines(th, &result));
@@ -655,7 +681,7 @@ fn render_matrix(area: Rect, app: &App, th: Theme, f: &mut Frame, envelope: &Opt
 }
 
 /// One matrix row for a completed sweep level, flagged when it is the
-/// detected knee (red) or the recommended sweet spot (green), and carrying
+/// detected knee (red) or the max-throughput level (green), and carrying
 /// the **Per-Stream t/s** column (FIX 3: aggregate ÷ users) plus a
 /// color-coded per-stream status.
 fn sweep_row<'a>(
@@ -669,7 +695,7 @@ fn sweep_row<'a>(
         .as_ref()
         .and_then(|e| e.knee)
         .is_some_and(|k| k.concurrency == level.concurrency);
-    let is_sweet = envelope.is_some_and(|e| e.sweet_spot == level.concurrency);
+    let is_max_throughput = envelope.is_some_and(|e| e.sweet_spot == level.concurrency);
 
     let mut state = if level.failed_streams == level.concurrency {
         "failed".to_string()
@@ -686,8 +712,8 @@ fn sweep_row<'a>(
     if is_knee {
         state.push_str(" · KNEE");
     }
-    if is_sweet {
-        state.push_str(" · SWEET");
+    if is_max_throughput {
+        state.push_str(" · MAX THROUGHPUT");
     }
 
     // FIX 3: per-stream t/s = aggregate ÷ users — what EACH user gets.
@@ -696,7 +722,7 @@ fn sweep_row<'a>(
 
     let value_style = if is_knee {
         style::value_err(th)
-    } else if is_sweet {
+    } else if is_max_throughput {
         style::value_ok(th)
     } else if level.concurrency == target {
         style::highlight(th)
@@ -705,7 +731,7 @@ fn sweep_row<'a>(
     };
     let state_style = if is_knee {
         style::value_err(th)
-    } else if is_sweet {
+    } else if is_max_throughput {
         style::value_ok(th)
     } else {
         style::footer(th)
@@ -746,9 +772,15 @@ fn per_stream_status(th: Theme, per: f64, baseline: f64) -> (String, Style) {
 }
 
 /// The dimmed `ℹ` notes explaining what the recommendation means (FIX 3).
-const RECOMMENDATION_INFO: [&str; 4] = [
+///
+/// The last line continues the previous sentence (rendered without an `ℹ`
+/// prefix by the caller), so keep the two-line "pure aggregate" sentence at
+/// the end.
+const RECOMMENDATION_INFO: [&str; 6] = [
     "\"Practical sweet spot\" = most users where each still gets ≥30 t/s.",
     "This is what matters for real use: coding agents, chat, RAG pipelines.",
+    "The curve's marked \"max throughput\" level is a different number —",
+    "it's what Flat Out runs at (max sustained t/s), not the hosting advice.",
     "Pure aggregate throughput is misleading — 32 users at 3.8 t/s each",
     "is not \"fast\", it's \"slow for everyone\".",
 ];
