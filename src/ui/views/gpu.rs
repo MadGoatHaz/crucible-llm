@@ -329,7 +329,10 @@ fn render_efficiency(area: Rect, mon: &GpuPowerMonitor, rate: f64, th: Theme, f:
             "$/1M tokens",
             cmt.map(format_money).unwrap_or(na.clone()),
         ),
-        eff_row(th, "Total tokens", fmt::format_tokens(mon.total_tokens)),
+        // I3: the all-token total (input + output) — the same denominator
+        // the J/token line and Engine D use, so the panel is internally
+        // consistent (J/token = Energy ÷ Total tokens).
+        eff_row(th, "Total tokens", fmt::format_tokens(mon.all_tokens())),
         Line::raw(""),
         eff_row(
             th,
@@ -1234,6 +1237,25 @@ mod tests {
 
     /// F1/I2: a GPU present *without* power telemetry renders the Energy
     /// line as `N/A` — never a silent `0.000 kWh` (the module's N/A rule).
+    /// I3: the efficiency panel's "Total tokens" row shows the all-token
+    /// total (input + output) — the denominator the J/token line uses —
+    /// so the panel is internally consistent (J/token = Energy ÷ Total).
+    #[test]
+    fn view4_efficiency_total_tokens_is_input_plus_output() {
+        let mut app = app_with_monitor(sample_monitor());
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 50);
+        // sample_monitor: 20,000 completion + 5,000 prompt = 25,000.
+        assert!(
+            text.contains("25,000"),
+            "Total tokens = input + output: {text}"
+        );
+        assert!(
+            !text.contains("Total tokens  : 20,000"),
+            "output-only total is not shown: {text}"
+        );
+    }
+
     #[test]
     fn view4_energy_line_is_na_without_power_telemetry() {
         // A fresh monitor: no power reading has ever arrived.

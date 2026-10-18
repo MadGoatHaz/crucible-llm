@@ -907,13 +907,27 @@ impl GpuPowerMonitor {
         (d > 0.0 && self.has_power).then(|| self.energy_joules() / d)
     }
 
-    /// Joules per token. `None` without power or without tokens (N/A rule).
-    pub fn joules_per_token(&self) -> Option<f64> {
-        (self.has_power && self.total_tokens > 0)
-            .then(|| self.energy_joules() / self.total_tokens as f64)
+    /// The **all-token** total for this run: input (prompt) + output
+    /// (completion), cumulative across every engine (I3). This is the same
+    /// denominator Engine D's headline J/token uses
+    /// (`sum_all_engines_tokens` in `engines/sequence.rs`), so the View 4
+    /// efficiency figure and the D result can never diverge by an unlabeled
+    /// output-only convention.
+    #[must_use]
+    pub fn all_tokens(&self) -> u64 {
+        self.prompt_tokens + self.total_tokens
     }
 
-    /// Joules per 1000 tokens (more intuitive than J/token).
+    /// Joules per **all** token (input + output) — the same denominator
+    /// Engine D uses (I3). `None` without power or without tokens (N/A
+    /// rule).
+    pub fn joules_per_token(&self) -> Option<f64> {
+        (self.has_power && self.all_tokens() > 0)
+            .then(|| self.energy_joules() / self.all_tokens() as f64)
+    }
+
+    /// Joules per 1000 tokens (more intuitive than J/token); the same
+    /// all-token denominator as [`Self::joules_per_token`].
     pub fn joules_per_ktoken(&self) -> Option<f64> {
         self.joules_per_token().map(|j| j * 1000.0)
     }
@@ -1241,6 +1255,37 @@ mod tests {
         assert_eq!(m.joules_per_token(), None);
         assert_eq!(m.joules_per_ktoken(), None);
         assert_eq!(m.tokens_per_watt(), None);
+    }
+
+    /// I3: the View 4 J/token line divides by the **all-token** total
+    /// (input + output) — the same denominator Engine D's headline uses —
+    /// not the output-only completion count the old (unlabeled) convention
+    /// applied. An output-heavy run (9:1 prompt:completion) shows the ~10×
+    /// difference the old convention hid.
+    #[test]
+    fn joules_per_token_uses_the_all_tokens_denominator() {
+        let mut m = GpuPowerMonitor::default();
+        m.begin_run();
+        m.start_load();
+        m.has_power = true;
+        m.prompt_tokens = 9_000;
+        m.total_tokens = 1_000; // completion only
+        let a = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = trace_sample(MonotonicInstant::now(), 100.0, 0.0);
+        m.trace = vec![a, b];
+        let energy = m.energy_joules();
+        assert!(energy > 0.0);
+        assert_eq!(m.all_tokens(), 10_000, "input + output");
+        let jpt = m.joules_per_token().expect("power + tokens");
+        assert!(
+            (jpt - energy / 10_000.0).abs() < 1e-9,
+            "J/token = energy / all tokens: {jpt}"
+        );
+        // The output-only figure would be 10× higher — never rendered.
+        assert!((jpt - energy / 1_000.0).abs() > 1e-9);
+        // J/ktoken follows the same denominator.
+        assert!((m.joules_per_ktoken().unwrap() - energy / 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2273,13 +2318,13 @@ mod tests {
         // kWh follows the full window.
         assert!((m.energy_kwh() - 180_000.0 / 3_600_000.0).abs() < 1e-12);
         // …and so does the J/token figure (tokens present): the full-window
-        // joules divided by the token count.
+        // joules divided by the all-token total (I3: input + output).
         m.prompt_tokens = 1_000_000;
         m.total_tokens = 100_000;
         let jpt = m.joules_per_token().expect("power + tokens");
         assert!(
-            (jpt - 180_000.0 / 100_000.0).abs() < 1e-9,
-            "J/token divides the full window: {jpt}"
+            (jpt - 180_000.0 / 1_100_000.0).abs() < 1e-9,
+            "J/token divides the full window by all tokens: {jpt}"
         );
     }
 
