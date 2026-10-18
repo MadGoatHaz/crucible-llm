@@ -568,6 +568,14 @@ fn render_cost_analysis(
                 ),
                 style::value_ok(th),
             )]));
+            // I8: the System panel's "Energy: X kWh" (the measured
+            // ∫P−idle dt integral) and this panel's "$/1M × tokens" total
+            // are **two different estimators** — a short note that the
+            // two figures need not match.
+            lines.push(Line::from(vec![Span::styled(
+                "    ℹ Distinct from the System 'Energy kWh' integral — two estimators, need not match",
+                style::info(th),
+            )]));
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled(
                 "  ℹ In=Σprefill⚡÷in-tokens · Out=Σdecode⚡÷out-tokens (all reqs)",
@@ -1299,6 +1307,20 @@ mod tests {
         // No cloud references.
         assert!(!text.contains("GPT-4o"), "no cloud refs: {text}");
         assert!(!text.contains("Claude"), "no cloud refs: {text}");
+    }
+
+    /// I8: the cost panel notes that its $/1M phase-power model is a
+    /// distinct estimator from the System panel's measured "Energy kWh"
+    /// integral — the two figures need not match.
+    #[test]
+    fn view4_cost_panel_notes_the_two_distinct_estimators() {
+        let mut app = app_with_monitor(sample_monitor());
+        app.view = crate::ui::app::View::Gpu;
+        let text = render_text(&app, 120, 80);
+        assert!(
+            text.contains("need not match"),
+            "the cross-reference note is present: {text}"
+        );
     }
 
     #[test]
