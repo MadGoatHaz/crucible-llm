@@ -33,11 +33,15 @@ pub struct MatrixReport {
     /// User: the quantization (e.g. `Q4_K_M`).
     pub quant: String,
     /// Auto (optional): the real Engine A mean decode speed, `""` when there
-    /// are no valid runs (never a silent `0`).
+    /// are no valid runs (never a silent `0`). A pure-CoT run's mean is its
+    /// full-window **blended** decode rate (B1) — a real number, honestly
+    /// labeled by [`Self::fill_pure_cot_note`].
     pub speed: String,
     /// User (optional): the use case (e.g. `daily chat`).
     pub use_case: String,
-    /// User (optional): notes (launch flags, quirks).
+    /// User (optional): notes (launch flags, quirks). Auto-filled with
+    /// [`Self::PURE_COT_NOTE`] when the speed is a pure-CoT blended rate
+    /// and the user has not written their own (B1).
     pub notes: String,
 }
 
@@ -125,10 +129,20 @@ impl MatrixReport {
         // Honest degradation ladder: a missing fact drops its own token
         // (never a fabricated `0GB` / `1x …`).
         let hardware = if has_gpu && has_vram {
-            if has_ram {
-                format!("{gpu_count}x {gpu_name} {vram_gb}GB + {ram_gb}GB RAM")
+            // B2: a multi-GPU **pool** is unambiguous — the per-card VRAM
+            // and the pool total. The old `{count}x {name} {total}GB`
+            // read as count×total ("8x NVIDIA RTX A4000 128GB" = 8×128 GB);
+            // a tp8 pool is 8×16 GB = 128 GB. Single-GPU form unchanged.
+            let vram_part = if gpu_count > 1 {
+                let per_gb = (vram_total_mib / gpu_count.max(1) as u64 / 1024) as f64;
+                format!("({per:.0} GB each, {vram_gb} GB total)", per = per_gb.round())
             } else {
-                format!("{gpu_count}x {gpu_name} {vram_gb}GB")
+                format!("{vram_gb}GB")
+            };
+            if has_ram {
+                format!("{gpu_count}x {gpu_name} {vram_part} + {ram_gb}GB RAM")
+            } else {
+                format!("{gpu_count}x {gpu_name} {vram_part}")
             }
         } else if has_gpu {
             // GPU present but no VRAM telemetry.
@@ -160,6 +174,29 @@ impl MatrixReport {
             speed,
             use_case: use_case.trim().to_string(),
             notes: notes.trim().to_string(),
+        }
+    }
+
+    /// The honest label for a blended-fallback speed (B1): appended to
+    /// `notes` when the speed field is a pure-CoT blended rate and the user
+    /// has not written their own notes. The auto-parser reads by key
+    /// ([`Self::render`]), so an auto-filled `notes` is contract-safe.
+    pub const PURE_COT_NOTE: &str =
+        "speed is the blended decode rate — all completion tokens were reasoning_content (pure CoT); the answer phase is N/A";
+
+    /// B1: fill the `notes` field with [`Self::PURE_COT_NOTE`] when the
+    /// report has a speed and the user has not written their own notes.
+    ///
+    /// The call sites (the TUI `build_matrix_report` and the headless
+    /// `headless_matrix_report`) invoke this **only** when
+    /// [`crate::engines::sequence::speed_mean_is_blended`] is `true` —
+    /// i.e. every valid Engine A run was pure-CoT, so the speed field is
+    /// the full-window blended decode rate, not an answer-phase
+    /// measurement. A no-op when the user typed notes (preserved) or the
+    /// speed is blank (nothing to explain).
+    pub fn fill_pure_cot_note(&mut self) {
+        if !self.speed.is_empty() && self.notes.is_empty() {
+            self.notes = Self::PURE_COT_NOTE.to_string();
         }
     }
 }
@@ -415,7 +452,8 @@ mod tests {
 
     #[test]
     fn build_hardware_multi_gpu() {
-        // The name is as given; the count is shown. Nothing is summed.
+        // B2: a multi-GPU pool is unambiguous — the per-card VRAM and the
+        // pool total (the old form read "2x … 24GB" as 2×24 GB).
         let r = MatrixReport::build(
             "RTX 4090",
             2,
@@ -428,7 +466,44 @@ mod tests {
             "",
             "",
         );
-        assert_eq!(r.hardware, "2x RTX 4090 24GB + 64GB RAM");
+        assert_eq!(r.hardware, "2x RTX 4090 (12 GB each, 24 GB total) + 64GB RAM");
+    }
+
+    #[test]
+    fn build_hardware_8x_a4000_pool_is_unambiguous() {
+        // The operator's v0.1.7 host: a tp8 pool of 16 GB A4000s (131072
+        // MiB total) + 118 decimal GB RAM. The old form read "8x … 128GB"
+        // as 8×128 GB; the new form names both the per-card and pool sizes.
+        let r = MatrixReport::build(
+            "NVIDIA RTX A4000",
+            8,
+            131072,
+            118 * 1_000_000_000,
+            "qwen3.8-27b",
+            56.4,
+            "",
+            "",
+            "",
+            "",
+        );
+        assert_eq!(
+            r.hardware,
+            "8x NVIDIA RTX A4000 (16 GB each, 128 GB total) + 118GB RAM"
+        );
+        // B3 (no change): the `vram` tier stays the pool aggregate — a 27B
+        // model cannot fit on one 16 GB card; the tier describes what the
+        // *deployment* needs.
+        assert_eq!(r.vram, "128GB — 96-128");
+        // And the pure-CoT blended mean renders as a real speed.
+        assert_eq!(r.speed, "56 tok/s");
+    }
+
+    #[test]
+    fn build_hardware_two_gpu_no_ram() {
+        // Multi-GPU form with no RAM telemetry: the `+ …GB RAM` tail drops,
+        // the per-card/total qualification stays.
+        let r = MatrixReport::build("RTX 4090", 2, 24576, 0, "m", 0.0, "", "", "", "");
+        assert_eq!(r.hardware, "2x RTX 4090 (12 GB each, 24 GB total)");
     }
 
     #[test]
@@ -525,5 +600,48 @@ mod tests {
         assert_eq!(r.quant, "Q4_K_M");
         assert_eq!(r.use_case, "daily chat");
         assert_eq!(r.notes, "flags here");
+    }
+
+    // ── B1: a pure-CoT blended speed renders, honestly noted ─────────
+
+    #[test]
+    fn build_pure_cot_blended_speed_populates_and_fills_the_note() {
+        // The call-site flow (W2-int): `build` renders the
+        // (blended-fallback) mean; `fill_pure_cot_note` — invoked only
+        // when `speed_mean_is_blended` is true — appends the honest
+        // explanation. A normal (non-pure-CoT) speed is never noted.
+        let mut r = MatrixReport::build("g", 1, 0, 0, "m", 56.4, "", "", "", "");
+        assert_eq!(r.speed, "56 tok/s", "the blended rate is a real number");
+        assert_eq!(r.notes, "", "build alone never fabricates a note");
+        r.fill_pure_cot_note();
+        assert_eq!(r.notes, MatrixReport::PURE_COT_NOTE);
+        // The filled report keeps the 8-key parser contract (value
+        // column intact; the notes line carries the explanation).
+        let rendered = r.render();
+        assert!(rendered.contains("speed:    56 tok/s"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("notes:    {}", MatrixReport::PURE_COT_NOTE)),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn fill_pure_cot_note_never_touches_user_notes() {
+        // A user who typed notes keeps them (the TUI's `open_report`
+        // preserves in-progress edits; `fill` is a no-op on non-empty
+        // notes).
+        let mut r = MatrixReport::build("g", 1, 0, 0, "m", 56.4, "", "", "", "my notes");
+        r.fill_pure_cot_note();
+        assert_eq!(r.notes, "my notes");
+    }
+
+    #[test]
+    fn fill_pure_cot_note_is_a_no_op_on_a_blank_speed() {
+        // Genuinely no speed (0 and not pure-CoT) → the existing honesty
+        // rule stands: blank, and no note to explain nothing.
+        let mut r = MatrixReport::build("g", 1, 0, 0, "m", 0.0, "", "", "", "");
+        assert_eq!(r.speed, "");
+        r.fill_pure_cot_note();
+        assert_eq!(r.notes, "");
     }
 }

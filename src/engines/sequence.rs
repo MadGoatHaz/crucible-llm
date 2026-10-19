@@ -1476,30 +1476,54 @@ pub fn summarize_speed(results: &[SpeedResult]) -> String {
     }
 }
 
+/// The runs that count toward a speed mean: the canonical filter
+/// (`speed.rs` `format_summary`) — `!is_failed() && !looping` — **plus**
+/// the B1 third clause `tg_speed > 0.0`. A failed run has no
+/// measurement; a decode-loop-guard-flagged run's throughput is zeroed
+/// (not a measurement of the server); and a `0.0` speed is an N/A
+/// sentinel (a degraded run — no token frame), not a zero the server
+/// achieved. One such sentinel must not dilute the mean of the real runs
+/// (the pre-B1 mean of `[56.4, 0.0]` was 28.2 — half the rig's real
+/// decode rate, reported as if measured).
+fn valid_runs(results: &[SpeedResult]) -> Vec<&SpeedResult> {
+    results
+        .iter()
+        .filter(|r| !r.is_failed() && !r.looping && r.tg_speed > 0.0)
+        .collect()
+}
+
 /// Engine A's mean decode speed over the **valid** runs — the shared
 /// definition the Matrix Report (`[COMMUNITY-SUBMISSION]` block,
 /// `crate::report`) uses on both the TUI and the headless path (design
 /// §1.5).
 ///
-/// The valid filter is the canonical one (`speed.rs` `format_summary`):
-/// `!is_failed() && !looping` — a decode-loop-guard-flagged run's
-/// throughput is zeroed (not a measurement of the server), so it is
-/// excluded from the mean. `0.0` when there are no valid runs (the
-/// report renders that as a **blank** speed field — never a silent `0`
-/// and never an estimate; a single iteration's mean is that iteration,
-/// which is honest).
+/// The valid filter is [`valid_runs`]: `!is_failed() && !looping &&
+/// tg_speed > 0.0`. `0.0` when there are no valid runs (the report
+/// renders that as a **blank** speed field — never a silent `0` and
+/// never an estimate; a single iteration's mean is that iteration, which
+/// is honest). A pure-CoT run (B1) carries its real blended rate in
+/// `tg_speed`, so it is included in the mean normally.
 #[must_use]
 pub fn speed_mean_tps(results: &[SpeedResult]) -> f64 {
-    let valid: Vec<f64> = results
-        .iter()
-        .filter(|r| !r.is_failed() && !r.looping)
-        .map(|r| r.tg_speed)
-        .collect();
+    let valid = valid_runs(results);
     if valid.is_empty() {
         0.0
     } else {
-        valid.iter().sum::<f64>() / valid.len() as f64
+        valid.iter().map(|r| r.tg_speed).sum::<f64>() / valid.len() as f64
     }
+}
+
+/// `true` when the mean is a **blended fallback** (B1): there is at
+/// least one valid run and *every* valid run is pure-CoT (its
+/// `tg_speed` is the full-window blended rate, not an answer-phase
+/// measurement). The Matrix Report call sites use this to append the
+/// honest `notes` line ([`crate::report::MatrixReport::fill_pure_cot_note`]).
+/// A mixed set (some answer-phase runs) is **not** flagged — its mean is
+/// what it is.
+#[must_use]
+pub fn speed_mean_is_blended(results: &[SpeedResult]) -> bool {
+    let valid = valid_runs(results);
+    !valid.is_empty() && valid.iter().all(|r| r.pure_cot)
 }
 
 /// Engine B's one-line summary: the **practical sweet spot** (the
@@ -2036,6 +2060,9 @@ mod tests {
             usage_discrepancy: false,
             e2e_only: false,
             itl_clamped: 0,
+            // B1: a clean (non-pure-CoT) fixture run.
+            pure_cot: false,
+            blended_tps: 0.0,
         }
     }
 
@@ -2073,6 +2100,67 @@ mod tests {
         assert!(!clean.contains("E2E-only"), "{clean}");
         assert!(!clean.contains("usage >"), "{clean}");
         assert!(!clean.contains("clamped"), "{clean}");
+    }
+
+    #[test]
+    fn speed_mean_tps_skips_the_zero_speed_n_a_sentinel() {
+        // B1b: a `0.0` tg_speed is an N/A sentinel (a degraded run), not a
+        // measured zero — `[56.4, 0.0]` averages 56.4 (was 28.2 pre-fix).
+        assert_eq!(
+            speed_mean_tps(&[
+                speed_result(56.4, 0.2, 256, false),
+                speed_result(0.0, 0.0, 0, false),
+            ]),
+            56.4
+        );
+        // All-zero / all-invalid / empty → 0.0 (the report renders a
+        // blank, never a silent 0).
+        assert_eq!(speed_mean_tps(&[speed_result(0.0, 0.0, 0, false)]), 0.0);
+        assert_eq!(speed_mean_tps(&[]), 0.0);
+        assert_eq!(
+            speed_mean_tps(&[
+                speed_result(0.0, 0.0, 0, true),
+                speed_result(0.0, 0.0, 0, false),
+            ]),
+            0.0
+        );
+        // A pure-CoT run flagged with a real blended rate is included
+        // normally (the B1 fallback is a measurement, not a sentinel).
+        let mut pure = speed_result(56.4, 0.2, 256, false);
+        pure.pure_cot = true;
+        pure.blended_tps = 56.4;
+        assert_eq!(
+            speed_mean_tps(&[pure, speed_result(55.6, 0.2, 256, false)]),
+            56.0
+        );
+    }
+
+    #[test]
+    fn speed_mean_is_blended_only_when_every_valid_run_is_pure_cot() {
+        let pure = |tg: f64| {
+            let mut r = speed_result(tg, 0.2, 256, false);
+            r.pure_cot = true;
+            r.blended_tps = tg;
+            r
+        };
+        // All-pure-CoT (every valid run's tg_speed is the blended
+        // fallback) → true.
+        assert!(speed_mean_is_blended(&[pure(56.4), pure(55.1)]));
+        // Mixed (one answer-phase run) → false: the mean is what it is.
+        assert!(!speed_mean_is_blended(&[
+            pure(56.4),
+            speed_result(60.0, 0.2, 256, false)
+        ]));
+        // No valid runs → false (there is no mean to label): empty, all
+        // failed, all looping, all 0.0-sentinel.
+        assert!(!speed_mean_is_blended(&[]));
+        assert!(!speed_mean_is_blended(&[speed_result(0.0, 0.0, 0, true)]));
+        let mut looping = pure(56.4);
+        looping.looping = true;
+        assert!(!speed_mean_is_blended(&[looping]));
+        let mut sentinel = pure(0.0);
+        sentinel.blended_tps = 0.0;
+        assert!(!speed_mean_is_blended(&[sentinel]));
     }
 
     #[test]
