@@ -784,6 +784,9 @@ impl BenchmarkSequence {
 
             // Mark the engine's result slot running (the views show the
             // in-progress state while its engine is the one on the bench).
+            // C4: the per-engine wall clock (the `✓` headline's
+            // `(wall Ns)` — the long pole, e.g. C1, becomes visible).
+            let t_start = std::time::Instant::now();
             let summary = match engine {
                 Engine::Speed => self.run_speed().await,
                 Engine::Concurrency => self.run_concurrency().await,
@@ -805,11 +808,9 @@ impl BenchmarkSequence {
                 let mut g = self.completed.lock().unwrap_or_else(|e| e.into_inner());
                 g.push((*engine, summary.clone()));
             }
-            self.log_line(format!("[seq] ✓ {} — {summary}", engine.label()));
-            self.logger.info(
-                Context::Sequence,
-                format!("✓ {} — {summary}", engine.label()),
-            );
+            let headline = headline_line(engine.label(), &summary, t_start.elapsed().as_secs_f64());
+            self.log_line(format!("[seq] {headline}"));
+            self.logger.info(Context::Sequence, headline);
             self.publish_state(SeqPhase::Complete, *engine, &summary);
 
             // FIX 2: the last engine is done — close the monitor's load
@@ -1412,8 +1413,17 @@ impl BenchmarkSequence {
 /// (telemetry present but the run produced nothing to divide by) — and both
 /// come from [`EnergyResult::na_reason`], so the TUI, headless, and
 /// `--json`/DB surfaces can never disagree.
-fn hardware_summary(energy: &EnergyResult) -> String {
-    match energy.joules_per_token {
+/// Engine D's one-line summary (`J/token` + peak power + utilization, or
+/// the labeled `N/A` root cause).
+///
+/// C4: when the trace carried VRAM telemetry, the **peak VRAM used** is
+/// appended (`· peak VRAM {gb:.1} GB`, binary GiB — the same convention as
+/// the `vram` tier / the multi-GPU hardware string). For a tp8 pool this
+/// shows the pool's headroom. No telemetry → no figure (the N/A path
+/// stands — never a fabricated 0).
+#[must_use]
+pub fn hardware_summary(energy: &EnergyResult) -> String {
+    let line = match energy.joules_per_token {
         Some(jpt) => {
             let peak = energy
                 .peak_power_w
@@ -1429,6 +1439,12 @@ fn hardware_summary(energy: &EnergyResult) -> String {
             let reason = energy.na_reason().unwrap_or("no power telemetry");
             format!("N/A ({reason})")
         }
+    };
+    if let Some(bytes) = energy.peak_vram_bytes {
+        let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        format!("{line} · peak VRAM {gb:.1} GB")
+    } else {
+        line
     }
 }
 
@@ -1445,6 +1461,15 @@ fn thousands(n: u64) -> String {
         out.push(*b as char);
     }
     out
+}
+
+/// The `✓` per-engine headline (C4): the engine label + summary, plus the
+/// engine's **wall-clock duration** (`(wall Ns)`) — the long pole of a run
+/// (e.g. the C1 matrix) becomes visible at a glance. Pure: no clock
+/// access — the caller measures.
+#[must_use]
+pub fn headline_line(label: &str, summary: &str, wall_secs: f64) -> String {
+    format!("✓ {label} — {summary} (wall {wall_secs:.0}s)")
 }
 
 /// Engine A's one-line summary: the averaged decode speed across the
@@ -2260,6 +2285,41 @@ mod tests {
             hardware_summary(&no_power),
             "N/A (no power telemetry)"
         );
+    }
+
+    // C4: the `✓` headline carries the per-engine wall time (the long
+    // pole — e.g. the C1 matrix — becomes visible at a glance).
+    #[test]
+    fn headline_line_carries_the_wall_time() {
+        assert_eq!(
+            headline_line("C1: NIAH", "reliable up to 64k", 34.2),
+            "✓ C1: NIAH — reliable up to 64k (wall 34s)"
+        );
+        // A sub-second engine rounds to 0s (an honest figure, not omitted).
+        assert_eq!(
+            headline_line("D: Energy", "N/A (no power telemetry)", 0.4),
+            "✓ D: Energy — N/A (no power telemetry) (wall 0s)"
+        );
+    }
+
+    // C4: the Engine D summary carries the peak VRAM used (a tp8 pool's
+    // headroom) when the trace had VRAM telemetry — binary GiB, the same
+    // convention as the `vram` tier / the multi-GPU hardware string.
+    #[test]
+    fn hardware_summary_carries_peak_vram_when_present() {
+        let mut e = energy_fixture(Some(0.098), Some(500.0), Some(521.0), Some(90.0));
+        e.peak_vram_bytes = Some(100 * 1024 * 1024 * 1024); // 100 GiB
+        let line = hardware_summary(&e);
+        assert!(line.starts_with("0.098 J/token"), "{line}");
+        assert!(line.ends_with("· peak VRAM 100.0 GB"), "{line}");
+    }
+
+    #[test]
+    fn hardware_summary_omits_peak_vram_without_telemetry() {
+        // `energy_fixture` carries `peak_vram_bytes: None` → no figure
+        // (never a fabricated 0 GB).
+        let e = energy_fixture(Some(0.5), Some(200.0), Some(300.0), Some(90.0));
+        assert!(!hardware_summary(&e).contains("peak VRAM"));
     }
 
     // ── CF-03: the J/token denominator spans every engine, not just A+B ──
