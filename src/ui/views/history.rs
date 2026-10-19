@@ -14,6 +14,8 @@
 //! * `Enter` — view details (List) / select the second run (Compare);
 //! * `C` — enter Compare mode (List only);
 //! * `D` — delete the selected run (List only, with confirmation);
+//! * `L` — open the cursor session's archive log (`run-<ts>-<session8>.log`)
+//!   in the run-log viewer;
 //! * `Esc` — back to the List (from Detail / Compare / DeleteConfirm);
 //! * `y` / `n` — confirm / cancel the delete prompt.
 //!

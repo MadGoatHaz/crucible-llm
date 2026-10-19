@@ -51,7 +51,7 @@ use crate::engines::{
     NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
 use crate::hw::{arm_power_monitor, GpuBackend, HwPoller, IDLE_WINDOW_SECS, MANUAL_IDLE_WINDOW_SECS};
-use crate::log::{Context, RunLogger};
+use crate::log::{read_log_file, Context, RunLogger};
 use crate::metrics::state::{MetricsSnapshot, MetricsState};
 use crate::report::MatrixReport;
 use crate::storage::db::Database;
@@ -64,6 +64,7 @@ use crate::ui::theme::{self, glyph, style, Theme};
 use crate::ui::views;
 use crate::ui::views::config::{ConfigKeyResult, ConfigMode, ConfigState};
 use crate::ui::views::history::{HistoryMode, HistoryState};
+use crate::ui::views::log::{LogKeyResult, LogState};
 use crate::ui::views::report::{ReportKeyResult, ReportState};
 use crate::ui::views::setup::{SetupKeyResult, SetupState};
 
@@ -153,6 +154,10 @@ pub enum Phase {
     /// The post-run Matrix Report takeover (full-screen): opens via `m`
     /// after a completed run; `Esc` closes it.
     Report,
+    /// The run-log viewer (full-screen takeover): opens via `l` from any
+    /// dashboard view with **no completion gate** (the log exists from
+    /// process start); `Esc` closes it.
+    Log,
     /// The six-view dashboard (Live / Concurrency / Needle / GPU / History
     /// / Config).
     #[default]
@@ -276,6 +281,12 @@ pub struct App {
     /// field buffers. Mutated only in the key path (the report is
     /// re-assembled on every open).
     pub report: ReportState,
+    /// The run-log viewer takeover state (the `l` key — no completion
+    /// gate: the log exists from process start): a read-only snapshot of
+    /// the run's `latest.log` (or a stored session's archive log from the
+    /// History view). Mutated only in the key path (re-read on every
+    /// open).
+    pub log_view: LogState,
     /// The first-run theme picker state (full-screen takeover shown before
     /// Setup when no theme has ever been chosen).
     pub theme_picker: crate::ui::views::theme_picker::ThemePickerState,
@@ -381,6 +392,7 @@ impl App {
             phase: Phase::Dashboard,
             setup: SetupState::new(),
             report: ReportState::default(),
+            log_view: LogState::default(),
             theme_picker: crate::ui::views::theme_picker::ThemePickerState::default(),
             target_explicit: false,
             discovery_error: Arc::new(ArcSwapOption::empty()),
@@ -616,6 +628,115 @@ impl App {
         self.report.notes_cursor = self.report.notes.chars().count();
         self.report.sync_report();
         self.phase = Phase::Report;
+    }
+
+    /// Open the **run-log viewer** (the `l` key): read the current run's
+    /// `latest.log` into the takeover and take over the screen.
+    ///
+    /// **No completion gate** (unlike `m`): the run log exists from
+    /// process start, so `l` works before, during, and after a run. The
+    /// content is a *snapshot* taken at open (the file keeps growing;
+    /// re-`l` after `Esc` re-reads a fresh copy). N/A-never-fail: a
+    /// disabled logger (no path) or an unreadable file yields the
+    /// placeholder view, never a crash.
+    pub fn open_log(&mut self) {
+        match self.logger.path() {
+            Some(p) => match read_log_file(p) {
+                Ok(lines) => {
+                    self.log_view =
+                        LogState::new(lines, p.display().to_string(), Self::log_save_path(ts_secs()));
+                }
+                Err(e) => {
+                    self.log_view = LogState::unavailable(format!(
+                        "cannot read {}: {e}",
+                        p.display()
+                    ));
+                }
+            },
+            None => self.log_view =
+                LogState::unavailable("run log unavailable (logger disabled)".to_string()),
+        }
+        self.phase = Phase::Log;
+    }
+
+    /// Open a **stored session's** archive log (the History view's `l`
+    /// key): find `run-<stamp>-<session8>.log` in the run-log directory
+    /// and read it into the takeover.
+    ///
+    /// The directory is the current run's log dir (`logger.path()`'s
+    /// parent) — archives from past sessions live alongside it — falling
+    /// back to `data_dir()/logs` when the logger is disabled. The match
+    /// is on the archive name's `-{session8}` suffix (the first 8 chars
+    /// of the session UUID, `log.rs` `short_id` semantics); when more
+    /// than one matches (a same-second collision, `-2` suffix —
+    /// practically impossible for a unique UUID), the lexicographically
+    /// greatest name wins (deterministic). N/A-never-fail: no match
+    /// yields the placeholder view, never a crash.
+    pub fn open_log_for_session(&mut self, session_id: &str) {
+        let short8: String = session_id.chars().take(8).collect();
+        let dir = self
+            .logger
+            .path()
+            .and_then(|p| p.parent().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| crate::config::data_dir().join("logs"));
+        let needle = format!("-{short8}");
+        let mut best: Option<std::path::PathBuf> = None;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("run-") && name.ends_with(".log") && name.contains(&needle) {
+                    let path = dir.join(&name);
+                    let greater = best
+                        .as_ref()
+                        .map_or(true, |b| path.to_string_lossy() > b.to_string_lossy());
+                    if greater {
+                        best = Some(path);
+                    }
+                }
+            }
+        }
+        match best {
+            Some(p) => match read_log_file(&p) {
+                Ok(lines) => {
+                    self.log_view =
+                        LogState::new(lines, p.display().to_string(), Self::log_save_path(ts_secs()));
+                }
+                Err(e) => {
+                    self.log_view = LogState::unavailable(format!(
+                        "cannot read {}: {e}",
+                        p.display()
+                    ));
+                }
+            },
+            None => self.log_view =
+                LogState::unavailable(format!("no archive log found for session {short8}")),
+        }
+        self.phase = Phase::Log;
+    }
+
+    /// The `c` key's log message for a run-log clipboard write outcome
+    /// (the N/A-never-fail rule, mirroring [`report_copy_message`] — a
+    /// terminal that drops the OSC 52 sequence is a logged warning,
+    /// never a crash; save-to-file is the guaranteed path). Pure over
+    /// the outcome so the handler logic is testable without a terminal.
+    #[must_use]
+    pub fn log_copy_message(res: &Result<(), String>) -> String {
+        match res {
+            Ok(()) => "[log] copied to clipboard (OSC 52)".to_string(),
+            Err(_) => "[log] clipboard unsupported by terminal — use [S]ave".to_string(),
+        }
+    }
+
+    /// The `s` key's save destination: `data_dir()/exports/run-log-<ts>.log`
+    /// (`exports` is the established user-save location — the same dir
+    /// the Matrix Report saves to). Pure over the timestamp so it is
+    /// unit-testable.
+    #[must_use]
+    pub fn log_save_path(ts: u64) -> String {
+        format!(
+            "{}/exports/run-log-{ts}.log",
+            crate::config::data_dir().display()
+        )
     }
 
     /// Stage-4 `Enter`: leave the Setup takeover, land on the Live view,
@@ -1179,6 +1300,55 @@ impl App {
             };
         }
 
+        // Run-log viewer phase (full-screen takeover, modeled on the
+        // Report phase above): `c` copy (OSC 52), `s` save, `Esc` close,
+        // scroll with j/k/arrows/PageUp/PageDown/Home/End. It returns
+        // before the `q`-quit arm, so `q` can never open the quit
+        // overlay from the log view.
+        if self.phase == Phase::Log {
+            return match self.log_view.handle_key(key) {
+                LogKeyResult::Inert => KeyAction::Continue,
+                // N/A-never-fail: a terminal that drops the OSC 52
+                // sequence is a logged warning, never a crash (the save
+                // path is the guaranteed one).
+                LogKeyResult::Copied => {
+                    let res = crate::clipboard::copy_to_clipboard(&self.log_view.lines.join("\n"));
+                    self.push_log(
+                        Self::log_copy_message(&res),
+                        if res.is_ok() {
+                            style::value_ok(th)
+                        } else {
+                            style::value_warn(th)
+                        },
+                    );
+                    KeyAction::Continue
+                }
+                LogKeyResult::Saved => {
+                    // The save destination is pre-filled at open
+                    // (data_dir()/exports — the established user-save
+                    // location); the view is read-only, so it is not
+                    // user-editable.
+                    match Self::write_report_file(&self.log_view.lines.join("\n"), &self.log_view.save_path)
+                    {
+                        Ok(p) => self.push_log(
+                            format!("[log] saved → {}", p.display()),
+                            style::value_ok(th),
+                        ),
+                        Err(e) => self
+                            .push_log(format!("[log] save failed: {e}"), style::value_warn(th)),
+                    }
+                    KeyAction::Continue
+                }
+                LogKeyResult::Closed => {
+                    // The run state is untouched; the view is back on
+                    // the dashboard. The log content is a snapshot —
+                    // re-`l` re-reads the (growing) file.
+                    self.phase = Phase::Dashboard;
+                    KeyAction::Continue
+                }
+            };
+        }
+
         // Setup phase (full-screen takeover): every other key routes to
         // the four-stage flow. `q` types into a field; `Esc` walks back
         // one stage (quitting only at stage 1).
@@ -1273,6 +1443,20 @@ impl App {
                 return KeyAction::Continue;
             }
             self.open_setup();
+            return KeyAction::Continue;
+        }
+
+        // `l` — open the run-log viewer. **No completion gate** (the log
+        // exists from process start — it works before, during, and after
+        // a run). Scoped away from View 6, where `l` is a typeable
+        // character in a field (the same scope as `c` above), and from
+        // the History view, which has its own `l` (the cursor session's
+        // archive log — the History block below).
+        if (key.code == KeyCode::Char('l') || key.code == KeyCode::Char('L'))
+            && self.view != View::Config
+            && self.view != View::History
+        {
+            self.open_log();
             return KeyAction::Continue;
         }
 
@@ -1443,6 +1627,20 @@ impl App {
                     KeyCode::Char('d') | KeyCode::Char('D') => {
                         if matches!(h.mode, HistoryMode::List) {
                             h.enter_delete_confirm();
+                        }
+                        return KeyAction::Continue;
+                    }
+                    // L: open the cursor session's archive log
+                    // (run-<ts>-<session8>.log) in the run-log viewer.
+                    // All three list-bearing modes have a cursor, so one
+                    // arm covers List / Detail / Compare; `Esc` in the
+                    // viewer returns here (the view state is untouched by
+                    // the phase change — the same rule as the Report
+                    // close).
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        let id = h.sessions.get(h.cursor).map(|s| s.session_id.clone());
+                        if let Some(id) = id {
+                            self.open_log_for_session(&id);
                         }
                         return KeyAction::Continue;
                     }
@@ -1973,6 +2171,8 @@ impl App {
             views::theme_picker::render(f.area(), self, f);
         } else if self.phase == Phase::Report {
             views::report::render(f.area(), self, f);
+        } else if self.phase == Phase::Log {
+            views::log::render(f.area(), self, f);
         } else if self.phase == Phase::Setup {
             views::setup::render(f.area(), self, f);
         } else {
@@ -2279,6 +2479,10 @@ impl App {
             spans.push(Span::styled("[M]Report".to_string(), key_style));
             spans.push(Span::raw(" "));
         }
+        // The `l` key opens the run-log viewer at any time (no completion
+        // gate — the log exists from process start).
+        spans.push(Span::styled("[L]og".to_string(), key_style));
+        spans.push(Span::raw(" "));
         spans.push(Span::styled("[q]Quit".to_string(), key_style));
         spans
     }
@@ -2287,6 +2491,16 @@ impl App {
 /// The footer's `│` separator span.
 fn footer_sep(th: Theme) -> Span<'static> {
     Span::styled(" │ ", style::tab_separator(th))
+}
+
+/// The current Unix seconds (the save-destination timestamp stamp, e.g.
+/// `run-log-<ts>.log`). `0` when the clock cannot be read (it never
+/// will in practice).
+fn ts_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The compact tab label for a view (the footer's `[n]Label` tabs).
@@ -3812,5 +4026,347 @@ mod tests {
         app.handle_key(&key(KeyCode::Esc));
         assert_eq!(app.phase, Phase::Dashboard, "Esc closes the report");
         assert!(app.running);
+    }
+
+    // ── Run-log viewer (Phase::Log, the `l` key) ─────────────────────────
+
+    /// A temp run-log dir + a real (non-disabled) logger writing into it
+    /// (the offline `open_log` / archive-scan fixture — no real
+    /// `~/.local/share` touched).
+    fn temp_logger(name: &str) -> (std::path::PathBuf, std::sync::Arc<RunLogger>) {
+        let dir = std::env::temp_dir().join(format!("crucible-logview-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        (dir, logger)
+    }
+
+    #[test]
+    fn l_key_opens_the_log_view_without_a_completion_gate() {
+        // The log exists from process start — no run is needed (this
+        // app's logger is disabled: the view opens in its N/A placeholder
+        // mode, never a crash).
+        let mut app = App::new();
+        let r = app.handle_key(&char_key('l'));
+        assert_eq!(r, KeyAction::Continue);
+        assert_eq!(app.phase, Phase::Log, "l opens the log view immediately");
+        assert!(app.running);
+    }
+
+    #[test]
+    fn l_key_opens_the_log_view_mid_run() {
+        // No completion gate even while a benchmark sequence is running
+        // (unlike `m`): the log is being written live.
+        let mut app = App::new();
+        app.seq.set_running(true);
+        app.handle_key(&char_key('l'));
+        assert_eq!(app.phase, Phase::Log, "mid-run l opens the log view");
+        assert!(app.seq.is_running(), "the run is untouched by the view");
+    }
+
+    #[test]
+    fn l_key_in_the_config_view_is_scoped_to_editing() {
+        // View 6 is a text form: at the gate `l` is ignored (and never
+        // opens the log view); in Editing, `l` types into the focused
+        // field — the same scope as the `c` key.
+        let mut app = App::new();
+        app.view = View::Config; // gate
+        app.config.cursor = 0; // URL
+        app.config.url.clear(); // start from a known-empty field
+        app.handle_key(&char_key('l'));
+        assert_eq!(
+            app.phase,
+            Phase::Dashboard,
+            "`l` must not open the log view from the gate"
+        );
+        assert_eq!(app.config.url, "", "the gate ignores typing");
+
+        app.config.edit_mode = ConfigMode::Editing;
+        app.handle_key(&char_key('l'));
+        assert_eq!(
+            app.phase,
+            Phase::Dashboard,
+            "`l` must not open the log view in Editing"
+        );
+        assert_eq!(app.config.url, "l", "`l` types into the URL in Editing");
+    }
+
+    #[test]
+    fn l_key_in_the_history_view_opens_the_cursor_session_archive() {
+        // A.5: from the History view, `l` opens the cursor session's
+        // archive log (run-<ts>-<session8>.log).
+        let (dir, logger) = temp_logger("history-l");
+        let session_id = "12345678-aaaa-bbbb-cccc-dddddddddddd".to_string();
+        let archive_name = "run-20261019-010000-12345678.log";
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(archive_name),
+            "[01:00:00.000] [INFO] [SETUP] archived run\n",
+        )
+        .unwrap();
+        logger.finish();
+
+        let mut app = App::new().with_logger(logger);
+        app.view = View::History;
+        app.history = Some(HistoryState {
+            sessions: vec![crate::storage::models::BenchmarkSession {
+                session_id: session_id.clone(),
+                ..Default::default()
+            }],
+            cursor: 0,
+            ..Default::default()
+        });
+        app.handle_key(&char_key('l'));
+        assert_eq!(app.phase, Phase::Log, "history l opens the log view");
+        assert_eq!(
+            app.log_view.path,
+            dir.join(archive_name).display().to_string(),
+            "the archive path is shown"
+        );
+        assert!(
+            app.log_view.lines.iter().any(|l| l.contains("archived run")),
+            "the archive content is read: {:?}",
+            app.log_view.lines
+        );
+        assert!(!app.log_view.unavailable);
+        // The History view state is untouched by the phase change.
+        assert_eq!(app.view, View::History);
+        assert!(app.history.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_log_reads_the_file_log_content() {
+        // A real logger in a temp dir: `latest.log` carries the records
+        // (the writer thread formats them).
+        let (dir, logger) = temp_logger("open-log");
+        logger.info(Context::Setup, "run started — url=http://x");
+        logger.warn(Context::EngineB, "step 2 slow");
+        logger.finish();
+
+        let mut app = App::new().with_logger(logger);
+        app.open_log();
+        assert_eq!(app.phase, Phase::Log);
+        assert_eq!(
+            app.log_view.path,
+            dir.join("latest.log").display().to_string()
+        );
+        assert!(
+            app.log_view
+                .lines
+                .iter()
+                .any(|l| l.contains("[INFO] [SETUP] run started")),
+            "the file log content is in the state: {:?}",
+            app.log_view.lines
+        );
+        assert!(
+            app.log_view
+                .lines
+                .iter()
+                .any(|l| l.contains("[WARN] [ENGINE_B] step 2 slow"))
+        );
+        assert!(!app.log_view.unavailable);
+        // The save destination is pre-filled under the exports dir.
+        assert!(app.log_view.save_path.contains("exports/run-log-"), "{}", app.log_view.save_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_log_with_a_disabled_logger_is_the_placeholder() {
+        let mut app = App::new(); // App::new() → the disabled logger
+        app.open_log();
+        assert_eq!(app.phase, Phase::Log, "the view opens regardless");
+        assert!(app.log_view.unavailable, "N/A-never-fail placeholder mode");
+        assert!(
+            app.log_view
+                .lines
+                .iter()
+                .any(|l| l.contains("logger disabled")),
+            "{:?}",
+            app.log_view.lines
+        );
+    }
+
+    #[test]
+    fn open_log_for_session_not_found_is_the_placeholder() {
+        let (dir, logger) = temp_logger("no-archive");
+        logger.finish();
+        let mut app = App::new().with_logger(logger);
+        app.open_log_for_session("ffffffff-eeee-dddd-cccc-aaaaaaaaaaaa");
+        assert_eq!(app.phase, Phase::Log);
+        assert!(app.log_view.unavailable);
+        assert!(
+            app.log_view
+                .lines
+                .iter()
+                .any(|l| l.contains("no archive log found for session ffffffff")),
+            "{:?}",
+            app.log_view.lines
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_esc_returns_to_the_dashboard() {
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        app.log_view = LogState::new(
+            vec!["line one".to_string()],
+            "/tmp/latest.log".to_string(),
+            "/tmp/run-log.log".to_string(),
+        );
+        let r = app.handle_key(&key(KeyCode::Esc));
+        assert_eq!(r, KeyAction::Continue);
+        assert_eq!(app.phase, Phase::Dashboard, "Esc closes the log view");
+        assert!(app.running);
+    }
+
+    #[test]
+    fn log_scrolling_via_the_app_key_path() {
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        app.log_view = LogState::new(
+            (0..20).map(|i| format!("line {i}")).collect(),
+            "/tmp/latest.log".to_string(),
+            "/tmp/run-log.log".to_string(),
+        );
+        app.handle_key(&char_key('j'));
+        assert_eq!(app.log_view.scroll, 1);
+        app.handle_key(&key(KeyCode::Down));
+        assert_eq!(app.log_view.scroll, 2);
+        app.handle_key(&char_key('k'));
+        assert_eq!(app.log_view.scroll, 1);
+        app.handle_key(&key(KeyCode::PageDown));
+        assert_eq!(app.log_view.scroll, 11);
+        app.handle_key(&key(KeyCode::PageUp));
+        assert_eq!(app.log_view.scroll, 1);
+        app.handle_key(&key(KeyCode::End));
+        assert_eq!(app.log_view.scroll, 19, "End = the last line index");
+        app.handle_key(&key(KeyCode::Home));
+        assert_eq!(app.log_view.scroll, 0);
+    }
+
+    #[test]
+    fn log_q_is_inert_and_never_opens_the_quit_overlay() {
+        // The Log branch returns before the q-quit arm (the same rule as
+        // the report).
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        let r = app.handle_key(&char_key('q'));
+        assert_eq!(r, KeyAction::Continue);
+        assert!(!app.pending_quit, "q must not open the quit overlay");
+        assert_eq!(app.phase, Phase::Log, "the view stays open");
+        assert!(app.running);
+    }
+
+    #[test]
+    fn log_copy_message_is_ok_and_na_never_fail() {
+        // The `c` key's handler decision, pure over the outcome (the
+        // N/A-never-fail rule — a broken sink is a warning, never a
+        // crash).
+        assert_eq!(
+            App::log_copy_message(&Ok(())),
+            "[log] copied to clipboard (OSC 52)"
+        );
+        assert_eq!(
+            App::log_copy_message(&Err("broken sink".to_string())),
+            "[log] clipboard unsupported by terminal — use [S]ave"
+        );
+    }
+
+    #[test]
+    fn log_copy_key_logs_success_and_stays_open() {
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        app.log_view = LogState::new(
+            vec![
+                "[01:00:00.000] [INFO] [SETUP] run started".to_string(),
+                "[01:00:01.000] [INFO] [SSE] token #1".to_string(),
+            ],
+            "/tmp/latest.log".to_string(),
+            "/tmp/run-log.log".to_string(),
+        );
+        // In a piped `cargo test` the OSC 52 write to stdout succeeds
+        // (inert bytes on the pipe — the clipboard.rs smoke test
+        // establishes the convention) → the success log. The app never
+        // crashes and stays in the log view.
+        app.handle_key(&key(KeyCode::Char('c')));
+        let log_text: Vec<String> = app.log.iter().map(line_text).collect();
+        assert!(
+            log_text
+                .iter()
+                .any(|l| l == "[log] copied to clipboard (OSC 52)"),
+            "the c key logs the copy: {log_text:?}"
+        );
+        assert!(app.running, "copy never quits the app");
+        assert_eq!(app.phase, Phase::Log, "stays in the log view after copy");
+    }
+
+    #[test]
+    fn log_save_key_writes_the_log_to_the_save_path() {
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        let path = std::env::temp_dir().join(format!("crucible-logview-{}.log", std::process::id()));
+        app.log_view = LogState::new(
+            vec![
+                "=== crucible-llm run log — 2026-10-19 01:00:00 ===".to_string(),
+                "[01:00:00.000] [INFO] [SETUP] run started".to_string(),
+            ],
+            "/tmp/logs/latest.log".to_string(),
+            path.to_string_lossy().into_owned(),
+        );
+        app.handle_key(&key(KeyCode::Char('s')));
+
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("the s key wrote the file: {e}"));
+        assert!(content.contains("=== crucible-llm run log"), "{content}");
+        assert!(content.contains("run started"), "{content}");
+        let log_text: Vec<String> = app.log.iter().map(line_text).collect();
+        assert!(
+            log_text
+                .iter()
+                .any(|l| l.starts_with("[log] saved → ") && l.contains("crucible-logview-")),
+            "the s key logs the path: {log_text:?}"
+        );
+        assert_eq!(app.phase, Phase::Log, "the view stays open after save");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn log_save_path_is_under_the_exports_dir() {
+        // `exports` is the established user-save location (the same dir
+        // the Matrix Report saves to).
+        let p = App::log_save_path(123);
+        assert!(p.contains("exports/run-log-123.log"), "{p}");
+        assert!(p.starts_with(&crate::config::data_dir().display().to_string()), "{p}");
+    }
+
+    #[test]
+    fn footer_shows_the_log_key() {
+        let app = App::new();
+        let t = line_text(&app.footer_line());
+        assert!(t.contains("[L]og"), "the footer names the log key: {t}");
+    }
+
+    #[test]
+    fn render_phase_log_shows_the_takeover() {
+        let mut app = App::new();
+        app.phase = Phase::Log;
+        app.log_view = LogState::new(
+            vec![
+                "=== crucible-llm run log — 2026-10-19 01:00:00 (session 12345678) ===".to_string(),
+                "[01:00:00.000] [INFO] [SETUP] run started".to_string(),
+            ],
+            "/tmp/logs/latest.log".to_string(),
+            "/tmp/exports/run-log-1.log".to_string(),
+        );
+        let text = rendered_text(&app, 120, 40);
+        assert!(text.contains("RUN LOG"), "the top bar: {text}");
+        assert!(text.contains("run started"), "the log line: {text}");
+        assert!(text.contains("[C]opy"), "{text}");
+        assert!(text.contains("[S]ave"), "{text}");
+        assert!(text.contains("[Esc]lose"), "{text}");
+        assert!(text.contains("/tmp/logs/latest.log"), "the path: {text}");
+        // The dashboard must not render underneath the takeover.
+        assert!(!text.contains("BENCHMARK SEQUENCE"), "{text}");
     }
 }

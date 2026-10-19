@@ -18,6 +18,7 @@ pub mod config;
 pub mod gpu;
 pub mod history;
 pub mod live;
+pub mod log;
 pub mod needle;
 pub mod report;
 pub mod setup;
