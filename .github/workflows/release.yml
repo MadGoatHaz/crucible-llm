@@ -116,5 +116,5 @@ jobs:
           # Explicit tag so manual/back-fill runs target the right release.
           # The action creates the release if the tag has none yet.
           tag_name: v${{ steps.version.outputs.version }}
-          name: v${{ steps.version.outputs.version }}
+          name: Crucible LLM v${{ steps.version.outputs.version }}
           files: dist/*
