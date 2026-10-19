@@ -151,6 +151,10 @@ pub struct RunLogger {
     handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The `latest.log` path (`None` when disabled).
     path: Option<PathBuf>,
+    /// The archive path (`run-<stamp>-<session8>.log`, `None` when
+    /// disabled) — the run's permanent log copy, known at start (the
+    /// name is computed before the writer thread spawns).
+    archive_path: Option<PathBuf>,
     /// R2 (traceability): the run's session UUID, stamped into the log
     /// header + archive name so the log joins deterministically to the
     /// `benchmark_sessions` row. `None` when the caller did not supply one.
@@ -162,6 +166,7 @@ impl std::fmt::Debug for RunLogger {
         f.debug_struct("RunLogger")
             .field("active", &self.active.load(Ordering::Relaxed))
             .field("path", &self.path)
+            .field("archive_path", &self.archive_path)
             .field("session", &self.session)
             .finish()
     }
@@ -273,6 +278,7 @@ impl RunLogger {
             active: AtomicBool::new(true),
             handle: std::sync::Mutex::new(handle),
             path: Some(dir.join("latest.log")),
+            archive_path: Some(dir.join(&archive_name)),
             session,
         });
         // The header is the first record the writer emits (it is not
@@ -292,6 +298,7 @@ impl RunLogger {
             active: AtomicBool::new(false),
             handle: std::sync::Mutex::new(None),
             path: None,
+            archive_path: None,
             session: None,
         })
     }
@@ -311,6 +318,12 @@ impl RunLogger {
     /// The `latest.log` path (`None` when disabled).
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// The archive path (`run-<stamp>-<session8>.log`, `None` when
+    /// disabled) — the run's permanent log copy.
+    pub fn archive_path(&self) -> Option<&Path> {
+        self.archive_path.as_deref()
     }
 
     /// Log at [`Level::Debug`].
@@ -367,6 +380,19 @@ impl Drop for RunLogger {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// Read a run-log file into lines (the **N/A-never-fail** seam for the
+/// log-view / `--show-log` readers): `Ok(lines)` on success; `Err(String)`
+/// when the file is missing or unreadable (disabled logger, a
+/// `--log-dir` elsewhere, permissions). Pure `std::fs` — the only file
+/// reads in the log module live on key-press / run-end paths, never the
+/// non-blocking writer path.
+#[must_use]
+pub fn read_log_file(path: &Path) -> Result<Vec<String>, String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .map(|s| s.lines().map(String::from).collect())
 }
 
 /// The writer thread: drain the channel, format each record, and write it
@@ -639,6 +665,12 @@ mod tests {
 
         // The logger exposes the session id for a programmatic join.
         assert_eq!(logger.session_id(), Some(session_id.as_str()));
+        // The archive path accessor points at the on-disk archive.
+        assert_eq!(
+            logger.archive_path(),
+            Some(dir.join(&archives[0]).as_path()),
+            "archive_path() is the created archive file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -673,12 +705,50 @@ mod tests {
         let logger = RunLogger::disabled();
         assert!(!logger.is_active());
         assert!(logger.path().is_none());
+        assert!(logger.archive_path().is_none());
         // All four levels are no-ops (no panic, no channel).
         logger.debug(Context::Setup, "x");
         logger.info(Context::Setup, "x");
         logger.warn(Context::Setup, "x");
         logger.error(Context::Setup, "x");
         logger.finish(); // idempotent no-op
+    }
+
+    // ── read_log_file (the N/A-never-fail read seam) ────────────────────
+
+    #[test]
+    fn read_log_file_returns_the_lines() {
+        let dir = temp_log_dir("read-log-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("latest.log");
+        std::fs::write(&p, "[10:00:00.000] [INFO] [SETUP] one\n[10:00:01.000] [INFO] [SSE] two\n")
+            .unwrap();
+        let lines = read_log_file(&p).expect("readable file");
+        assert_eq!(
+            lines,
+            vec![
+                "[10:00:00.000] [INFO] [SETUP] one".to_string(),
+                "[10:00:01.000] [INFO] [SSE] two".to_string(),
+            ]
+        );
+        // A trailing newline does not produce a phantom empty line.
+        let p2 = dir.join("trailing.log");
+        std::fs::write(&p2, "only\n").unwrap();
+        assert_eq!(read_log_file(&p2).unwrap(), vec!["only".to_string()]);
+        // An empty file is zero lines (not an error).
+        let p3 = dir.join("empty.log");
+        std::fs::write(&p3, "").unwrap();
+        assert!(read_log_file(&p3).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_log_file_missing_is_an_err_not_a_panic() {
+        let missing = std::env::temp_dir()
+            .join(format!("crucible-runlog-missing-{}", std::process::id()))
+            .join("never-created.log");
+        let e = read_log_file(&missing).unwrap_err();
+        assert!(!e.is_empty(), "the error carries the io reason");
     }
 
     #[test]
