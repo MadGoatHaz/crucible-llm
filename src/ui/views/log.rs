@@ -277,8 +277,7 @@ mod tests {
     fn state() -> LogState {
         LogState::new(
             vec![
-                "=== crucible-llm run log — 2026-10-19 01:00:00 (session 12345678) ==="
-                    .to_string(),
+                "=== crucible-llm run log — 2026-10-19 01:00:00 (session 12345678) ===".to_string(),
                 "[01:00:00.000] [INFO] [SETUP] run started".to_string(),
                 "[01:00:01.000] [INFO] [SSE] token #1 received".to_string(),
             ],
@@ -370,7 +369,10 @@ mod tests {
         app.log_view = state();
         let text = render_text(&app, 120, 40);
         assert!(text.contains("RUN LOG"), "{text}");
-        assert!(text.contains("/tmp/logs/latest.log"), "path in the bar: {text}");
+        assert!(
+            text.contains("/tmp/logs/latest.log"),
+            "path in the bar: {text}"
+        );
         assert!(text.contains("run started"), "log line 2: {text}");
         assert!(text.contains("token #1 received"), "log line 3: {text}");
         // The footer: the three actions + the visible range + the path.
@@ -397,8 +399,7 @@ mod tests {
     fn render_unavailable_shows_the_placeholder_and_omits_copy_save() {
         let mut app = App::new();
         app.phase = Phase::Log;
-        app.log_view =
-            LogState::unavailable("run log unavailable (logger disabled)".to_string());
+        app.log_view = LogState::unavailable("run log unavailable (logger disabled)".to_string());
         let text = render_text(&app, 120, 40);
         assert!(
             text.contains("run log unavailable (logger disabled)"),

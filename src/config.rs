@@ -1162,7 +1162,12 @@ pub fn layer(
         env_vars::MATRIX_REPORT,
         file.and_then(|f| f.matrix_report),
     )?;
-    let show_log = bool_layer(cli.show_log, "show_log", env_vars::SHOW_LOG, file.and_then(|f| f.show_log))?;
+    let show_log = bool_layer(
+        cli.show_log,
+        "show_log",
+        env_vars::SHOW_LOG,
+        file.and_then(|f| f.show_log),
+    )?;
     // `--banner` is a CLI-only display marker (hidden flag): it never
     // layers from env/file.
     let banner = cli.banner;

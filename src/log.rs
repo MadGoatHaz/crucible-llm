@@ -720,8 +720,11 @@ mod tests {
         let dir = temp_log_dir("read-log-file");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("latest.log");
-        std::fs::write(&p, "[10:00:00.000] [INFO] [SETUP] one\n[10:00:01.000] [INFO] [SSE] two\n")
-            .unwrap();
+        std::fs::write(
+            &p,
+            "[10:00:00.000] [INFO] [SETUP] one\n[10:00:01.000] [INFO] [SSE] two\n",
+        )
+        .unwrap();
         let lines = read_log_file(&p).expect("readable file");
         assert_eq!(
             lines,
