@@ -33,8 +33,8 @@ use crate::engines::sequence::{
     summarize_speed,
 };
 use crate::engines::speed::{
-    all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
-    PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
+    all_failed, format_split_report, format_summary, iteration_complete_line, json_report_split,
+    perceived_ttft_seconds, PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
     build_sweep, context_size_label, flatout_streams_for, summarize_sweep, Engine, FlatOutEngine,
@@ -184,6 +184,25 @@ pub fn show_log_output(logger: &RunLogger) -> Option<Result<String, String>> {
     logger
         .path()
         .map(|p| read_log_file(p).map(|lines| lines.join("\n")))
+}
+
+/// C2/C4 parity: the headless Engine A per-iteration **completion** line —
+/// the same pure [`iteration_complete_line`] the TUI logs, so headless and
+/// TUI emit the identical format (content/reasoning split + the answer /
+/// full-window blended decode rates + TTFT). `None` for a failed iteration
+/// (the caller logs the `Iteration {i}/{n} failed` error line instead,
+/// mirroring the TUI).
+///
+/// Pure and testable (no I/O): [`run_headless`] routes each successful
+/// iteration through this and fires it on the non-blocking log channel
+/// (an mpsc send — never the stream timing path).
+#[must_use]
+pub fn headless_iteration_complete_line(
+    i: usize,
+    iterations: usize,
+    r: &SpeedResult,
+) -> Option<String> {
+    (!r.is_failed()).then(|| iteration_complete_line(i, iterations, r))
 }
 
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
@@ -367,6 +386,25 @@ pub fn run_headless(
                         "  chunks={} content={} reasoning={}",
                         result.total_chunks, result.content_chunks, result.reasoning_chunks
                     ));
+                }
+                // C2/C4 parity: the per-iteration completion line — the same
+                // `iteration_complete_line()` the TUI logs, so headless and
+                // TUI emit the identical format (content/reasoning split +
+                // answer / blended rates + TTFT). The non-blocking log
+                // channel (an mpsc send) — never the stream timing path. A
+                // failed iteration logs the `Iteration {i}/{n} failed`
+                // error line instead (mirroring the TUI).
+                match headless_iteration_complete_line(i, iterations, &result) {
+                    Some(line) => logger.info(Context::EngineA, line),
+                    None => logger.error(
+                        Context::EngineA,
+                        format!(
+                            "Iteration {}/{} failed: {}",
+                            i + 1,
+                            iterations,
+                            result.error.as_deref().unwrap_or("unknown")
+                        ),
+                    ),
                 }
                 results.push(result);
             }
@@ -1200,6 +1238,66 @@ mod tests {
             Option<Box<CpuPowerBackend>>,
             String,
         ) -> i32 = run_headless;
+    }
+
+    /// C2/C4 parity: the headless Engine A per-iteration completion line is
+    /// the SAME pure `iteration_complete_line` the TUI logs — so headless
+    /// and TUI emit the identical format (content/reasoning split +
+    /// answer / blended rates + TTFT). A failed iteration (an error with
+    /// zero completion tokens) yields `None` (the caller logs the
+    /// `Iteration {i}/{n} failed` error line instead).
+    #[test]
+    fn headless_iteration_line_matches_the_tui_format() {
+        // A pure-CoT run: all 256 completion tokens are reasoning (0
+        // content) — the v0.1.7 shape.
+        let pure_cot = SpeedResult {
+            ttft: 0.18,
+            prompt_tokens: 60,
+            completion_tokens: 256,
+            reasoning_tokens: Some(256),
+            pp_speed: 333.3,
+            tg_speed: 56.4,
+            mtp_efficiency: 1.0,
+            stream_time: 4.6,
+            total_chunks: 256,
+            content_chunks: 0,
+            reasoning_chunks: 256,
+            other_chunks: 0,
+            estimated: false,
+            model: "m".into(),
+            mode: "chat".into(),
+            error: None,
+            looping: false,
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
+            pure_cot: true,
+            blended_tps: 56.4,
+        };
+        // The headless line is byte-identical to the TUI's pure builder.
+        let line = headless_iteration_complete_line(0, 3, &pure_cot).expect("a completion line");
+        assert_eq!(line, iteration_complete_line(0, 3, &pure_cot));
+        assert_eq!(
+            line,
+            "Iteration 1/3 complete: 256 tok (0 content / 256 reasoning), \
+             56.4 t/s answer, 56.4 t/s blended, TTFT 180 ms"
+        );
+
+        // A failed iteration (error + zero completion tokens) → `None` (the
+        // caller logs the `Iteration {i}/{n} failed` error line instead).
+        let failed = SpeedResult {
+            completion_tokens: 0,
+            reasoning_tokens: None,
+            tg_speed: 0.0,
+            blended_tps: 0.0,
+            pure_cot: false,
+            error: Some("connection refused".into()),
+            ..pure_cot
+        };
+        assert!(
+            headless_iteration_complete_line(0, 3, &failed).is_none(),
+            "a failed iteration must not emit a completion line"
+        );
     }
 
     /// P3-A / CF-53 / I4: the `--json` energy object carries the
