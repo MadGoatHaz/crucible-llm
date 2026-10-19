@@ -505,6 +505,7 @@ impl ConfigState {
             // Mode markers are CLI concerns — never persisted (Chunk 20).
             headless: None,
             matrix_report: None,
+            show_log: None,
             export: None,
             export_path: None,
             // The log dir is a CLI/env concern — never persisted from the form.

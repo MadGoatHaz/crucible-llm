@@ -70,6 +70,9 @@ pub mod env_vars {
     /// on stdout after the run (auto-parsed by
     /// https://madgoathaz.github.io/llm-matrix/; implies headless).
     pub const MATRIX_REPORT: &str = "CRUCIBLE_MATRIX_REPORT";
+    /// `true`/`false` — print the full run log on stdout after the run
+    /// (pipeable; implies headless).
+    pub const SHOW_LOG: &str = "CRUCIBLE_SHOW_LOG";
     pub const CONFIG: &str = "CRUCIBLE_CONFIG";
     /// Comma-separated concurrency ladder (Chunk 18).
     pub const LADDER: &str = "CRUCIBLE_LADDER";
@@ -513,6 +516,13 @@ pub struct Cli {
     /// cannot appear inside it, so a pipe consumer slices on them).
     #[arg(long)]
     pub matrix_report: bool,
+    /// Print the full run log on stdout after the run (pipeable).
+    /// Implies headless mode; with `--json`, the JSON document prints
+    /// first (the log's `[ts] [LEVEL] [CTX]` line shape is what a pipe
+    /// consumer slices on). Read errors go to stderr — the exit-code
+    /// rule is untouched (N/A-never-fail).
+    #[arg(long)]
+    pub show_log: bool,
     /// Print the startup banner and exit (Chunk 20: the bare-invocation
     /// banner path, demoted to an explicit flag).
     #[arg(long, hide = true)]
@@ -622,6 +632,11 @@ pub struct Config {
     /// file). Implies headless mode at dispatch; the user fields are
     /// left blank (the block is a copy-pasteable starting point).
     pub matrix_report: bool,
+    /// Print the full run log on stdout after the run (`--show-log` /
+    /// `CRUCIBLE_SHOW_LOG` / config file). Implies headless mode at
+    /// dispatch; read errors go to stderr (N/A-never-fail — the
+    /// exit-code rule is untouched).
+    pub show_log: bool,
     /// Print the startup banner and exit (Chunk 20; CLI-only, hidden
     /// flag — the demoted bare-invocation banner path).
     pub banner: bool,
@@ -733,6 +748,7 @@ impl Default for Config {
             tui: false,
             headless: false,
             matrix_report: false,
+            show_log: false,
             banner: false,
             export: None,
             export_path: None,
@@ -816,6 +832,7 @@ pub struct ConfigFile {
     pub tui: Option<bool>,
     pub headless: Option<bool>,
     pub matrix_report: Option<bool>,
+    pub show_log: Option<bool>,
     pub export: Option<ExportFormat>,
     pub export_path: Option<PathBuf>,
     /// The concurrency ladder (Chunk 18).
@@ -894,6 +911,9 @@ impl ConfigFile {
         }
         if let Some(v) = self.matrix_report {
             c.matrix_report = v;
+        }
+        if let Some(v) = self.show_log {
+            c.show_log = v;
         }
         if let Some(v) = self.export {
             c.export = Some(v);
@@ -1142,6 +1162,7 @@ pub fn layer(
         env_vars::MATRIX_REPORT,
         file.and_then(|f| f.matrix_report),
     )?;
+    let show_log = bool_layer(cli.show_log, "show_log", env_vars::SHOW_LOG, file.and_then(|f| f.show_log))?;
     // `--banner` is a CLI-only display marker (hidden flag): it never
     // layers from env/file.
     let banner = cli.banner;
@@ -1383,6 +1404,7 @@ pub fn layer(
         tui,
         headless,
         matrix_report,
+        show_log,
         banner,
         export,
         export_path,
@@ -1775,6 +1797,7 @@ mod tests {
         assert!(!cfg.tui);
         assert!(!cfg.headless);
         assert!(!cfg.matrix_report);
+        assert!(!cfg.show_log);
         assert!(!cfg.banner);
         assert!(cfg.api_key.is_none());
         assert!(cfg.tokenizer.is_none());
@@ -2022,6 +2045,82 @@ mod tests {
         // A file without the key keeps the default (false).
         let f = ConfigFile::default();
         assert!(!f.to_config().matrix_report);
+    }
+
+    // ── Show-log marker (`--show-log`) ───────────────────────────────────
+
+    #[test]
+    fn show_log_flag_off_by_default() {
+        assert!(!resolve_bare(&["crucible-llm"]).show_log);
+        // The flag parses on the CLI surface.
+        let cli = Cli::try_parse_from(["crucible-llm", "--show-log"]).unwrap();
+        assert!(cli.show_log);
+        assert!(resolve_bare(&["crucible-llm", "--show-log"]).show_log);
+    }
+
+    #[test]
+    fn show_log_layering_cli_over_env_over_file() {
+        let cli_from_args = |args: &[&str]| (cli_from(args), matches_from(args));
+        let file_true = ConfigFile {
+            show_log: Some(true),
+            ..Default::default()
+        };
+        let file_false = ConfigFile {
+            show_log: Some(false),
+            ..Default::default()
+        };
+        let env_true = vec![(env_vars::SHOW_LOG.to_string(), "true".to_string())];
+        let env_false = vec![(env_vars::SHOW_LOG.to_string(), "false".to_string())];
+        // CLI beats env + file (both pointing the other way).
+        let (cli, matches) = cli_from_args(&["crucible-llm", "--show-log"]);
+        assert!(
+            layer(&cli, &matches, &env_false, Some(&file_false))
+                .unwrap()
+                .show_log
+        );
+        // Env beats file (no CLI flag).
+        let (cli, matches) = cli_from_args(&["crucible-llm"]);
+        assert!(
+            layer(&cli, &matches, &env_true, Some(&file_false))
+                .unwrap()
+                .show_log
+        );
+        // Env (false) beats file (true) — the file only fills what the
+        // layers above leave unset.
+        let (cli, matches) = cli_from_args(&["crucible-llm"]);
+        assert!(
+            !layer(&cli, &matches, &env_false, Some(&file_true))
+                .unwrap()
+                .show_log
+        );
+        // No env: the file beats the default.
+        let (cli, matches) = cli_from_args(&["crucible-llm"]);
+        assert!(
+            layer(&cli, &matches, &[], Some(&file_true))
+                .unwrap()
+                .show_log
+        );
+        // The default is false.
+        assert!(!Config::default().show_log);
+    }
+
+    #[test]
+    fn config_file_show_log_roundtrip() {
+        let f = ConfigFile {
+            show_log: Some(true),
+            ..Default::default()
+        };
+        assert!(f.to_config().show_log);
+        // The key serializes + deserializes (a saved file carries it).
+        let json = serde_json::to_string(&f).expect("serialize");
+        assert!(json.contains("\"show_log\":true"), "{json}");
+        let back: ConfigFile = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.show_log, Some(true));
+        // A file without the key keeps the default (false) —
+        // `deny_unknown_fields` means old files (without the key) stay
+        // valid.
+        let f = ConfigFile::default();
+        assert!(!f.to_config().show_log);
     }
 
     #[test]
