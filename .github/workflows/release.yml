@@ -7,8 +7,10 @@
 # `tag` to back-fill binaries for an existing tag (e.g. v0.1.7); if left empty,
 # the latest tag is used.
 #
-# Artifact naming: crucible-llm-v<VERSION>-<target>.{tar.gz|zip}
-#   linux/macos → .tar.gz, windows → .zip (PowerShell Compress-Archive)
+# Artifact naming: crucible-llm-v<VERSION>-<os>-<arch>  (raw binary, NO archive)
+#   Matches the prior release convention (e.g. crucible-llm-v0.1.5-linux-x86_64,
+#   contentType application/octet-stream). linux/macos → no extension,
+#   windows → .exe.
 #
 # NOTE: an optional second macOS entry (x86_64-apple-darwin, for Intel Macs)
 # can be added by appending one pair to each matrix list below:
@@ -84,17 +86,27 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TARGET="${{ matrix.target }}"
+          OS="${{ matrix.os }}"
           mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          # Map the cargo target to a human-readable "<os>-<arch>" label matching
+          # the prior release convention (e.g. linux-x86_64).
+          case "${TARGET}" in
+            x86_64-unknown-linux-gnu) LABEL="linux-x86_64"   ;;
+            aarch64-apple-darwin)     LABEL="macos-aarch64"  ;;
+            x86_64-apple-darwin)      LABEL="macos-x86_64"   ;;
+            x86_64-pc-windows-msvc)   LABEL="windows-x86_64" ;;
+            *) echo "Unknown target: ${TARGET}"; exit 1 ;;
+          esac
+          # Raw binary (no tar.gz / zip) — matches the prior release convention.
+          # Windows keeps the .exe suffix; unix targets have no extension.
+          if [ "${OS}" = "windows-latest" ]; then
             BIN="crucible-llm.exe"
-            ARTIFACT="dist/crucible-llm-v${VERSION}-${TARGET}.zip"
-            powershell -NoProfile -Command \
-              "Compress-Archive -Path 'target/${TARGET}/release/${BIN}' -DestinationPath '${ARTIFACT}'"
+            ARTIFACT="dist/crucible-llm-v${VERSION}-${LABEL}.exe"
           else
             BIN="crucible-llm"
-            ARTIFACT="dist/crucible-llm-v${VERSION}-${TARGET}.tar.gz"
-            tar -cz "${ARTIFACT}" -C "target/${TARGET}/release" "${BIN}"
+            ARTIFACT="dist/crucible-llm-v${VERSION}-${LABEL}"
           fi
+          cp "target/${TARGET}/release/${BIN}" "${ARTIFACT}"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
           ls -lh dist/
 
