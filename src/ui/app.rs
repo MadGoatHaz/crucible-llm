@@ -1131,6 +1131,10 @@ impl App {
             );
             return;
         }
+        // C1: the run-start `[CONFIG]` block — the resolved inputs (one
+        // compact line near the top of the run log; a channel send, never
+        // a blocking write).
+        self.logger.log_config(&cfg);
         self.seq.set_running(true);
         // Publish the initial sequence state *synchronously* so the Live
         // view's header / progress bar / queue panel are correct from the

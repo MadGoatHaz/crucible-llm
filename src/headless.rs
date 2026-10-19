@@ -207,6 +207,10 @@ pub fn run_headless(
         logger.warn(Context::Setup, "no engines selected — nothing to run");
         return 0;
     }
+    // C1: the run-start `[CONFIG]` block — the resolved inputs (one
+    // compact line near the top of the run log; a channel send, never a
+    // blocking write).
+    logger.log_config(cfg);
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()

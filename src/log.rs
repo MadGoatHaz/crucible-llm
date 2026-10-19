@@ -34,6 +34,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::Config;
+use crate::engines::human_size;
+
 /// A log level (the `[LEVEL]` field of each line).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
@@ -346,6 +349,14 @@ impl RunLogger {
         self.send(Level::Error, ctx, msg);
     }
 
+    /// Emit the run-start `[CONFIG]` block (C1): the resolved inputs
+    /// (url / model / mode / tokens / iterations / timeout / nocache /
+    /// ladder / NIAH ladder / engines / hardware) as one compact,
+    /// greppable line. One channel send — never blocks the caller.
+    pub fn log_config(&self, cfg: &Config) {
+        self.info(Context::Setup, config_block_line(cfg));
+    }
+
     fn send(&self, level: Level, ctx: Context, msg: impl Into<String>) {
         if !self.active.load(Ordering::Relaxed) {
             return;
@@ -449,6 +460,71 @@ fn write_line(
         .and(w_archive.write_all(b"\n"))
         .is_ok();
     ok
+}
+
+/// The run-start `[CONFIG]` block (C1): the resolved inputs of the run —
+/// url / model / mode / tokens / iterations / timeout / nocache / the
+/// concurrency ladder / the NIAH ladder / the selected engines / the
+/// hardware toggle — as **one** compact line (a multi-line block would
+/// break the `[ts] [LEVEL] [CTX] msg` line contract). Pure: no I/O.
+#[must_use]
+pub fn config_block_line(cfg: &Config) -> String {
+    format!(
+        "[CONFIG] url={} model={} mode={} tokens={} iterations={} timeout={}s nocache={} ladder=[{}] niah={} engines=[{}] hardware={}",
+        cfg.url,
+        cfg.model,
+        cfg.mode.label(),
+        cfg.tokens,
+        cfg.iterations,
+        cfg.timeout,
+        cfg.nocache,
+        cfg.ladder
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        niah_ladder(cfg),
+        cfg.engines.iter_labels().collect::<Vec<_>>().join(","),
+        if cfg.hardware { "on" } else { "off" },
+    )
+}
+
+/// The NIAH (C1) part of the `[CONFIG]` line: the configured ladder
+/// (`2k..128k × 0..100`, or `custom 256k` for the count-test mode).
+///
+/// C3 (qualify once): without a `--tokenizer` the sizes are `chars/4`
+/// estimates, and the one-time `(approx. token counts — no --tokenizer)`
+/// qualifier lands **here** (plus the C1 start line in `sequence.rs`)
+/// instead of repeating on every one of the per-cell log lines.
+fn niah_ladder(cfg: &Config) -> String {
+    let base = match cfg.niah_custom {
+        Some(s) => format!("custom {}", human_size(s)),
+        None => {
+            let (Some(first), Some(last)) =
+                (cfg.niah_contexts.first(), cfg.niah_contexts.last())
+            else {
+                return String::new();
+            };
+            let (d0, d1) = match (cfg.niah_depths.first(), cfg.niah_depths.last()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    return format!("{}..{}", human_size(*first), human_size(*last))
+                }
+            };
+            format!(
+                "{}..{} × {}..{}",
+                human_size(*first),
+                human_size(*last),
+                d0,
+                d1
+            )
+        }
+    };
+    if cfg.tokenizer.is_none() && !base.is_empty() {
+        format!("{base} (approx. token counts — no --tokenizer)")
+    } else {
+        base
+    }
 }
 
 /// Format one log line: `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`.
@@ -710,6 +786,10 @@ mod tests {
         logger.info(Context::Setup, "x");
         logger.warn(Context::Setup, "x");
         logger.error(Context::Setup, "x");
+        // C1: the config block is the same no-op channel send (the
+        // non-blocking invariant — no file I/O, no blocking, nothing to
+        // drop).
+        logger.log_config(&Config::default());
         logger.finish(); // idempotent no-op
     }
 
@@ -785,6 +865,98 @@ mod tests {
         let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
         let n = latest.lines().filter(|l| l.contains("record ")).count();
         assert_eq!(n, 200, "every record from every thread landed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── C1: the run-start [CONFIG] block ───────────────────────────────
+
+    #[test]
+    fn config_block_line_carries_the_resolved_inputs() {
+        use std::path::PathBuf;
+        let mut cfg = Config::default();
+        cfg.url = "http://192.168.1.10:8000".to_string();
+        cfg.model = "qwen3.8-27b".to_string();
+        cfg.mode = crate::config::Mode::Long;
+        cfg.tokens = 32_000;
+        cfg.iterations = 6;
+        cfg.timeout = 120;
+        cfg.nocache = true;
+        cfg.ladder = vec![1, 2, 4, 8];
+        cfg.niah_contexts = vec![2_000, 4_000, 8_000];
+        cfg.niah_depths = vec![0, 50, 100];
+        cfg.engines = crate::config::EngineSelection::all();
+        cfg.hardware = true;
+        cfg.tokenizer = Some(PathBuf::from("/tmp/tokenizer.json"));
+        let line = config_block_line(&cfg);
+        assert!(line.starts_with("[CONFIG] "), "{line}");
+        assert!(line.contains("url=http://192.168.1.10:8000"), "{line}");
+        assert!(line.contains("model=qwen3.8-27b"), "{line}");
+        assert!(line.contains("mode=long"), "{line}");
+        assert!(line.contains("tokens=32000"), "{line}");
+        assert!(line.contains("iterations=6"), "{line}");
+        assert!(line.contains("timeout=120s"), "{line}");
+        assert!(line.contains("nocache=true"), "{line}");
+        assert!(line.contains("ladder=[1,2,4,8]"), "{line}");
+        assert!(line.contains("niah=2k..8k × 0..100"), "{line}");
+        assert!(line.contains(
+            "engines=[A (speed),B (concurrency),C1 (niah),C2 (reasoning),C3 (structured),D (hardware),F (flat out)]"
+        ),
+            "{line}"
+        );
+        assert!(line.contains("hardware=on"), "{line}");
+        // A tokenizer is set → the NIAH sizes are exact → no qualifier.
+        assert!(!line.contains("approx"), "{line}");
+        // One line (the `[ts] [LEVEL] [CTX] msg` contract).
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn config_block_line_default_config_qualifies_niah_once() {
+        // The default config has no `--tokenizer`: the one-time
+        // `(approx.)` qualifier lands in the NIAH part (C3 — it no
+        // longer repeats on every per-cell line).
+        let line = config_block_line(&Config::default());
+        assert!(
+            line.contains("niah=2k..128k × 0..100 (approx. token counts — no --tokenizer)"),
+            "{line}"
+        );
+        // Exactly one occurrence.
+        assert_eq!(line.matches("approx").count(), 1, "{line}");
+    }
+
+    #[test]
+    fn niah_ladder_custom_mode_and_tokenizer() {
+        let mut cfg = Config::default();
+        cfg.niah_custom = Some(256_000);
+        assert_eq!(
+            niah_ladder(&cfg),
+            "custom 256k (approx. token counts — no --tokenizer)"
+        );
+        cfg.tokenizer = Some(std::path::PathBuf::from("/tmp/tok.json"));
+        assert_eq!(niah_ladder(&cfg), "custom 256k");
+    }
+
+    #[test]
+    fn log_config_is_the_first_record_after_the_header() {
+        let dir = temp_log_dir("config-block");
+        let logger = RunLogger::start(Some(&dir));
+        logger.log_config(&Config::default());
+        logger.info(Context::EngineA, "Engine A started");
+        logger.finish();
+
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        let lines: Vec<&str> = latest.lines().collect();
+        // Line 0 is the run header; the [CONFIG] block is line 1 — near
+        // the top of the run log, one compact line.
+        assert!(lines[0].starts_with("=== crucible-llm run log"), "{latest}");
+        assert!(
+            lines[1].contains("[SETUP] [CONFIG] url="),
+            "the [CONFIG] block is the first record: {latest}"
+        );
+        assert!(lines[1].contains("niah="), "{latest}");
+        assert!(lines[1].contains("engines="), "{latest}");
+        assert!(lines[1].contains("hardware="), "{latest}");
+        assert_eq!(lines.len(), 3, "header + config + one record: {latest}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
