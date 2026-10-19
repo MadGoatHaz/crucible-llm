@@ -2,7 +2,7 @@
 
 All notable changes to Crucible LLM.
 
-## [Unreleased]
+## [0.1.8] - 2026-10-19
 
 ### Added
 - **Easy run-log access** — the full run log (written by the non-blocking `RunLogger` to `~/.local/share/crucible/logs/` — `latest.log` + `run-<timestamp>-<session-id[:8]>.log` archives) is now viewable and shareable two ways. **TUI** — press `l` (any time, no completion gate) to open a full-screen, scrollable run-log viewer: `c` copies to the clipboard (OSC 52, in supporting terminals), `s` saves to `~/.local/share/crucible/exports/run-log-<timestamp>.log`, `Esc` closes; the History view's `l` opens a **past** run's archived log by session id. **Headless** — `--show-log` (implies headless) prints the full run log to stdout (pipeable).
