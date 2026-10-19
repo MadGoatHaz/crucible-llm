@@ -133,6 +133,16 @@ pub struct SpeedResult {
     /// CF-24 (P2-A surfacing): ITL samples clamped at the histogram's
     /// 60 s bound — the ITL percentiles are capped, not exact.
     pub itl_clamped: u64,
+    /// CF-26 extension: **pure CoT** — the server reported reasoning tokens
+    /// and *zero* content tokens, so there is no answer phase. `tg_speed`
+    /// carries the full-window **blended** rate (not `0.0`), honestly
+    /// flagged (B1: N/A is never a silent zero — the rig is decoding).
+    pub pure_cot: bool,
+    /// The full-window blended decode rate (`completion_tokens /
+    /// (T_last − T_first)`), computed for **every** run (the pre-CF-26
+    /// definition) so the log/digest can show answer vs. blended side by
+    /// side.
+    pub blended_tps: f64,
 }
 
 impl SpeedResult {
@@ -178,6 +188,10 @@ impl SpeedResult {
             "usage_discrepancy": self.usage_discrepancy,
             "e2e_only": self.e2e_only,
             "itl_clamped": self.itl_clamped,
+            // B1 (pure-CoT honesty): the CF-26 extension flags — additive
+            // keys; the prototype key set above is untouched.
+            "pure_cot": self.pure_cot,
+            "blended_tps": round(self.blended_tps, 2),
         })
     }
 }
@@ -996,8 +1010,29 @@ pub fn aggregate(
     let (t_first_content, t_last_content) = content_window(events);
     let reasoning_tokens = usage_details.map(|d| d.reasoning_tokens).unwrap_or(0);
     let content_tokens = completion_tokens.saturating_sub(reasoning_tokens);
+    // The full-window blended rate (the pre-CF-26 definition) — computed
+    // for **every** run so a pure-CoT run (and the log) can report it.
+    let blended = {
+        let w = match (t_first, t_last) {
+            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+            _ => (stream_time - ttft).max(0.001),
+        };
+        completion_tokens as f64 / w
+    };
+    // B1 — pure CoT: the server reported reasoning detail and ZERO content
+    // tokens, so there is no answer phase. The honest figure is the
+    // blended rate — never a silent 0 (the rig is decoding), never a
+    // fabricated answer-phase number. `reasoning_chunks > 0` guards the
+    // degenerate usage-only stream (the detail says 0 reasoning AND 0
+    // content): that stays the 0.0 degraded sentinel, not pure-CoT (no
+    // frames were observed to blend).
+    let pure_cot =
+        !looping && usage_details.is_some() && content_tokens == 0 && reasoning_chunks > 0;
     let tg_speed = if looping {
+        // The loop guard wins: a looping run's rates are zeroed.
         0.0
+    } else if pure_cot {
+        blended
     } else if usage_details.is_some() {
         // CF-26 answer phase: content tokens over the content window.
         match (t_first_content, t_last_content) {
@@ -1005,16 +1040,14 @@ pub fn aggregate(
                 let w = (fc.delta_nanos(&lc) as f64 / 1e9).max(0.001);
                 content_tokens as f64 / w
             }
-            // Pure CoT (no content frames) or zero content tokens: no answer phase.
+            // Content tokens reported but no content window observed:
+            // a degraded (CF-25) run — the 0.0 N/A sentinel stands.
             _ => 0.0,
         }
     } else {
-        // Fallback (no reasoning-token detail): the full-window blended rate.
-        let w = match (t_first, t_last) {
-            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
-            _ => (stream_time - ttft).max(0.001),
-        };
-        completion_tokens as f64 / w
+        // No reasoning-token detail: the historical full-window blended
+        // rate (behavior unchanged).
+        blended
     };
     // §7.4 — CF-12 canonical: MTP η = completion_tokens / ALL token frames
     // (Reasoning + Content), not content-only.
@@ -1074,6 +1107,9 @@ pub fn aggregate(
         usage_discrepancy: outcome.has_usage_discrepancy(),
         e2e_only: outcome.is_e2e_only(),
         itl_clamped,
+        // B1: the pure-CoT flag + the always-computed blended rate.
+        pure_cot,
+        blended_tps: blended,
     }
 }
 
@@ -1681,6 +1717,11 @@ mod tests {
             r.mtp_efficiency
         );
 
+        // B1: no usage detail → not pure-CoT; `tg_speed` is the blended
+        // rate itself (the pre-CF-26 definition).
+        assert!(!r.pure_cot);
+        assert_eq!(r.blended_tps, r.tg_speed);
+
         assert_eq!(r.model, "test-model");
         assert_eq!(r.mode, "short");
     }
@@ -1822,9 +1863,9 @@ mod tests {
 
         // Result keys: the prototype `to_dict` set + v0.1.1 `looping`
         // + CF-25 `degraded` + the P2-A integrity flags (CF-10/24/44)
-        // (no `other_chunks`).
+        // + B1 `pure_cot` / `blended_tps` (no `other_chunks`).
         let rj = v["results"][0].as_object().unwrap();
-        assert_eq!(rj.len(), 19);
+        assert_eq!(rj.len(), 21);
         for key in [
             "ttft_s",
             "prompt_tokens",
@@ -1845,11 +1886,18 @@ mod tests {
             "usage_discrepancy",
             "e2e_only",
             "itl_clamped",
+            "pure_cot",
+            "blended_tps",
         ] {
             assert!(rj.contains_key(key), "missing {key}");
         }
         assert!(!rj.contains_key("other_chunks"));
         assert_eq!(rj["looping"], false);
+        // B1: `completed_run` is a mixed run (2 content frames) — not
+        // pure-CoT; the blended rate is the published number itself
+        // (no usage detail in this fixture).
+        assert_eq!(rj["pure_cot"], false);
+        assert!(rj["blended_tps"].is_number());
         // P2-A surfacing: `completed_run` reports 34 usage tokens over 3
         // observed frames (34 > 3×4) → the CF-10 guard trips; it is a
         // streaming result (not E2E-only) with no clamped ITL samples.
@@ -2385,6 +2433,10 @@ mod tests {
             assert!(r.is_degraded(), "no token frame → degraded");
             assert_eq!(r.pp_speed, 0.0, "no TTFT → no prefill bandwidth");
             assert!(!r.is_failed(), "usage-only, no error → not failed");
+            // B1: a usage-only stream is not pure-CoT; the 0.0 sentinel
+            // stands (nothing was observed to blend).
+            assert!(!r.pure_cot);
+            assert_eq!(r.tg_speed, 0.0);
         });
     }
 
@@ -2473,6 +2525,15 @@ mod tests {
                 "answer-phase {}",
                 r.tg_speed
             );
+            // B1 (plan test b): a mixed run (content tokens present) is
+            // NOT pure-CoT — the answer-phase rate stands — while the
+            // blended rate is still computed for the log/digest.
+            assert!(!r.pure_cot, "2 content tokens → not pure-CoT");
+            assert!(
+                (r.blended_tps - 5.0 / 0.03).abs() < 1e-6,
+                "blended {}",
+                r.blended_tps
+            );
             // Without details: the historical full-window blended rate.
             let r2 = aggregate(&cfg(), &prompt(), &outcome, &events, None, None);
             assert!(
@@ -2484,15 +2545,16 @@ mod tests {
         });
     }
 
-    /// CF-26: a pure-CoT run (no content frames) has no answer phase → 0.
-    #[test]
-    fn pure_cot_run_has_no_answer_phase() {
+    /// The B1 pure-CoT fixture: 3 reasoning frames (10/20/30 ms), **no**
+    /// content, a usage block of 3 completion tokens, and a detail of 3
+    /// reasoning tokens (`content_tokens = 0`). The token window is
+    /// 10→30 ms, so the full-window blended rate is `3 / 0.02 s = 150 t/s`.
+    fn pure_cot_run() -> (StreamOutcome, Vec<StreamEvent>, UsageDetails) {
         let (clock, mock) = quanta::Clock::mock();
         quanta::with_clock(&clock, || {
             let t0 = MonotonicInstant::now(); // 0 ms
             mock.increment(10_000_000);
             let t1 = MonotonicInstant::now(); // 10 ms
-                                              // 3 reasoning frames, no content.
             let frame_times: Vec<MonotonicInstant> = (0..3)
                 .map(|_| {
                     let at = MonotonicInstant::now();
@@ -2544,13 +2606,104 @@ mod tests {
                 loop_excluded_tokens: 0,
                 frames: 3,
             };
-            // All 3 tokens are reasoning → content_tokens = 0 → no answer phase.
             let details = UsageDetails {
                 reasoning_tokens: 3,
                 cached_tokens: 0,
             };
+            (outcome, events, details)
+        })
+    }
+
+    /// B1 (plan test a): a pure-CoT run (reasoning-only frames + usage with
+    /// `reasoning_tokens == completion_tokens`) has no answer phase — its
+    /// `tg_speed` is the full-window **blended** rate, flagged `pure_cot`.
+    /// N/A is never a silent 0: the rig is decoding.
+    #[test]
+    fn pure_cot_run_reports_the_blended_rate_flagged() {
+        let (outcome, events, details) = pure_cot_run();
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, Some(details));
+        assert!(r.pure_cot, "reasoning-only + usage detail → pure CoT");
+        // 3 tokens over the 10→30 ms token window = 150 t/s blended.
+        assert!((r.tg_speed - 150.0).abs() < 1e-6, "blended {}", r.tg_speed);
+        assert!(r.tg_speed > 0.0, "N/A is never a silent 0");
+        assert_eq!(r.tg_speed, r.blended_tps, "tg_speed IS the blended rate");
+    }
+
+    /// B1 (plan test d): the loop guard wins over pure-CoT — a looping
+    /// run's rates are zeroed and it is never flagged pure-CoT.
+    #[test]
+    fn looping_pure_cot_run_is_zeroed_not_flagged() {
+        let (mut outcome, events, details) = pure_cot_run();
+        outcome.looping = true;
+        outcome.loop_excluded_tokens = 3;
+        let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, Some(details));
+        assert!(r.looping, "the flag survives into the result");
+        assert_eq!(r.tg_speed, 0.0, "looping wins: zeroed");
+        assert!(!r.pure_cot, "a looping run is never flagged pure-CoT");
+    }
+
+    /// B1 (plan test c): a usage-only stream (zero token frames; the detail
+    /// says 0 reasoning AND 0 content) stays the 0.0 **degraded** sentinel
+    /// — not pure-CoT (no frames were observed to blend).
+    #[test]
+    fn usage_only_stream_stays_degraded_not_pure_cot() {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(5_000_000);
+            let t1 = MonotonicInstant::now(); // 5 ms
+            mock.increment(50_000_000);
+            let t_end = MonotonicInstant::now(); // 55 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: None, // no token frame
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: 0,
+            };
+            let events = vec![
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Usage(usage),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t_end,
+                    timestamps: ts,
+                },
+                StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+            ];
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                usage_details: None,
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 0,
+            };
+            let details = UsageDetails {
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+            };
             let r = aggregate(&cfg(), &prompt(), &outcome, &events, None, Some(details));
-            assert_eq!(r.tg_speed, 0.0, "pure CoT → no answer-phase decode");
+            assert!(!r.pure_cot, "no reasoning frames → not pure-CoT");
+            assert_eq!(r.tg_speed, 0.0, "usage-only → the 0.0 N/A sentinel stands");
+            assert_eq!(r.blended_tps, 0.0);
+            assert!(r.is_degraded());
         });
     }
 

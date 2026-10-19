@@ -177,9 +177,10 @@ async fn json_report_matches_prototype_key_set() {
     assert_eq!(top["iterations"], 1);
 
     // Per-run keys: the prototype `to_dict` set + v0.1.1 `looping` +
-    // CF-25 `degraded` + the P2-A integrity flags (CF-10/24/44).
+    // CF-25 `degraded` + the P2-A integrity flags (CF-10/24/44)
+    // + B1 `pure_cot` / `blended_tps` (additive; §6 contract delta).
     let rj = top["results"][0].as_object().unwrap();
-    assert_eq!(rj.len(), 19);
+    assert_eq!(rj.len(), 21);
     for key in [
         "ttft_s",
         "prompt_tokens",
@@ -200,6 +201,8 @@ async fn json_report_matches_prototype_key_set() {
         "usage_discrepancy",
         "e2e_only",
         "itl_clamped",
+        "pure_cot",
+        "blended_tps",
     ] {
         assert!(rj.contains_key(key), "missing {key}");
     }
@@ -212,6 +215,10 @@ async fn json_report_matches_prototype_key_set() {
     assert_eq!(rj["completion_tokens"], 34);
     assert_eq!(rj["estimated"], false);
     assert_eq!(rj["error"], serde_json::Value::Null);
+    // B1: the mock stream has 2 content frames — a mixed (not pure-CoT)
+    // run; the blended rate is published as a number.
+    assert_eq!(rj["pure_cot"], false);
+    assert!(rj["blended_tps"].is_number());
 
     // The v0.1.1 blocks publish the measurement methodology.
     assert_eq!(top["timing"]["resolution"], "nanosecond");

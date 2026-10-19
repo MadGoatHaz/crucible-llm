@@ -52,6 +52,9 @@ fn speed_with_tokens(completion_tokens: u64) -> SpeedResult {
         usage_discrepancy: false,
         e2e_only: false,
         itl_clamped: 0,
+        // B1: a clean (non-pure-CoT) fixture run.
+        pure_cot: false,
+        blended_tps: 0.0,
     }
 }
 

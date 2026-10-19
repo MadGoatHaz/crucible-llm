@@ -335,6 +335,9 @@ fn stream_metric_row_carries_the_reasoning_tokens() {
         usage_discrepancy: false,
         e2e_only: false,
         itl_clamped: 0,
+        // B1: a clean (non-pure-CoT) fixture run.
+        pure_cot: false,
+        blended_tps: 0.0,
     };
     let mut row = StreamMetricRow::from_speed_result(&r, "sess", 1);
     assert_eq!(row.reasoning_tokens, None, "from_speed_result leaves it NULL");
