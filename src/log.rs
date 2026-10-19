@@ -92,6 +92,8 @@ pub enum Context {
     Sse,
     /// The TUI (app lifecycle events).
     Tui,
+    /// The run-end digest (C5): the compact shareable summary block.
+    Digest,
     /// Unstructured / catch-all errors.
     Error,
 }
@@ -113,6 +115,7 @@ impl Context {
             Context::Http => "HTTP",
             Context::Sse => "SSE",
             Context::Tui => "TUI",
+            Context::Digest => "DIGEST",
             Context::Error => "ERROR",
         }
     }
@@ -357,6 +360,18 @@ impl RunLogger {
         self.info(Context::Setup, config_block_line(cfg));
     }
 
+    /// Emit the run-end digest (C5): one `DIGEST` record per line (the
+    /// writer's one-record-per-line contract). The lines come from
+    /// [`digest_lines`] (pure) — the `[CONFIG]` block, the `✓`
+    /// per-engine headlines, any errors, and the totals. All channel
+    /// sends — the digest is assembled at run end, never on the
+    /// timing path.
+    pub fn log_digest(&self, lines: &[String]) {
+        for line in lines {
+            self.info(Context::Digest, line.clone());
+        }
+    }
+
     fn send(&self, level: Level, ctx: Context, msg: impl Into<String>) {
         if !self.active.load(Ordering::Relaxed) {
             return;
@@ -500,16 +515,13 @@ fn niah_ladder(cfg: &Config) -> String {
     let base = match cfg.niah_custom {
         Some(s) => format!("custom {}", human_size(s)),
         None => {
-            let (Some(first), Some(last)) =
-                (cfg.niah_contexts.first(), cfg.niah_contexts.last())
+            let (Some(first), Some(last)) = (cfg.niah_contexts.first(), cfg.niah_contexts.last())
             else {
                 return String::new();
             };
             let (d0, d1) = match (cfg.niah_depths.first(), cfg.niah_depths.last()) {
                 (Some(a), Some(b)) => (a, b),
-                _ => {
-                    return format!("{}..{}", human_size(*first), human_size(*last))
-                }
+                _ => return format!("{}..{}", human_size(*first), human_size(*last)),
             };
             format!(
                 "{}..{} × {}..{}",
@@ -525,6 +537,57 @@ fn niah_ladder(cfg: &Config) -> String {
     } else {
         base
     }
+}
+
+/// The run-end digest (C5): the compact, shareable block appended to the
+/// run log when the run completes:
+///
+/// 1. `[DIGEST] session {id} — {date} {n} engine(s), wall {s}s`;
+/// 2. the `[CONFIG]` line (C1, reused verbatim);
+/// 3. one line per `✓` per-engine headline (label + summary);
+/// 4. one line per collected error;
+/// 5. `[DIGEST] totals: {n} tokens generated, peak VRAM {gb} GB | n/a`.
+///
+/// `headlines` are `(label, summary)` **string** pairs (not the `Engine`
+/// type — keeps `log.rs` free of engine-module dependencies). Pure: no
+/// I/O — the caller sends the lines through the non-blocking channel
+/// ([`RunLogger::log_digest`]). A full 7-engine run is ~10–30 lines —
+/// self-describing (a shared log states its own inputs) and referenceable
+/// by session id (the archive name carries the same id).
+#[must_use]
+pub fn digest_lines(
+    cfg: &Config,
+    session_id: &str,
+    headlines: &[(String, String)],
+    errors: &[String],
+    total_tokens: u64,
+    wall_secs: f64,
+    peak_vram_mib: Option<u64>,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(4 + headlines.len() + errors.len());
+    lines.push(format!(
+        "[DIGEST] session {session_id} — {} {} engine(s), wall {wall_secs:.0}s",
+        format_timestamp(now_ms(), true),
+        cfg.engines.count()
+    ));
+    lines.push(config_block_line(cfg));
+    for (label, summary) in headlines {
+        lines.push(format!("[DIGEST] ✓ {label} — {summary}"));
+    }
+    for e in errors {
+        lines.push(format!("[DIGEST] error: {e}"));
+    }
+    // Binary GiB (the same convention as the `vram` tier / the
+    // hardware string); `n/a` when there is no telemetry (never a
+    // fabricated 0).
+    let vram = match peak_vram_mib {
+        Some(mib) => format!("peak VRAM {:.1} GB", mib as f64 / 1024.0),
+        None => "peak VRAM n/a".to_string(),
+    };
+    lines.push(format!(
+        "[DIGEST] totals: {total_tokens} tokens generated, {vram}"
+    ));
+    lines
 }
 
 /// Format one log line: `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`.
@@ -786,10 +849,14 @@ mod tests {
         logger.info(Context::Setup, "x");
         logger.warn(Context::Setup, "x");
         logger.error(Context::Setup, "x");
-        // C1: the config block is the same no-op channel send (the
-        // non-blocking invariant — no file I/O, no blocking, nothing to
-        // drop).
+        // C1/C5: the config block and the digest are the same no-op
+        // channel sends (the non-blocking invariant — no file I/O, no
+        // blocking, nothing to drop).
         logger.log_config(&Config::default());
+        logger.log_digest(&[
+            "[DIGEST] session x — 2026-01-01 00:00:00 1 engine(s), wall 1s".to_string(),
+            "[DIGEST] totals: 1 tokens generated, peak VRAM n/a".to_string(),
+        ]);
         logger.finish(); // idempotent no-op
     }
 
@@ -873,20 +940,22 @@ mod tests {
     #[test]
     fn config_block_line_carries_the_resolved_inputs() {
         use std::path::PathBuf;
-        let mut cfg = Config::default();
-        cfg.url = "http://192.168.1.10:8000".to_string();
-        cfg.model = "qwen3.8-27b".to_string();
-        cfg.mode = crate::config::Mode::Long;
-        cfg.tokens = 32_000;
-        cfg.iterations = 6;
-        cfg.timeout = 120;
-        cfg.nocache = true;
-        cfg.ladder = vec![1, 2, 4, 8];
-        cfg.niah_contexts = vec![2_000, 4_000, 8_000];
-        cfg.niah_depths = vec![0, 50, 100];
-        cfg.engines = crate::config::EngineSelection::all();
-        cfg.hardware = true;
-        cfg.tokenizer = Some(PathBuf::from("/tmp/tokenizer.json"));
+        let cfg = Config {
+            url: "http://192.168.1.10:8000".to_string(),
+            model: "qwen3.8-27b".to_string(),
+            mode: crate::config::Mode::Long,
+            tokens: 32_000,
+            iterations: 6,
+            timeout: 120,
+            nocache: true,
+            ladder: vec![1, 2, 4, 8],
+            niah_contexts: vec![2_000, 4_000, 8_000],
+            niah_depths: vec![0, 50, 100],
+            engines: crate::config::EngineSelection::all(),
+            hardware: true,
+            tokenizer: Some(PathBuf::from("/tmp/tokenizer.json")),
+            ..Config::default()
+        };
         let line = config_block_line(&cfg);
         assert!(line.starts_with("[CONFIG] "), "{line}");
         assert!(line.contains("url=http://192.168.1.10:8000"), "{line}");
@@ -926,13 +995,20 @@ mod tests {
 
     #[test]
     fn niah_ladder_custom_mode_and_tokenizer() {
-        let mut cfg = Config::default();
-        cfg.niah_custom = Some(256_000);
+        let cfg = Config {
+            niah_custom: Some(256_000),
+            ..Config::default()
+        };
         assert_eq!(
             niah_ladder(&cfg),
             "custom 256k (approx. token counts — no --tokenizer)"
         );
-        cfg.tokenizer = Some(std::path::PathBuf::from("/tmp/tok.json"));
+        // With a tokenizer the sizes are exact → no qualifier.
+        let cfg = Config {
+            niah_custom: Some(256_000),
+            tokenizer: Some(std::path::PathBuf::from("/tmp/tok.json")),
+            ..Config::default()
+        };
         assert_eq!(niah_ladder(&cfg), "custom 256k");
     }
 
@@ -957,6 +1033,145 @@ mod tests {
         assert!(lines[1].contains("engines="), "{latest}");
         assert!(lines[1].contains("hardware="), "{latest}");
         assert_eq!(lines.len(), 3, "header + config + one record: {latest}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── C5: the run-end digest ─────────────────────────────────────────
+
+    #[test]
+    fn digest_lines_full_run_is_compact_and_self_describing() {
+        let cfg = Config {
+            engines: crate::config::EngineSelection::all(),
+            ..Config::default()
+        };
+        let headlines: Vec<(String, String)> = [
+            ("A: Speed", "56.4 t/s decode · TTFT 180 ms · 6 run(s)"),
+            (
+                "B: Concurrency",
+                "practical sweet spot 4 users (~30 t/s each)",
+            ),
+            ("C1: NIAH", "reliable up to 64k"),
+            ("C2: Reasoning", "12/13 · avg 40.2 t/s"),
+            ("C3: Structured", "5/6 compliant"),
+            ("D: Energy", "0.098 J/token · peak 521 W · 90% util"),
+            (
+                "F: Flat Out",
+                "4 streams, 2619 tok in 60s — 43.7 t/s aggregate",
+            ),
+        ]
+        .map(|(l, s)| (l.to_string(), s.to_string()))
+        .to_vec();
+        let errors = vec!["A: Iteration 2/6 failed: HTTP 500: boom".to_string()];
+        let lines = digest_lines(
+            &cfg,
+            "12345678-aaaa-bbbb-cccc-dddddddddddd",
+            &headlines,
+            &errors,
+            1_607_850,
+            1_140.0,
+            Some(98_304), // 96 GiB in MiB
+        );
+        // ≤ ~30 lines for a full run (1 session + 1 config + 7 headlines
+        // + 1 error + 1 totals = 11 here).
+        assert!(lines.len() <= 30, "{lines:?}");
+        assert_eq!(lines.len(), 11, "{lines:?}");
+        // 1. session line (the archive-name join key).
+        assert!(
+            lines[0].starts_with("[DIGEST] session 12345678-aaaa-bbbb-cccc-dddddddddddd — "),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("7 engine(s), wall 1140s"), "{lines:?}");
+        // 2. the [CONFIG] line, reused verbatim from C1.
+        assert!(lines[1].starts_with("[CONFIG] url="), "{lines:?}");
+        // 3. every ✓ headline, in order.
+        for (i, (label, summary)) in headlines.iter().enumerate() {
+            assert_eq!(
+                lines[2 + i],
+                format!("[DIGEST] ✓ {label} — {summary}"),
+                "{lines:?}"
+            );
+        }
+        // 4. the error line.
+        assert_eq!(
+            lines[9], "[DIGEST] error: A: Iteration 2/6 failed: HTTP 500: boom",
+            "{lines:?}"
+        );
+        // 5. the totals line (binary GiB: 98304 MiB = 96.0 GB).
+        assert_eq!(
+            lines[10], "[DIGEST] totals: 1607850 tokens generated, peak VRAM 96.0 GB",
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn digest_lines_d_only_run_is_short() {
+        // D-only selection (all fields explicit — `EngineSelection` has no
+        // subset constructor).
+        let cfg = Config {
+            engines: crate::config::EngineSelection {
+                speed: false,
+                concurrency: false,
+                niah: false,
+                reasoning: false,
+                structured: false,
+                hardware: true,
+                flatout: false,
+            },
+            ..Config::default()
+        };
+        let lines = digest_lines(
+            &cfg,
+            "sess",
+            &[(
+                "D: Energy".to_string(),
+                "N/A (no power telemetry)".to_string(),
+            )],
+            &[],
+            0,
+            5.0,
+            None, // no telemetry
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}"); // session + config + 1 + totals
+        assert!(lines[0].contains("1 engine(s), wall 5s"), "{lines:?}");
+        assert!(
+            lines[3] == "[DIGEST] totals: 0 tokens generated, peak VRAM n/a",
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn log_digest_writes_one_record_per_line() {
+        let dir = temp_log_dir("digest");
+        let logger = RunLogger::start(Some(&dir));
+        let lines = digest_lines(
+            &Config::default(),
+            "sess-id-123",
+            &[("A: Speed".to_string(), "56.4 t/s".to_string())],
+            &[],
+            256,
+            42.0,
+            None,
+        );
+        logger.log_digest(&lines);
+        logger.finish();
+
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        // Every digest line is its own `[ts] [INFO] [DIGEST]` record (the
+        // writer's one-record-per-line contract — grep `[DIGEST]`).
+        let n = lines.len();
+        assert_eq!(
+            latest
+                .lines()
+                .filter(|l| l.contains("[INFO] [DIGEST]"))
+                .count(),
+            n,
+            "{latest}"
+        );
+        assert!(
+            latest.contains("[INFO] [DIGEST] [DIGEST] session sess-id-123"),
+            "{latest}"
+        );
+        assert!(latest.contains("peak VRAM n/a"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

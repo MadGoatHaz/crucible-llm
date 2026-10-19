@@ -28,13 +28,16 @@ use std::time::Duration;
 use crate::client::StreamEvent;
 use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::{joules_per_token, profile, EnergyResult};
-use crate::engines::sequence::{speed_mean_is_blended, speed_mean_tps, sum_all_engines_tokens};
+use crate::engines::sequence::{
+    hardware_summary, speed_mean_is_blended, speed_mean_tps, sum_all_engines_tokens,
+    summarize_speed,
+};
 use crate::engines::speed::{
     all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
 };
 use crate::engines::{
-    build_sweep, context_size_label, flatout_streams_for, summarize_sweep, FlatOutEngine,
+    build_sweep, context_size_label, flatout_streams_for, summarize_sweep, Engine, FlatOutEngine,
     FlatOutResult, NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StreamCountSource,
     StructuredEngine, StructuredResult, SweepResult,
 };
@@ -211,6 +214,11 @@ pub fn run_headless(
     // compact line near the top of the run log; a channel send, never a
     // blocking write).
     logger.log_config(cfg);
+    // C5: the run wall clock (the digest's `wall Ns`).
+    let run_started = std::time::Instant::now();
+    // C5: the digest's error lines — the engines' own error surfaces
+    // (the logger is fire-and-forget: no record buffer by design).
+    let mut run_errors: Vec<String> = Vec::new();
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -388,6 +396,13 @@ pub fn run_headless(
                     prefill.prompt_tokens
                 ),
             );
+            // C5: the failed iterations are the digest's A error lines.
+            for r in results.iter().filter(|r| r.is_failed()) {
+                run_errors.push(format!(
+                    "A: {}",
+                    r.error.clone().unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
         }
 
         // Chunk 17: harvest the sampler's power trace (brief lock on the
@@ -488,31 +503,44 @@ pub fn run_headless(
         // after them and *before* F (the TUI sequence order A→B→C1→C2→C3→D→F),
         // so the headless and TUI J/token share the same denominator.
         if extra.concurrency {
-            if let Some(sweep) = build_sweep(cfg, None, Some(logger.clone())) {
-                if !cfg.json {
-                    term.dim(&format!(
-                        "  [B] concurrency sweep [{}]…",
-                        cfg.ladder
-                            .iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    ));
+            match build_sweep(cfg, None, Some(logger.clone())) {
+                Some(sweep) => {
+                    if !cfg.json {
+                        term.dim(&format!(
+                            "  [B] concurrency sweep [{}]…",
+                            cfg.ladder
+                                .iter()
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                    }
+                    let r = sweep.run().await;
+                    // The shared helper (also used by the TUI sequence path)
+                    // guarantees headless and TUI consume the same max-
+                    // throughput level (the envelope).
+                    flatout_streams = Some(flatout_streams_for(&r));
+                    // FIX 3: the headless [B] summary leads with the
+                    // practical (per-stream usability) sweet spot, with
+                    // the pure-throughput knee as reference.
+                    if r.is_empty() {
+                        term.warning("  [B] sweep produced no usable levels");
+                    } else {
+                        term.info(&format!("  [B] {}", summarize_sweep(&r)));
+                    }
+                    sweep_result = Some(r);
                 }
-                let r = sweep.run().await;
-                // The shared helper (also used by the TUI sequence path)
-                // guarantees headless and TUI consume the same max-
-                // throughput level (the envelope).
-                flatout_streams = Some(flatout_streams_for(&r));
-                // FIX 3: the headless [B] summary leads with the
-                // practical (per-stream usability) sweet spot, with
-                // the pure-throughput knee as reference.
-                if r.is_empty() {
-                    term.warning("  [B] sweep produced no usable levels");
-                } else {
-                    term.info(&format!("  [B] {}", summarize_sweep(&r)));
+                None => {
+                    // C5: the TUI path logs this (sequence.rs
+                    // `run_concurrency`); the headless path surfaced
+                    // nothing — an init failure vanishes from the log
+                    // and the digest alike.
+                    logger.error(
+                        Context::EngineB,
+                        "Engine B init failed (client build) — sweep skipped",
+                    );
+                    run_errors.push("B: init failed (client build) — sweep skipped".to_string());
                 }
-                sweep_result = Some(r);
             }
         }
         if extra.niah {
@@ -544,6 +572,7 @@ pub fn run_headless(
                 Err(e) => {
                     term.warning(&format!("[C1] niah init failed: {e}"));
                     logger.error(Context::EngineC1, format!("niah init failed: {e}"));
+                    run_errors.push(format!("C1: niah init failed: {e}"));
                 }
             }
         }
@@ -564,6 +593,7 @@ pub fn run_headless(
                 Err(e) => {
                     term.warning(&format!("[C2] reasoning init failed: {e}"));
                     logger.error(Context::EngineC2, format!("reasoning init failed: {e}"));
+                    run_errors.push(format!("C2: reasoning init failed: {e}"));
                 }
             }
         }
@@ -592,6 +622,7 @@ pub fn run_headless(
                 Err(e) => {
                     term.warning(&format!("[C3] structured init failed: {e}"));
                     logger.error(Context::EngineC3, format!("structured init failed: {e}"));
+                    run_errors.push(format!("C3: structured init failed: {e}"));
                 }
             }
         }
@@ -672,6 +703,7 @@ pub fn run_headless(
                 Err(e) => {
                     term.warning(&format!("[F] flat out init failed: {e}"));
                     logger.error(Context::EngineF, format!("flat out init failed: {e}"));
+                    run_errors.push(format!("F: flat out init failed: {e}"));
                 }
             }
         }
@@ -802,6 +834,67 @@ pub fn run_headless(
                 }
             }
             Err(e) => term.warning(&format!("persist failed: {e}")),
+        }
+
+        // C5: the run-end digest — the compact shareable block (the
+        // `[CONFIG]` line + the `✓` per-engine headlines + any errors +
+        // the totals), referenced by the session id, appended to the run
+        // log. Emitted **before** the `--show-log` print, and
+        // `logger.finish()` joins the writer thread so the file is
+        // complete when the print reads it (main.rs's later `finish()`
+        // is an idempotent no-op). All channel sends — run-end path
+        // only, never the timing path.
+        {
+            let mut headlines: Vec<(String, String)> = Vec::new();
+            if cfg.engines.speed {
+                headlines.push((Engine::Speed.label().to_string(), summarize_speed(&results)));
+            }
+            if let Some(r) = &sweep_result {
+                headlines.push((Engine::Concurrency.label().to_string(), summarize_sweep(r)));
+            }
+            if let Some(r) = &niah_result {
+                headlines.push((Engine::Niah.label().to_string(), r.accuracy_label()));
+            }
+            if let Some(r) = &reasoning_result {
+                headlines.push((
+                    Engine::Reasoning.label().to_string(),
+                    format!("{} · avg {:.1} t/s", r.score.label(), r.avg_tg_speed()),
+                ));
+            }
+            if let Some(r) = &structured_result {
+                headlines.push((Engine::Structured.label().to_string(), r.summary_line()));
+            }
+            if let Some(e) = &energy_result {
+                headlines.push((Engine::Hardware.label().to_string(), hardware_summary(e)));
+            }
+            if let Some(r) = &flatout_result {
+                headlines.push((Engine::FlatOut.label().to_string(), r.summary_line()));
+            }
+            let total_tokens = sum_all_engines_tokens(
+                Some(results.as_slice()),
+                sweep_result.as_ref(),
+                niah_result.as_ref(),
+                reasoning_result.as_ref(),
+                structured_result.as_ref(),
+                flatout_result.as_ref(),
+            );
+            // Peak VRAM from the already-harvested trace (binary MiB);
+            // `None` (no telemetry) → the digest's honest `n/a`.
+            let peak_vram_mib = hw_trace
+                .iter()
+                .filter_map(|s| s.vram_used_bytes)
+                .max()
+                .map(|b| b / (1024 * 1024));
+            logger.log_digest(&crate::log::digest_lines(
+                cfg,
+                &session.session_id,
+                &headlines,
+                &run_errors,
+                total_tokens,
+                run_started.elapsed().as_secs_f64(),
+                peak_vram_mib,
+            ));
+            logger.finish();
         }
 
         // The `--json` document (printed after the additional engines so

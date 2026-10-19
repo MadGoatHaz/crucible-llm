@@ -761,6 +761,10 @@ impl BenchmarkSequence {
         // (the forever 100 ms poller's ticks) and never at the `r` keypress
         // (5 s earlier, mid-idle-window).
         self.metrics.mark_run_started();
+        // C5: the run wall clock (the digest's `wall Ns`) — anchored to the
+        // same instant the Total Duration clock starts, so the digest and
+        // the UI agree.
+        let run_started = std::time::Instant::now();
 
         for (i, engine) in self.engines.iter().enumerate() {
             self.current.store(i, Ordering::Relaxed);
@@ -878,6 +882,61 @@ impl BenchmarkSequence {
         // these rows). A storage failure degrades gracefully — it never
         // changes the run's outcome.
         self.persist_results();
+
+        // C5: the run-end digest — the compact shareable block (the
+        // `[CONFIG]` line + the `✓` per-engine headlines + any errors +
+        // the totals), referenced by the session id, appended to the run
+        // log. All channel sends (assembled at run end — never the timing
+        // path); `--show-log` / the `l` view / the archive all carry it.
+        let headlines: Vec<(String, String)> = self
+            .completed
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(e, s)| (e.label().to_string(), s.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let peak_vram_mib = self
+            .hw
+            .as_ref()
+            .and_then(|h| h.lock().ok())
+            .and_then(|g| g.trace().iter().filter_map(|s| s.vram_used_bytes).max())
+            .map(|b| b / (1024 * 1024));
+        let lines = crate::log::digest_lines(
+            &self.cfg,
+            &self.session_id,
+            &headlines,
+            &self.digest_errors(),
+            self.all_engines_tokens(),
+            run_started.elapsed().as_secs_f64(),
+            peak_vram_mib,
+        );
+        self.logger.log_digest(&lines);
+    }
+
+    /// The digest's error lines (C5): the engines' **own** error surfaces
+    /// in scope at run end — the logger is fire-and-forget (no record
+    /// buffer by design), so the digest collects what the run already has:
+    /// the failed Engine A iterations (`r.error`) and the `init failed`
+    /// per-engine summaries. Labeled N/As are outcomes, not errors.
+    fn digest_errors(&self) -> Vec<String> {
+        let mut errs = Vec::new();
+        if let Some(results) = (*self.slots.speed.load()).as_deref() {
+            for r in results.iter().filter(|r| r.is_failed()) {
+                errs.push(format!(
+                    "A: {}",
+                    r.error.clone().unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+        }
+        let completed = self.completed.lock().map(|g| g.clone()).unwrap_or_default();
+        for (e, s) in &completed {
+            if s.starts_with("init failed") {
+                errs.push(format!("{}: {s}", e.label()));
+            }
+        }
+        errs
     }
 
     /// The `engine_results` JSON for this run (R2 / CF-14): the headline
