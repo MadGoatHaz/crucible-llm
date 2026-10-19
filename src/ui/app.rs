@@ -45,10 +45,10 @@ use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::profile;
 use crate::engines::sequence::sum_all_engines_tokens;
 use crate::engines::{
-    fragmentation_warning, queue_for, speed_mean_tps, BenchmarkSequence, EngineProgress,
-    NiahEngineConfig, NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause, RunSlots,
-    SeqPhase, SeqState, SeqStateSlot, SpeedResult, StructuredResult, SweepResult, NIAH_DEPTHS,
-    NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
+    fragmentation_warning, queue_for, speed_mean_is_blended, speed_mean_tps, BenchmarkSequence,
+    EngineProgress, NiahEngineConfig, NiahSlot, ProgressBus, ReasoningResult, ResultSlot, RunPause,
+    RunSlots, SeqPhase, SeqState, SeqStateSlot, SpeedResult, StructuredResult, SweepResult,
+    NIAH_DEPTHS, NIAH_SIZES, VRAM_FRAGMENTATION_THRESHOLD, WINDOW_SECS,
 };
 use crate::hw::{arm_power_monitor, GpuBackend, HwPoller, IDLE_WINDOW_SECS, MANUAL_IDLE_WINDOW_SECS};
 use crate::log::{read_log_file, Context, RunLogger};
@@ -2009,13 +2009,22 @@ impl App {
             (gpu_name, gpu_count, vram_mib, ram_bytes)
         };
         // Engine A's mean decode speed (the valid filter; 0.0 = no valid
-        // runs → the report's blank speed field).
-        let speed = speed_mean_tps((*self.speed_slot.load()).as_deref().unwrap_or(&[]));
+        // runs → the report's blank speed field). The `Arc` is bound so
+        // the borrowed `runs` slice outlives the statement.
+        let slot = self.speed_slot.load();
+        let runs = (*slot).as_deref().unwrap_or(&[]);
+        let speed = speed_mean_tps(runs);
         // The user fields start empty (the user fills them in the
         // takeover).
-        MatrixReport::build(
+        let mut report = MatrixReport::build(
             &gpu_name, gpu_count, vram_mib, ram_bytes, &cfg.model, speed, "", "", "", "",
-        )
+        );
+        // B1: every valid run pure-CoT → the speed is a blended full-window
+        // rate, so the note says so honestly (no-op otherwise).
+        if speed_mean_is_blended(runs) {
+            report.fill_pure_cot_note();
+        }
+        report
     }
 
     /// The `c` key's log message for a clipboard write outcome (the
@@ -2674,6 +2683,8 @@ mod tests {
             usage_discrepancy: false,
             e2e_only: false,
             itl_clamped: 0,
+            pure_cot: false,
+            blended_tps: 0.0,
         }]);
         // A C2 reasoning result in its slot (no dedicated table → it lives
         // in `engine_results`).
@@ -2783,6 +2794,8 @@ mod tests {
             usage_discrepancy: false,
             e2e_only: false,
             itl_clamped: 0,
+            pure_cot: false,
+            blended_tps: 0.0,
         }]);
         // Engine C2: 400 response chars → 100 tokens (the chars/4
         // estimate) in the all-engine denominator.
@@ -3840,6 +3853,8 @@ mod tests {
             usage_discrepancy: false,
             e2e_only: false,
             itl_clamped: 0,
+            pure_cot: false,
+            blended_tps: 0.0,
         }
     }
 

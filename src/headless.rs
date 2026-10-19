@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::client::StreamEvent;
 use crate::config::{Config, ExportFormat};
 use crate::engines::hardware::{joules_per_token, profile, EnergyResult};
-use crate::engines::sequence::{speed_mean_tps, sum_all_engines_tokens};
+use crate::engines::sequence::{speed_mean_is_blended, speed_mean_tps, sum_all_engines_tokens};
 use crate::engines::speed::{
     all_failed, format_split_report, format_summary, json_report_split, perceived_ttft_seconds,
     PrefillMetric, SpeedEngine, SpeedResult, MAX_GEN_TOKENS,
@@ -145,7 +145,7 @@ pub fn headless_matrix_report(
     vram_total_mib: u64,
     ram_total_bytes: u64,
 ) -> MatrixReport {
-    MatrixReport::build(
+    let mut report = MatrixReport::build(
         gpu_name.unwrap_or(""),
         gpu_count,
         vram_total_mib,
@@ -156,7 +156,13 @@ pub fn headless_matrix_report(
         "",
         "",
         "",
-    )
+    );
+    // B1: every valid run pure-CoT → the speed is a blended full-window
+    // rate, so the note says so honestly (no-op otherwise).
+    if speed_mean_is_blended(results) {
+        report.fill_pure_cot_note();
+    }
+    report
 }
 
 /// The `--show-log` read seam (pure over the logger; testable like
@@ -1553,6 +1559,8 @@ mod tests {
             usage_discrepancy: false,
             e2e_only: false,
             itl_clamped: 0,
+            pure_cot: false,
+            blended_tps: 0.0,
         }
     }
 
