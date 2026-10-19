@@ -905,12 +905,7 @@ impl StreamWorker {
     ///   the old `tokens == 1` arm re-fired on every such batch (3× per
     ///   C2 logic challenge in the v0.1.7 log). The latch is a `&mut bool`
     ///   parameter so [`run_sse`] stays field-free.
-    fn log_token_milestones(
-        &self,
-        ts: &StreamTimestamps,
-        tokens: u64,
-        first_logged: &mut bool,
-    ) {
+    fn log_token_milestones(&self, ts: &StreamTimestamps, tokens: u64, first_logged: &mut bool) {
         if tokens == 0 {
             return;
         }
@@ -2116,8 +2111,7 @@ mod tests {
     // `rate: 0.0 t/s` lines).
     #[test]
     fn token_milestones_latch_first_and_skip_zero() {
-        let dir =
-            std::env::temp_dir().join(format!("crucible-miles-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("crucible-miles-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let logger = RunLogger::start(Some(&dir));
         let w = StreamWorker::new(

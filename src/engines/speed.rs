@@ -2954,7 +2954,13 @@ mod tests {
         // fabricated 0.
         let r = result_fixture(34, None, 1700.0, 1700.0, 0.005);
         let line = iteration_complete_line(0, 1, &r);
-        assert!(line.contains("34 tok (34 content / n/a reasoning)"), "{line}");
-        assert!(line.contains("1700.0 t/s answer, 1700.0 t/s blended"), "{line}");
+        assert!(
+            line.contains("34 tok (34 content / n/a reasoning)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("1700.0 t/s answer, 1700.0 t/s blended"),
+            "{line}"
+        );
     }
 }
