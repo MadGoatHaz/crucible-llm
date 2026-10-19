@@ -196,6 +196,39 @@ impl SpeedResult {
     }
 }
 
+/// Engine A's per-iteration completion log line (C2): the
+/// **content/reasoning split** plus the answer-phase and the full-window
+/// blended decode rates side by side.
+///
+/// This is the line that made the v0.1.7 pure-CoT speed issue diagnosable
+/// in minutes: a run where every completion token is
+/// `reasoning_content` reads `256 tok (0 content / 256 reasoning), 0.0 t/s
+/// answer, 56.4 t/s blended` (pre-B1) — the answer phase is empty, the rig
+/// is decoding. Post-B1 a pure-CoT run's answer field *is* the honest
+/// blended fallback, so the line reads `56.4 t/s answer, 56.4 t/s
+/// blended` with the 0-content split implying `pure_cot`.
+///
+/// `reasoning_tokens == None` (the server did not report the split, CF-02)
+/// renders `n/a` — the split is shown only when it is known (N/A is never
+/// a silent 0).
+#[must_use]
+pub fn iteration_complete_line(i: usize, iterations: usize, r: &SpeedResult) -> String {
+    let reasoning = r
+        .reasoning_tokens
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    format!(
+        "Iteration {}/{} complete: {} tok ({} content / {reasoning} reasoning), {:.1} t/s answer, {:.1} t/s blended, TTFT {:.0} ms",
+        i + 1,
+        iterations,
+        r.completion_tokens,
+        r.completion_tokens.saturating_sub(r.reasoning_tokens.unwrap_or(0)),
+        r.tg_speed,
+        r.blended_tps,
+        r.ttft * 1000.0
+    )
+}
+
 /// The CF-05 **pre-fill throughput** metric — the *bandwidth* half of the
 /// split, distinct from first-token *latency*.
 ///
@@ -817,17 +850,7 @@ impl SpeedEngine {
                         ),
                     );
                 } else {
-                    l.info(
-                        Context::EngineA,
-                        format!(
-                            "Iteration {}/{} complete: {} tok, {:.1} t/s decode, TTFT {:.0} ms",
-                            i + 1,
-                            iterations,
-                            r.completion_tokens,
-                            r.tg_speed,
-                            r.ttft * 1000.0
-                        ),
-                    );
+                    l.info(Context::EngineA, iteration_complete_line(i, iterations, &r));
                 }
             }
             results.push(r);
@@ -2863,5 +2886,75 @@ mod tests {
             let v = json_report(&cfg(), std::slice::from_ref(&r));
             assert_eq!(v["results"][0]["itl_clamped"], 1);
         });
+    }
+
+    // ── C2: the content/reasoning split on the completion line ─────────
+
+    fn result_fixture(
+        completion: u64,
+        reasoning: Option<u64>,
+        tg: f64,
+        blended: f64,
+        ttft: f64,
+    ) -> SpeedResult {
+        SpeedResult {
+            ttft,
+            prompt_tokens: 128,
+            completion_tokens: completion,
+            reasoning_tokens: reasoning,
+            pp_speed: 0.0,
+            tg_speed: tg,
+            mtp_efficiency: 0.0,
+            stream_time: 0.0,
+            total_chunks: 0,
+            content_chunks: 0,
+            reasoning_chunks: 0,
+            other_chunks: 0,
+            estimated: false,
+            model: String::new(),
+            mode: String::new(),
+            error: None,
+            looping: false,
+            usage_discrepancy: false,
+            e2e_only: false,
+            itl_clamped: 0,
+            pure_cot: false,
+            blended_tps: blended,
+        }
+    }
+
+    #[test]
+    fn iteration_complete_line_pure_cot_shows_the_zero_content_split() {
+        // The v0.1.7 shape: all 256 completion tokens are reasoning —
+        // no answer phase (post-B1 the answer field is the blended
+        // fallback).
+        let r = result_fixture(256, Some(256), 56.4, 56.4, 0.18);
+        assert_eq!(
+            iteration_complete_line(0, 1, &r),
+            "Iteration 1/1 complete: 256 tok (0 content / 256 reasoning), \
+             56.4 t/s answer, 56.4 t/s blended, TTFT 180 ms"
+        );
+    }
+
+    #[test]
+    fn iteration_complete_line_mixed_run_shows_both_phases() {
+        // 34 completion, 20 of them reasoning → 14 content.
+        let r = result_fixture(34, Some(20), 400.0, 1700.0, 0.005);
+        let line = iteration_complete_line(1, 3, &r);
+        assert_eq!(
+            line,
+            "Iteration 2/3 complete: 34 tok (14 content / 20 reasoning), \
+             400.0 t/s answer, 1700.0 t/s blended, TTFT 5 ms"
+        );
+    }
+
+    #[test]
+    fn iteration_complete_line_without_reasoning_detail_shows_na() {
+        // The server did not report the split (CF-02): `n/a`, never a
+        // fabricated 0.
+        let r = result_fixture(34, None, 1700.0, 1700.0, 0.005);
+        let line = iteration_complete_line(0, 1, &r);
+        assert!(line.contains("34 tok (34 content / n/a reasoning)"), "{line}");
+        assert!(line.contains("1700.0 t/s answer, 1700.0 t/s blended"), "{line}");
     }
 }
