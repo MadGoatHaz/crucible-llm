@@ -80,7 +80,7 @@ The **default mode** — a bare `crucible-llm` opens it, no flag required. A key
 - **View 5 · History** — browse stored runs, drill into a run's detail, **compare** two runs side-by-side with signed deltas, and **delete** old ones.
 - **View 6 · Config** — an editable form with **per-field explanations** behind a read-only **edit gate**; now includes the **NIAH (C1) matrix ladders** (contexts / depths / custom size, `k`/`M` suffixes) alongside the URL, model, mode, ladder, engines, theme, and $/kWh; save to the config file, reset, or launch a run from it.
 - **Color-coded capability assessment** (Reasoning / Long-context / Structured / Energy) with plain-language verdicts.
-- **Pause/resume** (`Space`), one-key export (`e`), the **Matrix Report** (`m`, after a run completes), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
+- **Pause/resume** (`Space`), one-key export (`e`), the **Matrix Report** (`m`, after a run completes), the full **run-log viewer** (`l`, any time), and `Ctrl+C` left **inert** for the terminal's copy selection — quit with `q`, which asks for confirmation.
 
 More views in action:
 
@@ -125,11 +125,11 @@ After a benchmark run completes, Crucible can generate a **Matrix Report** — a
 - **TUI:** press `m` after a run completes — the Report view shows the block with the user fields editable; `c` copies it to the clipboard (OSC 52), `s` saves it as a `.md` file, `Esc` closes.
 - **Headless / CLI:** `--matrix-report` prints the block to stdout (pipeable).
 
-**Auto-filled by Crucible:** `hardware` (e.g. `1x RTX 4090 24GB + 128GB RAM`), `vram` (bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a value in a gap reports the raw size, never a forced tier), `model`, and `speed` (Engine A answer-phase tokens/s).
+**Auto-filled by Crucible:** `hardware` (e.g. `1x RTX 4090 24GB + 128GB RAM`; a **multi-GPU pool** reads unambiguously — `8x NVIDIA RTX A4000 (16 GB each, 128 GB total) + 118GB RAM`), `vram` (bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a value in a gap reports the raw size, never a forced tier), `model`, and `speed` (Engine A answer-phase tokens/s — for a pure-reasoning "CoT-only" model with no answer phase, the honest **blended** decode rate instead, labeled in `notes`).
 
 **User-filled** (Crucible can't detect these): `backend` (Ollama / llama.cpp / vLLM / …), `quant` (Q4_K_M / FP16 / …), `use_case`, `notes`.
 
-> **Honesty notes:** `speed` is the Engine A *answer-phase* rate — for a pure-reasoning ("CoT-only") model it can legitimately be **blank** (Crucible never fabricates a number); it is an optional field. Copy-to-clipboard uses the terminal's **OSC 52** sequence and works in OSC-52-capable terminals (Windows Terminal, iTerm2, kitty, …); on a terminal that doesn't support it, Crucible says so and **save-to-file is the guaranteed path**. VRAM is read in binary GiB.
+> **Honesty notes:** `speed` is the Engine A *answer-phase* rate. For a pure-reasoning ("CoT-only") model with **no** answer phase, Crucible falls back to the honest **blended** decode rate and auto-appends a `notes` line explaining it — never a fabricated answer-phase number, and never a silent blank while the rig is decoding. Copy-to-clipboard uses the terminal's **OSC 52** sequence and works in OSC-52-capable terminals (Windows Terminal, iTerm2, kitty, …); on a terminal that doesn't support it, Crucible says so and **save-to-file is the guaranteed path**. VRAM is read in binary GiB.
 
 ---
 
@@ -354,6 +354,22 @@ A 3-level complexity ladder — **Simple** (flat object) → **Medium** (fixed-l
 | Config file | `~/.config/crucible/config.json` |
 
 **Every run is traceable end-to-end.** Each run gets a session UUID that stamps the `benchmark_sessions` row, the run-log archive name, and the default export filename — the three join deterministically. The session row records **which engines ran** (`engines` column) and the **headline result of every non-stream engine** (`engine_results`: B's sweet spot, C2's score, C3's compliance/penalty, D's energy, F's throughput); Engine A persists per-run `stream_metrics` (including `reasoning_tokens`) and C1 persists per-cell `needle_evaluations` (including the `truncated_by_reasoning` flag). So a stored run carries the complete picture — not just A + C1. Exports (JSON/MD/CSV) are equally complete: the energy object, the prefill/latency split, the dual per-stream denominators, NIAH reliability, and `reasoning_tokens` all make it out. A storage failure degrades gracefully and **never** changes the exit code of a benchmark.
+
+---
+
+## Run Logs
+
+Every run is written to a file-based, timestamped log by a **non-blocking `RunLogger`** — a log write is a `send` on a channel to a dedicated writer thread, so **no file I/O ever touches the benchmark timing path** (and a logger that can't create its files degrades to a silent no-op rather than breaking a run).
+
+**Where it lives:** `~/.local/share/crucible/logs/` (override with `--log-dir` / `CRUCIBLE_LOG_DIR`) — two files:
+- `latest.log` — **overwritten on every run** (the file to review after the app runs);
+- `run-<timestamp>-<session-id[:8]>.log` — an **archive** per run. The run's session UUID stamps the archive name (and the DB `benchmark_sessions` row), so a log joins deterministically to its stored run.
+
+**How to view / share it:**
+- **TUI** — press **`l`** (any time, no completion gate) to open a full-screen, scrollable run-log viewer: **`c`** copies to the clipboard (OSC 52, in supporting terminals), **`s`** saves to `~/.local/share/crucible/exports/run-log-<timestamp>.log` (the universal path on every terminal), **`Esc`** closes. The History view's `l` opens a **past** run's archived log by session id.
+- **Headless / CLI** — **`--show-log`** prints the full run log to stdout (pipeable, e.g. `| less` or `> run.log`).
+
+**What's in it:** each line is `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`. The run opens with a **`[CONFIG]`** line (the resolved inputs) and closes with a **`[DIGEST]`** block — a compact ~15–30 line, self-describing summary (config + every `✓` per-engine headline + totals) that is the quick thing to paste when sharing a run. Engine A's completion line shows the content/reasoning token split plus answer/blended rates and TTFT; each `✓` headline carries its wall-clock duration, and Engine D's carries peak VRAM.
 
 ---
 

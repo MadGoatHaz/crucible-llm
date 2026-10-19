@@ -2,6 +2,22 @@
 
 All notable changes to Crucible LLM.
 
+## [Unreleased]
+
+### Added
+- **Easy run-log access** — the full run log (written by the non-blocking `RunLogger` to `~/.local/share/crucible/logs/` — `latest.log` + `run-<timestamp>-<session-id[:8]>.log` archives) is now viewable and shareable two ways. **TUI** — press `l` (any time, no completion gate) to open a full-screen, scrollable run-log viewer: `c` copies to the clipboard (OSC 52, in supporting terminals), `s` saves to `~/.local/share/crucible/exports/run-log-<timestamp>.log`, `Esc` closes; the History view's `l` opens a **past** run's archived log by session id. **Headless** — `--show-log` (implies headless) prints the full run log to stdout (pipeable).
+- **Run-end `[DIGEST]` block** — a compact (~15–30 line), self-describing summary appended to the log: a `session <id> — <date> <n> engine(s), wall <s>s` header, the resolved `[CONFIG]` line, one `✓` headline per engine that ran, any run errors, and a `totals` line (tokens generated, peak VRAM). The quick block to paste when sharing a run.
+- **`[CONFIG]` block at run start** — one compact line recording the run's **resolved** inputs (url, model, mode, tokens, iterations, timeout, nocache, concurrency ladder, NIAH ladder, engines, hardware) so a shared log states exactly what it ran.
+
+### Improved
+- **Multi-GPU Matrix Report `hardware` string is unambiguous** — a multi-GPU pool now reads as `8x NVIDIA RTX A4000 (16 GB each, 128 GB total) + 118GB RAM` (per-card **and** pool total both named) instead of the old `8x … 128GB`, which read as 8×128 GB. The single-GPU form is unchanged.
+- **Each `✓` per-engine headline carries its wall-clock duration** (`(wall <s>s)`) so the long pole (e.g. a big NIAH matrix) is visible; **Engine D's headline additionally carries peak VRAM used** (`· peak VRAM <gb> GB`).
+- **Headless / TUI log parity** — Engine A's per-iteration completion line (content/reasoning split + answer/blended rates + TTFT) and the run-end digest are produced on **both** the TUI and headless paths (the headless line reuses the TUI's pure `iteration_complete_line`), so `--show-log` and the `l` viewer show the same record.
+
+### Fixed
+- **Matrix Report `speed` for pure-reasoning ("CoT-only") models** — when the answer phase is empty (all completion tokens are `reasoning_content`), the report now falls back to the honest **blended** decode rate and auto-appends a `notes` line explaining it (`speed is the blended decode rate — all completion tokens were reasoning_content (pure CoT); the answer phase is N/A`) — never a fabricated answer-phase number, and never a silent blank while the rig is decoding. The `speed_mean_tps` filter also now excludes `0.0` degraded runs so one can no longer dilute the mean to zero.
+- **Run-log noise cleaned up** — a stream's completion is logged **once** (the double-logged Engine-B completion is gone); the `token #1` first-token milestone and the every-50-token milestone both **latch** (they no longer re-fire on zero-token keep-alive frames); the meaningless `token #0 … rate: 0.0` line is gone; and the `(approx.)` NIAH qualifier is stated once (in `[CONFIG]` / the C1 start line) instead of repeated on every cell.
+
 ## [0.1.7] - 2026-10-18
 
 ### Added

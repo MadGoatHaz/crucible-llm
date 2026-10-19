@@ -737,6 +737,46 @@ The post-run takeover (modeled on `Phase::Setup`):
 
 The CLI flag (layered CLI > env `CRUCIBLE_MATRIX_REPORT` > config file > default `false`) **implies headless mode** (`main.rs` dispatch: `headless || json || matrix_report`). `headless_matrix_report()` is a pure helper over the in-scope run variables (the harvested `hw_trace`'s last sample for VRAM, the detected GPU name/count, a fresh `sysinfo` RAM read, and Engine A's `speed_mean_tps`); `run_headless` prints `report.render()` to stdout after the run. The user fields are left **blank** (a copy-pasteable starting point). With `--json`, the JSON document prints first — the block's markers can't appear inside it, so a pipe consumer slices stdout on the markers.
 
+## The Run Logger (non-blocking)
+
+Every run is written to a file-based, timestamped diagnostic log by **`RunLogger`** (`src/log.rs`) — the same "pure module + TUI phase + headless flag" shape as the Matrix Report, and the same **measurement-isolation** discipline: a log write never touches the timing path.
+
+### `src/log.rs` — non-blocking mpsc + writer thread
+
+- **Two files** in the run-log directory (default `~/.local/share/crucible/logs/`; override with `--log-dir` / `CRUCIBLE_LOG_DIR` / the config file):
+  - `latest.log` — **overwritten on every run** (the file to review after the app runs);
+  - `run-<YYYYmmdd-HHMMSS>-<session-id[:8]>.log` — an **archive** copy for this run. The run's **session UUID** stamps the archive name (and the DB `benchmark_sessions` row), so the log joins deterministically to its stored session.
+- **Line format:** `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message` — one line per record.
+- **Non-blocking by construction:** every `info`/`warn`/`error`/`debug` call is a `send` on an unbounded `std::sync::mpsc` channel from any thread/task; a **dedicated writer thread** drains the channel, formats each record, and writes it to **both** files (a `LineWriter` per file, flushed on every newline). There is **no file I/O on any timing path** (stream worker, 60 Hz tick, 100 ms poller) — the benchmark is never slowed by logging. A logger whose files can't be created degrades to a **silent no-op** (`RunLogger::disabled`) — logging never breaks a run.
+- **Pure, testable seams:** `config_block_line()` and `digest_lines()` are pure formatters (no I/O); `read_log_file()` is the N/A-never-fail read used by both view paths; `path()` / `session_id()` / `archive_path()` expose the file locations.
+
+### The `[CONFIG]` block and the `[DIGEST]` block
+
+The log bookends the run with two self-describing blocks (each a dedicated `Context` so a grep finds them):
+
+- **`[CONFIG]`** (one line, at run start) — the **resolved** inputs in one compact line: `url`, `model`, `mode`, `tokens`, `iterations`, `timeout`, `nocache`, the concurrency `ladder`, the NIAH ladder, the `engines` list, and `hardware=on|off`. This is the "what exactly did this run do" line — a shared log states its own inputs. (Without a `--tokenizer`, the one-time NIAH size qualifier `(approx. token counts — no --tokenizer)` is carried here, not repeated on every cell.)
+- **`[DIGEST]`** (at run end, ~15–30 lines) — the compact, shareable summary: a `session <id> — <date> <n> engine(s), wall <s>s` header, the `[CONFIG]` line verbatim, one `✓ <engine> — <headline>` line per engine that ran, one `error: …` line per collected run error, and a `totals: <n> tokens generated, peak VRAM <gb> GB | n/a` line. It is the block to paste when sharing a run.
+
+### The per-line content (log enhancements)
+
+- **Engine A's completion line** shows the **content / reasoning token split** plus both rates and TTFT: `Iteration i/n complete: <tok> tok (<content> content / <reasoning> reasoning), <answer> t/s answer, <blended> t/s blended, TTFT <ms> ms`. `reasoning` reads `n/a` when the server reports no usage detail — the split is shown only when it is known (never a fabricated split).
+- **Each `✓` per-engine headline carries its wall-clock duration** (`(wall <s>s)`) — the long pole (e.g. a big NIAH matrix) becomes visible; **Engine D's headline additionally carries peak VRAM used** (`· peak VRAM <gb> GB`, the pool's headroom).
+- **Noise is cleaned up:** a stream's completion is logged **once** (the double-logged Engine-B pool event is gone); the `token #1` first-token milestone and the every-50-token milestone both **latch** (they no longer re-fire on zero-token keep-alive frames); there is **no** `token #0 … rate: 0.0` line.
+- **Headless / TUI parity:** Engine A's per-iteration line and the digest are produced on **both** paths — the headless path reuses the TUI's pure `iteration_complete_line()` / `digest_lines()`, so `--show-log` and the `l` viewer show the same record.
+
+### TUI: `Phase::Log` (the `l` key)
+
+A full-screen, **read-only, scrollable** run-log viewer (`src/ui/views/log.rs`), opened from any dashboard view with **`l`** — **no completion gate** (the log exists from process start, so it works before, during, and after a run; `Esc` then re-`l` re-reads a fresh snapshot of the still-growing file).
+
+- **Top bar:** brand + the log file path. **Body:** the wrapped log lines, scrollable (`j`/`↓` +1, `k`/`↑` −1, `PageDown`/`PageUp` ±10, `Home`/`End` first/last; clamped so over-scroll never panics). **Footer:** `[C]opy  [S]ave  [Esc]lose  │  line <first>–<last> of <n>  │  <path>`.
+- **`c`/`C`** copies the whole log to the clipboard via **OSC 52** (in supporting terminals). A terminal that drops OSC 52 yields a logged warning ("clipboard unsupported by terminal — use [S]ave"), never a crash. **`s`/`S`** saves it to `~/.local/share/crucible/exports/run-log-<unix-ts>.log` — **the universal path on every terminal**. **`Esc`** closes and returns to the dashboard (view state untouched).
+- **History view `l`:** from View 5, `l` on the cursor's session opens **that past run's archived log** by scanning the log dir for the session's 8-char id — the deterministic log↔DB join in reverse.
+- **Measurement isolation** holds: `LogState` is mutated only in the key path; the file is read **only on key-press** (`open_log` / `open_log_for_session`), never on the 60 Hz render/tick path; `render()` is a pure `&App` read. The in-memory EVENT LOG tail panel on the Live view is unchanged (it is the live-events surface; `l` is the way to the *file* record).
+
+### Headless: `--show-log`
+
+The CLI flag (layered CLI > env `CRUCIBLE_SHOW_LOG` > config file > default `false`) **joins the headless implication** (`main.rs` dispatch: `headless || json || matrix_report || show_log`). After the run, `run_headless` reads `latest.log` via `show_log_output()` and prints it to **stdout** (pipeable, e.g. `| less` or `> run.log`). **N/A-never-fail:** a read error or a disabled logger goes to **stderr** (`crucible-llm: cannot read run log: …` / `run log unavailable (logger disabled)`) and leaves the exit code untouched. With `--json`, the JSON document prints first (the log's own `[ts] [LEVEL] [CTX]` line shape is what a pipe consumer slices on). The **`[DIGEST]`** block sits at the end of the printed log, so `--show-log` gives the full record *and* the compact shareable summary in one pipeable stream.
+
 ## Themes
 
 The TUI is skinned by a `Theme` enum with three complete palettes (`ui/theme.rs`). Every color a view draws comes from the active theme — no view hardcodes a `Color` — so switching re-colors the entire screen from a single source of truth.
@@ -823,7 +863,7 @@ The tool always runs, even when optional features are missing:
 
 Every run is logged, stored, and exportable:
 
-- **Run log**: every HTTP request, SSE frame milestone, stream completion, and engine transition is written to `latest.log` (overwritten each run) and an archived `run-<timestamp>-<session-id[:8]>.log`. The run's session UUID stamps both the archive name and the log header, so the log joins deterministically to its `benchmark_sessions` row. Thread-safe, non-blocking (dedicated writer thread), and degrades to a silent no-op when files can't be created.
+- **Run log**: every HTTP request, SSE frame milestone, stream completion, and engine transition is written to `latest.log` (overwritten each run) and an archived `run-<timestamp>-<session-id[:8]>.log`. The run's session UUID stamps both the archive name and the log header, so the log joins deterministically to its `benchmark_sessions` row. Thread-safe, non-blocking (dedicated writer thread), and degrades to a silent no-op when files can't be created. See **The Run Logger (non-blocking)** above for the `[CONFIG]` / `[DIGEST]` blocks and the `l` / `--show-log` access paths.
 - **SQLite storage**: every benchmark session is persisted with the engines it ran (`engines` column), the headline result of every non-stream engine (`engine_results`), Engine A's per-run `stream_metrics` (including `reasoning_tokens`), Engine C1's per-cell `needle_evaluations`, and the energy profile. Compare across time, across models, across hardware, across server versions.
 - **Export**: JSON (for CI/CD pipelines), GitHub Flavored Markdown (for PRs and READMEs), and raw CSV (for external analysis in Python, R, or Grafana).
 - **Deterministic**: `temperature: 0` ensures the same prompt produces the same tokens. The 13-challenge reasoning bank has hand-verified canonical answers. NIAH needles are random per cell (so a coincidental match is impossible), but the pass/fail criterion is deterministic.

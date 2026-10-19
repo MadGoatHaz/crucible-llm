@@ -349,6 +349,46 @@ Press `e` during or after a run. There is no format menu — the export is writt
 ### Default Export Location
 `~/.local/share/crucible/exports/crucible-<session-id[:8]>.<ext>` — the run's session UUID (first 8 chars), so the export joins deterministically to the stored session and the session-stamped run-log archive. A TUI `e`-key export of the live snapshot uses `live-<unix-timestamp>.<ext>` instead.
 
+## Viewing / Sharing the Run Log
+
+Every run is written to a file log you can open, copy, and save — the fastest way to review what a run did (or to share it). The log is written by a **non-blocking** logger (a channel send to a writer thread), so it **never slows the benchmark**.
+
+### Where the log lives
+
+`~/.local/share/crucible/logs/` — override the directory with `--log-dir` / `CRUCIBLE_LOG_DIR`. Two files:
+- `latest.log` — **rewritten on every run** (the file to review after the app runs);
+- `run-<timestamp>-<session-id[:8]>.log` — an **archive** per run, stamped with the run's session id so it joins deterministically to the stored run in `benchmarks.db`.
+
+### From the TUI (press `l`)
+
+Press **`l`** at any time — there is **no completion gate**, so it works before, during, and after a run. It opens a full-screen, scrollable **run-log viewer**:
+- **Scroll** — `j`/`↓` and `k`/`↑` (one line), `PageDown`/`PageUp` (±10), `Home`/`End` (first/last).
+- **`c`** — copy the whole log to your clipboard via **OSC 52**. This works in OSC-52-capable terminals (Windows Terminal, iTerm2, kitty, …). If your terminal drops OSC 52, Crucible tells you and **`s` is the universal fallback**.
+- **`s`** — save the log to `~/.local/share/crucible/exports/run-log-<timestamp>.log` (works on **every** terminal).
+- **`Esc`** — close and return to the dashboard.
+
+From the **History view (View 5)**, pressing `l` on the cursor's session opens **that past run's archived log** (by session id) — no need to re-run it.
+
+### From the CLI (`--show-log`)
+
+Add `--show-log` to a headless run and it prints the **full run log to stdout** after the run — pipeable:
+
+```bash
+# Page through the log
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model \
+  --engine speed --show-log | less
+
+# Capture the log to a file
+./crucible-llm --headless --url http://localhost:8000/v1 --model my-model \
+  --engine speed --show-log > run.log
+```
+
+`--show-log` implies headless mode. With `--json`, the JSON document prints first and the log follows (a pipe consumer can slice on the log's own `[timestamp] [LEVEL] [CONTEXT]` line shape).
+
+### The `[DIGEST]` — the quick share
+
+The log opens with a **`[CONFIG]`** line (the run's resolved inputs) and closes with a **`[DIGEST]`** block — a compact ~15–30 line, self-describing summary: the session id + date + engine count + total wall time, the `[CONFIG]` line, one `✓` headline per engine that ran (each with its wall-clock duration; Engine D's adds peak VRAM), any run errors, and a totals line (tokens generated, peak VRAM). **Paste the `[DIGEST]` block when you want to share a run without the full log.**
+
 ## Matrix Report
 
 After a benchmark run completes, you can generate a **Matrix Report** — a `[COMMUNITY-SUBMISSION]` block formatted for the Level1Techs "Local LLM Matrix" (auto-parsed by https://madgoathaz.github.io/llm-matrix/ ). It's the quick way to submit your hardware + model + speed to the community matrix.
@@ -382,16 +422,16 @@ notes:    enable_thinking=false
 
 | Field | Filled by | Notes |
 |-------|-----------|-------|
-| `hardware` | **auto** | e.g. `1x RTX 4090 24GB + 128GB RAM` (GPU + VRAM + host RAM; degrades honestly if telemetry is missing) |
+| `hardware` | **auto** | e.g. `1x RTX 4090 24GB + 128GB RAM`; a **multi-GPU pool** reads unambiguously — `8x NVIDIA RTX A4000 (16 GB each, 128 GB total) + 118GB RAM` (per-card **and** pool total, not the old `8x … 128GB` which read as 8×128 GB) (GPU + VRAM + host RAM; degrades honestly if telemetry is missing) |
 | `vram` | **auto** | Bucketed into the matrix tiers `≤16` / `16-24` / `24-32` / `48-64` / `96-128` / `196-256GB+`; a value in a gap (e.g. `40GB`) reports the raw size, never a forced tier; read in **binary GiB** |
 | `model` | **auto** | The target model from your config |
-| `speed` | **auto** | Engine A answer-phase tokens/s — **blank** for a pure-reasoning (CoT-only) model (never a fabricated number) |
+| `speed` | **auto** | Engine A answer-phase tokens/s. For a pure-reasoning ("CoT-only") model with **no** answer phase, the honest **blended** decode rate — with a `notes` line auto-appended explaining it (never a fabricated answer-phase number, never a silent blank while the rig is decoding) |
 | `backend` | **you** | Ollama / llama.cpp / vLLM / LM Studio / … |
 | `quant` | **you** | Q4_K_M / FP16 / … |
 | `use_case` | **you** | e.g. "daily chat" |
 | `notes` | **you** | launch flags, quirks |
 
-> **Honesty:** `speed` is the Engine A *answer-phase* rate. For a pure-CoT model that spends its whole budget thinking (no answer phase), it is legitimately **blank** — an optional field in the template, and Crucible never invents a number.
+> **Honesty:** `speed` is the Engine A *answer-phase* rate. For a pure-CoT model that spends its whole budget thinking (no answer phase), Crucible reports the **blended** decode rate (the full completion window) and auto-appends a `notes` line saying so — *labeled* as a blended rate, never a fabricated answer-phase number, and never a silent blank while the rig is decoding. `notes` remains an optional field in the template.
 
 ### Headless / CLI (`--matrix-report`)
 
