@@ -122,6 +122,18 @@ pub fn human_size(tokens: u32) -> String {
     }
 }
 
+/// The per-cell worker tag (C3): `C1:{size}-d{depth}` with the shared
+/// [`human_size`] formatter (`C1:128k-d50` / `C1:1M-d50`).
+///
+/// The `(approx.)` qualifier is deliberately **absent** — in the v0.1.7
+/// log it repeated on every one of the per-cell lines (114 hits). It is
+/// qualified once instead: the run-start `[CONFIG]` line (C1) and the C1
+/// start line (`sequence.rs::run_niah`).
+#[must_use]
+pub fn cell_tag(size: u32, depth: u8) -> String {
+    format!("C1:{}-d{depth}", human_size(size))
+}
+
 /// Render a raw context size with the optional `(approx.)` qualifier — the
 /// free-function form of [`NiahCell::context_label`] for call sites that have
 /// a size (not a cell) plus an estimate flag.
@@ -1073,15 +1085,14 @@ impl NiahEngine {
             self.max_gen_tokens,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
-        // Issue #3 + Issue #4: the shared size formatter (was `C1:{size}k-…`,
+        // Issue #3 + C3: the shared size formatter (was `C1:{size}k-…`,
         // which rendered a 128 000-token cell as `C1:128000k-d50` in the
-        // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI) plus
-        // the `(approx.)` qualifier when the haystack is the `chars/4`
-        // estimate (`doc.estimated` — no `--tokenizer`): `C1:128k (approx.)-d50`.
-        .tag(format!(
-            "C1:{}-d{depth}",
-            context_size_label(size, doc.estimated)
-        ));
+        // headless log; now `C1:128k-d50` / `C1:1M-d50`, matching the TUI).
+        // The `(approx.)` qualifier is **not** repeated here (it used to
+        // ride every one of the per-cell lines): it is qualified once at
+        // the `[CONFIG]` line and the C1 start line (`sequence.rs`)
+        // instead.
+        .tag(cell_tag(size, depth));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -1958,6 +1969,19 @@ mod tests {
         // The `chars/4` estimate carries the qualifier (Issue #4).
         assert_eq!(context_size_label(128_000, true), "128k (approx.)");
         assert_eq!(context_size_label(1_000_000, true), "1M (approx.)");
+    }
+
+    // C3 (qualify once): the per-cell worker tag no longer repeats
+    // `(approx.)` (the v0.1.7 log had 114 hits) — it is a plain
+    // `C1:{size}-d{depth}`; the one-time qualification lives in the
+    // `[CONFIG]` line + the C1 start line.
+    #[test]
+    fn cell_tag_is_plain_and_uses_human_size() {
+        assert_eq!(cell_tag(128_000, 50), "C1:128k-d50");
+        assert_eq!(cell_tag(1_000_000, 0), "C1:1M-d0");
+        assert_eq!(cell_tag(2_000, 100), "C1:2k-d100");
+        // No `(approx.)` on the tag (the estimate case is the same).
+        assert!(!cell_tag(128_000, 50).contains("approx"));
     }
 
     // ── large haystack scaling (Issue #5) ─────────────────────────────

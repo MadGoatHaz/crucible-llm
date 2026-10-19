@@ -712,6 +712,9 @@ impl StreamWorker {
             )
         };
         let mut tokens = 0u64;
+        // C3: latch the `token #1` milestone (a keep-alive batch keeps the
+        // cumulative count at 1 — the arm must fire at most once).
+        let mut first_logged = false;
         let mut last_token_at: Option<MonotonicInstant> = None;
         // Retain the body (bounded) so a stream that ends with *zero* valid
         // `data:` frames can be inspected: rescued as a non-streaming JSON
@@ -733,7 +736,7 @@ impl StreamWorker {
         {
             Ok((d, tc)) => {
                 tokens += tc;
-                self.log_token_milestones(ts, tokens);
+                self.log_token_milestones(ts, tokens, &mut first_logged);
                 d
             }
             Err(_) => {
@@ -848,7 +851,7 @@ impl StreamWorker {
                         Ok((d, tc)) => {
                             done = d;
                             tokens += tc;
-                            self.log_token_milestones(ts, tokens);
+                            self.log_token_milestones(ts, tokens, &mut first_logged);
                         }
                         Err(_) => {
                             ts.t_end = Some(at);
@@ -892,8 +895,30 @@ impl StreamWorker {
     /// Log the first token and every 50th token of the stream (the
     /// per-token hot path stays allocation-free: at most one formatted
     /// line per 50 tokens per worker).
-    fn log_token_milestones(&self, ts: &StreamTimestamps, tokens: u64) {
+    ///
+    /// C3 (noise cleanup):
+    /// * `tokens == 0` returns early — a keep-alive batch (`tc == 0`) used
+    ///   to hit `0.is_multiple_of(50)` and log a meaningless
+    ///   `token #0 received (… rate: 0.0 t/s)` line;
+    /// * `first_logged` latches the `token #1` milestone —
+    ///   whitespace-only delta frames keep the cumulative count at 1, and
+    ///   the old `tokens == 1` arm re-fired on every such batch (3× per
+    ///   C2 logic challenge in the v0.1.7 log). The latch is a `&mut bool`
+    ///   parameter so [`run_sse`] stays field-free.
+    fn log_token_milestones(
+        &self,
+        ts: &StreamTimestamps,
+        tokens: u64,
+        first_logged: &mut bool,
+    ) {
+        if tokens == 0 {
+            return;
+        }
         if tokens == 1 {
+            if *first_logged {
+                return;
+            }
+            *first_logged = true;
             let elapsed_ms = ts
                 .t0
                 .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
@@ -2082,6 +2107,68 @@ mod tests {
             latest.contains("256 tokens in 0.2s (2560.0 t/s) (premature close)"),
             "premature marker missing: {latest}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // C3 (noise cleanup): the `token #1` milestone latches (a keep-alive /
+    // whitespace-only batch keeps the cumulative count at 1 — it must not
+    // re-fire), and `token #0` never logs (no more meaningless
+    // `rate: 0.0 t/s` lines).
+    #[test]
+    fn token_milestones_latch_first_and_skip_zero() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-miles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("test");
+
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(10_000_000);
+            let t3 = MonotonicInstant::now(); // 10 ms (first token)
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: None,
+                t2: None,
+                t3: Some(t3),
+                t_end: None,
+            };
+            let mut first_logged = false;
+            // Keep-alive batch (tc == 0): the count stays 0 — no line.
+            w.log_token_milestones(&ts, 0, &mut first_logged);
+            // The first token: the milestone fires.
+            w.log_token_milestones(&ts, 1, &mut first_logged);
+            // Whitespace-only batches (the count stays 1): the latch holds.
+            w.log_token_milestones(&ts, 1, &mut first_logged);
+            w.log_token_milestones(&ts, 1, &mut first_logged);
+            // The every-50 milestone (t3 → now = 50 ms → 1000 t/s). The
+            // count is cumulative (each multiple fires once per stream),
+            // so the realistic sequence advances it.
+            mock.increment(50_000_000);
+            w.log_token_milestones(&ts, 50, &mut first_logged);
+            // The every-100 milestone (t3 → now = 100 ms → 1000 t/s).
+            mock.increment(50_000_000);
+            w.log_token_milestones(&ts, 100, &mut first_logged);
+        });
+        logger.finish();
+        // The writer flushes on every newline; read after finish.
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        // Exactly one `token #1`, zero `token #0`, one each of #50 / #100.
+        assert_eq!(latest.matches("token #1 received").count(), 1, "{latest}");
+        assert_eq!(latest.matches("token #0").count(), 0, "{latest}");
+        assert_eq!(latest.matches("token #50 received").count(), 1, "{latest}");
+        assert_eq!(latest.matches("token #100 received").count(), 1, "{latest}");
+        // No meaningless `rate: 0.0` line (the keep-alive batch is gone).
+        assert!(!latest.contains("rate: 0.0"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

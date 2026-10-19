@@ -1272,9 +1272,9 @@ impl Sweep {
             .unwrap_or(DEFAULT_TTFB_STALL_TIMEOUT)
     }
 
-    /// Log the per-worker terminal events (stream complete / failure).
-    /// Token-reception milestones (first token, every 50th) are logged by
-    /// the workers themselves (the `B{step}-{id}` tags).
+    /// Log the per-worker terminal events (failure). Token-reception
+    /// milestones (first token, every 50th) and the stream completion are
+    /// logged by the workers themselves (the `B{step}-{id}` tags).
     fn log_pool_event(
         &self,
         e: &PoolEvent,
@@ -1283,16 +1283,13 @@ impl Sweep {
         total_steps: usize,
     ) {
         match e {
-            PoolEvent::Complete { stream, .. } => {
-                let tokens = acc
-                    .trackers
-                    .get(*stream as usize)
-                    .map(|t| t.tokens())
-                    .unwrap_or(0);
-                self.logi(
-                    Context::Sse,
-                    format!("B{step}-{stream} stream complete: {tokens} tokens"),
-                );
+            PoolEvent::Complete { .. } => {
+                // C3 (noise cleanup): the worker's own `log_stream_end`
+                // (client/stream.rs) is the single completion line — same
+                // `B{step}-{stream}` tag, with the time + rate. The engine
+                // no longer double-logs it (the v0.1.7 log had two
+                // `B1-0 stream complete` lines per worker, same
+                // millisecond).
             }
             PoolEvent::Failed { stream, error, .. } => {
                 let tokens = acc
@@ -3025,6 +3022,65 @@ mod tests {
             assert_eq!(latest.matches("awaiting first token").count(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    // C3 (noise cleanup): the engine no longer double-logs a completed
+    // stream — the worker's own `log_stream_end` (client/stream.rs) is the
+    // single `B{step}-{stream} stream complete` line (with time + rate).
+    // The `Failed` arms are untouched.
+    #[test]
+    fn pool_complete_is_not_double_logged() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-poolcomplete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let sweep = Sweep::new(pool_with_cap(None), [2]).logger(logger.clone());
+
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t0),
+                t2: Some(t0),
+                t3: Some(t0),
+                t_end: Some(t0),
+            };
+            let mut acc = LevelAccumulator::new(2, 16, 0);
+            let complete = PoolEvent::Complete {
+                stream: 0,
+                timestamps: ts,
+                usage: None,
+                premature: false,
+                malformed_frames: 0,
+                looping: false,
+                loop_excluded_tokens: 0,
+            };
+            acc.on_event(&complete);
+            // The engine logs nothing for a completion…
+            sweep.log_pool_event(&complete, &acc, 1, 7);
+            // …but the failure arms still do.
+            sweep.log_pool_event(
+                &PoolEvent::Failed {
+                    stream: 1,
+                    timestamps: ts,
+                    error: StreamError::Read("reset".into()),
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                },
+                &acc,
+                1,
+                7,
+            );
+        });
+        logger.finish();
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        // Zero completion lines from the engine (the v0.1.7 log had two
+        // `B1-0 stream complete` lines per worker, same millisecond).
+        assert!(!latest.contains("stream complete"), "{latest}");
+        // The failure line is preserved.
+        assert!(latest.contains("worker #1 failed"), "{latest}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── v0.1.1: loop guard exclusion, labeled layers, 2D matrix ───────

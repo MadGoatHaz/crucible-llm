@@ -1112,6 +1112,16 @@ impl BenchmarkSequence {
             .metrics(self.metrics.clone())
             .pause(self.pause.clone())
             .logger(self.logger.clone());
+        // C3 (qualify once): without a `--tokenizer` the NIAH sizes are
+        // `chars/4` estimates. The one-time qualification lands here (and
+        // in the run-start `[CONFIG]` line) — the per-cell worker tags no
+        // longer repeat `(approx.)` on every line of the matrix.
+        if self.cfg.tokenizer.is_none() {
+            self.logger.info(
+                Context::EngineC1,
+                "NIAH cell sizes are approximate token counts (no --tokenizer)",
+            );
+        }
         let result = engine.run().await;
         self.slots.niah.set_running(false);
         self.slots.niah.store(result.clone());
