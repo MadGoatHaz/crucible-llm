@@ -688,7 +688,7 @@ impl App {
                     let path = dir.join(&name);
                     let greater = best
                         .as_ref()
-                        .map_or(true, |b| path.to_string_lossy() > b.to_string_lossy());
+                        .is_none_or(|b| path.to_string_lossy() > b.to_string_lossy());
                     if greater {
                         best = Some(path);
                     }

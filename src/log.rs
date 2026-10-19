@@ -388,7 +388,6 @@ impl Drop for RunLogger {
 /// `--log-dir` elsewhere, permissions). Pure `std::fs` — the only file
 /// reads in the log module live on key-press / run-end paths, never the
 /// non-blocking writer path.
-#[must_use]
 pub fn read_log_file(path: &Path) -> Result<Vec<String>, String> {
     std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
