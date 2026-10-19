@@ -134,9 +134,11 @@ fn main() {
 
     // Chunk 20 — the TUI is the default mode. The run goes headless when
     // an explicit headless marker is present (`--headless`, `--json`
-    // which implies it, or `--matrix-report` which prints the
-    // `[COMMUNITY-SUBMISSION]` block on stdout after the run)…
-    let headless = cfg.headless || cfg.json || cfg.matrix_report;
+    // which implies it, `--matrix-report` which prints the
+    // `[COMMUNITY-SUBMISSION]` block on stdout after the run, or
+    // `--show-log` which prints the full run log on stdout after the
+    // run)…
+    let headless = cfg.headless || cfg.json || cfg.matrix_report || cfg.show_log;
     // …or when stdout is not a TTY (pipe / CI) and the user did not
     // explicitly ask for the dashboard with `--tui`. A TUI on a pipe
     // cannot render; the headless run is the sane fallback.

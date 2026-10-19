@@ -21,7 +21,7 @@
 //! `cpu_power_estimated` flag ([`build_energy_json`]) so a CI/CD consumer can
 //! tell a measured power reading from the labeled fixed-estimate fallback.
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ use crate::hw::{
     arm_power_monitor, CpuPowerBackend, GpuBackend, HwPoller, IDLE_WINDOW_SECS,
     HW_POLL_INTERVAL_MS,
 };
-use crate::log::{Context, RunLogger};
+use crate::log::{read_log_file, Context, RunLogger};
 use crate::report::MatrixReport;
 use crate::storage::export::{self, ExportPayload, PacketSample};
 use crate::storage::{
@@ -157,6 +157,24 @@ pub fn headless_matrix_report(
         "",
         "",
     )
+}
+
+/// The `--show-log` read seam (pure over the logger; testable like
+/// [`headless_matrix_report`] — the `println!`/`eprintln!` in
+/// [`run_headless`] is the only I/O in the flag's path):
+///
+/// * `Some(Ok(text))` — the run log's content (the lines joined with
+///   `\n`), to print on stdout (pipeable);
+/// * `Some(Err(e))` — the file is missing/unreadable: print the read
+///   notice on **stderr** (N/A-never-fail — the exit-code rule is
+///   untouched);
+/// * `None` — the logger is disabled (no path): print the unavailable
+///   notice on **stderr**.
+#[must_use]
+pub fn show_log_output(logger: &RunLogger) -> Option<Result<String, String>> {
+    logger
+        .path()
+        .map(|p| read_log_file(p).map(|lines| lines.join("\n")))
 }
 
 /// The headless (non-TUI) path: run N single-stream iterations (Engine A)
@@ -810,6 +828,26 @@ pub fn run_headless(
                 sys.total_memory(),
             );
             println!("{}", report.render());
+        }
+
+        // `--show-log`: print the full run log on stdout (pipeable —
+        // `| less`, `| grep`). The file is complete at this point: the
+        // writer flushes on every newline and `logger.finish()` runs
+        // *after* `run_headless` returns (main.rs), so nothing is lost.
+        // With `--json`, the JSON document prints *first* (the same
+        // ordering as the `--matrix-report` block above): the log's
+        // `[ts] [LEVEL] [CTX]` line shape is what a pipe consumer slices
+        // on. N/A-never-fail: read errors / a disabled logger go to
+        // **stderr** — the exit-code rule below is untouched.
+        if cfg.show_log {
+            match show_log_output(&logger) {
+                Some(Ok(text)) => {
+                    let mut stdout = std::io::stdout();
+                    let _ = writeln!(stdout, "{text}");
+                }
+                Some(Err(e)) => eprintln!("crucible-llm: cannot read run log: {e}"),
+                None => eprintln!("crucible-llm: run log unavailable (logger disabled)"),
+            }
         }
 
         // Prototype exit-code rule: all runs failed → exit 1.
@@ -1602,5 +1640,52 @@ mod tests {
         // 8192 MiB = 8 GiB (binary) → the `≤16` tier.
         assert_eq!(r.vram, "8GB — ≤16");
         assert_eq!(r.hardware, "1x G 8GB + 16GB RAM");
+    }
+
+    // ── `--show-log` (the read seam) ─────────────────────────────────────
+
+    #[test]
+    fn show_log_output_disabled_logger_is_none() {
+        // A disabled logger (no path) → the `None` arm: the caller
+        // prints the "logger disabled" stderr notice.
+        let logger = RunLogger::disabled();
+        assert!(show_log_output(&logger).is_none());
+    }
+
+    #[test]
+    fn show_log_output_reads_the_run_log() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-showlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        logger.info(Context::Setup, "run started");
+        logger.warn(Context::EngineB, "step 2 slow");
+        logger.finish(); // the writer thread flushes both files
+
+        let text = show_log_output(&logger)
+            .expect("an active logger has a path")
+            .expect("the file is readable");
+        // The header is the first line (the writer emits it before
+        // draining the channel), then the records in order.
+        assert!(text.starts_with("=== crucible-llm run log"), "{text}");
+        assert!(text.contains("[INFO] [SETUP] run started"), "{text}");
+        assert!(text.contains("[WARN] [ENGINE_B] step 2 slow"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn show_log_output_unreadable_file_is_an_err_not_a_panic() {
+        // The path survives (the logger opened the file at start); the
+        // read fails (the file is gone) → `Err` (the caller prints the
+        // stderr notice), never a panic.
+        let dir = std::env::temp_dir()
+            .join(format!("crucible-showlog-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        logger.finish();
+        std::fs::remove_file(dir.join("latest.log")).ok();
+        let out = show_log_output(&logger).expect("an active logger has a path");
+        assert!(out.is_err(), "a missing file is Err: {out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
