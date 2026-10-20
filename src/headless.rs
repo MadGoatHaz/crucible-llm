@@ -233,8 +233,6 @@ pub fn run_headless(
     // compact line near the top of the run log; a channel send, never a
     // blocking write).
     logger.log_config(cfg);
-    // C5: the run wall clock (the digest's `wall Ns`).
-    let run_started = std::time::Instant::now();
     // C5: the digest's error lines — the engines' own error surfaces
     // (the logger is fire-and-forget: no record buffer by design).
     let mut run_errors: Vec<String> = Vec::new();
@@ -302,6 +300,11 @@ pub fn run_headless(
         if let Some(h) = &hw {
             arm_power_monitor(h, IDLE_WINDOW_SECS).await;
         }
+        // N22: the run wall clock anchors **after** the idle baseline
+        // (matching the TUI's `sequence.rs:767` anchor), so the digest
+        // `wall Ns` excludes the no-load window — headless and TUI report
+        // the same wall for the same run.
+        let run_started = std::time::Instant::now();
 
         // Engine A (speed) — gated on the selection (R1). `--engine niah`
         // runs *only* C1; a selection that omits `speed` skips Engine A
@@ -1870,7 +1873,8 @@ mod tests {
             .expect("the file is readable");
         // The header is the first line (the writer emits it before
         // draining the channel), then the records in order.
-        assert!(text.starts_with("=== crucible-llm run log"), "{text}");
+        // S7: the header carries the crate version.
+        assert!(text.starts_with("=== crucible-llm v"), "{text}");
         assert!(text.contains("[INFO] [SETUP] run started"), "{text}");
         assert!(text.contains("[WARN] [ENGINE_B] step 2 slow"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);

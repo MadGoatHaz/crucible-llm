@@ -266,12 +266,14 @@ impl RunLogger {
         // is joinable to its DB row even without reading the archive name.
         let header = match &session {
             Some(id) => format!(
-                "=== crucible-llm run log — {} (session {}) ===",
+                "=== crucible-llm v{} run log — {} (session {}) ===",
+                env!("CARGO_PKG_VERSION"),
                 format_timestamp(header_at, true),
                 id
             ),
             None => format!(
-                "=== crucible-llm run log — {} ===",
+                "=== crucible-llm v{} run log — {} ===",
+                env!("CARGO_PKG_VERSION"),
                 format_timestamp(header_at, true)
             ),
         };
@@ -515,21 +517,19 @@ fn niah_ladder(cfg: &Config) -> String {
     let base = match cfg.niah_custom {
         Some(s) => format!("custom {}", human_size(s)),
         None => {
-            let (Some(first), Some(last)) = (cfg.niah_contexts.first(), cfg.niah_contexts.last())
-            else {
+            if cfg.niah_contexts.is_empty() {
                 return String::new();
+            }
+            let contexts: Vec<String> =
+                cfg.niah_contexts.iter().map(|c| human_size(*c)).collect();
+            let ctx_str = format!("[{}]", discrete_list(&contexts));
+            let depths: Vec<String> = cfg.niah_depths.iter().map(|d| d.to_string()).collect();
+            let dep_str = if depths.is_empty() {
+                String::new()
+            } else {
+                format!(" × [{}]", discrete_list(&depths))
             };
-            let (d0, d1) = match (cfg.niah_depths.first(), cfg.niah_depths.last()) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return format!("{}..{}", human_size(*first), human_size(*last)),
-            };
-            format!(
-                "{}..{} × {}..{}",
-                human_size(*first),
-                human_size(*last),
-                d0,
-                d1
-            )
+            format!("{ctx_str}{dep_str}")
         }
     };
     if cfg.tokenizer.is_none() && !base.is_empty() {
@@ -539,14 +539,33 @@ fn niah_ladder(cfg: &Config) -> String {
     }
 }
 
+/// Format a list of strings in discrete bracket form. Lists with ≤ 7
+/// items show all; longer lists show the first 2, `…`, and the last 1
+/// (e.g. `[0,10,…,100]`) so the reader sees a discrete set, not a
+/// continuous range.
+fn discrete_list(items: &[String]) -> String {
+    if items.len() <= 7 {
+        items.join(",")
+    } else {
+        let first: Vec<&str> = items.iter().take(2).map(|s| s.as_str()).collect();
+        let last = items.last().unwrap().as_str();
+        format!("{},…,{}", first.join(","), last)
+    }
+}
+
 /// The run-end digest (C5): the compact, shareable block appended to the
 /// run log when the run completes:
 ///
-/// 1. `[DIGEST] session {id} — {date} {n} engine(s), wall {s}s`;
+/// 1. `session {id} — v{ver} {date} {n} engine(s), wall {s}s`;
 /// 2. the `[CONFIG]` line (C1, reused verbatim);
 /// 3. one line per `✓` per-engine headline (label + summary);
 /// 4. one line per collected error;
-/// 5. `[DIGEST] totals: {n} tokens generated, peak VRAM {gb} GB | n/a`.
+/// 5. `totals: {n} tokens processed (input+output), peak VRAM {gb} GB | n/a`.
+///
+/// N11: the in-message `[DIGEST]` prefix is dropped — the
+/// `Context::Digest` tag in the `[ts] [LEVEL] [CONTEXT] msg` line
+/// already provides it. The `[CONFIG]` prefix on the config line is
+/// kept (a message-level label, not a context tag).
 ///
 /// `headlines` are `(label, summary)` **string** pairs (not the `Engine`
 /// type — keeps `log.rs` free of engine-module dependencies). Pure: no
@@ -565,27 +584,36 @@ pub fn digest_lines(
     peak_vram_mib: Option<u64>,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(4 + headlines.len() + errors.len());
+    // N11: no in-message `[DIGEST]` prefix — the `Context::Digest` tag
+    // already provides it in the `[ts] [LEVEL] [CONTEXT] msg` line.
+    // S7: the version is recorded so a forum reader knows which build
+    // produced the log.
     lines.push(format!(
-        "[DIGEST] session {session_id} — {} {} engine(s), wall {wall_secs:.0}s",
+        "session {session_id} — v{} {} {} engine(s), wall {wall_secs:.0}s",
+        env!("CARGO_PKG_VERSION"),
         format_timestamp(now_ms(), true),
         cfg.engines.count()
     ));
+    // The `[CONFIG]` prefix is kept (its context is `SETUP` when emitted
+    // via `log_config`; in the digest it is a message-level label).
     lines.push(config_block_line(cfg));
     for (label, summary) in headlines {
-        lines.push(format!("[DIGEST] ✓ {label} — {summary}"));
+        lines.push(format!("✓ {label} — {summary}"));
     }
     for e in errors {
-        lines.push(format!("[DIGEST] error: {e}"));
+        lines.push(format!("error: {e}"));
     }
     // Binary GiB (the same convention as the `vram` tier / the
     // hardware string); `n/a` when there is no telemetry (never a
     // fabricated 0).
+    // H3: `total_tokens` is `all_engines_tokens()` = input + output
+    // (prompt + completion) — "generated" implied output-only.
     let vram = match peak_vram_mib {
         Some(mib) => format!("peak VRAM {:.1} GB", mib as f64 / 1024.0),
         None => "peak VRAM n/a".to_string(),
     };
     lines.push(format!(
-        "[DIGEST] totals: {total_tokens} tokens generated, {vram}"
+        "totals: {total_tokens} tokens processed (input+output), {vram}"
     ));
     lines
 }
@@ -747,8 +775,8 @@ mod tests {
 
         for content in [&latest, &archive] {
             assert!(
-                content.contains("=== crucible-llm run log"),
-                "header: {content}"
+                content.contains("=== crucible-llm v"),
+                "header carries the crate version: {content}"
             );
             assert!(
                 content.contains("[INFO] [SETUP] run started — url=http://x"),
@@ -777,12 +805,16 @@ mod tests {
         logger.info(Context::Setup, "run started");
         logger.finish();
 
-        // The header in latest.log carries the full session id.
+        // The header in latest.log carries the full session id + version.
         let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
         let needle = format!("(session {session_id})");
         assert!(
             latest.contains(&needle),
             "header carries the session id: {latest}"
+        );
+        assert!(
+            latest.contains("=== crucible-llm v"),
+            "header carries the crate version: {latest}"
         );
 
         // The archive file name carries the short (8-char) session id.
@@ -966,7 +998,7 @@ mod tests {
         assert!(line.contains("timeout=120s"), "{line}");
         assert!(line.contains("nocache=true"), "{line}");
         assert!(line.contains("ladder=[1,2,4,8]"), "{line}");
-        assert!(line.contains("niah=2k..8k × 0..100"), "{line}");
+        assert!(line.contains("niah=[2k,4k,8k] × [0,50,100]"), "{line}");
         assert!(line.contains(
             "engines=[A (speed),B (concurrency),C1 (niah),C2 (reasoning),C3 (structured),D (hardware),F (flat out)]"
         ),
@@ -984,9 +1016,13 @@ mod tests {
         // The default config has no `--tokenizer`: the one-time
         // `(approx.)` qualifier lands in the NIAH part (C3 — it no
         // longer repeats on every per-cell line).
+        // S4/N24: discrete form (7 contexts all shown, 11 depths
+        // abbreviated to first 2 + … + last 1).
         let line = config_block_line(&Config::default());
         assert!(
-            line.contains("niah=2k..128k × 0..100 (approx. token counts — no --tokenizer)"),
+            line.contains(
+                "niah=[2k,4k,8k,16k,32k,64k,128k] × [0,10,…,100] (approx. token counts — no --tokenizer)"
+            ),
             "{line}"
         );
         // Exactly one occurrence.
@@ -1024,7 +1060,7 @@ mod tests {
         let lines: Vec<&str> = latest.lines().collect();
         // Line 0 is the run header; the [CONFIG] block is line 1 — near
         // the top of the run log, one compact line.
-        assert!(lines[0].starts_with("=== crucible-llm run log"), "{latest}");
+        assert!(lines[0].starts_with("=== crucible-llm v"), "{latest}");
         assert!(
             lines[1].contains("[SETUP] [CONFIG] url="),
             "the [CONFIG] block is the first record: {latest}"
@@ -1076,29 +1112,32 @@ mod tests {
         assert!(lines.len() <= 30, "{lines:?}");
         assert_eq!(lines.len(), 11, "{lines:?}");
         // 1. session line (the archive-name join key).
+        // N11: no in-message `[DIGEST]` prefix (the context tag provides it).
+        // S7: the crate version is recorded.
         assert!(
-            lines[0].starts_with("[DIGEST] session 12345678-aaaa-bbbb-cccc-dddddddddddd — "),
+            lines[0].starts_with("session 12345678-aaaa-bbbb-cccc-dddddddddddd — v"),
             "{lines:?}"
         );
         assert!(lines[0].contains("7 engine(s), wall 1140s"), "{lines:?}");
         // 2. the [CONFIG] line, reused verbatim from C1.
         assert!(lines[1].starts_with("[CONFIG] url="), "{lines:?}");
-        // 3. every ✓ headline, in order.
+        // 3. every ✓ headline, in order (N11: no `[DIGEST]` prefix).
         for (i, (label, summary)) in headlines.iter().enumerate() {
             assert_eq!(
                 lines[2 + i],
-                format!("[DIGEST] ✓ {label} — {summary}"),
+                format!("✓ {label} — {summary}"),
                 "{lines:?}"
             );
         }
-        // 4. the error line.
+        // 4. the error line (N11: no `[DIGEST]` prefix).
         assert_eq!(
-            lines[9], "[DIGEST] error: A: Iteration 2/6 failed: HTTP 500: boom",
+            lines[9], "error: A: Iteration 2/6 failed: HTTP 500: boom",
             "{lines:?}"
         );
-        // 5. the totals line (binary GiB: 98304 MiB = 96.0 GB).
+        // 5. the totals line (H3: "tokens processed (input+output)";
+        // binary GiB: 98304 MiB = 96.0 GB).
         assert_eq!(
-            lines[10], "[DIGEST] totals: 1607850 tokens generated, peak VRAM 96.0 GB",
+            lines[10], "totals: 1607850 tokens processed (input+output), peak VRAM 96.0 GB",
             "{lines:?}"
         );
     }
@@ -1133,8 +1172,9 @@ mod tests {
         );
         assert_eq!(lines.len(), 4, "{lines:?}"); // session + config + 1 + totals
         assert!(lines[0].contains("1 engine(s), wall 5s"), "{lines:?}");
+        // N11 + H3: no `[DIGEST]` prefix; "tokens processed (input+output)".
         assert!(
-            lines[3] == "[DIGEST] totals: 0 tokens generated, peak VRAM n/a",
+            lines[3] == "totals: 0 tokens processed (input+output), peak VRAM n/a",
             "{lines:?}"
         );
     }
@@ -1167,9 +1207,15 @@ mod tests {
             n,
             "{latest}"
         );
+        // N11: no double `[DIGEST] [DIGEST]` tag — the context tag is
+        // enough; the in-message prefix is dropped.
         assert!(
-            latest.contains("[INFO] [DIGEST] [DIGEST] session sess-id-123"),
+            latest.contains("[INFO] [DIGEST] session sess-id-123"),
             "{latest}"
+        );
+        assert!(
+            !latest.contains("[DIGEST] [DIGEST]"),
+            "no double tag: {latest}"
         );
         assert!(latest.contains("peak VRAM n/a"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);

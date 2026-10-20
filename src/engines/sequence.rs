@@ -1093,11 +1093,13 @@ impl BenchmarkSequence {
                     self.logger.info(
                         Context::Sequence,
                         format!(
-                            "run persisted → {} (session {}, {} metric rows, {} needle rows)",
+                            "run persisted → {} (session {}, {} metric row{}, {} needle row{})",
                             db.path().display(),
                             &id[..8],
                             metrics.len(),
-                            needles.len()
+                            if metrics.len() == 1 { "" } else { "s" },
+                            needles.len(),
+                            if needles.len() == 1 { "" } else { "s" },
                         ),
                     );
                 }
@@ -1355,10 +1357,14 @@ impl BenchmarkSequence {
         // matches the power trace the numerator integrates, so numerator and
         // denominator span the same engine set (no more A+B-only inflation).
         let total_tokens = self.all_engines_tokens();
+        // N6: the label no longer claims "all engines" (F runs after D, so
+        // its tokens are not yet known); the 3 s is a progress-display
+        // window, not the integration window (J/token integrates the full
+        // load window).
         self.logger.info(
             Context::EngineD,
             format!(
-                "Engine D (Energy) started — 3s sampling window over {total_tokens} tokens (all engines)"
+                "Engine D (Energy) started — sampling over {total_tokens} tokens (A–C3; F runs after D); J/token integrates the full load window"
             ),
         );
         const WINDOW: Duration = Duration::from_secs(3);
@@ -1636,9 +1642,12 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
         .and_then(|e| e.knee)
         .map(|k| format!(" · throughput knee at {}", k.concurrency))
         .unwrap_or_default();
+    // N21: the sweet spot / knee is pinned to the ctx=0 (pure decode)
+    // leg by CF-27 — disclose the basis so a reader knows which context
+    // the figure came from.
     match us.practical_sweet_spot {
         Some(n) => format!(
-            "practical sweet spot {} users (~{:.0} t/s each){}",
+            "practical sweet spot {} users (~{:.0} t/s each, ctx=0 decode){}",
             n, us.practical_per_stream, knee
         ),
         None => {
@@ -1646,10 +1655,10 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
             // (29.4 effective): report the usability edge instead.
             match us.max_usable {
                 Some(n) => format!(
-                    "no level reaches 30 t/s/user — usable up to {} users (~{:.0} t/s each){}",
+                    "no level reaches 30 t/s/user — usable up to {} users (~{:.0} t/s each, ctx=0 decode){}",
                     n, us.max_usable_per_stream, knee
                 ),
-                None => format!("unusable for interactive use (below 15 t/s/user even at 1){knee}"),
+                None => format!("unusable for interactive use (below 15 t/s/user even at 1, ctx=0 decode){knee}"),
             }
         }
     }
@@ -2293,6 +2302,8 @@ mod tests {
         let line = summarize_sweep(&result);
         assert!(line.contains("practical sweet spot 2 users"), "{line}");
         assert!(line.contains("~175 t/s each"), "{line}");
+        // N21: the ctx=0 basis is disclosed (CF-27 pins the primary leg).
+        assert!(line.contains("ctx=0 decode"), "{line}");
         assert_eq!(summarize_sweep(&SweepResult::default()), "no usable levels");
     }
 
@@ -2717,6 +2728,49 @@ mod tests {
             256 + 1000 + 8015 + 100 + 200 + 5000,
             "the full all-engine sum"
         );
+    }
+
+    // ── N17: metric/needle row grammar ─────────────────────────────────
+
+    #[test]
+    fn metric_rows_grammar_singular_at_one() {
+        // 1 row → "1 metric row" (not "1 metric rows").
+        let s = format!(
+            "{} metric row{}",
+            1,
+            if 1 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "1 metric row");
+        // 2 rows → "2 metric rows".
+        let s = format!(
+            "{} metric row{}",
+            2,
+            if 2 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "2 metric rows");
+        // 0 rows → "0 metric rows".
+        let s = format!(
+            "{} needle row{}",
+            0,
+            if 0 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "0 needle rows");
+    }
+
+    // ── N6: D started line relabel ──────────────────────────────────────
+
+    #[test]
+    fn d_started_line_does_not_claim_all_engines() {
+        // N6: the label must say "F runs after D" (not "all engines")
+        // and describe the 3s as sampling (not the integration window).
+        let total_tokens = 12345u64;
+        let line = format!(
+            "Engine D (Energy) started — sampling over {total_tokens} tokens (A–C3; F runs after D); J/token integrates the full load window"
+        );
+        assert!(line.contains("F runs after D"), "{line}");
+        assert!(!line.contains("(all engines)"), "{line}");
+        assert!(line.contains("J/token integrates the full load window"), "{line}");
+        assert!(!line.contains("3s sampling window"), "{line}");
     }
 
     // ── the sequence run itself (no network: empty engines no-op) ───────
