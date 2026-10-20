@@ -567,17 +567,20 @@ fn discrete_list(items: &[String]) -> String {
 /// already provides it. The `[CONFIG]` prefix on the config line is
 /// kept (a message-level label, not a context tag).
 ///
-/// `headlines` are `(label, summary)` **string** pairs (not the `Engine`
-/// type — keeps `log.rs` free of engine-module dependencies). Pure: no
-/// I/O — the caller sends the lines through the non-blocking channel
-/// ([`RunLogger::log_digest`]). A full 7-engine run is ~10–30 lines —
-/// self-describing (a shared log states its own inputs) and referenceable
-/// by session id (the archive name carries the same id).
+/// `headlines` are `(label, summary, wall_secs)` triples (not the
+/// `Engine` type — keeps `log.rs` free of engine-module dependencies).
+/// S3: the per-engine wall time is rendered on each ✓ line
+/// (`(wall Ns)`) so the long pole (e.g. C1's 1385s) is visible in the
+/// shareable block. Pure: no I/O — the caller sends the lines through
+/// the non-blocking channel ([`RunLogger::log_digest`]). A full
+/// 7-engine run is ~10–30 lines — self-describing (a shared log states
+/// its own inputs) and referenceable by session id (the archive name
+/// carries the same id).
 #[must_use]
 pub fn digest_lines(
     cfg: &Config,
     session_id: &str,
-    headlines: &[(String, String)],
+    headlines: &[(String, String, f64)],
     errors: &[String],
     total_tokens: u64,
     wall_secs: f64,
@@ -597,8 +600,10 @@ pub fn digest_lines(
     // The `[CONFIG]` prefix is kept (its context is `SETUP` when emitted
     // via `log_config`; in the digest it is a message-level label).
     lines.push(config_block_line(cfg));
-    for (label, summary) in headlines {
-        lines.push(format!("✓ {label} — {summary}"));
+    // S3: each ✓ line carries the per-engine wall time (the long pole,
+    // e.g. C1's 1385s, becomes visible in the shareable block).
+    for (label, summary, w) in headlines {
+        lines.push(format!("✓ {label} — {summary} (wall {w:.0}s)"));
     }
     for e in errors {
         lines.push(format!("error: {e}"));
@@ -616,6 +621,33 @@ pub fn digest_lines(
         "totals: {total_tokens} tokens processed (input+output), {vram}"
     ));
     lines
+}
+
+/// P3/N3: the `[HW]` detail line — vLLM server version, GPU driver, and
+/// CUDA version (all best-effort: a value that is unavailable is omitted,
+/// never fabricated). The caller probes the vLLM `GET /version` endpoint
+/// and the NVML `sys_driver_version()` / `sys_cuda_driver_version()`
+/// functions (zero new deps — existing `reqwest` + `nvml-wrapper`), then
+/// passes the results here for formatting.
+///
+/// Returns `None` when all three values are unavailable (nothing to log).
+#[must_use]
+pub fn hw_detail_line(
+    vllm_version: Option<&str>,
+    driver_version: Option<&str>,
+    cuda_version: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(v) = vllm_version {
+        parts.push(format!("vLLM {v}"));
+    }
+    if let Some(v) = driver_version {
+        parts.push(format!("driver {v}"));
+    }
+    if let Some(v) = cuda_version {
+        parts.push(format!("CUDA {v}"));
+    }
+    (!parts.is_empty()).then(|| format!("[HW] {}", parts.join(", ")))
 }
 
 /// Format one log line: `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`.
@@ -1080,22 +1112,25 @@ mod tests {
             engines: crate::config::EngineSelection::all(),
             ..Config::default()
         };
-        let headlines: Vec<(String, String)> = [
-            ("A: Speed", "56.4 t/s decode · TTFT 180 ms · 6 run(s)"),
+        // S3: headlines are (label, summary, wall_secs) triples.
+        let headlines: Vec<(String, String, f64)> = [
+            ("A: Speed", "56.4 t/s decode · TTFT 180 ms · 6 run(s)", 12.0),
             (
                 "B: Concurrency",
-                "practical sweet spot 4 users (~30 t/s each)",
+                "practical sweet spot 4 users (~30 t/s each, ctx=0 decode)",
+                45.0,
             ),
-            ("C1: NIAH", "reliable up to 64k"),
-            ("C2: Reasoning", "12/13 · avg 40.2 t/s"),
-            ("C3: Structured", "5/6 compliant"),
-            ("D: Energy", "0.098 J/token · peak 521 W · 90% util"),
+            ("C1: NIAH", "reliable up to 64k", 1385.0),
+            ("C2: Reasoning", "12/13 · avg 40.2 t/s", 8.0),
+            ("C3: Structured", "5/6 compliant", 5.0),
+            ("D: Energy", "0.098 J/token · peak 521 W · 90% util", 3.0),
             (
                 "F: Flat Out",
                 "4 streams, 2619 tok in 60s — 43.7 t/s aggregate",
+                60.0,
             ),
         ]
-        .map(|(l, s)| (l.to_string(), s.to_string()))
+        .map(|(l, s, w)| (l.to_string(), s.to_string(), w))
         .to_vec();
         let errors = vec!["A: Iteration 2/6 failed: HTTP 500: boom".to_string()];
         let lines = digest_lines(
@@ -1121,14 +1156,17 @@ mod tests {
         assert!(lines[0].contains("7 engine(s), wall 1140s"), "{lines:?}");
         // 2. the [CONFIG] line, reused verbatim from C1.
         assert!(lines[1].starts_with("[CONFIG] url="), "{lines:?}");
-        // 3. every ✓ headline, in order (N11: no `[DIGEST]` prefix).
-        for (i, (label, summary)) in headlines.iter().enumerate() {
+        // 3. every ✓ headline, in order (N11: no `[DIGEST]` prefix;
+        // S3: carries `(wall Ns)`).
+        for (i, (label, summary, w)) in headlines.iter().enumerate() {
             assert_eq!(
                 lines[2 + i],
-                format!("✓ {label} — {summary}"),
+                format!("✓ {label} — {summary} (wall {w:.0}s)"),
                 "{lines:?}"
             );
         }
+        // S3: the C1 long pole (1385s) is visible in the shareable block.
+        assert!(lines[4].contains("(wall 1385s)"), "{lines:?}");
         // 4. the error line (N11: no `[DIGEST]` prefix).
         assert_eq!(
             lines[9], "error: A: Iteration 2/6 failed: HTTP 500: boom",
@@ -1158,12 +1196,14 @@ mod tests {
             },
             ..Config::default()
         };
+        // S3: headlines are (label, summary, wall_secs) triples.
         let lines = digest_lines(
             &cfg,
             "sess",
             &[(
                 "D: Energy".to_string(),
                 "N/A (no power telemetry)".to_string(),
+                3.0,
             )],
             &[],
             0,
@@ -1172,6 +1212,8 @@ mod tests {
         );
         assert_eq!(lines.len(), 4, "{lines:?}"); // session + config + 1 + totals
         assert!(lines[0].contains("1 engine(s), wall 5s"), "{lines:?}");
+        // S3: the ✓ line carries the wall time.
+        assert!(lines[2].contains("(wall 3s)"), "{lines:?}");
         // N11 + H3: no `[DIGEST]` prefix; "tokens processed (input+output)".
         assert!(
             lines[3] == "totals: 0 tokens processed (input+output), peak VRAM n/a",
@@ -1186,7 +1228,7 @@ mod tests {
         let lines = digest_lines(
             &Config::default(),
             "sess-id-123",
-            &[("A: Speed".to_string(), "56.4 t/s".to_string())],
+            &[("A: Speed".to_string(), "56.4 t/s".to_string(), 12.0)],
             &[],
             256,
             42.0,
@@ -1219,6 +1261,27 @@ mod tests {
         );
         assert!(latest.contains("peak VRAM n/a"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── P3/N3: the [HW] detail line (best-effort, omit-if-unavailable) ──
+
+    #[test]
+    fn hw_detail_line_omits_unavailable_values() {
+        // All three present.
+        let line = hw_detail_line(Some("0.6.2"), Some("550.54"), Some("12.4"))
+            .expect("all present → Some");
+        assert_eq!(line, "[HW] vLLM 0.6.2, driver 550.54, CUDA 12.4");
+
+        // Only vLLM (driver + CUDA unavailable — non-NVML host).
+        let line = hw_detail_line(Some("0.6.2"), None, None).expect("vLLM only");
+        assert_eq!(line, "[HW] vLLM 0.6.2");
+
+        // Only driver + CUDA (no vLLM — the server has no /version).
+        let line = hw_detail_line(None, Some("550.54"), Some("12.4")).expect("driver+CUDA");
+        assert_eq!(line, "[HW] driver 550.54, CUDA 12.4");
+
+        // None available (driverless host, no server) → None (nothing to log).
+        assert_eq!(hw_detail_line(None, None, None), None);
     }
 
     #[test]

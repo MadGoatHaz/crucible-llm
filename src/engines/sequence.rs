@@ -35,8 +35,8 @@ use arc_swap::ArcSwapOption;
 
 use crate::config::Config;
 use crate::engines::capability::{
-    NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
-    NIAH_MAX_GEN_TOKENS,
+    NiahCellState, NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StructuredEngine,
+    StructuredResult, NIAH_MAX_GEN_TOKENS,
 };
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::StreamCountSource;
@@ -551,7 +551,12 @@ pub struct BenchmarkSequence {
     current: Arc<AtomicUsize>,
     /// Completed engines so far (the queue panel's `✓` rows) — a brief
     /// lock on the completion path only, never the timing path.
-    completed: Arc<Mutex<Vec<(Engine, String)>>>,
+    /// S3: each entry is `(engine, summary, wall_secs)` so the digest
+    /// ✓ lines carry the per-engine wall time (the long pole, e.g. C1's
+    /// 1385s, becomes visible in the shareable block). The ticker maps
+    /// this to `SeqState.completed` (which stays `(Engine, String)` —
+    /// no struct ripple to the TUI).
+    completed: Arc<Mutex<Vec<(Engine, String, f64)>>>,
 }
 
 /// The ordered engine queue for a selection: the selected engines in the
@@ -654,7 +659,13 @@ impl BenchmarkSequence {
         } else {
             None
         };
-        let completed = self.completed.lock().map(|g| g.clone()).unwrap_or_default();
+        // S3: map (Engine, String, f64) → (Engine, String) for the
+        // TUI-facing SeqState (no struct ripple).
+        let completed: Vec<(Engine, String)> = self
+            .completed
+            .lock()
+            .map(|g| g.iter().map(|(e, s, _)| (*e, s.clone())).collect())
+            .unwrap_or_default();
         self.slot.store(SeqState {
             phase,
             queue: self.engines.clone(),
@@ -728,7 +739,10 @@ impl BenchmarkSequence {
                     let Ok(g) = completed.lock() else {
                         continue;
                     };
-                    let completed = g.clone();
+                    // S3: map (Engine, String, f64) → (Engine, String)
+                    // for the TUI-facing SeqState (no struct ripple).
+                    let completed: Vec<(Engine, String)> =
+                        g.iter().map(|(e, s, _)| (*e, s.clone())).collect();
                     drop(g);
                     // The ticker re-publishes the *same* engine at 10 Hz:
                     // keep its start stamp (a new engine gets one from
@@ -808,11 +822,14 @@ impl BenchmarkSequence {
             };
 
             self.bus.reset();
+            let wall = t_start.elapsed().as_secs_f64();
             {
                 let mut g = self.completed.lock().unwrap_or_else(|e| e.into_inner());
-                g.push((*engine, summary.clone()));
+                // S3: store the wall time alongside the summary so the
+                // digest ✓ lines can render `(wall Ns)`.
+                g.push((*engine, summary.clone(), wall));
             }
-            let headline = headline_line(engine.label(), &summary, t_start.elapsed().as_secs_f64());
+            let headline = headline_line(engine.label(), &summary, wall);
             self.log_line(format!("[seq] {headline}"));
             self.logger.info(Context::Sequence, headline);
             self.publish_state(SeqPhase::Complete, *engine, &summary);
@@ -888,12 +905,14 @@ impl BenchmarkSequence {
         // the totals), referenced by the session id, appended to the run
         // log. All channel sends (assembled at run end — never the timing
         // path); `--show-log` / the `l` view / the archive all carry it.
-        let headlines: Vec<(String, String)> = self
+        // S3: headlines carry the per-engine wall time (the 3-tuple from
+        // the `completed` slot), so the digest ✓ lines render `(wall Ns)`.
+        let headlines: Vec<(String, String, f64)> = self
             .completed
             .lock()
             .map(|g| {
                 g.iter()
-                    .map(|(e, s)| (e.label().to_string(), s.clone()))
+                    .map(|(e, s, w)| (e.label().to_string(), s.clone(), *w))
                     .collect()
             })
             .unwrap_or_default();
@@ -931,9 +950,49 @@ impl BenchmarkSequence {
             }
         }
         let completed = self.completed.lock().map(|g| g.clone()).unwrap_or_default();
-        for (e, s) in &completed {
+        for (e, s, _) in &completed {
             if s.starts_with("init failed") {
                 errs.push(format!("{}: {s}", e.label()));
+            }
+        }
+        // M2/N8: cell-level failures — failed C1 cells (!retrieved with
+        // an error/stall) and failed/timed-out B streams. Capped at 5
+        // with "…and k more" to bound the digest.
+        if let Some(niah) = (*self.slots.niah.load()).as_ref() {
+            let failed_cells: Vec<String> = niah
+                .cells
+                .iter()
+                .filter(|c| c.target_tokens > 0 && !c.retrieved && c.state == NiahCellState::Failed)
+                .map(|c| {
+                    format!(
+                        "C1: {} depth {}% — retrieval failed",
+                        c.context_label(),
+                        c.depth_percent
+                    )
+                })
+                .collect();
+            let (shown, extra) = (&failed_cells[..failed_cells.len().min(3)], failed_cells.len().saturating_sub(3));
+            errs.extend(shown.iter().cloned());
+            if extra > 0 {
+                errs.push(format!("…and {extra} more C1 failures"));
+            }
+        }
+        if let Some(sweep) = (*self.slots.concurrency.load()).as_ref() {
+            let failed_levels: Vec<String> = sweep
+                .levels
+                .iter()
+                .filter(|l| l.failed_streams > 0 || l.timed_out_streams > 0)
+                .map(|l| {
+                    format!(
+                        "B: level {} — {} failed, {} timed out",
+                        l.concurrency, l.failed_streams, l.timed_out_streams
+                    )
+                })
+                .collect();
+            let (shown, extra) = (&failed_levels[..failed_levels.len().min(3)], failed_levels.len().saturating_sub(3));
+            errs.extend(shown.iter().cloned());
+            if extra > 0 {
+                errs.push(format!("…and {extra} more B failures"));
             }
         }
         errs

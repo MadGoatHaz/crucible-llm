@@ -312,6 +312,14 @@ pub fn run_headless(
         // are declared outside the gate so the persistence + export below
         // can use them (they stay empty when A did not run).
         let mut results: Vec<SpeedResult> = Vec::new();
+        // S3: per-engine wall clocks (the digest ✓ lines carry `(wall Ns)`).
+        let mut engine_wall_a = 0.0f64;
+        let mut engine_wall_b = 0.0f64;
+        let mut engine_wall_c1 = 0.0f64;
+        let mut engine_wall_c2 = 0.0f64;
+        let mut engine_wall_c3 = 0.0f64;
+        let mut engine_wall_d = 0.0f64;
+        let mut engine_wall_f = 0.0f64;
         // CF-05: the per-run client-perceived first-token latency (T3−T0) for
         // the short-prompt runs, alongside the server-side value in each
         // `SpeedResult.ttft`.
@@ -329,6 +337,7 @@ pub fn run_headless(
         let mut windows: Vec<Option<(MonotonicInstant, MonotonicInstant)>> = Vec::new();
 
         if cfg.engines.speed {
+            let t_a = std::time::Instant::now();
             let engine = match SpeedEngine::new(cfg) {
                 Ok(e) => e,
                 Err(e) => {
@@ -444,6 +453,7 @@ pub fn run_headless(
                     r.error.clone().unwrap_or_else(|| "unknown".to_string())
                 ));
             }
+            engine_wall_a = t_a.elapsed().as_secs_f64();
         }
 
         // Chunk 17: harvest the sampler's power trace (brief lock on the
@@ -544,6 +554,7 @@ pub fn run_headless(
         // after them and *before* F (the TUI sequence order A→B→C1→C2→C3→D→F),
         // so the headless and TUI J/token share the same denominator.
         if extra.concurrency {
+            let t_b = std::time::Instant::now();
             match build_sweep(cfg, None, Some(logger.clone())) {
                 Some(sweep) => {
                     if !cfg.json {
@@ -583,8 +594,33 @@ pub fn run_headless(
                     run_errors.push("B: init failed (client build) — sweep skipped".to_string());
                 }
             }
+            // M2/N8: B failed/timed-out streams (capped at 3 with
+            // "…and k more").
+            if let Some(r) = &sweep_result {
+                let failed_levels: Vec<String> = r
+                    .levels
+                    .iter()
+                    .filter(|l| l.failed_streams > 0 || l.timed_out_streams > 0)
+                    .map(|l| {
+                        format!(
+                            "B: level {} — {} failed, {} timed out",
+                            l.concurrency, l.failed_streams, l.timed_out_streams
+                        )
+                    })
+                    .collect();
+                let (shown, extra_n) = (
+                    &failed_levels[..failed_levels.len().min(3)],
+                    failed_levels.len().saturating_sub(3),
+                );
+                run_errors.extend(shown.iter().cloned());
+                if extra_n > 0 {
+                    run_errors.push(format!("…and {extra_n} more B failures"));
+                }
+            }
+            engine_wall_b = t_b.elapsed().as_secs_f64();
         }
         if extra.niah {
+            let t_c1 = std::time::Instant::now();
             match NiahEngine::new(cfg) {
                 Ok(engine) => {
                     if !cfg.json {
@@ -616,8 +652,34 @@ pub fn run_headless(
                     run_errors.push(format!("C1: niah init failed: {e}"));
                 }
             }
+            // M2/N8: failed C1 cells (!retrieved with a Failed state),
+            // capped at 3 with "…and k more".
+            if let Some(r) = &niah_result {
+                let failed_cells: Vec<String> = r
+                    .cells
+                    .iter()
+                    .filter(|c| c.target_tokens > 0 && !c.retrieved && c.state == crate::engines::capability::NiahCellState::Failed)
+                    .map(|c| {
+                        format!(
+                            "C1: {} depth {}% — retrieval failed",
+                            c.context_label(),
+                            c.depth_percent
+                        )
+                    })
+                    .collect();
+                let (shown, extra_n) = (
+                    &failed_cells[..failed_cells.len().min(3)],
+                    failed_cells.len().saturating_sub(3),
+                );
+                run_errors.extend(shown.iter().cloned());
+                if extra_n > 0 {
+                    run_errors.push(format!("…and {extra_n} more C1 failures"));
+                }
+            }
+            engine_wall_c1 = t_c1.elapsed().as_secs_f64();
         }
         if extra.reasoning {
+            let t_c2 = std::time::Instant::now();
             match ReasoningEngine::new(cfg) {
                 Ok(engine) => {
                     if !cfg.json {
@@ -637,8 +699,10 @@ pub fn run_headless(
                     run_errors.push(format!("C2: reasoning init failed: {e}"));
                 }
             }
+            engine_wall_c2 = t_c2.elapsed().as_secs_f64();
         }
         if extra.structured {
+            let t_c3 = std::time::Instant::now();
             match StructuredEngine::new(cfg) {
                 Ok(engine) => {
                     if !cfg.json {
@@ -666,6 +730,7 @@ pub fn run_headless(
                     run_errors.push(format!("C3: structured init failed: {e}"));
                 }
             }
+            engine_wall_c3 = t_c3.elapsed().as_secs_f64();
         }
 
         // Engine D (hardware/energy) — after A+B+C1+C2+C3, before F (the TUI
@@ -682,6 +747,7 @@ pub fn run_headless(
         // poll()-only path, which never opens a load window), not the bounded
         // 6-min trace.
         if extra.hardware {
+            let t_d = std::time::Instant::now();
             let total_tokens = sum_all_engines_tokens(
                 Some(results.as_slice()),
                 sweep_result.as_ref(),
@@ -691,6 +757,7 @@ pub fn run_headless(
                 None,
             );
             energy_result = Some(headless_energy(&hw, total_tokens));
+            engine_wall_d = t_d.elapsed().as_secs_f64();
         }
         if let Some(energy) = &energy_result {
             if !cfg.json {
@@ -719,6 +786,7 @@ pub fn run_headless(
 
         // F runs last, after D.
         if extra.flatout {
+            let t_f = std::time::Instant::now();
             match FlatOutEngine::new(cfg) {
                 Ok(mut engine) => {
                     // The stream count is Engine B's max-throughput level
@@ -747,6 +815,7 @@ pub fn run_headless(
                     run_errors.push(format!("F: flat out init failed: {e}"));
                 }
             }
+            engine_wall_f = t_f.elapsed().as_secs_f64();
         }
 
         // F7: close the load window once the workload is done, so the
@@ -886,30 +955,57 @@ pub fn run_headless(
         // is an idempotent no-op). All channel sends — run-end path
         // only, never the timing path.
         {
-            let mut headlines: Vec<(String, String)> = Vec::new();
+            // S3: headlines are (label, summary, wall_secs) triples so
+            // the digest ✓ lines carry the per-engine wall time.
+            let mut headlines: Vec<(String, String, f64)> = Vec::new();
             if cfg.engines.speed {
-                headlines.push((Engine::Speed.label().to_string(), summarize_speed(&results)));
+                headlines.push((
+                    Engine::Speed.label().to_string(),
+                    summarize_speed(&results),
+                    engine_wall_a,
+                ));
             }
             if let Some(r) = &sweep_result {
-                headlines.push((Engine::Concurrency.label().to_string(), summarize_sweep(r)));
+                headlines.push((
+                    Engine::Concurrency.label().to_string(),
+                    summarize_sweep(r),
+                    engine_wall_b,
+                ));
             }
             if let Some(r) = &niah_result {
-                headlines.push((Engine::Niah.label().to_string(), r.accuracy_label()));
+                headlines.push((
+                    Engine::Niah.label().to_string(),
+                    r.accuracy_label(),
+                    engine_wall_c1,
+                ));
             }
             if let Some(r) = &reasoning_result {
                 headlines.push((
                     Engine::Reasoning.label().to_string(),
                     format!("{} · avg {:.1} t/s", r.score.label(), r.avg_tg_speed()),
+                    engine_wall_c2,
                 ));
             }
             if let Some(r) = &structured_result {
-                headlines.push((Engine::Structured.label().to_string(), r.summary_line()));
+                headlines.push((
+                    Engine::Structured.label().to_string(),
+                    r.summary_line(),
+                    engine_wall_c3,
+                ));
             }
             if let Some(e) = &energy_result {
-                headlines.push((Engine::Hardware.label().to_string(), hardware_summary(e)));
+                headlines.push((
+                    Engine::Hardware.label().to_string(),
+                    hardware_summary(e),
+                    engine_wall_d,
+                ));
             }
             if let Some(r) = &flatout_result {
-                headlines.push((Engine::FlatOut.label().to_string(), r.summary_line()));
+                headlines.push((
+                    Engine::FlatOut.label().to_string(),
+                    r.summary_line(),
+                    engine_wall_f,
+                ));
             }
             let total_tokens = sum_all_engines_tokens(
                 Some(results.as_slice()),
