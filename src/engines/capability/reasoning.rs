@@ -588,16 +588,9 @@ impl ReasoningEngine {
             tg_speeds,
             estimated,
         };
-        if let Some(l) = &self.logger {
-            l.info(
-                crate::log::Context::EngineC2,
-                format!(
-                    "Engine C2 complete — {} (avg {:.1} t/s)",
-                    result.score.label(),
-                    result.avg_tg_speed()
-                ),
-            );
-        }
+        // N12: the per-engine `complete` line is dropped — the sequence's
+        // `✓` headline (and the DIGEST) already carry `{score} · avg {t} t/s`,
+        // so logging it here a ~1 ms earlier was a verbatim duplicate.
         result
     }
 }

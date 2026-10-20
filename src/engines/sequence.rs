@@ -44,7 +44,7 @@ use crate::engines::flatout::{
     flatout_streams_for, FlatOutEngine, FlatOutResult, DEFAULT_STREAM_COUNT, WINDOW_SECS,
 };
 use crate::engines::hardware::{profile, EnergyResult};
-use crate::engines::speed::{SpeedEngine, SpeedResult};
+use crate::engines::speed::{SpeedEngine, SpeedResult, MAX_GEN_TOKENS};
 use crate::engines::{build_sweep, NiahSlot, ResultSlot};
 use crate::hw::{HwPoller, IDLE_WINDOW_SECS};
 use crate::log::{Context, RunLogger};
@@ -1188,6 +1188,17 @@ impl BenchmarkSequence {
             .progress(self.bus.clone())
             .pause(self.pause.clone())
             .logger(self.logger.clone());
+        // N13: the conventional `Engine A (Speed) started` line — the TUI
+        // path previously jumped straight from `▶ A` to the warmup line.
+        // Mirrors the headless anchor (headless.rs) so both paths announce
+        // A identically.
+        self.logger.info(
+            Context::EngineA,
+            format!(
+                "Engine A (Speed) started — {} iteration(s), {} max tokens",
+                self.cfg.iterations, MAX_GEN_TOKENS
+            ),
+        );
         let (_, results) = engine.run().await;
         self.slots.speed.set_running(false);
         self.slots.speed.store(results.clone());
@@ -1482,8 +1493,9 @@ impl BenchmarkSequence {
         // idle-subtracted basis as `joules`.
         apply_load_window(&mut energy, load_joules, total_tokens, duration);
         let summary = hardware_summary(&energy);
-        self.logger
-            .info(Context::EngineD, format!("Engine D complete — {summary}"));
+        // N12: the per-engine `complete` line is dropped — the sequence's
+        // `✓` headline (and the DIGEST) already carry `hardware_summary()`,
+        // so logging it here a ~1 ms earlier was a verbatim duplicate.
         summary
     }
 
@@ -1841,7 +1853,7 @@ pub fn apply_load_window(
 mod tests {
     use super::*;
     use crate::config::EngineSelection;
-    use crate::engines::capability::{NiahResult, ReasoningScore};
+    use crate::engines::capability::{NiahCell, NiahResult, ReasoningScore};
     use crate::engines::concurrency::{ConcurrencyMatrix, MatrixCell, SweepLevel};
     use crate::hw::{GpuBackend, GpuSample};
 
@@ -3144,6 +3156,193 @@ mod tests {
         assert!(
             v2["d_energy"].get("cpu_power_estimated").is_none(),
             "measured CPU is not labeled estimated: {json2}"
+        );
+    }
+
+    // ── M2/N8: the digest collects cell-level failures (C1 + B) ────────
+
+    /// A B sweep level with `failed` failed streams / `timed_out` timed-out
+    /// streams (everything else neutral) — the M2/N8 fixture.
+    fn failed_level(concurrency: usize, failed: usize, timed_out: usize) -> SweepLevel {
+        SweepLevel {
+            concurrency,
+            aggregate_tps: 100.0,
+            p50_tpot_ns: 1_000_000,
+            p90_tpot_ns: 2_000_000,
+            p99_tpot_ns: 3_000_000,
+            ttft_p50_ns: 10_000_000,
+            ttft_p90_ns: 20_000_000,
+            total_tokens: 100,
+            completed_streams: concurrency.saturating_sub(failed + timed_out),
+            failed_streams: failed,
+            timed_out_streams: timed_out,
+            timed_out_tokens: 0,
+            aborted: false,
+            wall_ns: 1_000_000_000,
+            streams: Vec::new(),
+            context: 0,
+            per_stream_tps: 100.0,
+            loop_excluded_streams: 0,
+            loop_excluded_tokens: 0,
+            estimated: false,
+        }
+    }
+
+    /// A failed C1 cell (the stream-stall case: `target_tokens > 0`,
+    /// `!retrieved`, `state == Failed`) at the given depth.
+    fn failed_cell(depth: u8) -> NiahCell {
+        let mut c = NiahCell::unrun();
+        c.target_tokens = 2048;
+        c.depth_percent = depth;
+        c
+    }
+
+    /// A sequence with only C1 + B selected (the two cell-level sources
+    /// `digest_errors` collects); the other slots stay `None` = not run.
+    fn c1_b_sequence() -> BenchmarkSequence {
+        seq(EngineSelection {
+            speed: false,
+            concurrency: true,
+            niah: true,
+            reasoning: false,
+            structured: false,
+            hardware: false,
+            flatout: false,
+        })
+    }
+
+    /// M2/N8: a failed C1 cell (a stream stall) AND a failed/timed-out B
+    /// stream both surface in the digest's error list.
+    #[test]
+    fn digest_errors_collects_the_failed_c1_cell_and_b_stream() {
+        let s = c1_b_sequence();
+        // One failed C1 cell (the stream-stall `!retrieved` + error case).
+        s.slots
+            .niah
+            .store(NiahResult {
+                sizes: vec![2048],
+                depths: vec![50],
+                cells: vec![failed_cell(50)],
+            });
+        // One B level with a failed stream and one timed out.
+        s.slots
+            .concurrency
+            .store(SweepResult {
+                levels: vec![failed_level(4, 1, 1)],
+                ..Default::default()
+            });
+
+        let errs = s.digest_errors();
+        // The C1 cell failure is present.
+        assert!(
+            errs.iter()
+                .any(|e| e.starts_with("C1: ") && e.contains("retrieval failed")),
+            "expected a C1 retrieval-failure line in {errs:?}"
+        );
+        // The B stream failures are present (both the failed and timed-out
+        // counts on the same level line).
+        assert!(
+            errs.iter().any(|e| e == "B: level 4 — 1 failed, 1 timed out"),
+            "expected the B level-4 failure line in {errs:?}"
+        );
+    }
+
+    /// M2/N8: with many cell/stream failures the digest caps each source at
+    /// 3 and appends "…and k more".
+    #[test]
+    fn digest_errors_caps_many_cell_failures_with_and_more() {
+        let s = c1_b_sequence();
+        // 5 failed C1 cells → 3 shown + "…and 2 more C1 failures".
+        s.slots
+            .niah
+            .store(NiahResult {
+                sizes: vec![2048],
+                depths: vec![10, 20, 30, 40, 50],
+                cells: (10..=50).step_by(10).map(failed_cell).collect(),
+            });
+        // 4 failed B levels → 3 shown + "…and 1 more B failures".
+        s.slots
+            .concurrency
+            .store(SweepResult {
+                levels: (1..=4).map(|c| failed_level(c, 1, 0)).collect(),
+                ..Default::default()
+            });
+
+        let errs = s.digest_errors();
+        // Exactly 3 C1 lines shown, plus the cap marker.
+        assert_eq!(
+            errs.iter().filter(|e| e.starts_with("C1: ")).count(),
+            3,
+            "expected exactly 3 C1 lines shown in {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e == "…and 2 more C1 failures"),
+            "expected the C1 cap marker in {errs:?}"
+        );
+        // Exactly 3 B lines shown, plus the cap marker.
+        assert_eq!(
+            errs.iter().filter(|e| e.starts_with("B: ")).count(),
+            3,
+            "expected exactly 3 B lines shown in {errs:?}"
+        );
+        assert!(
+            errs.iter().any(|e| e == "…and 1 more B failures"),
+            "expected the B cap marker in {errs:?}"
+        );
+    }
+
+    // ── N22: the TUI and headless paths anchor the run wall identically ─
+
+    /// N22: the digest `wall Ns` is only consistent across the TUI and
+    /// headless paths if BOTH anchor `run_started` to `Instant::now()`
+    /// AFTER the 5 s idle-power baseline — so the no-load window is excluded
+    /// identically (before the fix the headless anchor sat at the top of the
+    /// run and included the idle window). This guard reads both sources at
+    /// compile time and asserts the anchor expression is byte-identical and
+    /// positioned after the power-monitor arming call in each path.
+    #[test]
+    fn n22_tui_and_headless_anchor_the_run_wall_after_the_idle_baseline() {
+        let tui = include_str!("sequence.rs");
+        let headless = include_str!("../headless.rs");
+
+        const ANCHOR: &str = "let run_started = std::time::Instant::now();";
+
+        // (1) Both paths use the identical anchor expression.
+        assert!(
+            tui.contains(ANCHOR),
+            "TUI (sequence.rs) lost its `run_started = Instant::now()` anchor"
+        );
+        assert!(
+            headless.contains(ANCHOR),
+            "headless.rs lost its `run_started = Instant::now()` anchor"
+        );
+
+        // (2) TUI: the anchor sits AFTER the idle-baseline arming
+        // (`prepare_power_monitor`), not before it (the old top-of-run bug).
+        let tui_arm = "self.prepare_power_monitor().await;";
+        let tui_arm_at =
+            tui.find(tui_arm).expect("TUI prepare_power_monitor() call moved/renamed");
+        let tui_anchor_at =
+            tui.find(ANCHOR).expect("TUI run_started anchor moved/renamed");
+        assert!(
+            tui_anchor_at > tui_arm_at,
+            "TUI: `run_started` must anchor AFTER the idle baseline, not before it"
+        );
+
+        // (3) Headless: the anchor sits AFTER the idle-baseline arming
+        // (`arm_power_monitor(h, IDLE_WINDOW_SECS)`), not before it.
+        let headless_arm = "arm_power_monitor(h, IDLE_WINDOW_SECS).await;";
+        let headless_arm_at =
+            headless
+                .find(headless_arm)
+                .expect("headless arm_power_monitor() call moved/renamed");
+        let headless_anchor_at =
+            headless
+                .find(ANCHOR)
+                .expect("headless run_started anchor moved/renamed");
+        assert!(
+            headless_anchor_at > headless_arm_at,
+            "headless: `run_started` must anchor AFTER the idle baseline, not before it"
         );
     }
 }

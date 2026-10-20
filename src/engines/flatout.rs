@@ -929,25 +929,18 @@ impl FlatOutEngine {
             });
         }
 
-        if self.stream_count_source == StreamCountSource::Default {
-            if let Some(l) = &self.logger {
-                l.info(
-                    Context::EngineF,
-                    format!("No concurrency data — using default {n} streams"),
-                );
-            }
-        } else {
-            // The non-default sources name what actually drove the count so
-            // the run log matches the JSON `stream_count_source` label.
-            let source_desc = self.stream_count_source.log_descriptor();
-            if let Some(l) = &self.logger {
-                l.info(
-                    Context::EngineF,
-                    format!(
-                        "Real-world max throughput: {n} streams ({source_desc}) for {WINDOW_SECS:.0}s, max_tokens {max_tokens_used}"
-                    ),
-                );
-            }
+        // N13: the conventional `Engine F (Flat Out) started` line. The
+        // source descriptor names what actually drove the count (the run log
+        // matches the JSON `stream_count_source` label) — `default` when
+        // Engine B did not run, else the measured level.
+        let source_desc = self.stream_count_source.log_descriptor();
+        if let Some(l) = &self.logger {
+            l.info(
+                Context::EngineF,
+                format!(
+                    "Engine F (Flat Out) started — {n} streams ({source_desc}) for {WINDOW_SECS:.0}s, max_tokens {max_tokens_used}"
+                ),
+            );
         }
         // CF-29: make the clamp visible in the run log (the probe
         // succeeded and reduced the cap).
