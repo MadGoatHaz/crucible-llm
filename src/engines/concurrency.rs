@@ -89,6 +89,42 @@ pub fn normalize_ladder(ladder: impl IntoIterator<Item = usize>) -> Vec<usize> {
     v
 }
 
+/// S2/N10: the Engine B start / leg log line, pure (testable without a
+/// network).
+///
+/// A **single-context** sweep announces itself once with the conventional
+/// `Engine B (Concurrency) started — ladder […]` line (a non-zero
+/// `context` appends `, context=N tok`). A **2D-matrix leg** does *not*
+/// re-announce "started" — the matrix line is the single start — so it logs
+/// a `B leg: context …, ladder […]` marker instead (`context 0` means the
+/// configured prompt). This keeps a 3-context matrix reading 1 started + 3
+/// leg markers, not 4 "started" lines.
+#[must_use]
+pub fn ladder_start_line(context: u32, ladder: &[usize], is_matrix_leg: bool) -> String {
+    let ladder_list = ladder
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if is_matrix_leg {
+        let ctx_note = if context == 0 {
+            "0 (configured prompt)".to_string()
+        } else {
+            format!("{context} tok")
+        };
+        format!("B leg: context {ctx_note}, ladder [{ladder_list}]")
+    } else {
+        format!(
+            "Engine B (Concurrency) started — ladder [{ladder_list}]{ctx_note}",
+            ctx_note = if context == 0 {
+                String::new()
+            } else {
+                format!(", context={context} tok")
+            }
+        )
+    }
+}
+
 /// One ladder step of a [`Sweep`]: a point on the throughput/latency curve.
 #[derive(Debug, Clone)]
 pub struct SweepLevel {
@@ -772,7 +808,7 @@ impl Sweep {
             return self.run_matrix().await;
         }
         let levels = self
-            .run_ladder(self.context_tokens, 1, self.ladder.len())
+            .run_ladder(self.context_tokens, 1, self.ladder.len(), false)
             .await;
         self.logi(
             Context::EngineB,
@@ -794,22 +830,16 @@ impl Sweep {
         context: u32,
         first_step: usize,
         total_steps: usize,
+        is_matrix_leg: bool,
     ) -> Vec<SweepLevel> {
+        // S2/N10: a single-context sweep announces itself once with the
+        // conventional `Engine B (Concurrency) started` line; a 2D-matrix
+        // *leg* does not re-announce "started" (the matrix line is the
+        // single start) — it logs a `leg` marker instead, so a 3-context
+        // matrix reads 1 started + 3 leg markers, not 4 "started" lines.
         self.logi(
             Context::EngineB,
-            format!(
-                "Engine B (Concurrency) started — ladder [{}]{ctx_note}",
-                self.ladder
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                ctx_note = if context == 0 {
-                    String::new()
-                } else {
-                    format!(", context={context} tok")
-                }
-            ),
+            ladder_start_line(context, &self.ladder, is_matrix_leg),
         );
         let mut levels = Vec::with_capacity(self.ladder.len());
         let mut prev_wall_ns = 0u64;
@@ -923,7 +953,7 @@ impl Sweep {
             leg.pool = self.pool_for_context(ctx);
             leg.contexts = Vec::new(); // a leg is single-context: no recursion
             let levels = leg
-                .run_ladder(ctx, ci * self.ladder.len() + 1, total_cells)
+                .run_ladder(ctx, ci * self.ladder.len() + 1, total_cells, true)
                 .await;
             // CF-27: pin the primary (sweet-spot) leg to the **zero-context**
             // measurement REGARDLESS of its position in the contexts list, so
@@ -1960,6 +1990,32 @@ mod tests {
             t3: Some(t3),
             t_end: None,
         }
+    }
+
+    // S2/N10: a single-context sweep announces the conventional `started`
+    // line; a matrix leg logs a `leg` marker (no repeated "started").
+    #[test]
+    fn ladder_start_line_distinguishes_single_context_from_matrix_leg() {
+        // Single-context, base prompt (context 0): the plain started line.
+        assert_eq!(
+            ladder_start_line(0, &[1, 2, 4], false),
+            "Engine B (Concurrency) started — ladder [1,2,4]"
+        );
+        // Single-context, explicit context: the `, context=N tok` suffix.
+        assert_eq!(
+            ladder_start_line(8000, &[1, 2, 4], false),
+            "Engine B (Concurrency) started — ladder [1,2,4], context=8000 tok"
+        );
+        // Matrix leg, non-zero context: a `leg` marker, not "started".
+        assert_eq!(
+            ladder_start_line(8000, &[1, 2, 4], true),
+            "B leg: context 8000 tok, ladder [1,2,4]"
+        );
+        // Matrix leg, zero context: `0 (configured prompt)`.
+        assert_eq!(
+            ladder_start_line(0, &[1, 2, 4], true),
+            "B leg: context 0 (configured prompt), ladder [1,2,4]"
+        );
     }
 
     /// Two streams, three content frames each arriving at 10/20/30 ms,

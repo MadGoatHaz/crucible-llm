@@ -83,8 +83,12 @@ fn main() {
     match &gpu {
         Some(g) => {
             let name = gpu_display_name(g.as_ref());
-            eprintln!("[HW] Detected: {name}");
-            logger.info(Context::Setup, format!("[HW] Detected: {name}"));
+            // H4: the VRAM / power figures are per-device aggregates, so the
+            // detected line carries the device count (the `poll_all` len —
+            // the same source the matrix report's `8x …` string uses).
+            let line = hw_detected_line(&name, g.poll_all().len());
+            eprintln!("{line}");
+            logger.info(Context::Setup, line);
         }
         None => {
             eprintln!("[HW] No GPU telemetry available");
@@ -226,6 +230,18 @@ fn resolve_engine_d(
     } else {
         unified_hardware(hardware, gpu_present)
     }
+}
+
+/// H4: the `[HW] Detected:` line, with the **device count** made explicit.
+///
+/// The VRAM / power figures the run reports are *per-device aggregates*
+/// (the multi-GPU backend sums every card), so a bare single-card name
+/// beside a `124.9 GB` total reads as "8 GPUs look like 1" — the recurring
+/// red flag. The count fixes that: an 8× host logs `8× NVIDIA RTX A4000`,
+/// a single-GPU host `1× …` (the count is always printed, for uniformity).
+#[must_use]
+fn hw_detected_line(name: &str, count: usize) -> String {
+    format!("[HW] Detected: {count}× {name}")
 }
 
 /// Run the TUI on a dedicated single-thread runtime, guaranteeing the
@@ -408,5 +424,21 @@ mod tests {
         // `--engine niah` (explicit, omits D): Engine D stays off even with
         // a GPU + poller on.
         assert!(!resolve_engine_d(true, true, true, false));
+    }
+
+    // H4: the `[HW]` line carries the device count — the VRAM / power
+    // figures are per-device aggregates, so a bare single-card name beside
+    // them reads "8 GPUs look like 1". The count is always printed
+    // (uniformity: a single-GPU host reads `1× …`).
+    #[test]
+    fn hw_line_carries_the_device_count() {
+        assert_eq!(
+            hw_detected_line("NVIDIA RTX A4000", 8),
+            "[HW] Detected: 8× NVIDIA RTX A4000"
+        );
+        assert_eq!(
+            hw_detected_line("NVIDIA GeForce RTX 3080 Ti", 1),
+            "[HW] Detected: 1× NVIDIA GeForce RTX 3080 Ti"
+        );
     }
 }
