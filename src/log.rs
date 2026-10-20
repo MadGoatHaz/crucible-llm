@@ -266,12 +266,14 @@ impl RunLogger {
         // is joinable to its DB row even without reading the archive name.
         let header = match &session {
             Some(id) => format!(
-                "=== crucible-llm run log — {} (session {}) ===",
+                "=== crucible-llm v{} run log — {} (session {}) ===",
+                env!("CARGO_PKG_VERSION"),
                 format_timestamp(header_at, true),
                 id
             ),
             None => format!(
-                "=== crucible-llm run log — {} ===",
+                "=== crucible-llm v{} run log — {} ===",
+                env!("CARGO_PKG_VERSION"),
                 format_timestamp(header_at, true)
             ),
         };
@@ -515,21 +517,19 @@ fn niah_ladder(cfg: &Config) -> String {
     let base = match cfg.niah_custom {
         Some(s) => format!("custom {}", human_size(s)),
         None => {
-            let (Some(first), Some(last)) = (cfg.niah_contexts.first(), cfg.niah_contexts.last())
-            else {
+            if cfg.niah_contexts.is_empty() {
                 return String::new();
+            }
+            let contexts: Vec<String> =
+                cfg.niah_contexts.iter().map(|c| human_size(*c)).collect();
+            let ctx_str = format!("[{}]", discrete_list(&contexts));
+            let depths: Vec<String> = cfg.niah_depths.iter().map(|d| d.to_string()).collect();
+            let dep_str = if depths.is_empty() {
+                String::new()
+            } else {
+                format!(" × [{}]", discrete_list(&depths))
             };
-            let (d0, d1) = match (cfg.niah_depths.first(), cfg.niah_depths.last()) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return format!("{}..{}", human_size(*first), human_size(*last)),
-            };
-            format!(
-                "{}..{} × {}..{}",
-                human_size(*first),
-                human_size(*last),
-                d0,
-                d1
-            )
+            format!("{ctx_str}{dep_str}")
         }
     };
     if cfg.tokenizer.is_none() && !base.is_empty() {
@@ -539,55 +539,115 @@ fn niah_ladder(cfg: &Config) -> String {
     }
 }
 
+/// Format a list of strings in discrete bracket form. Lists with ≤ 7
+/// items show all; longer lists show the first 2, `…`, and the last 1
+/// (e.g. `[0,10,…,100]`) so the reader sees a discrete set, not a
+/// continuous range.
+fn discrete_list(items: &[String]) -> String {
+    if items.len() <= 7 {
+        items.join(",")
+    } else {
+        let first: Vec<&str> = items.iter().take(2).map(|s| s.as_str()).collect();
+        let last = items.last().unwrap().as_str();
+        format!("{},…,{}", first.join(","), last)
+    }
+}
+
 /// The run-end digest (C5): the compact, shareable block appended to the
 /// run log when the run completes:
 ///
-/// 1. `[DIGEST] session {id} — {date} {n} engine(s), wall {s}s`;
+/// 1. `session {id} — v{ver} {date} {n} engine(s), wall {s}s`;
 /// 2. the `[CONFIG]` line (C1, reused verbatim);
 /// 3. one line per `✓` per-engine headline (label + summary);
 /// 4. one line per collected error;
-/// 5. `[DIGEST] totals: {n} tokens generated, peak VRAM {gb} GB | n/a`.
+/// 5. `totals: {n} tokens processed (input+output), peak VRAM {gb} GB | n/a`.
 ///
-/// `headlines` are `(label, summary)` **string** pairs (not the `Engine`
-/// type — keeps `log.rs` free of engine-module dependencies). Pure: no
-/// I/O — the caller sends the lines through the non-blocking channel
-/// ([`RunLogger::log_digest`]). A full 7-engine run is ~10–30 lines —
-/// self-describing (a shared log states its own inputs) and referenceable
-/// by session id (the archive name carries the same id).
+/// N11: the in-message `[DIGEST]` prefix is dropped — the
+/// `Context::Digest` tag in the `[ts] [LEVEL] [CONTEXT] msg` line
+/// already provides it. The `[CONFIG]` prefix on the config line is
+/// kept (a message-level label, not a context tag).
+///
+/// `headlines` are `(label, summary, wall_secs)` triples (not the
+/// `Engine` type — keeps `log.rs` free of engine-module dependencies).
+/// S3: the per-engine wall time is rendered on each ✓ line
+/// (`(wall Ns)`) so the long pole (e.g. C1's 1385s) is visible in the
+/// shareable block. Pure: no I/O — the caller sends the lines through
+/// the non-blocking channel ([`RunLogger::log_digest`]). A full
+/// 7-engine run is ~10–30 lines — self-describing (a shared log states
+/// its own inputs) and referenceable by session id (the archive name
+/// carries the same id).
 #[must_use]
 pub fn digest_lines(
     cfg: &Config,
     session_id: &str,
-    headlines: &[(String, String)],
+    headlines: &[(String, String, f64)],
     errors: &[String],
     total_tokens: u64,
     wall_secs: f64,
     peak_vram_mib: Option<u64>,
 ) -> Vec<String> {
     let mut lines = Vec::with_capacity(4 + headlines.len() + errors.len());
+    // N11: no in-message `[DIGEST]` prefix — the `Context::Digest` tag
+    // already provides it in the `[ts] [LEVEL] [CONTEXT] msg` line.
+    // S7: the version is recorded so a forum reader knows which build
+    // produced the log.
     lines.push(format!(
-        "[DIGEST] session {session_id} — {} {} engine(s), wall {wall_secs:.0}s",
+        "session {session_id} — v{} {} {} engine(s), wall {wall_secs:.0}s",
+        env!("CARGO_PKG_VERSION"),
         format_timestamp(now_ms(), true),
         cfg.engines.count()
     ));
+    // The `[CONFIG]` prefix is kept (its context is `SETUP` when emitted
+    // via `log_config`; in the digest it is a message-level label).
     lines.push(config_block_line(cfg));
-    for (label, summary) in headlines {
-        lines.push(format!("[DIGEST] ✓ {label} — {summary}"));
+    // S3: each ✓ line carries the per-engine wall time (the long pole,
+    // e.g. C1's 1385s, becomes visible in the shareable block).
+    for (label, summary, w) in headlines {
+        lines.push(format!("✓ {label} — {summary} (wall {w:.0}s)"));
     }
     for e in errors {
-        lines.push(format!("[DIGEST] error: {e}"));
+        lines.push(format!("error: {e}"));
     }
     // Binary GiB (the same convention as the `vram` tier / the
     // hardware string); `n/a` when there is no telemetry (never a
     // fabricated 0).
+    // H3: `total_tokens` is `all_engines_tokens()` = input + output
+    // (prompt + completion) — "generated" implied output-only.
     let vram = match peak_vram_mib {
         Some(mib) => format!("peak VRAM {:.1} GB", mib as f64 / 1024.0),
         None => "peak VRAM n/a".to_string(),
     };
     lines.push(format!(
-        "[DIGEST] totals: {total_tokens} tokens generated, {vram}"
+        "totals: {total_tokens} tokens processed (input+output), {vram}"
     ));
     lines
+}
+
+/// P3/N3: the `[HW]` detail line — vLLM server version, GPU driver, and
+/// CUDA version (all best-effort: a value that is unavailable is omitted,
+/// never fabricated). The caller probes the vLLM `GET /version` endpoint
+/// and the NVML `sys_driver_version()` / `sys_cuda_driver_version()`
+/// functions (zero new deps — existing `reqwest` + `nvml-wrapper`), then
+/// passes the results here for formatting.
+///
+/// Returns `None` when all three values are unavailable (nothing to log).
+#[must_use]
+pub fn hw_detail_line(
+    vllm_version: Option<&str>,
+    driver_version: Option<&str>,
+    cuda_version: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(v) = vllm_version {
+        parts.push(format!("vLLM {v}"));
+    }
+    if let Some(v) = driver_version {
+        parts.push(format!("driver {v}"));
+    }
+    if let Some(v) = cuda_version {
+        parts.push(format!("CUDA {v}"));
+    }
+    (!parts.is_empty()).then(|| format!("[HW] {}", parts.join(", ")))
 }
 
 /// Format one log line: `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`.
@@ -747,8 +807,8 @@ mod tests {
 
         for content in [&latest, &archive] {
             assert!(
-                content.contains("=== crucible-llm run log"),
-                "header: {content}"
+                content.contains("=== crucible-llm v"),
+                "header carries the crate version: {content}"
             );
             assert!(
                 content.contains("[INFO] [SETUP] run started — url=http://x"),
@@ -777,12 +837,16 @@ mod tests {
         logger.info(Context::Setup, "run started");
         logger.finish();
 
-        // The header in latest.log carries the full session id.
+        // The header in latest.log carries the full session id + version.
         let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
         let needle = format!("(session {session_id})");
         assert!(
             latest.contains(&needle),
             "header carries the session id: {latest}"
+        );
+        assert!(
+            latest.contains("=== crucible-llm v"),
+            "header carries the crate version: {latest}"
         );
 
         // The archive file name carries the short (8-char) session id.
@@ -966,7 +1030,7 @@ mod tests {
         assert!(line.contains("timeout=120s"), "{line}");
         assert!(line.contains("nocache=true"), "{line}");
         assert!(line.contains("ladder=[1,2,4,8]"), "{line}");
-        assert!(line.contains("niah=2k..8k × 0..100"), "{line}");
+        assert!(line.contains("niah=[2k,4k,8k] × [0,50,100]"), "{line}");
         assert!(line.contains(
             "engines=[A (speed),B (concurrency),C1 (niah),C2 (reasoning),C3 (structured),D (hardware),F (flat out)]"
         ),
@@ -984,9 +1048,13 @@ mod tests {
         // The default config has no `--tokenizer`: the one-time
         // `(approx.)` qualifier lands in the NIAH part (C3 — it no
         // longer repeats on every per-cell line).
+        // S4/N24: discrete form (7 contexts all shown, 11 depths
+        // abbreviated to first 2 + … + last 1).
         let line = config_block_line(&Config::default());
         assert!(
-            line.contains("niah=2k..128k × 0..100 (approx. token counts — no --tokenizer)"),
+            line.contains(
+                "niah=[2k,4k,8k,16k,32k,64k,128k] × [0,10,…,100] (approx. token counts — no --tokenizer)"
+            ),
             "{line}"
         );
         // Exactly one occurrence.
@@ -1024,7 +1092,7 @@ mod tests {
         let lines: Vec<&str> = latest.lines().collect();
         // Line 0 is the run header; the [CONFIG] block is line 1 — near
         // the top of the run log, one compact line.
-        assert!(lines[0].starts_with("=== crucible-llm run log"), "{latest}");
+        assert!(lines[0].starts_with("=== crucible-llm v"), "{latest}");
         assert!(
             lines[1].contains("[SETUP] [CONFIG] url="),
             "the [CONFIG] block is the first record: {latest}"
@@ -1044,22 +1112,25 @@ mod tests {
             engines: crate::config::EngineSelection::all(),
             ..Config::default()
         };
-        let headlines: Vec<(String, String)> = [
-            ("A: Speed", "56.4 t/s decode · TTFT 180 ms · 6 run(s)"),
+        // S3: headlines are (label, summary, wall_secs) triples.
+        let headlines: Vec<(String, String, f64)> = [
+            ("A: Speed", "56.4 t/s decode · TTFT 180 ms · 6 run(s)", 12.0),
             (
                 "B: Concurrency",
-                "practical sweet spot 4 users (~30 t/s each)",
+                "practical sweet spot 4 users (~30 t/s each, ctx=0 decode)",
+                45.0,
             ),
-            ("C1: NIAH", "reliable up to 64k"),
-            ("C2: Reasoning", "12/13 · avg 40.2 t/s"),
-            ("C3: Structured", "5/6 compliant"),
-            ("D: Energy", "0.098 J/token · peak 521 W · 90% util"),
+            ("C1: NIAH", "reliable up to 64k", 1385.0),
+            ("C2: Reasoning", "12/13 · avg 40.2 t/s", 8.0),
+            ("C3: Structured", "5/6 compliant", 5.0),
+            ("D: Energy", "0.098 J/token · peak 521 W · 90% util", 3.0),
             (
                 "F: Flat Out",
                 "4 streams, 2619 tok in 60s — 43.7 t/s aggregate",
+                60.0,
             ),
         ]
-        .map(|(l, s)| (l.to_string(), s.to_string()))
+        .map(|(l, s, w)| (l.to_string(), s.to_string(), w))
         .to_vec();
         let errors = vec!["A: Iteration 2/6 failed: HTTP 500: boom".to_string()];
         let lines = digest_lines(
@@ -1076,29 +1147,35 @@ mod tests {
         assert!(lines.len() <= 30, "{lines:?}");
         assert_eq!(lines.len(), 11, "{lines:?}");
         // 1. session line (the archive-name join key).
+        // N11: no in-message `[DIGEST]` prefix (the context tag provides it).
+        // S7: the crate version is recorded.
         assert!(
-            lines[0].starts_with("[DIGEST] session 12345678-aaaa-bbbb-cccc-dddddddddddd — "),
+            lines[0].starts_with("session 12345678-aaaa-bbbb-cccc-dddddddddddd — v"),
             "{lines:?}"
         );
         assert!(lines[0].contains("7 engine(s), wall 1140s"), "{lines:?}");
         // 2. the [CONFIG] line, reused verbatim from C1.
         assert!(lines[1].starts_with("[CONFIG] url="), "{lines:?}");
-        // 3. every ✓ headline, in order.
-        for (i, (label, summary)) in headlines.iter().enumerate() {
+        // 3. every ✓ headline, in order (N11: no `[DIGEST]` prefix;
+        // S3: carries `(wall Ns)`).
+        for (i, (label, summary, w)) in headlines.iter().enumerate() {
             assert_eq!(
                 lines[2 + i],
-                format!("[DIGEST] ✓ {label} — {summary}"),
+                format!("✓ {label} — {summary} (wall {w:.0}s)"),
                 "{lines:?}"
             );
         }
-        // 4. the error line.
+        // S3: the C1 long pole (1385s) is visible in the shareable block.
+        assert!(lines[4].contains("(wall 1385s)"), "{lines:?}");
+        // 4. the error line (N11: no `[DIGEST]` prefix).
         assert_eq!(
-            lines[9], "[DIGEST] error: A: Iteration 2/6 failed: HTTP 500: boom",
+            lines[9], "error: A: Iteration 2/6 failed: HTTP 500: boom",
             "{lines:?}"
         );
-        // 5. the totals line (binary GiB: 98304 MiB = 96.0 GB).
+        // 5. the totals line (H3: "tokens processed (input+output)";
+        // binary GiB: 98304 MiB = 96.0 GB).
         assert_eq!(
-            lines[10], "[DIGEST] totals: 1607850 tokens generated, peak VRAM 96.0 GB",
+            lines[10], "totals: 1607850 tokens processed (input+output), peak VRAM 96.0 GB",
             "{lines:?}"
         );
     }
@@ -1119,12 +1196,14 @@ mod tests {
             },
             ..Config::default()
         };
+        // S3: headlines are (label, summary, wall_secs) triples.
         let lines = digest_lines(
             &cfg,
             "sess",
             &[(
                 "D: Energy".to_string(),
                 "N/A (no power telemetry)".to_string(),
+                3.0,
             )],
             &[],
             0,
@@ -1133,8 +1212,11 @@ mod tests {
         );
         assert_eq!(lines.len(), 4, "{lines:?}"); // session + config + 1 + totals
         assert!(lines[0].contains("1 engine(s), wall 5s"), "{lines:?}");
+        // S3: the ✓ line carries the wall time.
+        assert!(lines[2].contains("(wall 3s)"), "{lines:?}");
+        // N11 + H3: no `[DIGEST]` prefix; "tokens processed (input+output)".
         assert!(
-            lines[3] == "[DIGEST] totals: 0 tokens generated, peak VRAM n/a",
+            lines[3] == "totals: 0 tokens processed (input+output), peak VRAM n/a",
             "{lines:?}"
         );
     }
@@ -1146,7 +1228,7 @@ mod tests {
         let lines = digest_lines(
             &Config::default(),
             "sess-id-123",
-            &[("A: Speed".to_string(), "56.4 t/s".to_string())],
+            &[("A: Speed".to_string(), "56.4 t/s".to_string(), 12.0)],
             &[],
             256,
             42.0,
@@ -1167,12 +1249,39 @@ mod tests {
             n,
             "{latest}"
         );
+        // N11: no double `[DIGEST] [DIGEST]` tag — the context tag is
+        // enough; the in-message prefix is dropped.
         assert!(
-            latest.contains("[INFO] [DIGEST] [DIGEST] session sess-id-123"),
+            latest.contains("[INFO] [DIGEST] session sess-id-123"),
             "{latest}"
+        );
+        assert!(
+            !latest.contains("[DIGEST] [DIGEST]"),
+            "no double tag: {latest}"
         );
         assert!(latest.contains("peak VRAM n/a"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── P3/N3: the [HW] detail line (best-effort, omit-if-unavailable) ──
+
+    #[test]
+    fn hw_detail_line_omits_unavailable_values() {
+        // All three present.
+        let line = hw_detail_line(Some("0.6.2"), Some("550.54"), Some("12.4"))
+            .expect("all present → Some");
+        assert_eq!(line, "[HW] vLLM 0.6.2, driver 550.54, CUDA 12.4");
+
+        // Only vLLM (driver + CUDA unavailable — non-NVML host).
+        let line = hw_detail_line(Some("0.6.2"), None, None).expect("vLLM only");
+        assert_eq!(line, "[HW] vLLM 0.6.2");
+
+        // Only driver + CUDA (no vLLM — the server has no /version).
+        let line = hw_detail_line(None, Some("550.54"), Some("12.4")).expect("driver+CUDA");
+        assert_eq!(line, "[HW] driver 550.54, CUDA 12.4");
+
+        // None available (driverless host, no server) → None (nothing to log).
+        assert_eq!(hw_detail_line(None, None, None), None);
     }
 
     #[test]

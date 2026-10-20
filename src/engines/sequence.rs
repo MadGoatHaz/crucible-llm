@@ -35,8 +35,8 @@ use arc_swap::ArcSwapOption;
 
 use crate::config::Config;
 use crate::engines::capability::{
-    NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StructuredEngine, StructuredResult,
-    NIAH_MAX_GEN_TOKENS,
+    NiahCellState, NiahEngine, NiahResult, ReasoningEngine, ReasoningResult, StructuredEngine,
+    StructuredResult, NIAH_MAX_GEN_TOKENS,
 };
 use crate::engines::concurrency::SweepResult;
 use crate::engines::flatout::StreamCountSource;
@@ -551,7 +551,12 @@ pub struct BenchmarkSequence {
     current: Arc<AtomicUsize>,
     /// Completed engines so far (the queue panel's `✓` rows) — a brief
     /// lock on the completion path only, never the timing path.
-    completed: Arc<Mutex<Vec<(Engine, String)>>>,
+    /// S3: each entry is `(engine, summary, wall_secs)` so the digest
+    /// ✓ lines carry the per-engine wall time (the long pole, e.g. C1's
+    /// 1385s, becomes visible in the shareable block). The ticker maps
+    /// this to `SeqState.completed` (which stays `(Engine, String)` —
+    /// no struct ripple to the TUI).
+    completed: Arc<Mutex<Vec<(Engine, String, f64)>>>,
 }
 
 /// The ordered engine queue for a selection: the selected engines in the
@@ -654,7 +659,13 @@ impl BenchmarkSequence {
         } else {
             None
         };
-        let completed = self.completed.lock().map(|g| g.clone()).unwrap_or_default();
+        // S3: map (Engine, String, f64) → (Engine, String) for the
+        // TUI-facing SeqState (no struct ripple).
+        let completed: Vec<(Engine, String)> = self
+            .completed
+            .lock()
+            .map(|g| g.iter().map(|(e, s, _)| (*e, s.clone())).collect())
+            .unwrap_or_default();
         self.slot.store(SeqState {
             phase,
             queue: self.engines.clone(),
@@ -728,7 +739,10 @@ impl BenchmarkSequence {
                     let Ok(g) = completed.lock() else {
                         continue;
                     };
-                    let completed = g.clone();
+                    // S3: map (Engine, String, f64) → (Engine, String)
+                    // for the TUI-facing SeqState (no struct ripple).
+                    let completed: Vec<(Engine, String)> =
+                        g.iter().map(|(e, s, _)| (*e, s.clone())).collect();
                     drop(g);
                     // The ticker re-publishes the *same* engine at 10 Hz:
                     // keep its start stamp (a new engine gets one from
@@ -808,11 +822,14 @@ impl BenchmarkSequence {
             };
 
             self.bus.reset();
+            let wall = t_start.elapsed().as_secs_f64();
             {
                 let mut g = self.completed.lock().unwrap_or_else(|e| e.into_inner());
-                g.push((*engine, summary.clone()));
+                // S3: store the wall time alongside the summary so the
+                // digest ✓ lines can render `(wall Ns)`.
+                g.push((*engine, summary.clone(), wall));
             }
-            let headline = headline_line(engine.label(), &summary, t_start.elapsed().as_secs_f64());
+            let headline = headline_line(engine.label(), &summary, wall);
             self.log_line(format!("[seq] {headline}"));
             self.logger.info(Context::Sequence, headline);
             self.publish_state(SeqPhase::Complete, *engine, &summary);
@@ -888,12 +905,14 @@ impl BenchmarkSequence {
         // the totals), referenced by the session id, appended to the run
         // log. All channel sends (assembled at run end — never the timing
         // path); `--show-log` / the `l` view / the archive all carry it.
-        let headlines: Vec<(String, String)> = self
+        // S3: headlines carry the per-engine wall time (the 3-tuple from
+        // the `completed` slot), so the digest ✓ lines render `(wall Ns)`.
+        let headlines: Vec<(String, String, f64)> = self
             .completed
             .lock()
             .map(|g| {
                 g.iter()
-                    .map(|(e, s)| (e.label().to_string(), s.clone()))
+                    .map(|(e, s, w)| (e.label().to_string(), s.clone(), *w))
                     .collect()
             })
             .unwrap_or_default();
@@ -931,9 +950,49 @@ impl BenchmarkSequence {
             }
         }
         let completed = self.completed.lock().map(|g| g.clone()).unwrap_or_default();
-        for (e, s) in &completed {
+        for (e, s, _) in &completed {
             if s.starts_with("init failed") {
                 errs.push(format!("{}: {s}", e.label()));
+            }
+        }
+        // M2/N8: cell-level failures — failed C1 cells (!retrieved with
+        // an error/stall) and failed/timed-out B streams. Capped at 5
+        // with "…and k more" to bound the digest.
+        if let Some(niah) = (*self.slots.niah.load()).as_ref() {
+            let failed_cells: Vec<String> = niah
+                .cells
+                .iter()
+                .filter(|c| c.target_tokens > 0 && !c.retrieved && c.state == NiahCellState::Failed)
+                .map(|c| {
+                    format!(
+                        "C1: {} depth {}% — retrieval failed",
+                        c.context_label(),
+                        c.depth_percent
+                    )
+                })
+                .collect();
+            let (shown, extra) = (&failed_cells[..failed_cells.len().min(3)], failed_cells.len().saturating_sub(3));
+            errs.extend(shown.iter().cloned());
+            if extra > 0 {
+                errs.push(format!("…and {extra} more C1 failures"));
+            }
+        }
+        if let Some(sweep) = (*self.slots.concurrency.load()).as_ref() {
+            let failed_levels: Vec<String> = sweep
+                .levels
+                .iter()
+                .filter(|l| l.failed_streams > 0 || l.timed_out_streams > 0)
+                .map(|l| {
+                    format!(
+                        "B: level {} — {} failed, {} timed out",
+                        l.concurrency, l.failed_streams, l.timed_out_streams
+                    )
+                })
+                .collect();
+            let (shown, extra) = (&failed_levels[..failed_levels.len().min(3)], failed_levels.len().saturating_sub(3));
+            errs.extend(shown.iter().cloned());
+            if extra > 0 {
+                errs.push(format!("…and {extra} more B failures"));
             }
         }
         errs
@@ -1093,11 +1152,13 @@ impl BenchmarkSequence {
                     self.logger.info(
                         Context::Sequence,
                         format!(
-                            "run persisted → {} (session {}, {} metric rows, {} needle rows)",
+                            "run persisted → {} (session {}, {} metric row{}, {} needle row{})",
                             db.path().display(),
                             &id[..8],
                             metrics.len(),
-                            needles.len()
+                            if metrics.len() == 1 { "" } else { "s" },
+                            needles.len(),
+                            if needles.len() == 1 { "" } else { "s" },
                         ),
                     );
                 }
@@ -1355,10 +1416,14 @@ impl BenchmarkSequence {
         // matches the power trace the numerator integrates, so numerator and
         // denominator span the same engine set (no more A+B-only inflation).
         let total_tokens = self.all_engines_tokens();
+        // N6: the label no longer claims "all engines" (F runs after D, so
+        // its tokens are not yet known); the 3 s is a progress-display
+        // window, not the integration window (J/token integrates the full
+        // load window).
         self.logger.info(
             Context::EngineD,
             format!(
-                "Engine D (Energy) started — 3s sampling window over {total_tokens} tokens (all engines)"
+                "Engine D (Energy) started — sampling over {total_tokens} tokens (A–C3; F runs after D); J/token integrates the full load window"
             ),
         );
         const WINDOW: Duration = Duration::from_secs(3);
@@ -1636,9 +1701,12 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
         .and_then(|e| e.knee)
         .map(|k| format!(" · throughput knee at {}", k.concurrency))
         .unwrap_or_default();
+    // N21: the sweet spot / knee is pinned to the ctx=0 (pure decode)
+    // leg by CF-27 — disclose the basis so a reader knows which context
+    // the figure came from.
     match us.practical_sweet_spot {
         Some(n) => format!(
-            "practical sweet spot {} users (~{:.0} t/s each){}",
+            "practical sweet spot {} users (~{:.0} t/s each, ctx=0 decode){}",
             n, us.practical_per_stream, knee
         ),
         None => {
@@ -1646,10 +1714,10 @@ pub fn summarize_sweep(result: &SweepResult) -> String {
             // (29.4 effective): report the usability edge instead.
             match us.max_usable {
                 Some(n) => format!(
-                    "no level reaches 30 t/s/user — usable up to {} users (~{:.0} t/s each){}",
+                    "no level reaches 30 t/s/user — usable up to {} users (~{:.0} t/s each, ctx=0 decode){}",
                     n, us.max_usable_per_stream, knee
                 ),
-                None => format!("unusable for interactive use (below 15 t/s/user even at 1){knee}"),
+                None => format!("unusable for interactive use (below 15 t/s/user even at 1, ctx=0 decode){knee}"),
             }
         }
     }
@@ -2293,6 +2361,8 @@ mod tests {
         let line = summarize_sweep(&result);
         assert!(line.contains("practical sweet spot 2 users"), "{line}");
         assert!(line.contains("~175 t/s each"), "{line}");
+        // N21: the ctx=0 basis is disclosed (CF-27 pins the primary leg).
+        assert!(line.contains("ctx=0 decode"), "{line}");
         assert_eq!(summarize_sweep(&SweepResult::default()), "no usable levels");
     }
 
@@ -2717,6 +2787,49 @@ mod tests {
             256 + 1000 + 8015 + 100 + 200 + 5000,
             "the full all-engine sum"
         );
+    }
+
+    // ── N17: metric/needle row grammar ─────────────────────────────────
+
+    #[test]
+    fn metric_rows_grammar_singular_at_one() {
+        // 1 row → "1 metric row" (not "1 metric rows").
+        let s = format!(
+            "{} metric row{}",
+            1,
+            if 1 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "1 metric row");
+        // 2 rows → "2 metric rows".
+        let s = format!(
+            "{} metric row{}",
+            2,
+            if 2 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "2 metric rows");
+        // 0 rows → "0 metric rows".
+        let s = format!(
+            "{} needle row{}",
+            0,
+            if 0 == 1 { "" } else { "s" }
+        );
+        assert_eq!(s, "0 needle rows");
+    }
+
+    // ── N6: D started line relabel ──────────────────────────────────────
+
+    #[test]
+    fn d_started_line_does_not_claim_all_engines() {
+        // N6: the label must say "F runs after D" (not "all engines")
+        // and describe the 3s as sampling (not the integration window).
+        let total_tokens = 12345u64;
+        let line = format!(
+            "Engine D (Energy) started — sampling over {total_tokens} tokens (A–C3; F runs after D); J/token integrates the full load window"
+        );
+        assert!(line.contains("F runs after D"), "{line}");
+        assert!(!line.contains("(all engines)"), "{line}");
+        assert!(line.contains("J/token integrates the full load window"), "{line}");
+        assert!(!line.contains("3s sampling window"), "{line}");
     }
 
     // ── the sequence run itself (no network: empty engines no-op) ───────
