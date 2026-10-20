@@ -2,6 +2,24 @@
 
 All notable changes to Crucible LLM.
 
+## [Unreleased]
+
+The v0.1.9 log-quality + measurement-integrity pass: the run log is now self-consistent, honest, and forum-ready — a number means what it says.
+
+### Fixed
+- **C2 (Reasoning) and Engine A answer-phase phantom rates** — a sub-~10 ms content window (e.g. a 2-token answer delivered in one MTP batch) no longer divides by a clamped 1 ms sliver to mint a fake ~2000 t/s; it reads **`n/a`** (the existing N/A sentinel) and is **excluded from averages** — the old "avg 799 t/s on a 27B model" is gone. The same 10 ms floor is applied to the **live gauge's decode rate** and the **every-50-token milestone** line (no more 7–9-digit phantoms), and a zero-span completion reads `n/a`, never a misleading `0.0 t/s`.
+- **Flat Out token-count consistency** — the Flat Out summary and the per-stream `stream complete` lines now use **one** counting method (server `usage` first, `chars/4` re-tokenization flagged `est.`), so the per-stream figures **reconcile** with the summary (the old 4654-vs-1314 gap is gone).
+- **Self-consistent `stream complete` lines** — each reads `{n} tokens in {total}s (decode {rate} t/s; TTFB {ttfb}s}`: the wall span (T0 → last token) and the decode window (T3 → last token) are shown separately, so the printed rate is derivable from the line (`count / (total − TTFB)`) instead of two windows being mixed into one opaque figure.
+- **Multi-GPU `[HW]` device count** — the `[HW]` line now shows the **count** of detected devices (e.g. `8× NVIDIA RTX A4000`) beside the aggregate VRAM/power, so an 8-card pool no longer reads as one 16 GB card.
+
+### Improved
+- **Log format cleanup (review/share-ready)** — exactly **one `started` line per engine** (Engine A and F now included; Engine B's per-leg lines are `leg` markers, not starts); the redundant per-engine **`complete`** lines (C1/C2/C3/B/D) are gone — the `✓` headline + `[DIGEST]` carry the summary; the **`[time] [LEVEL] [CONTEXT]`** contract holds on every line (no `[ERROR] [ERROR]` / `[DIGEST] [DIGEST]` double tags — worker failures carry the engine's context); consistent **`D: Energy`** naming; a **single `≈`** glyph for estimates; and grammar fixes (`× 1 repeat`, `1 metric row`).
+- **Richer `[DIGEST]` (the shareable block)** — now carries the **version** (in the run header and the digest session line), the **`[CONFIG]`** line (with the NIAH ladder in **discrete** `[ctx] × [depth]` form and a one-line **`mode=…`** legend), one `✓` headline per engine with its **`(wall Ns)`** (the long pole included), **cell-level failures** (C1 stalls / B timeouts, capped `…and k more`), **`tokens processed (input+output)`** (not the old "tokens generated"), and the **`[HW]`** detail.
+- **`[HW]` line records the vLLM server version and the GPU driver / CUDA version** — the vLLM version is probed from the server's `/version` endpoint (zero new dependencies) and the driver/CUDA come from local NVML; each is **omitted when unavailable, never fabricated**, and a missing probe never fails the run.
+
+### Changed
+- **Honest `n/a` for sub-10 ms / pure-CoT answer windows** — for a pure-reasoning ("CoT-only") model whose entire answer arrives in a sub-10 ms burst, the answer-phase speed now reads **`n/a`** (an unmeasurable window) rather than the old clamped-1 ms phantom. This is a deliberate, honest change from v0.1.8: where a real decode rate exists it is still reported, and the Matrix Report uses the **blended** decode rate with an explanatory `notes` line for such models.
+
 ## [0.1.8] - 2026-10-19
 
 ### Added

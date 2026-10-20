@@ -387,7 +387,11 @@ Add `--show-log` to a headless run and it prints the **full run log to stdout** 
 
 ### The `[DIGEST]` — the quick share
 
-The log opens with a **`[CONFIG]`** line (the run's resolved inputs) and closes with a **`[DIGEST]`** block — a compact ~15–30 line, self-describing summary: the session id + date + engine count + total wall time, the `[CONFIG]` line, one `✓` headline per engine that ran (each with its wall-clock duration; Engine D's adds peak VRAM), any run errors, and a totals line (tokens generated, peak VRAM). **Paste the `[DIGEST]` block when you want to share a run without the full log.**
+The log opens with a **`[CONFIG]`** line (the run's resolved inputs — the NIAH ladder in discrete `[ctx] × [depth]` form and a one-line `mode=…` legend) and a **`[HW]`** line, and closes with a **`[DIGEST]`** block — a compact ~15–30 line, self-describing summary: the session id + **version** + date + engine count + total wall time, the `[CONFIG]` line, one `✓` headline per engine that ran (each with its wall-clock duration, so the long pole is visible; Engine D's adds peak VRAM), any **cell-level failures** (C1 stalls, B timeouts — capped `…and k more`), a totals line (**`tokens processed (input+output)`**, peak VRAM), and the `[HW]` detail. **Paste the `[DIGEST]` block when you want to share a run without the full log.**
+
+**The `[HW]` line is unambiguous for multi-GPU:** it names the **device count** (e.g. `8× NVIDIA RTX A4000`) alongside the **vLLM server version** (probed from the server) and the **GPU driver / CUDA** version (local, via NVML) — each best-effort: omitted when unavailable, never fabricated.
+
+**Honest rates, no phantoms:** a decode window shorter than **10 ms** (e.g. a 2-token answer delivered in one MTP batch — including a pure-reasoning "CoT-only" model whose entire answer arrives in one sub-10 ms burst) reads **`n/a`** in the log — an unmeasurable window, not the old clamped-1 ms phantom — and is excluded from averages. Where a real decode rate exists it is still reported, and each `stream complete` line is self-consistent: `{n} tokens in {total}s (decode {rate} t/s; TTFB {ttfb}s}`. For a CoT-only model, the Matrix Report uses the **blended** decode rate with an explanatory `notes` line.
 
 ## Matrix Report
 
