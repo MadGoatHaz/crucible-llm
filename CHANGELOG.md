@@ -2,7 +2,7 @@
 
 All notable changes to Crucible LLM.
 
-## [Unreleased]
+## [0.1.9] - 2026-10-20
 
 The v0.1.9 log-quality + measurement-integrity pass: the run log is now self-consistent, honest, and forum-ready — a number means what it says.
 
