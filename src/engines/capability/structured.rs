@@ -227,6 +227,32 @@ pub fn json_schema_response_format(name: &str, schema: &serde_json::Value) -> se
     })
 }
 
+/// N7: the per-run C3 worker tag.
+///
+/// The three constrained cases are distinguished by their name
+/// (`C3:constrained-Simple` / `-Medium` / `-Complex`) so the log no longer
+/// shows three *indistinguishable* `C3:constrained` streams; the free-form
+/// baseline stays `C3:free`.
+#[must_use]
+pub fn c3_case_tag(constrained: bool, case_name: &str) -> String {
+    if constrained {
+        format!("C3:constrained-{case_name}")
+    } else {
+        "C3:free".to_string()
+    }
+}
+
+/// N19: the `× N repeats` label for the C3 start line — singular at
+/// `n == 1` (`1 repeat`), plural otherwise (`N repeats`).
+#[must_use]
+fn repeats_label(n: usize) -> String {
+    if n == 1 {
+        "1 repeat".to_string()
+    } else {
+        format!("{n} repeats")
+    }
+}
+
 /// The complexity ladder: three cases of increasing schema depth. Each
 /// prompt asks for a *specific* JSON shape so the constrained output can be
 /// checked field-by-field.
@@ -703,16 +729,23 @@ impl StructuredResult {
     /// failure. CF-51: a `stability …` figure is added when the cases were
     /// repeated. CF-08: the constraint mode is flagged inline so a ~0%
     /// penalty on a backend that drops `response_format` is never misread as
-    /// "constrained decoding is free". **R2:** the schema score and the
-    /// distinct truncated bucket are broken out (`2/3 schema, 1
-    /// truncated_by_reasoning`).
+    /// "constrained decoding is free". **R2:** the distinct truncated
+    /// bucket is broken out (`1 truncated_by_reasoning`). N16: the schema
+    /// count is *not* repeated here — `compliance_label()` already carries
+    /// it (`schema-correct c/t`), so only the truncated bucket is appended;
+    /// and a **negative** penalty (the constrained run was faster) reads as
+    /// a `speedup`, not a `-…% penalty`.
     #[must_use]
     pub fn summary_line(&self) -> String {
-        let (c, _p, _f) = self.score();
         let t = self.truncated_count();
-        let total = self.cases.len();
         let penalty = if self.constraint_effective() {
-            format!("{:+.1}% penalty", self.penalty_pct)
+            // N16: a negative penalty is a speedup — flip the sign and the
+            // word so `-0.5%` never reads as a penalty.
+            if self.penalty_pct < 0.0 {
+                format!("{:.1}% speedup", -self.penalty_pct)
+            } else {
+                format!("{:+.1}% penalty", self.penalty_pct)
+            }
         } else if self
             .cases
             .first()
@@ -732,7 +765,9 @@ impl StructuredResult {
             parts.push(self.counting_method.label().to_string());
         }
         parts.push(self.compliance_label());
-        parts.push(format!("{c}/{total} schema, {t} truncated_by_reasoning"));
+        // N16: the schema count lives in `compliance_label()` — don't repeat
+        // it; only the distinct truncated bucket is appended here.
+        parts.push(format!("{t} truncated_by_reasoning"));
         let stability = self.stability_label();
         if !stability.is_empty() {
             parts.push(stability);
@@ -1006,11 +1041,9 @@ impl StructuredEngine {
             self.max_gen_tokens,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
-        .tag(if constrained {
-            "C3:constrained"
-        } else {
-            "C3:free"
-        });
+        // N7: the tag carries the case name so the three constrained
+        // streams are distinguishable in the log.
+        .tag(c3_case_tag(constrained, case.name));
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -1172,11 +1205,13 @@ impl StructuredEngine {
         let n = self.repeats.max(1);
         // 1 free-form baseline (the speed pair) + N repeats per constrained case.
         let total_runs = 1 + STRUCTURED_CASES.len() * n;
+        // N19: singular at n == 1 (`× 1 repeat`), plural otherwise.
+        let repeats_str = repeats_label(n);
         if let Some(l) = &self.logger {
             l.info(
                 crate::log::Context::EngineC3,
                 format!(
-                    "Engine C3 (Structured) started — 3 schema cases (Simple → Complex) × {n} repeats + free-form baseline"
+                    "Engine C3 (Structured) started — 3 schema cases (Simple → Complex) × {repeats_str} + free-form baseline"
                 ),
             );
         }
@@ -1607,6 +1642,34 @@ mod tests {
     use crate::sse::Usage;
     use crate::timing::MonotonicInstant;
 
+    // ── N7: the per-run worker tags distinguish the three cases ──
+    #[test]
+    fn c3_tags_distinguish_the_three_constrained_cases() {
+        // Each of the three constrained cases carries its own name; the
+        // free-form baseline stays `C3:free`.
+        assert_eq!(c3_case_tag(true, "Simple"), "C3:constrained-Simple");
+        assert_eq!(c3_case_tag(true, "Medium"), "C3:constrained-Medium");
+        assert_eq!(c3_case_tag(true, "Complex"), "C3:constrained-Complex");
+        assert_eq!(c3_case_tag(false, "Simple"), "C3:free");
+        // The three constrained tags are pairwise distinct.
+        let tags = [
+            c3_case_tag(true, "Simple"),
+            c3_case_tag(true, "Medium"),
+            c3_case_tag(true, "Complex"),
+        ];
+        assert_ne!(tags[0], tags[1]);
+        assert_ne!(tags[1], tags[2]);
+        assert_ne!(tags[0], tags[2]);
+    }
+
+    // ── N19: `× 1 repeat` at n == 1, plural otherwise ──
+    #[test]
+    fn repeats_label_is_singular_at_one() {
+        assert_eq!(repeats_label(1), "1 repeat");
+        assert_eq!(repeats_label(2), "2 repeats");
+        assert_eq!(repeats_label(3), "3 repeats");
+    }
+
     // ── hybrid reasoning (R2): the budget is the correctness guarantee ──
 
     #[test]
@@ -1836,6 +1899,39 @@ mod tests {
         assert!(r.summary_line().contains("+5.2% penalty"));
         assert!(r.summary_line().contains("valid JSON 3/3"));
         assert!(r.summary_line().contains("schema-correct 2/3"));
+    }
+
+    #[test]
+    fn summary_line_negative_penalty_is_a_speedup() {
+        // N16: a negative penalty (the constrained run was *faster* than the
+        // free-form baseline) reads as a `speedup`, never a `-…% penalty`.
+        let r = StructuredResult {
+            free_tps: 60.0,
+            constrained_tps: 60.3,
+            penalty_pct: -0.5,
+            free_ttft: 0.2,
+            constrained_ttft: 0.21,
+            cases: vec![
+                evaluate_case("Simple", r#"{"name": "Ada", "age": 36}"#),
+                evaluate_case(
+                    "Medium",
+                    r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
+                ),
+                evaluate_case(
+                    "Complex",
+                    r#"{"user":{"name":"Ada","email":"e@x"},"orders":[{"id":1,"total":1.0,"items":["a"]}]}"#,
+                ),
+            ],
+            constrained_body: String::new(),
+            free_body: String::new(),
+            counting_method: CountingMethod::ServerUsage,
+        };
+        assert!(r.constraint_effective(), "case-0 valid JSON → effective");
+        let s = r.summary_line();
+        assert!(s.contains("0.5% speedup"), "negative penalty → speedup: {s}");
+        assert!(!s.contains("penalty"), "no 'penalty' wording: {s}");
+        // N16 dedup: the schema count is not repeated as `3/3 schema`.
+        assert!(!s.contains("3/3 schema"), "{s}");
     }
 
     #[test]
@@ -2244,9 +2340,9 @@ mod tests {
 
     #[test]
     fn summary_line_breaks_out_truncated_cases() {
-        // R2 terminal surfacing: the C3 summary breaks the truncated cases
-        // out of the schema score (`2/3 schema, 1 truncated_by_reasoning`),
-        // alongside the intact CF-17 split.
+        // R2 terminal surfacing: the C3 summary breaks the truncated case
+        // out (`1 truncated_by_reasoning`), alongside the intact CF-17
+        // split (the schema count lives in `compliance_label()` — N16 dedup).
         let mut r = result_with(
             r#"{"name": "Ada", "age": 36}"#,
             r#"[{"id":1,"label":"a","active":true},{"id":2,"label":"b","active":false},{"id":3,"label":"c","active":true}]"#,
@@ -2255,11 +2351,13 @@ mod tests {
         r.cases[2] = evaluate_case_with("Complex", "", true, None);
         let s = r.summary_line();
         assert!(
-            s.contains("2/3 schema, 1 truncated_by_reasoning"),
+            s.contains("1 truncated_by_reasoning"),
             "the summary breaks out the truncated case: {s}"
         );
         assert!(s.contains("valid JSON 2/3"), "CF-17 split intact: {s}");
         assert!(s.contains("schema-correct 2/3"), "CF-17 split intact: {s}");
+        // N16 dedup: the schema count is not repeated as `2/3 schema`.
+        assert!(!s.contains("2/3 schema"), "N16 dedup: {s}");
     }
 
     #[test]
@@ -2299,7 +2397,9 @@ mod tests {
             s.contains("penalty N/A (case-0 truncated by reasoning)"),
             "{s}"
         );
-        assert!(s.contains("0/3 schema, 3 truncated_by_reasoning"), "{s}");
+        assert!(s.contains("3 truncated_by_reasoning"), "{s}");
+        // N16 dedup: the schema count is not repeated as `0/3 schema`.
+        assert!(!s.contains("0/3 schema"), "{s}");
     }
 
     #[test]
