@@ -320,7 +320,13 @@ pub struct ReasoningResult {
 
 impl ReasoningResult {
     /// Mean content-phase decode speed across challenges that produced a
-    /// committed answer (CF-49).
+    /// measurable committed answer (CF-49).
+    ///
+    /// H1: the `> 0.0` filter drops the CF-25 `0.0` N/A sentinels — a
+    /// sub-10 ms content window (a 1–2-token answer in one MTP batch) is
+    /// stored as `0.0` by [`answer_phase_speed`] and excluded here, so
+    /// the average is a **real decode rate**, never a clamped-sliver
+    /// phantom (the v0.1.8 log's indefensible ~799 t/s).
     pub fn avg_tg_speed(&self) -> f64 {
         let vals: Vec<f64> = self
             .tg_speeds
@@ -435,7 +441,10 @@ impl ReasoningEngine {
             REASONING_MAX_GEN_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.timeout.max(1)))
-        .tag(format!("C2:{}", challenge.id));
+        .tag(format!("C2:{}", challenge.id))
+        // H2: the worker's `stream complete` line counts with the same
+        // authoritative method (and tokenizer) as this engine's result.
+        .tokenizer(self.tokenizer.clone());
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
@@ -925,6 +934,16 @@ fn content_count(
 ///
 /// `(0.0, false)` when there is no committed answer (pure CoT / failure /
 /// empty content) — no meaningful content decode rate.
+///
+/// **H1 (the 10 ms floor):** a content window below
+/// [`MIN_MEASURABLE_WINDOW_SECS`] is *not a measurable decode rate* — a
+/// 1–2-token C2 answer committed in one MTP / speculative-decoding batch
+/// arrives in a sub-millisecond burst (`first ≈ last`), and the old
+/// `.max(0.001)` clamp turned that sliver into phantom 10³–10⁴ t/s
+/// figures (the indefensible ~799 t/s "average" in the v0.1.8 log). Such
+/// a challenge reports the CF-25 `0.0` N/A sentinel instead (its
+/// `estimated` flag preserved), and [`ReasoningResult::avg_tg_speed`]
+/// excludes it — the published average is a real decode rate, or nothing.
 fn answer_phase_speed(
     events: &[StreamEvent],
     stream_time: f64,
@@ -932,17 +951,23 @@ fn answer_phase_speed(
     usage: Option<Usage>,
     usage_details: Option<UsageDetails>,
 ) -> (f64, bool) {
+    use crate::client::stream::MIN_MEASURABLE_WINDOW_SECS;
     let (c_first, c_last, content_frames) = content_phase(events);
     let (content_tokens, estimated) = content_count(usage, usage_details, content_frames);
     if content_tokens == 0 {
         return (0.0, false);
     }
     let content_time = match (c_first, c_last) {
-        (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
+        (Some(f), Some(l)) => f.delta_nanos(&l) as f64 / 1e9,
         // A single content frame (no span) → attribute the full
         // post-TTFT generation time to it.
-        _ => (stream_time - ttft).max(0.001),
+        _ => stream_time - ttft,
     };
+    // H1: a sub-floor window is not measurable — the N/A sentinel
+    // stands (no clamped-divisor phantom).
+    if content_time < MIN_MEASURABLE_WINDOW_SECS {
+        return (0.0, estimated);
+    }
     (content_tokens as f64 / content_time, estimated)
 }
 
@@ -1574,5 +1599,130 @@ mod tests {
         let got = challenge_ttft(&ts);
         assert!((got - expected).abs() < 1e-9, "{got} vs {expected}");
         assert!(got > 0.0);
+    }
+
+    // ── H1: sub-floor content windows are N/A, never phantoms ─────────
+
+    /// A content frame at `at` carrying `text`.
+    fn h1_content_frame(at: MonotonicInstant, text: &str) -> StreamEvent {
+        StreamEvent::Frame {
+            frame: ParsedFrame {
+                chunk: Chunk::Content(text.into()),
+                t_nanos: 0,
+                done: false,
+            },
+            at,
+            timestamps: StreamTimestamps::default(),
+        }
+    }
+
+    #[test]
+    fn h1_two_token_sub_ms_burst_is_na_not_a_phantom() {
+        // The v0.1.8 fault: 2-token C2 answers arriving in one
+        // sub-millisecond MTP batch — the old `.max(0.001)` clamp minted
+        // 2 / 0.001 = 2000 t/s each (→ the indefensible ~799 t/s avg).
+        // Now: the CF-25 `0.0` N/A sentinel (a sub-10 ms window is not a
+        // measurable decode rate).
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let first = MonotonicInstant::now();
+            mock.increment(1_000_000); // 1 ms later: second frame
+            let last = MonotonicInstant::now();
+            let events = vec![h1_content_frame(first, "No"), h1_content_frame(last, ".")];
+            let (speed, estimated) = answer_phase_speed(
+                &events,
+                0.0,
+                0.0,
+                Some(Usage {
+                    prompt_tokens: 42,
+                    completion_tokens: 2,
+                }),
+                Some(UsageDetails {
+                    reasoning_tokens: 0,
+                    cached_tokens: 0,
+                }),
+            );
+            assert_eq!(
+                speed, 0.0,
+                "a 1 ms content window is below the 10 ms floor → N/A, not 2000 t/s"
+            );
+            assert!(!estimated, "a usage-reported count is not an estimate");
+        });
+    }
+
+    #[test]
+    fn h1_single_frame_sub_floor_post_ttft_is_na() {
+        // A single content frame (no span) attributes the post-TTFT
+        // generation time to it; below the floor that is N/A too.
+        let (clock, _mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let at = MonotonicInstant::now();
+            let events = vec![h1_content_frame(at, "42")];
+            // stream_time − ttft = 5 ms − 2 ms = 3 ms < 10 ms → N/A.
+            let (speed, _) = answer_phase_speed(&events, 0.005, 0.002, None, None);
+            assert_eq!(speed, 0.0, "a 3 ms post-TTFT window is below the floor → N/A");
+        });
+    }
+
+    #[test]
+    fn h1_normal_content_window_still_measures() {
+        // A genuine 200 ms content window reads its real rate — the floor
+        // must not mask a real (fast) decode.
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let first = MonotonicInstant::now();
+            mock.increment(200_000_000); // 200 ms
+            let last = MonotonicInstant::now();
+            let events = vec![h1_content_frame(first, "a"), h1_content_frame(last, "b")];
+            let (speed, estimated) = answer_phase_speed(
+                &events,
+                0.0,
+                0.0,
+                Some(Usage {
+                    prompt_tokens: 42,
+                    completion_tokens: 10,
+                }),
+                Some(UsageDetails {
+                    reasoning_tokens: 0,
+                    cached_tokens: 0,
+                }),
+            );
+            assert!(!estimated);
+            assert!(
+                (speed - 10.0 / 0.2).abs() < 1e-9,
+                "10 tokens over 200 ms = 50 t/s, got {speed}"
+            );
+        });
+    }
+
+    #[test]
+    fn h1_avg_excludes_sub_floor_phantoms() {
+        // The published average: [0.0 (sub-floor N/A), 40.0] == 40.0 —
+        // never the old (2000 + 40) / 2 ≈ 1020 phantom blend. An all-N/A
+        // bank reports 0.0 (nothing measurable), not a fake rate.
+        let with_phantom = ReasoningResult {
+            responses: vec![],
+            ttfts: vec![],
+            tg_speeds: vec![0.0, 40.0],
+            score: ReasoningScore {
+                total: 0,
+                solved: 0,
+                by_category: [(0, 0); 3],
+            },
+            estimated: false,
+        };
+        assert_eq!(with_phantom.avg_tg_speed(), 40.0);
+        let all_na = ReasoningResult {
+            responses: vec![],
+            ttfts: vec![],
+            tg_speeds: vec![0.0, 0.0],
+            score: ReasoningScore {
+                total: 0,
+                solved: 0,
+                by_category: [(0, 0); 3],
+            },
+            estimated: false,
+        };
+        assert_eq!(all_na.avg_tg_speed(), 0.0);
     }
 }

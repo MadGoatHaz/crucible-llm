@@ -390,11 +390,25 @@ async fn live_bank_run_against_clever_mock_scores_13_of_13() {
     );
     assert_eq!(result.score.by_category, [(5, 5), (5, 5), (3, 3)]);
     // Speed alongside accuracy: every challenge produced tokens with a
-    // measured TTFT and decode speed.
+    // measured TTFT.
     assert_eq!(result.ttfts.len(), 13);
     assert!(result.ttfts.iter().all(|t| *t >= 0.0));
-    assert!(result.tg_speeds.iter().all(|t| *t > 0.0));
-    assert!(result.avg_tg_speed() > 0.0);
+    // H1: the mock serves each short answer in a sub-10 ms burst, so the
+    // content window is below the measurable floor — the honest result is
+    // the `0.0` N/A sentinel, NEVER the old clamped-sliver phantom (the
+    // v0.1.8 fault: 2 tokens / 0.001 s = 2000 t/s per challenge → a
+    // ~799 t/s "average"). A real (slower) decode is allowed, a 4-figure
+    // phantom is not.
+    assert!(
+        result.tg_speeds.iter().all(|t| *t == 0.0 || *t < 1000.0),
+        "no sub-floor phantom decode speed: {:?}",
+        result.tg_speeds
+    );
+    assert!(
+        result.avg_tg_speed() < 1000.0,
+        "the average is a real decode rate or nothing — never a phantom: {}",
+        result.avg_tg_speed()
+    );
 }
 
 #[tokio::test]

@@ -217,15 +217,31 @@ pub fn iteration_complete_line(i: usize, iterations: usize, r: &SpeedResult) -> 
         .reasoning_tokens
         .map(|n| n.to_string())
         .unwrap_or_else(|| "n/a".to_string());
+    // CF-25 / H1b: the `0.0` N/A sentinel (a degraded run, or a
+    // sub-10 ms window that is not a measurable rate) renders `n/a` —
+    // N/A is never a silent 0.0 (a bare `0.0 t/s` reads as "the server
+    // produced nothing", which is false on a run that did produce
+    // tokens).
+    let rate = |v: f64| {
+        if v > 0.0 {
+            format!("{v:.1} t/s")
+        } else {
+            "n/a".to_string()
+        }
+    };
+    let ttft = if r.ttft > 0.0 {
+        format!("{:.0} ms", r.ttft * 1000.0)
+    } else {
+        "n/a".to_string()
+    };
     format!(
-        "Iteration {}/{} complete: {} tok ({} content / {reasoning} reasoning), {:.1} t/s answer, {:.1} t/s blended, TTFT {:.0} ms",
+        "Iteration {}/{} complete: {} tok ({} content / {reasoning} reasoning), {} answer, {} blended, TTFT {ttft}",
         i + 1,
         iterations,
         r.completion_tokens,
         r.completion_tokens.saturating_sub(r.reasoning_tokens.unwrap_or(0)),
-        r.tg_speed,
-        r.blended_tps,
-        r.ttft * 1000.0
+        rate(r.tg_speed),
+        rate(r.blended_tps),
     )
 }
 
@@ -490,7 +506,10 @@ impl SpeedEngine {
             MAX_GEN_TOKENS,
         )
         .read_timeout(Duration::from_secs(self.cfg.timeout.max(1)))
-        .tag(tag_prefix);
+        .tag(tag_prefix)
+        // H2: the worker's `stream complete` line counts with the same
+        // authoritative method (and tokenizer) as this engine's result.
+        .tokenizer(self.generator.tokenizer());
         if let Some(key) = &self.cfg.api_key {
             worker = worker.api_key(key);
         }
@@ -1035,12 +1054,20 @@ pub fn aggregate(
     let content_tokens = completion_tokens.saturating_sub(reasoning_tokens);
     // The full-window blended rate (the pre-CF-26 definition) — computed
     // for **every** run so a pure-CoT run (and the log) can report it.
+    // H1b: the same floor as H1 — a token window below 10 ms (a single
+    // MTP / speculative batch: `first ≈ last`) is not a measurable rate;
+    // the CF-25 `0.0` N/A sentinel stands (never a clamped-sliver
+    // phantom).
     let blended = {
         let w = match (t_first, t_last) {
-            (Some(f), Some(l)) => (f.delta_nanos(&l) as f64 / 1e9).max(0.001),
-            _ => (stream_time - ttft).max(0.001),
+            (Some(f), Some(l)) => f.delta_nanos(&l) as f64 / 1e9,
+            _ => stream_time - ttft,
         };
-        completion_tokens as f64 / w
+        if w >= crate::client::stream::MIN_MEASURABLE_WINDOW_SECS {
+            completion_tokens as f64 / w
+        } else {
+            0.0
+        }
     };
     // B1 — pure CoT: the server reported reasoning detail and ZERO content
     // tokens, so there is no answer phase. The honest figure is the
@@ -1060,8 +1087,18 @@ pub fn aggregate(
         // CF-26 answer phase: content tokens over the content window.
         match (t_first_content, t_last_content) {
             (Some(fc), Some(lc)) if content_tokens > 0 => {
-                let w = (fc.delta_nanos(&lc) as f64 / 1e9).max(0.001);
-                content_tokens as f64 / w
+                let w = fc.delta_nanos(&lc) as f64 / 1e9;
+                // H1b: the same floor as H1 (identical rule, identical
+                // N/A sentinel) — a non-CoT answer committed in one MTP
+                // batch (content window < 10 ms) is not a measurable
+                // decode rate: the 0.0 N/A sentinel stands (never
+                // `N / 0.001`), so Engine A and C2 agree on what a
+                // sub-window means.
+                if w >= crate::client::stream::MIN_MEASURABLE_WINDOW_SECS {
+                    content_tokens as f64 / w
+                } else {
+                    0.0
+                }
             }
             // Content tokens reported but no content window observed:
             // a degraded (CF-25) run — the 0.0 N/A sentinel stands.
@@ -2886,6 +2923,124 @@ mod tests {
             let v = json_report(&cfg(), std::slice::from_ref(&r));
             assert_eq!(v["results"][0]["itl_clamped"], 1);
         });
+    }
+
+    // ── H1b: Engine A's same sub-floor window is N/A, never a phantom ──
+
+    /// A non-CoT run on the mock clock: `usage` with `completion`
+    /// tokens, `with_detail` CF-02 detail (reasoning 0), and two
+    /// content frames `gap_ns` apart.
+    fn h1b_non_cot_run(gap_ns: u64, completion: u64, with_detail: bool) -> SpeedResult {
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(50_000_000);
+            let t1 = MonotonicInstant::now();
+            mock.increment(50_000_000);
+            let first = MonotonicInstant::now(); // first content frame
+            mock.increment(gap_ns);
+            let last = MonotonicInstant::now(); // last content frame
+            mock.increment(10_000_000);
+            let t_end = MonotonicInstant::now();
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t1),
+                t2: Some(t1),
+                t3: Some(first),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 100,
+                completion_tokens: completion,
+            };
+            let detail = if with_detail {
+                Some(UsageDetails {
+                    reasoning_tokens: 0,
+                    cached_tokens: 0,
+                })
+            } else {
+                None
+            };
+            let frames = [
+                (Chunk::Content("a".into()), first),
+                (Chunk::Content("b".into()), last),
+            ];
+            let events: Vec<StreamEvent> = frames
+                .iter()
+                .map(|(chunk, at)| StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: chunk.clone(),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .collect();
+            let outcome = StreamOutcome {
+                timestamps: ts,
+                usage: Some(usage),
+                usage_details: detail,
+                premature: false,
+                malformed_frames: 0,
+                error: None,
+                looping: false,
+                loop_excluded_tokens: 0,
+                frames: 2,
+            };
+            aggregate(&cfg(), &prompt(), &outcome, &events, None, detail)
+        })
+    }
+
+    #[test]
+    fn h1b_non_cot_sub_ms_content_burst_is_na() {
+        // H1b: a non-CoT model committing 2 content tokens in one MTP
+        // batch (a 1 ms content window) — the old `.max(0.001)` clamp
+        // minted 2 / 0.001 = 2000 t/s. Now: the CF-25 `0.0` N/A
+        // sentinel (the same floor and rule as C2's H1, so A and C2
+        // agree on what a sub-window means).
+        let r = h1b_non_cot_run(1_000_000, 2, true);
+        assert_eq!(
+            r.tg_speed, 0.0,
+            "a 1 ms content window is below the 10 ms floor → N/A, not 2000 t/s"
+        );
+        assert!(!r.pure_cot, "content tokens present → not a pure-CoT run");
+    }
+
+    #[test]
+    fn h1b_no_detail_sub_ms_window_is_na_too() {
+        // H1b (the no-detail path): a server that reports no CF-02
+        // detail takes the historical blended branch — a 1 ms
+        // full-token window is N/A there too, never `N / 0.001`.
+        let r = h1b_non_cot_run(1_000_000, 2, false);
+        assert_eq!(r.tg_speed, 0.0, "the blended branch carries the same floor");
+        assert_eq!(r.blended_tps, 0.0, "the published blended rate is N/A, not a phantom");
+    }
+
+    #[test]
+    fn h1b_normal_content_window_still_measures() {
+        // A genuine 1 s content window reads its real rate (10 tokens →
+        // 10 t/s) — the floor must not mask a real decode.
+        let r = h1b_non_cot_run(1_000_000_000, 10, true);
+        assert!(
+            (r.tg_speed - 10.0).abs() < 1e-9,
+            "10 tokens over a 1 s content window = 10 t/s, got {}",
+            r.tg_speed
+        );
+    }
+
+    #[test]
+    fn iteration_line_labels_na_sentinels() {
+        // H1b + CF-25: a `0.0` N/A sentinel (a degraded / sub-floor run)
+        // renders `n/a` on the completion line — never a bare `0.0 t/s`
+        // (which reads as "the server produced nothing", false on a run
+        // that did produce tokens).
+        let r = result_fixture(2, Some(0), 0.0, 0.0, 0.0);
+        let line = iteration_complete_line(0, 1, &r);
+        assert!(
+            line.contains("2 tok (2 content / 0 reasoning), n/a answer, n/a blended, TTFT n/a"),
+            "{line}"
+        );
     }
 
     // ── C2: the content/reasoning split on the completion line ─────────

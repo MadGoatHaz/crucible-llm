@@ -368,7 +368,14 @@ impl WorkerPool {
         )
         .read_timeout(self.read_timeout)
         .retries(self.retries)
-        .tag(tag);
+        .tag(tag)
+        // H2: the pool's optional tokenizer (CF-13) reaches every
+        // worker, so the per-stream `stream complete` line counts with
+        // the SAME authoritative method as the engine's summary (usage
+        // first, else re-tokenized text) — the two reconcile. (Before
+        // this, the field existed but never propagated: the summary and
+        // the per-stream line used different methods on the same stream.)
+        .tokenizer(self.tokenizer.clone());
         if self.ignore_eos {
             worker = worker.ignore_eos(true);
         }

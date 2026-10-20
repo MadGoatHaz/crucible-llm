@@ -127,12 +127,20 @@ async fn sse_run_produces_prototype_metrics() {
     assert_eq!(r.other_chunks, 2);
     assert_eq!(r.total_chunks, 6);
 
-    // §7 formulas: TTFT / PP / TG all positive; MTP η (CF-12) = 34
+    // §7 formulas: TTFT / PP positive; MTP η (CF-12) = 34
     // completion / 4 total token frames (2 reasoning + 2 content) = 8.5.
+    // H1b: the mock serves all 4 token frames in a sub-10 ms burst (no
+    // decode cadence), so the blended rate is the `0.0` N/A sentinel —
+    // a real rate is allowed, a clamped-sliver phantom (34 / 0.001 s =
+    // 34,000 t/s pre-H1b) is not.
     assert!(r.ttft > 0.0);
     assert!(r.stream_time > r.ttft);
     assert!(r.pp_speed > 0.0);
-    assert!(r.tg_speed > 0.0);
+    assert!(
+        r.tg_speed == 0.0 || r.tg_speed < 1000.0,
+        "tg_speed is a real rate or N/A, never a phantom: {}",
+        r.tg_speed
+    );
     assert!((r.mtp_efficiency - 8.5).abs() < 1e-9);
     assert_eq!(r.model, "test-model");
     assert_eq!(r.mode, "short");
@@ -320,7 +328,14 @@ async fn plain_json_fallback_runs_through_the_engine() {
     assert_eq!(r.other_chunks, 1);
     assert_eq!(r.total_chunks, 2);
     assert!((r.mtp_efficiency - 7.0).abs() < 1e-9);
-    assert!(r.tg_speed > 0.0);
+    // H1b + CF-44: the plain-JSON blob is a single frame (first == last —
+    // zero decode span, E2E-only), so the rate is the `0.0` N/A sentinel,
+    // not the old 7 / 0.001 s = 7000 t/s clamped-sliver phantom.
+    assert!(
+        r.tg_speed == 0.0 || r.tg_speed < 1000.0,
+        "tg_speed is a real rate or N/A, never a phantom: {}",
+        r.tg_speed
+    );
 }
 
 #[tokio::test]

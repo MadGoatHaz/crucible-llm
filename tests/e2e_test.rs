@@ -187,7 +187,15 @@ async fn full_pipeline_single_stream_sweep_niah_persist_and_export() {
     );
     assert!(result.ttft > 0.0, "TTFT measured");
     assert!(result.pp_speed > 0.0, "prefill throughput measured");
-    assert!(result.tg_speed > 0.0, "generation throughput measured");
+    // H1b: the mock serves the whole two-frame answer in a sub-10 ms
+    // burst (no decode cadence) — the honest figure is the `0.0` N/A
+    // sentinel; a real rate is allowed, a clamped-sliver phantom
+    // (tokens / 0.001 s) is not.
+    assert!(
+        result.tg_speed == 0.0 || result.tg_speed < 1000.0,
+        "tg_speed is a real rate or N/A, never a phantom: {}",
+        result.tg_speed
+    );
     assert!(result.mtp_efficiency > 0.0, "MTP ratio measured");
     assert!(result.completion_tokens > 0, "usage captured");
     // The raw per-packet samples the CSV export dumps:
@@ -415,9 +423,13 @@ fn binary_headless_json_and_export_end_to_end() {
     for r in results {
         assert!(r["error"].is_null(), "no run failed: {:?}", r["error"]);
         assert!((r["ttft_s"].as_f64().unwrap_or(0.0)) > 0.0, "TTFT > 0");
+        // H1b: the mock's sub-10 ms burst is not a measurable decode
+        // rate — the JSON carries the `0.0` N/A sentinel (a real rate is
+        // allowed; a clamped-sliver phantom is not).
+        let tg = r["tg_speed_tok_s"].as_f64().unwrap_or(0.0);
         assert!(
-            (r["tg_speed_tok_s"].as_f64().unwrap_or(0.0)) > 0.0,
-            "TG speed > 0"
+            tg == 0.0 || tg < 1000.0,
+            "TG speed is a real rate or N/A, never a phantom: {tg}"
         );
         assert!(
             r["completion_tokens"].as_u64().unwrap_or(0) > 0,

@@ -931,7 +931,12 @@ impl FlatOutEngine {
         // The 60 s window — not the model's own end-token — is the only
         // stop: llama.cpp servers honor `ignore_eos`, other backends
         // ignore the field (graceful degradation).
-        .ignore_eos(true);
+        .ignore_eos(true)
+        // H2: the pool's tokenizer reaches every worker, so the
+        // per-stream `stream complete` lines count with the SAME
+        // authoritative method as this summary (usage first, else
+        // re-tokenized text) — the two reconcile, no 3.5× gap.
+        .with_tokenizer(self.generator.tokenizer());
         let pool = match &self.cfg.api_key {
             Some(key) => pool.api_key(key.clone()),
             None => pool,
@@ -2092,6 +2097,63 @@ mod tests {
             let v = r.to_dict();
             assert_eq!(v["tokens_estimated"], true);
             assert_eq!(v["counting_method"], "mixed");
+        });
+    }
+
+    // ── H2: one counting method — the summary and the per-stream lines reconcile ──
+
+    #[test]
+    fn h2_summary_total_equals_sum_of_per_stream_counts() {
+        // H2: the Flat Out summary and the per-stream `stream complete`
+        // lines must use ONE counting method — the summary total equals
+        // the sum of the per-stream authoritative counts (the worker's
+        // line drives from the same `authoritative_count` core over the
+        // same text), so the two reconcile exactly (no 3.5× gap).
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(100_000_000);
+            let t1 = MonotonicInstant::now();
+            let ts = ts_at(t0);
+            // Stream 0: no usage → the text (8 chars → chars/4 = 2).
+            let s0 = vec![content_frame_text("abcdefgh", t1, ts)];
+            // Stream 1: no usage → the text (4 chars → chars/4 = 1).
+            let s1 = vec![content_frame_text("abcd", t1, ts)];
+            // Stream 2: usage present → the server's figure (42).
+            let s2 = vec![
+                content_frame_text("abcd", t1, ts),
+                StreamEvent::Frame {
+                    frame: ParsedFrame {
+                        chunk: Chunk::Usage(Usage {
+                            prompt_tokens: 15,
+                            completion_tokens: 42,
+                        }),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: t1,
+                    timestamps: ts,
+                },
+            ];
+            let per_stream = vec![s0, s1, s2];
+            let r =
+                FlatOutResult::from_events(&per_stream, 10.0, None, StreamCountSource::Default);
+            // The per-stream counts the worker's completion line computes
+            // (the same core, the same text source as `stream_text`).
+            let mut sum = 0u64;
+            for events in &per_stream {
+                let (n, _) = crate::client::stream::authoritative_count(
+                    stream_usage(events),
+                    &crate::client::stream::stream_text(events),
+                    None,
+                );
+                sum += n;
+            }
+            assert_eq!(
+                r.total_tokens, sum,
+                "Σ(per-stream counts) must equal the summary total"
+            );
+            assert_eq!(r.total_tokens, 45, "2 (chars/4) + 1 (chars/4) + 42 (usage)");
         });
     }
 
