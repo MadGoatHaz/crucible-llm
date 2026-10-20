@@ -1162,14 +1162,10 @@ impl App {
         );
         let (tx, rx) = std::sync::mpsc::channel();
         self.log_rx = Some(rx);
-        self.logger.info(
-            Context::Sequence,
-            format!(
-                "run started — {} engine(s): {}",
-                cfg.engines.count(),
-                cfg.engines.iter_labels().collect::<Vec<_>>().join(" → ")
-            ),
-        );
+        // S1: the single run-start line is the sequence's own
+        // `sequence started — N engine(s): …` (sequence.rs — it fires after
+        // the per-run slot reset). The duplicate `run started` that used to
+        // be logged here (~0 ms earlier, same fact) is gone.
         let seq = BenchmarkSequence::new(
             cfg,
             self.metrics.clone(),
