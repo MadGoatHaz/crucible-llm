@@ -450,9 +450,11 @@ impl FlatOutResult {
     /// prefixed with `≈` and annotated `(est., <method>)`, so the number
     /// is never read as a precise measurement.
     ///
-    /// The per-stream figure is shown in both labeled views (CF-04):
-    /// `t/s per stream` (÷ requested — the user-experience view) and
-    /// `t/s per completed stream` (÷ completed — the capacity view).
+    /// P1/N15: the per-stream figure is shown in **both** labeled views
+    /// (CF-04: `t/s per requested stream` — the user-experience view —
+    /// and `t/s per completed stream` — the capacity view) only when
+    /// they *differ* (some streams failed). A clean run prints the one
+    /// figure once — no duplicate number, no opaque `(requested)`.
     /// A run where more than a fifth of the requested streams produced
     /// no tokens (above [`FAILED_STREAM_RATIO_FLAG`]) carries a `⚠`
     /// failure-ratio flag.
@@ -482,13 +484,54 @@ impl FlatOutResult {
             String::new()
         };
         format!(
-            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {req:.1} t/s per stream · {comp:.1} t/s per completed stream{fail_note} · {tok} tok in {d:.0}s",
+            "{agg_prefix}{agg:.1} t/s aggregate ({n} streams){est_note} · {per_stream}{fail_note} · {tok} tok in {d:.0}s",
             agg = self.aggregate_tps,
             n = self.stream_count,
-            req = self.tps_per_requested_stream,
-            comp = self.tps_per_completed_stream,
+            per_stream = Self::per_stream_figure(self),
             tok = self.total_tokens,
             d = self.duration_secs
+        )
+    }
+
+    /// P1/N15: the per-stream part of a Flat Out line. When no stream
+    /// failed, the requested and completed views are the *same number* —
+    /// one figure, labeled `per stream`. When some failed, both views
+    /// are printed (they differ — the CF-04 distinction is meaningful),
+    /// each labeled with its denominator.
+    #[must_use]
+    pub fn per_stream_figure(r: &FlatOutResult) -> String {
+        if r.failed_stream_ratio == 0.0 {
+            format!("{:.1} t/s per stream", r.tps_per_requested_stream)
+        } else {
+            format!(
+                "{:.1} t/s per requested stream · {:.1} t/s per completed stream",
+                r.tps_per_requested_stream, r.tps_per_completed_stream
+            )
+        }
+    }
+
+    /// The one-line completion summary logged when the window closes
+    /// (same P1/N15 dedup as [`summary_line`]: one per-stream figure on
+    /// a clean run, both labeled views when streams failed).
+    #[must_use]
+    pub fn complete_line(n: usize, r: &FlatOutResult) -> String {
+        // CF-07: never log the headline as precise when it is an
+        // estimate (the default — the window aborts each stream before
+        // its terminal `usage` frame arrives).
+        let est_note = if r.tokens_estimated {
+            format!(" [token count estimated: {}]", r.counting_method)
+        } else {
+            String::new()
+        };
+        format!(
+            "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {} (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
+            r.total_tokens,
+            r.duration_secs,
+            r.aggregate_tps,
+            Self::per_stream_figure(r),
+            r.ttft_avg_ms,
+            r.itl_p50_ms,
+            r.itl_p99_ms
         )
     }
 
@@ -936,7 +979,15 @@ impl FlatOutEngine {
         // per-stream `stream complete` lines count with the SAME
         // authoritative method as this summary (usage first, else
         // re-tokenized text) — the two reconcile, no 3.5× gap.
-        .with_tokenizer(self.generator.tokenizer());
+        .with_tokenizer(self.generator.tokenizer())
+        // N11: a failed F stream logs `[ERROR] [ENGINE_F]` (engine
+        // attribution), not the old `[ERROR] [ERROR]` double tag.
+        .context(Context::EngineF)
+        // P2/N14: Flat Out *deliberately* aborts every stream at the
+        // 60 s window (EOF without `[DONE]`) — the completion line says
+        // `(60s window close)`, not the fault-reading
+        // `(premature close)`.
+        .close_note(Some("60s window close".to_string()));
         let pool = match &self.cfg.api_key {
             Some(key) => pool.api_key(key.clone()),
             None => pool,
@@ -1045,28 +1096,7 @@ impl FlatOutEngine {
             });
         }
         if let Some(l) = &self.logger {
-            // CF-07: never log the headline as precise when it is an
-            // estimate (the default — the window aborts each stream before
-            // its terminal `usage` frame arrives).
-            let est_note = if result.tokens_estimated {
-                format!(" [token count estimated: {}]", result.counting_method)
-            } else {
-                String::new()
-            };
-            l.info(
-                Context::EngineF,
-                format!(
-                    "Flat Out: {n} streams, {} tok in {:.1}s — {:.1} t/s aggregate, {:.1} t/s per stream (requested), {:.1} t/s per completed stream (TTFT avg {:.0} ms, ITL p50 {:.1} / p99 {:.1} ms){est_note}",
-                    result.total_tokens,
-                    result.duration_secs,
-                    result.aggregate_tps,
-                    result.tps_per_requested_stream,
-                    result.tps_per_completed_stream,
-                    result.ttft_avg_ms,
-                    result.itl_p50_ms,
-                    result.itl_p99_ms
-                ),
-            );
+            l.info(Context::EngineF, FlatOutResult::complete_line(n, &result));
             // CF-04: a level where more than a fifth of the requested
             // streams produced no tokens is flagged, not silently
             // averaged.
@@ -1903,12 +1933,81 @@ mod tests {
         };
         let line = r.summary_line();
         assert!(line.contains("285.4 t/s aggregate (8 streams)"), "{line}");
+        // P1/N15: a clean run (no failed streams) prints the one
+        // per-stream figure once — the duplicate `per completed stream`
+        // and the opaque `(requested)` are gone.
         assert!(line.contains("35.7 t/s per stream"), "{line}");
-        // CF-04: the capacity view is labeled separately.
-        assert!(line.contains("35.7 t/s per completed stream"), "{line}");
+        assert!(!line.contains("per completed stream"), "{line}");
+        assert!(!line.contains("(requested)"), "{line}");
         assert!(line.contains("17124 tok in 60s"), "{line}");
         // No failure flag when nothing failed.
         assert!(!line.contains("of streams failed"), "{line}");
+    }
+
+    #[test]
+    fn summary_line_shows_both_views_when_streams_fail() {
+        // P1/N15: when streams failed, the requested and completed
+        // views *differ* — both are printed, each labeled with its
+        // denominator (the CF-04 distinction is meaningful then).
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let s0 = vec![content_frame_text("abcd", t0, ts)]; // 1 token
+        let s1 = vec![content_frame_text("efgh", t0, ts)]; // 1 token
+        let s2 = vec![failed_stream(t0, 400)]; // failed, no tokens
+        let r =
+            FlatOutResult::from_events(&[s0, s1, s2], 10.0, None, StreamCountSource::Default);
+        let line = r.summary_line();
+        assert!(line.contains("per requested stream"), "{line}");
+        assert!(line.contains("per completed stream"), "{line}");
+    }
+
+    #[test]
+    fn complete_line_dedups_on_a_clean_run() {
+        // P1/N15: a clean run logs one per-stream figure — no
+        // duplicate, no opaque `(requested)`.
+        let r = FlatOutResult {
+            stream_count: 8,
+            stream_count_source: StreamCountSource::ConcurrencySweetSpot,
+            total_tokens: 17_124,
+            duration_secs: 60.0,
+            aggregate_tps: 285.4,
+            per_stream_tps: 35.7,
+            tps_per_completed_stream: 35.7,
+            tps_per_requested_stream: 35.7,
+            failed_stream_ratio: 0.0,
+            config_error: None,
+            max_tokens_used: MAX_TOKENS,
+            ttft_avg_ms: 312.5,
+            itl_p50_ms: 28.3,
+            itl_p99_ms: 65.1,
+            tokens_estimated: false,
+            counting_method: "usage".into(),
+        };
+        let line = FlatOutResult::complete_line(8, &r);
+        assert!(line.contains("35.7 t/s per stream"), "{line}");
+        assert!(!line.contains("per completed stream"), "{line}");
+        assert!(!line.contains("(requested)"), "{line}");
+        assert!(line.contains("17124 tok in 60.0s"), "{line}");
+        assert!(line.contains("TTFT avg 312 ms"), "{line}");
+    }
+
+    #[test]
+    fn complete_line_keeps_both_views_on_failures() {
+        // P1/N15: with failed streams, both labeled views are printed.
+        let t0 = MonotonicInstant::now();
+        let ts = ts_at(t0);
+        let r = FlatOutResult::from_events(
+            &[
+                vec![content_frame_text("abcd", t0, ts)],
+                vec![failed_stream(t0, 400)],
+            ],
+            10.0,
+            None,
+            StreamCountSource::Default,
+        );
+        let line = FlatOutResult::complete_line(2, &r);
+        assert!(line.contains("per requested stream"), "{line}");
+        assert!(line.contains("per completed stream"), "{line}");
     }
 
     #[test]

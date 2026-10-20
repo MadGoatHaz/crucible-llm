@@ -37,7 +37,7 @@ use futures_util::future::join_all;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::log::RunLogger;
+use crate::log::{Context, RunLogger};
 use crate::prompt::Tokenizer;
 use crate::sse::{ParsedFrame, Usage};
 use crate::timing::{MonotonicInstant, StreamTimestamps};
@@ -191,6 +191,14 @@ pub struct WorkerPool {
     /// sweep re-counts a stream's text with it so the token count is
     /// authoritative instead of a silent `chars/4` estimate.
     tokenizer: Option<Arc<Tokenizer>>,
+    /// N11: the engine's log context the workers' failure lines carry
+    /// (Engine F sets `Context::EngineF`; the default `Context::Sse`
+    /// stands when the pool's engine is unknown).
+    context: Context,
+    /// P2/N14: the label the workers give a *deliberate* early close
+    /// (Engine F: `Some("60s window close")` — the 60 s window abort is
+    /// the designed stop, not a fault; `None` keeps `premature close`).
+    close_note: Option<String>,
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -206,6 +214,8 @@ impl std::fmt::Debug for WorkerPool {
             .field("worker_timeout", &self.worker_timeout)
             .field("ignore_eos", &self.ignore_eos)
             .field("tokenizer", &self.tokenizer.is_some())
+            .field("context", &self.context)
+            .field("close_note", &self.close_note)
             .finish()
     }
 }
@@ -236,6 +246,8 @@ impl WorkerPool {
             worker_timeout: None,
             ignore_eos: false,
             tokenizer: None,
+            context: Context::Sse,
+            close_note: None,
         }
     }
 
@@ -328,6 +340,21 @@ impl WorkerPool {
         self.tokenizer.as_ref()
     }
 
+    /// N11 — the engine's log context the workers' failure lines carry
+    /// (the worker's `finish_failed` uses it instead of `Context::Error`).
+    pub fn context(mut self, ctx: Context) -> Self {
+        self.context = ctx;
+        self
+    }
+
+    /// P2/N14 — the label the workers give a deliberate early close
+    /// (Engine F's 60 s window): `None` keeps the generic
+    /// `(premature close)`.
+    pub fn close_note(mut self, note: Option<String>) -> Self {
+        self.close_note = note;
+        self
+    }
+
     /// The pool's target endpoint.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -375,7 +402,11 @@ impl WorkerPool {
         // first, else re-tokenized text) — the two reconcile. (Before
         // this, the field existed but never propagated: the summary and
         // the per-stream line used different methods on the same stream.)
-        .tokenizer(self.tokenizer.clone());
+        .tokenizer(self.tokenizer.clone())
+        // N11 + P2/N14: the engine attribution and the deliberate-close
+        // label reach every worker the same way.
+        .context(self.context)
+        .close_note(self.close_note.clone());
         if self.ignore_eos {
             worker = worker.ignore_eos(true);
         }

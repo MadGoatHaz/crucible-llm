@@ -419,6 +419,20 @@ pub struct StreamWorker {
     /// `≈`). Without it, a configured `--tokenizer` made the summary and
     /// the per-stream line read different numbers on the same stream.
     tokenizer: Option<Arc<Tokenizer>>,
+    /// N11 — the `[CONTEXT]` a *failure* line carries (the worker's
+    /// engine): `finish_failed` logs `Level::Error` with **this**
+    /// context instead of `Context::Error` — the old `[ERROR] [ERROR]`
+    /// double tag lost the engine attribution. `Context::Sse` (the
+    /// worker's own subsystem) stands when the engine is unknown; the
+    /// message's tag (`C2:…` / `B5-3` / …) disambiguates.
+    context: Context,
+    /// P2/N14 — an optional label for a *deliberate* early close,
+    /// overriding the generic `(premature close)` tag on the
+    /// completion line. Engine F sets `"60s window close"`: Flat Out
+    /// aborts every stream at the 60-second window (an EOF without
+    /// `[DONE]` is the designed stop, not a fault). A genuine
+    /// mid-stream drop (no note) still reads `(premature close)`.
+    close_note: Option<String>,
 }
 
 impl StreamWorker {
@@ -447,6 +461,8 @@ impl StreamWorker {
             logger: None,
             tag: "stream".to_string(),
             tokenizer: None,
+            context: Context::Sse,
+            close_note: None,
         }
     }
 
@@ -550,6 +566,23 @@ impl StreamWorker {
     /// `None` keeps the `chars/4` fallback, flagged `≈`).
     pub fn tokenizer(mut self, tokenizer: Option<Arc<Tokenizer>>) -> Self {
         self.tokenizer = tokenizer;
+        self
+    }
+
+    /// N11 — the engine's log context for this worker's failure lines
+    /// (`finish_failed` uses it instead of `Context::Error`, so a failed
+    /// stream reads `[ERROR] [ENGINE_C2] C2:… failed: …` — engine
+    /// attribution restored, the `[ERROR] [ERROR]` double tag gone).
+    pub fn context(mut self, ctx: Context) -> Self {
+        self.context = ctx;
+        self
+    }
+
+    /// P2/N14 — label a deliberate early close (e.g. Engine F's 60 s
+    /// window): the completion line prints `(<note>)` instead of the
+    /// fault-reading `(premature close)`.
+    pub fn close_note(mut self, note: Option<String>) -> Self {
+        self.close_note = note;
         self
     }
 
@@ -1103,7 +1136,17 @@ impl StreamWorker {
             None => "n/a".to_string(),
         };
         let est_note = if estimated { " (est, no usage)" } else { "" };
-        let tag = if premature { " (premature close)" } else { "" };
+        // P2/N14: a deliberate early close (Engine F's 60 s window)
+        // carries its own label; a genuine mid-stream drop keeps the
+        // generic fault marker.
+        let tag = if premature {
+            self.close_note
+                .as_deref()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_else(|| " (premature close)".to_string())
+        } else {
+            String::new()
+        };
         let msg = format!(
             "{} stream complete: {approx}{count} tokens{est_note} in {total_s:.1}s (decode {rate_str}; TTFB {ttfb_s:.1}s){tag}",
             self.tag
@@ -1425,6 +1468,12 @@ impl StreamWorker {
     }
 
     /// Emit the terminal `Failed` event and build the outcome.
+    ///
+    /// N11: the failure line carries the **worker's engine context**
+    /// ([`context`](Self::context) — `Context::Sse` when the engine is
+    /// unknown) with `Level::Error`, not `Context::Error`: the old
+    /// `[ERROR] [ERROR]` double tag lost the engine attribution (the
+    /// message's tag — `C2:…`, `F-1`, … — already disambiguates).
     async fn finish_failed(
         &self,
         tx: &mut mpsc::Sender<StreamEvent>,
@@ -1435,7 +1484,7 @@ impl StreamWorker {
     ) -> StreamOutcome {
         self.logl(
             Level::Error,
-            Context::Error,
+            self.context,
             &format!("{} failed: {error}", self.tag),
         );
         let event = StreamEvent::Failed {
@@ -2429,6 +2478,140 @@ mod tests {
             authoritative_tokens(&events, Some(usage), None),
             "usage counts must agree"
         );
+    }
+
+    // ── P2/N14: a deliberate early close carries its own label ─────────
+
+    #[test]
+    fn stream_end_premature_uses_the_close_note() {
+        // P2/N14: a *deliberate* early close (Engine F's 60 s window —
+        // EOF without `[DONE]` is the designed stop) is labeled as such,
+        // not the fault-reading `(premature close)`; a genuine
+        // mid-stream drop (no note) keeps the old marker.
+        let dir =
+            std::env::temp_dir().join(format!("crucible-close-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let noted = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("F-1")
+        .close_note(Some("60s window close".to_string()));
+        let bare = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("B1-1");
+
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(100_000_000);
+            let t3 = MonotonicInstant::now(); // 100 ms
+            mock.increment(100_000_000);
+            let last = MonotonicInstant::now(); // 200 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: None,
+                t2: None,
+                t3: Some(t3),
+                t_end: Some(last),
+            };
+            let usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 256,
+            });
+            noted.log_stream_end(&ts, usage, Some(last), true, "x");
+            bare.log_stream_end(&ts, usage, Some(last), true, "x");
+        });
+        logger.finish();
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        assert!(
+            latest.contains("F-1 stream complete: 256 tokens in 0.2s (decode 2560.0 t/s; TTFB 0.1s) (60s window close)"),
+            "the deliberate close carries its own label: {latest}"
+        );
+        assert!(
+            latest.contains("B1-1 stream complete: 256 tokens in 0.2s (decode 2560.0 t/s; TTFB 0.1s) (premature close)"),
+            "a genuine drop keeps the fault marker: {latest}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── N11: a worker failure carries the engine's context ─────────────
+
+    #[tokio::test]
+    async fn finish_failed_uses_the_engine_context() {
+        // N11: a worker failure logs `Level::Error` with the **engine's**
+        // context — `[ERROR] [ENGINE_C2] C2:… failed: …` — restoring
+        // engine attribution; the old `[ERROR] [ERROR]` double tag is
+        // gone. A worker with no engine set keeps `Context::Sse`.
+        let dir = std::env::temp_dir().join(format!("crucible-fail-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let c2 = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("C2:math-mul")
+        .context(Context::EngineC2);
+        let sse = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("pool-0");
+
+        let (mut tx, _rx) = mpsc::channel(16);
+        c2.finish_failed(
+            &mut tx,
+            StreamTimestamps::default(),
+            StreamError::Connection("refused".into()),
+            false,
+            0,
+        )
+        .await;
+        drop(tx);
+        let (mut tx, _rx) = mpsc::channel(16);
+        sse.finish_failed(
+            &mut tx,
+            StreamTimestamps::default(),
+            StreamError::Read("reset".into()),
+            false,
+            0,
+        )
+        .await;
+        drop(tx);
+        logger.finish();
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        assert!(
+            latest.contains("[ERROR] [ENGINE_C2] C2:math-mul failed:"),
+            "the failure line carries the engine's context: {latest}"
+        );
+        assert!(
+            latest.contains("[ERROR] [SSE] pool-0 failed:"),
+            "no engine set → the worker's own subsystem: {latest}"
+        );
+        assert!(
+            !latest.contains("[ERROR] [ERROR]"),
+            "the double tag is gone: {latest}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // C3 (noise cleanup): the `token #1` milestone latches (a keep-alive /

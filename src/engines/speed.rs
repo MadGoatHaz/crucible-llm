@@ -509,7 +509,10 @@ impl SpeedEngine {
         .tag(tag_prefix)
         // H2: the worker's `stream complete` line counts with the same
         // authoritative method (and tokenizer) as this engine's result.
-        .tokenizer(self.generator.tokenizer());
+        .tokenizer(self.generator.tokenizer())
+        // N11: a failed A iteration logs `[ERROR] [ENGINE_A]`, not the
+        // old `[ERROR] [ERROR]` double tag.
+        .context(Context::EngineA);
         if let Some(key) = &self.cfg.api_key {
             worker = worker.api_key(key);
         }

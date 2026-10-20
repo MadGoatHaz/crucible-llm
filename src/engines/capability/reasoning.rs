@@ -444,7 +444,10 @@ impl ReasoningEngine {
         .tag(format!("C2:{}", challenge.id))
         // H2: the worker's `stream complete` line counts with the same
         // authoritative method (and tokenizer) as this engine's result.
-        .tokenizer(self.tokenizer.clone());
+        .tokenizer(self.tokenizer.clone())
+        // N11: a failed C2 stream logs `[ERROR] [ENGINE_C2]`, not the
+        // old `[ERROR] [ERROR]` double tag.
+        .context(crate::log::Context::EngineC2);
         if let Some(key) = &self.api_key {
             worker = worker.api_key(key);
         }
