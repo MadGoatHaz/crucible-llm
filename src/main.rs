@@ -30,7 +30,7 @@ use crucible_llm::config::{Config, ConfigError, DEFAULT_MODEL};
 use crucible_llm::hw::{
     detect_gpu, gpu_display_name, CpuPowerBackend, GpuBackend, HwPoller, HW_POLL_INTERVAL_MS,
 };
-use crucible_llm::log::{Context, RunLogger};
+use crucible_llm::log::{hw_detail_line, log_hw_detail, Context, RunLogger};
 // CF-42: the headless orchestration is a public lib function — `main` is a
 // thin caller.
 use crucible_llm::run_headless;
@@ -275,6 +275,22 @@ fn run_tui(
             .expect("failed to build tokio runtime");
         runtime.block_on(async {
             let mut event_loop = EventLoop::new()?;
+            // P3/N3: the `[HW]` detail line (vLLM version + GPU driver +
+            // CUDA). The driver/CUDA are captured now (sync NVML) *before*
+            // `gpu` is moved into the App below. With a real (explicit)
+            // target the vLLM version is probed live (best-effort); with the
+            // Setup takeover (placeholder URL) only the driver/CUDA are
+            // logged — probing a placeholder would stall the first render for
+            // its timeout.
+            let (driver, cuda) = gpu
+                .as_ref()
+                .map(|g| g.driver_and_cuda_versions())
+                .unwrap_or((None, None));
+            if cfg.target_explicit {
+                log_hw_detail(&logger, &cfg.url, driver.as_deref(), cuda.as_deref()).await;
+            } else if let Some(line) = hw_detail_line(None, driver.as_deref(), cuda.as_deref()) {
+                logger.info(Context::Setup, line);
+            }
             // Chunk 18: the App is seeded with the full resolved config —
             // the editable Configuration form (View 6) and the engine
             // selection all draw from the same `Config` the headless and

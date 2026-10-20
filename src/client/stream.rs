@@ -1045,18 +1045,29 @@ impl StreamWorker {
                 .t0
                 .map(|t0| t0.delta_nanos(&now) as f64 / 1e9)
                 .unwrap_or(0.0);
-            let rate = ts
-                .t3
-                .map(|t3| {
-                    let span = t3.delta_nanos(&now).max(1) as f64 / 1e9;
-                    tokens as f64 / span
-                })
-                .unwrap_or(0.0);
+            // M1/H5 (every-50 milestone phantom): a decode window below the
+            // `MIN_MEASURABLE_WINDOW_SECS` floor (a 1–2-token burst committed
+            // in one MTP / speculative batch — the span is sub-millisecond)
+            // is not a measurable rate. The old `.max(1)` ns clamp turned it
+            // into a 7–9 digit phantom (`50 / 1e-9`); now it reads `n/a`
+            // (the CF-25 N/A convention), consistent with the `stream
+            // complete` line's `decode n/a`.
+            let rate_str = match ts.t3 {
+                Some(t3) => {
+                    let span = t3.delta_nanos(&now) as f64 / 1e9;
+                    if span >= MIN_MEASURABLE_WINDOW_SECS {
+                        format!("{:.1} t/s", tokens as f64 / span)
+                    } else {
+                        "n/a".to_string()
+                    }
+                }
+                None => "n/a".to_string(),
+            };
             self.logl(
                 Level::Info,
                 Context::Sse,
                 &format!(
-                    "{} token #{tokens} received (elapsed: {elapsed_s:.1}s, rate: {rate:.1} t/s)",
+                    "{} token #{tokens} received (elapsed: {elapsed_s:.1}s, rate: {rate_str})",
                     self.tag
                 ),
             );
@@ -2737,6 +2748,53 @@ mod tests {
         assert_eq!(latest.matches("token #50 received").count(), 1, "{latest}");
         assert_eq!(latest.matches("token #100 received").count(), 1, "{latest}");
         assert_eq!(latest.matches("token #150 received").count(), 1, "{latest}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // M1/H5 (every-50 milestone phantom): a sub-10 ms decode window (a
+    // 1–2-token burst committed in one MTP / speculative batch) is not a
+    // measurable rate — the milestone reads `rate: n/a` (never a 7–9 digit
+    // phantom from the old `.max(1)` ns clamp).
+    #[test]
+    fn token_milestones_sub_floor_burst_is_na() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-miles-na-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let logger = RunLogger::start(Some(&dir));
+        let w = StreamWorker::new(
+            reqwest::Client::new(),
+            "http://localhost:8000",
+            "m",
+            "p",
+            10,
+        )
+        .logger(logger.clone())
+        .tag("test");
+
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now(); // 0 ms
+            mock.increment(10_000_000);
+            let t3 = MonotonicInstant::now(); // 10 ms (first token)
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: None,
+                t2: None,
+                t3: Some(t3),
+                t_end: None,
+            };
+            let mut first_logged = false;
+            let mut last_logged_50 = 0u64;
+            // The #50 milestone fires with a 2 ms window (t3 → now) — below
+            // the 10 ms floor → `rate: n/a`.
+            mock.increment(2_000_000);
+            w.log_token_milestones(&ts, 50, &mut first_logged, &mut last_logged_50);
+        });
+        logger.finish();
+        let latest = std::fs::read_to_string(dir.join("latest.log")).unwrap();
+        // The sub-floor burst reads `n/a`, never a phantom `t/s` figure.
+        assert!(latest.contains("rate: n/a"), "{latest}");
+        assert!(!latest.contains("t/s"), "{latest}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

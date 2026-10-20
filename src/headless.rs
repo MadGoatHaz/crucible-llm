@@ -45,7 +45,7 @@ use crate::hw::{
     arm_power_monitor, CpuPowerBackend, GpuBackend, HwPoller, IDLE_WINDOW_SECS,
     HW_POLL_INTERVAL_MS,
 };
-use crate::log::{read_log_file, Context, RunLogger};
+use crate::log::{log_hw_detail, read_log_file, Context, RunLogger};
 use crate::report::MatrixReport;
 use crate::storage::export::{self, ExportPayload, PacketSample};
 use crate::storage::{
@@ -252,6 +252,14 @@ pub fn run_headless(
     // `gpu` is moved into the poller below (the trait `poll_all`; NVML
     // overrides per-device).
     let gpu_count = gpu.as_ref().map(|g| g.poll_all().len() as u32).unwrap_or(0);
+    // P3/N3: capture the GPU driver + CUDA versions (sync NVML) *before*
+    // `gpu` is moved into the poller below. The `[HW]` detail line (vLLM
+    // version + these) is logged from the async block once the runtime is up.
+    // Best-effort: a non-NVIDIA GPU yields `(None, None)` (omitted).
+    let (hw_driver, hw_cuda) = gpu
+        .as_ref()
+        .map(|g| g.driver_and_cuda_versions())
+        .unwrap_or((None, None));
     // CF-40: the 100 ms hardware sampler runs for the whole headless run
     // **only when the hardware telemetry is enabled** (`--no-hardware` off,
     // or a selection that omits D). It runs on a **dedicated OS thread** —
@@ -305,6 +313,13 @@ pub fn run_headless(
         // `wall Ns` excludes the no-load window — headless and TUI report
         // the same wall for the same run.
         let run_started = std::time::Instant::now();
+
+        // P3/N3: the `[HW]` detail line — vLLM server version (live probe,
+        // best-effort: a dead / versionless server omits it) + the GPU
+        // driver/CUDA captured above. Headless always has a real target, so
+        // the probe runs unconditionally; it is logged after the idle
+        // baseline anchor (N22) so the run wall clock is unaffected.
+        log_hw_detail(&logger, &cfg.url, hw_driver.as_deref(), hw_cuda.as_deref()).await;
 
         // Engine A (speed) — gated on the selection (R1). `--engine niah`
         // runs *only* C1; a selection that omits `speed` skips Engine A

@@ -94,6 +94,29 @@ impl NvmlBackend {
     pub fn device_count(&self) -> u32 {
         self.count
     }
+
+    /// P3/N3: the NVIDIA driver version (`nvmlSystemGetDriverVersion`),
+    /// e.g. `"550.54.05"`. `None` when the driver refuses the query (the
+    /// N/A rule — the `[HW]` detail line omits it, never fabricates).
+    pub fn driver_version(&self) -> Option<String> {
+        self.nvml.sys_driver_version().ok()
+    }
+
+    /// P3/N3: the CUDA driver version (`nvmlSystemGetCudaDriverVersion`),
+    /// formatted `major.minor` (e.g. `12040` → `"12.4"`). `None` when the
+    /// driver refuses the query (the N/A rule).
+    pub fn cuda_version(&self) -> Option<String> {
+        self.nvml
+            .sys_cuda_driver_version()
+            .ok()
+            .map(|v| {
+                format!(
+                    "{}.{}",
+                    nvml_wrapper::cuda_driver_version_major(v),
+                    nvml_wrapper::cuda_driver_version_minor(v)
+                )
+            })
+    }
 }
 
 impl GpuBackend for NvmlBackend {
@@ -200,6 +223,13 @@ impl GpuBackend for NvmlBackend {
     /// the 100 ms energy math and the Live panel consume.
     fn poll(&self) -> GpuSample {
         GpuSample::aggregate(&self.poll_all())
+    }
+
+    /// P3/N3: the GPU driver + CUDA versions for the `[HW]` detail line.
+    /// NVML is the only backend that can provide them (the trait default
+    /// returns `(None, None)` for AMD / Intel).
+    fn driver_and_cuda_versions(&self) -> (Option<String>, Option<String>) {
+        (self.driver_version(), self.cuda_version())
     }
 }
 

@@ -18,7 +18,7 @@ pub mod pool;
 pub mod stream;
 
 pub use loop_guard::{LoopGuard, LOOP_BUFFER, LOOP_REPETITIONS, LOOP_WINDOW};
-pub use models::{list_models, normalize_base_url, ModelError, ModelInfo};
+pub use models::{list_models, normalize_base_url, server_version, ModelError, ModelInfo};
 pub use stream::{
     authoritative_tokens, join_worker, normalize_endpoint, run_worker, spawn_worker, stream_text,
     token_window, StreamError, StreamEvent, StreamOutcome, StreamWorker, DEFAULT_READ_TIMEOUT,

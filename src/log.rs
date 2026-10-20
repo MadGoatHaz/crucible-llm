@@ -486,11 +486,16 @@ fn write_line(
 /// break the `[ts] [LEVEL] [CTX] msg` line contract). Pure: no I/O.
 #[must_use]
 pub fn config_block_line(cfg: &Config) -> String {
+    // P4: `mode={label}` alone hides what the mode means; add the legend
+    // (`Mode::description()`) so a shared log states its own prompt
+    // contract (the `--json` contract is unaffected — the label is still
+    // `short` / `long`).
     format!(
-        "[CONFIG] url={} model={} mode={} tokens={} iterations={} timeout={}s nocache={} ladder=[{}] niah={} engines=[{}] hardware={}",
+        "[CONFIG] url={} model={} mode={} ({}) tokens={} iterations={} timeout={}s nocache={} ladder=[{}] niah={} engines=[{}] hardware={}",
         cfg.url,
         cfg.model,
         cfg.mode.label(),
+        cfg.mode.description(),
         cfg.tokens,
         cfg.iterations,
         cfg.timeout,
@@ -648,6 +653,26 @@ pub fn hw_detail_line(
         parts.push(format!("CUDA {v}"));
     }
     (!parts.is_empty()).then(|| format!("[HW] {}", parts.join(", ")))
+}
+
+/// P3/N3: compose and log the `[HW]` detail line (vLLM server version +
+/// GPU driver + CUDA version). **Best-effort** — any unavailable value is
+/// omitted (never fabricated): the vLLM version is a live `GET /version`
+/// probe (a dead / slow / versionless server → `None` → omitted), and the
+/// driver/CUDA are pre-captured by the caller from the NVML backend
+/// (a non-NVIDIA GPU → `None` → omitted). Logs **nothing** when all three
+/// are unavailable. Runs on the caller's async runtime; the probe uses a
+/// short timeout so a blackholed server cannot stall the TUI.
+pub async fn log_hw_detail(
+    logger: &RunLogger,
+    base_url: &str,
+    driver_version: Option<&str>,
+    cuda_version: Option<&str>,
+) {
+    let vllm = crate::client::models::server_version(base_url).await;
+    if let Some(line) = hw_detail_line(vllm.as_deref(), driver_version, cuda_version) {
+        logger.info(Context::Setup, line);
+    }
 }
 
 /// Format one log line: `[HH:MM:SS.mmm] [LEVEL] [CONTEXT] message`.
@@ -1024,15 +1049,24 @@ mod tests {
         assert!(line.starts_with("[CONFIG] "), "{line}");
         assert!(line.contains("url=http://192.168.1.10:8000"), "{line}");
         assert!(line.contains("model=qwen3.8-27b"), "{line}");
-        assert!(line.contains("mode=long"), "{line}");
+        // P4: the mode now carries its legend (short = fixed ≈50-token
+        // prompt; long = padded to --tokens) so a shared log is
+        // self-describing.
+        assert!(
+            line.contains("mode=long (prompt padded to --tokens)"),
+            "{line}"
+        );
         assert!(line.contains("tokens=32000"), "{line}");
         assert!(line.contains("iterations=6"), "{line}");
         assert!(line.contains("timeout=120s"), "{line}");
         assert!(line.contains("nocache=true"), "{line}");
         assert!(line.contains("ladder=[1,2,4,8]"), "{line}");
         assert!(line.contains("niah=[2k,4k,8k] × [0,50,100]"), "{line}");
+        // N18: Engine D uses the same name as its `✓` headline / started
+        // line (`D: Energy`), so the `[CONFIG]` list no longer shows two
+        // names for the same engine (`D (hardware)` is gone).
         assert!(line.contains(
-            "engines=[A (speed),B (concurrency),C1 (niah),C2 (reasoning),C3 (structured),D (hardware),F (flat out)]"
+            "engines=[A (speed),B (concurrency),C1 (niah),C2 (reasoning),C3 (structured),D: Energy,F (flat out)]"
         ),
             "{line}"
         );

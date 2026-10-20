@@ -1303,12 +1303,9 @@ impl StructuredEngine {
             // estimate is never hidden behind an exact number.
             counting_method: constrained_counting.max(free_counting),
         };
-        if let Some(l) = &self.logger {
-            l.info(
-                crate::log::Context::EngineC3,
-                format!("Engine C3 complete — {}", result.summary_line()),
-            );
-        }
+        // N12: the per-engine `complete` line is dropped — the sequence's
+        // `✓` headline (and the DIGEST) already carry `summary_line()`, so
+        // logging it here a ~1 ms earlier was a verbatim duplicate.
         result
     }
 }

@@ -33,6 +33,13 @@ const V1_SUFFIX: &str = "/v1";
 /// so a server that cannot answer within this window is stuck.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// P3/N3: a shorter timeout for the `/version` probe. It runs on the TUI's
+/// startup path (a `current_thread` runtime), so a blackholed server must
+/// not stall the UI for the full discovery window — `3s` bounds the worst
+/// case while an up server answers in well under it (the endpoint is an
+/// in-memory lookup).
+const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// One entry of an OpenAI-compatible `/v1/models` response
 /// (`data[i]`). All fields except `id` degrade to `None`/empty when the
 /// server omits them.
@@ -151,6 +158,64 @@ pub async fn list_models(
         .await
         .map_err(|e| ModelError::Connection(e.to_string()))?;
     handle_models_response(status, &body)
+}
+
+/// P3/N3: the vLLM **server version** for the `[HW]` detail line.
+///
+/// vLLM (and most OpenAI-compatible servers) expose a lightweight
+/// `GET /version` endpoint at the API **root** (not under `/v1`) that
+/// returns `{"version": "0.6.2"}`. This is a **best-effort** probe: any
+/// failure (endpoint missing, non-2xx, non-JSON, timeout, dead server)
+/// yields `None` — the caller omits the value, never fabricates one. A
+/// short [`VERSION_TIMEOUT`] keeps a blackholed server from stalling the
+/// TUI startup path.
+pub async fn server_version(base_url: &str) -> Option<String> {
+    let base = normalize_base_url(base_url); // e.g. `http://host:8000/v1`
+    let root = base.trim_end_matches("/v1"); // e.g. `http://host:8000`
+    // Try the root `/version` first (vLLM's actual location), then the
+    // `/v1/version` a few servers use. The first success wins.
+    let candidates = [format!("{root}/version"), format!("{base}/version")];
+
+    let client = reqwest::Client::builder()
+        .timeout(VERSION_TIMEOUT)
+        .build()
+        .ok()?;
+
+    for url in candidates {
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => continue, // connection refused / timeout → next candidate
+        };
+        if !resp.status().is_success() {
+            continue; // 404 (no /version route) → next candidate
+        }
+        let body = match resp.text().await.ok() {
+            Some(b) => b,
+            None => continue,
+        };
+        if let Some(v) = parse_version_body(&body) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Parse a `/version` response body. Accepts the vLLM shape
+/// (`{"version": "x.y.z"}`) and a bare JSON string (`"x.y.z"`). Any other
+/// shape → `None` (best-effort: omit, never fabricate).
+fn parse_version_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    // Bare JSON string: `"0.6.2"`.
+    if let Ok(s) = serde_json::from_str::<String>(trimmed) {
+        return (!s.is_empty()).then_some(s);
+    }
+    // vLLM object: `{"version": "0.6.2"}` (extra fields ignored).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(s) = v.get("version").and_then(|x| x.as_str()) {
+            return (!s.is_empty()).then_some(s.to_string());
+        }
+    }
+    None
 }
 
 /// Pure response handling (unit-testable without a live server):
@@ -354,5 +419,50 @@ mod tests {
         .is_retriable());
         assert!(!ModelError::Timeout(Duration::from_secs(10)).is_retriable());
         assert!(!ModelError::InvalidJson("nope".into()).is_retriable());
+    }
+
+    // ── P3/N3: the /version probe ───────────────────────────────────────
+
+    #[test]
+    fn parse_version_body_vllm_object() {
+        assert_eq!(
+            parse_version_body(r#"{"version": "0.6.2"}"#),
+            Some("0.6.2".to_string())
+        );
+        // Extra fields are ignored.
+        assert_eq!(
+            parse_version_body(r#"{"version": "0.6.2", "other": 1}"#),
+            Some("0.6.2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_body_bare_string() {
+        assert_eq!(
+            parse_version_body(r#""0.6.2""#),
+            Some("0.6.2".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_body_rejects_unknown_shapes() {
+        assert_eq!(parse_version_body("not json"), None);
+        assert_eq!(parse_version_body(r#"{"no_version": "x"}"#), None);
+        assert_eq!(parse_version_body(r#"{"version": ""}"#), None);
+        assert_eq!(parse_version_body(r#"{"version": 5}"#), None);
+        assert_eq!(parse_version_body(r#""""#), None);
+    }
+
+    #[test]
+    fn server_version_connection_refused_is_none() {
+        // Port 1 on loopback is not listening: both `/version` candidates
+        // fail at connect → `None` (best-effort omit, never a fabricated
+        // version). No external network is touched.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(server_version("http://127.0.0.1:1")), None);
     }
 }

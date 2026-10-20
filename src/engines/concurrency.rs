@@ -810,14 +810,10 @@ impl Sweep {
         let levels = self
             .run_ladder(self.context_tokens, 1, self.ladder.len(), false)
             .await;
-        self.logi(
-            Context::EngineB,
-            format!(
-                "Engine B complete — {} level(s), {} degraded",
-                levels.len(),
-                levels.iter().filter(|l| l.degraded()).count()
-            ),
-        );
+        // N12: the per-engine `complete` line is dropped — the sequence's
+        // `✓` headline (and the DIGEST) already carry the level / degraded
+        // summary, so logging it here a ~1 ms earlier was a verbatim
+        // duplicate.
         SweepResult::from_levels(levels, None)
     }
 
@@ -990,15 +986,10 @@ impl Sweep {
                 });
             }
         }
-        self.logi(
-            Context::EngineB,
-            format!(
-                "Engine B matrix complete — {} cells ({} contexts × {} levels)",
-                total_cells,
-                contexts.len(),
-                self.ladder.len()
-            ),
-        );
+        // N12: the per-engine `complete` line is dropped — the sequence's
+        // `✓` headline (and the DIGEST) already carry the cell / matrix
+        // summary, so logging it here a ~1 ms earlier was a verbatim
+        // duplicate.
         SweepResult::from_levels(
             primary_levels,
             Some(ConcurrencyMatrix {

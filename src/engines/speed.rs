@@ -702,10 +702,18 @@ impl SpeedEngine {
         // The decode rate: `tokens_received / (T_last − T_first)`.
         // One formula, used for the per-stream detail, the labeled layer,
         // and the aggregate.
+        // H1b (live-gauge phantom): a token window below the
+        // `MIN_MEASURABLE_WINDOW_SECS` floor (a single MTP / speculative
+        // batch: `first ≈ last`, a sub-10 ms burst) is not a measurable
+        // rate — the `0.0` N/A sentinel stands (never a `10³–10⁴ t/s`
+        // live reading from a clamped sliver). Identical rule to the
+        // final-metric path and to `stream.rs`'s `decode rate` helper.
         let decode_rate = match (first_token_at, last_token_at) {
             (Some(first), Some(last)) => {
                 let span_s = first.delta_nanos(&last) as f64 / 1e9;
-                if span_s > 0.0 && tokens_received > 0 {
+                if span_s >= crate::client::stream::MIN_MEASURABLE_WINDOW_SECS
+                    && tokens_received > 0
+                {
                     tokens_received as f64 / span_s
                 } else {
                     0.0
@@ -2075,6 +2083,69 @@ mod tests {
             assert_ne!(snap.prefill_throughput, snap.decode_throughput);
             assert_ne!(snap.decode_throughput, snap.e2e_throughput);
             assert_eq!(snap.loop_excluded_streams, 0);
+        });
+    }
+
+    #[test]
+    fn single_stream_snapshot_sub_floor_burst_is_na() {
+        // H1b (live-gauge phantom): a decode window below the 10 ms floor
+        // (a single MTP / speculative batch: first ≈ last) is not a
+        // measurable rate — the `0.0` N/A sentinel stands (never a
+        // `10³–10⁴ t/s` live reading from a clamped sliver).
+        let (clock, mock) = quanta::Clock::mock();
+        quanta::with_clock(&clock, || {
+            let t0 = MonotonicInstant::now();
+            mock.increment(20_000_000);
+            let t3 = MonotonicInstant::now(); // 20 ms (first token)
+            // Ten content frames 1 ms apart (20..29 ms) — the first→last
+            // token window is 9 ms, below the 10 ms floor.
+            let frame_times: Vec<MonotonicInstant> = (0..10)
+                .map(|_| {
+                    let at = MonotonicInstant::now();
+                    mock.increment(1_000_000);
+                    at
+                })
+                .collect();
+            let t_end = MonotonicInstant::now(); // 30 ms
+            let ts = StreamTimestamps {
+                t0: Some(t0),
+                t1: Some(t0),
+                t2: Some(t0),
+                t3: Some(t3),
+                t_end: Some(t_end),
+            };
+            let usage = Usage {
+                prompt_tokens: 60,
+                completion_tokens: 10,
+            };
+            let events: Vec<StreamEvent> = frame_times
+                .iter()
+                .map(|at| StreamEvent::Frame {
+                    frame: crate::sse::ParsedFrame {
+                        chunk: Chunk::Content("a".into()),
+                        t_nanos: 0,
+                        done: false,
+                    },
+                    at: *at,
+                    timestamps: ts,
+                })
+                .chain(std::iter::once(StreamEvent::Complete {
+                    timestamps: ts,
+                    usage: Some(usage),
+                    premature: false,
+                    malformed_frames: 0,
+                    looping: false,
+                    loop_excluded_tokens: 0,
+                }))
+                .collect();
+            let snap =
+                SpeedEngine::single_stream_snapshot("http://x", "m", "short", &events, 256, None);
+            // The decode window is 9 ms (< 10 ms floor) → the N/A sentinel.
+            assert_eq!(
+                snap.decode_throughput, 0.0,
+                "{}",
+                snap.decode_throughput
+            );
         });
     }
 

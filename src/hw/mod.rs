@@ -234,6 +234,15 @@ pub trait GpuBackend: Send + Sync + std::fmt::Debug {
             .map(str::to_string)
             .unwrap_or_else(|| self.vendor().to_string())]
     }
+
+    /// P3/N3: the GPU driver + CUDA versions (best-effort, N/A rule) for
+    /// the `[HW]` detail line. Only the NVIDIA (NVML) backend can provide
+    /// these (it queries `nvmlSystemGetDriverVersion` /
+    /// `nvmlSystemGetCudaDriverVersion`); every other backend returns
+    /// `(None, None)` and the line omits them (never fabricated).
+    fn driver_and_cuda_versions(&self) -> (Option<String>, Option<String>) {
+        (None, None)
+    }
 }
 
 /// Auto-detect the best available GPU backend (NVIDIA → AMD → Intel).
