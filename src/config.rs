@@ -139,6 +139,18 @@ impl Mode {
             Mode::Long => "long",
         }
     }
+
+    /// P4: a human-readable legend so `mode=short` / `mode=long` are not
+    /// opaque in the log — a reader can tell what the mode means from the
+    /// `[CONFIG]` line alone (`short` = the fixed ~50-token prompt; `long` =
+    /// a prompt padded to `--tokens`).
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            Mode::Short => "≈50-token fixed prompt",
+            Mode::Long => "prompt padded to --tokens",
+        }
+    }
 }
 
 impl std::str::FromStr for Mode {
@@ -365,6 +377,10 @@ impl EngineSelection {
 
     /// The display labels of the enabled engines, in A/B/C1/C2/C3/D order
     /// (for logs and the headless "running selected engines" line).
+    ///
+    /// N18: Engine D uses the **same** name as its `✓` headline / started
+    /// line (`Engine::label` → `D: Energy`), so the log no longer shows two
+    /// names for the same engine (`D (hardware)` vs `D: Energy`).
     pub fn iter_labels(&self) -> impl Iterator<Item = &'static str> {
         [
             (self.speed, "A (speed)"),
@@ -372,7 +388,7 @@ impl EngineSelection {
             (self.niah, "C1 (niah)"),
             (self.reasoning, "C2 (reasoning)"),
             (self.structured, "C3 (structured)"),
-            (self.hardware, "D (hardware)"),
+            (self.hardware, "D: Energy"),
             (self.flatout, "F (flat out)"),
         ]
         .into_iter()
@@ -1642,6 +1658,38 @@ mod tests {
         let cli = cli_from(cli_args);
         let matches = matches_from(cli_args);
         layer(&cli, &matches, &[], None).unwrap()
+    }
+
+    // ── N18 / P4: engine labels + the mode legend ────────────────────────
+
+    #[test]
+    fn engine_d_uses_the_same_name_as_the_headline() {
+        // N18: with Engine D selected (and the rest off), the `[CONFIG]`
+        // engine list uses `D: Energy` (the same name as the `✓` headline /
+        // started line), not a second name (`D (hardware)`).
+        let sel = EngineSelection {
+            speed: false,
+            concurrency: false,
+            niah: false,
+            reasoning: false,
+            structured: false,
+            hardware: true,
+            flatout: false,
+        };
+        let labels: Vec<&str> = sel.iter_labels().collect();
+        assert_eq!(labels, vec!["D: Energy"]);
+        assert!(!labels.iter().any(|l| l.contains("hardware")), "{labels:?}");
+    }
+
+    #[test]
+    fn mode_description_legends_the_config_line() {
+        // P4: each mode carries a short legend so `mode=short` is not
+        // opaque in the log.
+        assert_eq!(Mode::Short.description(), "≈50-token fixed prompt");
+        assert_eq!(Mode::Long.description(), "prompt padded to --tokens");
+        // The CLI/JSON label is unchanged (the `--json` contract is intact).
+        assert_eq!(Mode::Short.label(), "short");
+        assert_eq!(Mode::Long.label(), "long");
     }
 
     // ── hardware / energy telemetry (CF-39) ──────────────────────────────
