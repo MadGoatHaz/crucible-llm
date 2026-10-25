@@ -91,6 +91,8 @@ enum Source {
         path: PathBuf,
         prev_uj: u64,
         prev_time: Instant,
+        /// `max_energy_range_uj`: where the counter wraps (`None` = unreadable).
+        max_uj: Option<u64>,
     },
     /// Super I/O: a direct power file, or a CPU current × CPU voltage pair.
     SuperIo {
@@ -230,16 +232,17 @@ impl CpuPowerBackend {
                 path,
                 prev_uj,
                 prev_time,
+                max_uj,
             } => {
-                // RAPL: ΔµJ / Δt / 1e6 = W (`wrapping_sub` absorbs the
-                // 2^40 µJ counter wrap). A non-advancing clock yields the
-                // last known value.
+                // RAPL: ΔµJ / Δt / 1e6 = W ([`rapl_delta`] absorbs the
+                // counter wrap). A non-advancing clock yields the last
+                // known value.
                 let now = Instant::now();
                 match read_u64(path) {
                     Some(energy) => {
                         let dt = now.duration_since(*prev_time).as_secs_f64();
                         *prev_time = now;
-                        let delta_uj = energy.wrapping_sub(*prev_uj) as f64;
+                        let delta_uj = rapl_delta(*prev_uj, energy, *max_uj) as f64;
                         *prev_uj = energy;
                         if dt > 0.0 {
                             (delta_uj / 1e6) / dt
@@ -315,13 +318,14 @@ fn warn_anomalous_cpu(method: CpuPowerMethod, raw: f64) {
 /// `None` when the node is absent or the live sample is implausible.
 fn try_rapl() -> Option<Source> {
     let path = Path::new("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj");
+    let max_uj = read_u64(&path.with_file_name("max_energy_range_uj"));
     let first = read_u64(path)?;
     let t0 = Instant::now();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let second = read_u64(path)?;
     let dt = t0.elapsed().as_secs_f64();
     let watts = if dt > 0.0 {
-        (second.wrapping_sub(first) as f64) / 1e6 / dt
+        (rapl_delta(first, second, max_uj) as f64) / 1e6 / dt
     } else {
         f64::INFINITY
     };
@@ -329,7 +333,20 @@ fn try_rapl() -> Option<Source> {
         path: path.to_path_buf(),
         prev_uj: second,
         prev_time: Instant::now(),
+        max_uj,
     })
+}
+
+/// The µJ advanced between two RAPL `energy_uj` reads. The counter wraps to
+/// 0 at `max_energy_range_uj` (~65.5 kJ on a Threadripper — every few
+/// minutes under load), not at 2^64, so a plain `wrapping_sub` across a
+/// rollover underflows to ~2^64 µJ. Without a readable max, fall back to
+/// `wrapping_sub`.
+fn rapl_delta(prev: u64, now: u64, max_uj: Option<u64>) -> u64 {
+    match max_uj {
+        Some(max) if now < prev => max.saturating_sub(prev).saturating_add(now),
+        _ => now.wrapping_sub(prev),
+    }
 }
 
 /// Probe the Super I/O chips for a CPU power source: a direct `power1_*`
@@ -561,6 +578,23 @@ mod tests {
         let cur_wrap = 5u64;
         let w3 = (cur_wrap.wrapping_sub(prev_wrap) as f64) / 1e6 / 1.0;
         assert!((w3 - 16.0e-6).abs() < 1e-12, "wrap Δ = 16 µJ / 1 s: {w3}");
+    }
+
+    /// A rollover at `max_energy_range_uj` (the Threadripper 9970X value)
+    /// yields the real small delta, not the ~2^64 underflow that read as
+    /// 1.8e14 W.
+    #[test]
+    fn rapl_delta_wraps_at_max_energy_range() {
+        let max = 65_532_610_987u64;
+        // 300 J before the wrap + 200 J after it = 500 J.
+        assert_eq!(
+            rapl_delta(max - 300_000_000, 200_000_000, Some(max)),
+            500_000_000
+        );
+        // No wrap: plain difference, max irrelevant.
+        assert_eq!(rapl_delta(1_000, 6_000, Some(max)), 5_000);
+        // Max unreadable: old `wrapping_sub` behavior.
+        assert_eq!(rapl_delta(u64::MAX - 10, 5, None), 16);
     }
 
     /// The Super I/O V×I math: (mV / 1000) × (mA / 1000) = watts. The
